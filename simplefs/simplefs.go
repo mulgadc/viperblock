@@ -14,6 +14,7 @@ import (
 type SimpleVolume struct {
 	Used map[uint64]bool
 	Free []uint64
+	Size uint64
 	Name string
 }
 
@@ -39,13 +40,15 @@ func New() *SimpleFS {
 }
 
 func (sfs *SimpleFS) CreateVolume(name string, size uint64) error {
-	fmt.Println("Creating volume", name, size)
+	//fmt.Println("Creating volume", name, size)
 	// Confirm size is a multiple of the blocksize
 	if size%sfs.Blocksize != 0 {
 		return fmt.Errorf("size must be a multiple of the blocksize")
 	}
 
 	totalBlocks := size / sfs.Blocksize
+
+	sfs.Volume.Size = totalBlocks
 
 	sfs.Volume.Name = name
 	sfs.Volume.Used = make(map[uint64]bool)
@@ -54,8 +57,6 @@ func (sfs *SimpleFS) CreateVolume(name string, size uint64) error {
 	for i := uint64(0); i < totalBlocks; i++ {
 		sfs.Volume.Free[i] = i
 	}
-
-	fmt.Println(sfs.Volume)
 
 	return nil
 }
@@ -66,10 +67,10 @@ func (sfs *SimpleFS) FormatVolume() error {
 	defer sfs.mu.Unlock()
 
 	sfs.Volume.Used = make(map[uint64]bool)
-	sfs.Volume.Free = make([]uint64, len(sfs.Volume.Free))
+	sfs.Volume.Free = make([]uint64, sfs.Volume.Size)
 
 	// Create free blocks
-	for i := uint64(0); i < uint64(len(sfs.Volume.Free)); i++ {
+	for i := uint64(0); i < sfs.Volume.Size; i++ {
 		sfs.Volume.Free[i] = i
 	}
 
@@ -87,7 +88,7 @@ func (sfs *SimpleFS) AllocateBlocks(size uint64) (blocks []uint64, err error) {
 	blocks = make([]uint64, size)
 
 	// First, error if there are not enough free blocks
-	fmt.Println("Allocating blocks", len(sfs.Volume.Free), size)
+	//fmt.Println("Allocating blocks", len(sfs.Volume.Free), size)
 	if len(sfs.Volume.Free) < int(size) {
 		return nil, fmt.Errorf("not enough free blocks")
 	}

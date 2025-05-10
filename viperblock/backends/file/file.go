@@ -91,7 +91,7 @@ func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (e
 	// TODO Improve
 	filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
-	fmt.Println("CREATING CHUNK FILE:", filename)
+	//fmt.Println("CREATING CHUNK FILE:", filename)
 
 	file, err := os.Create(filename)
 
@@ -100,7 +100,7 @@ func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (e
 		return err
 	}
 
-	fmt.Println("Writing headers & block")
+	//fmt.Println("Writing headers & block")
 	file.Write(*headers)
 	file.Write(*data)
 
@@ -112,7 +112,7 @@ func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (e
 
 func (backend *Backend) Sync() {
 
-	fmt.Println("Syncing block")
+	//fmt.Println("Syncing block")
 
 }
 

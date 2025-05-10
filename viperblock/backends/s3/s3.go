@@ -38,6 +38,7 @@ type S3Backend struct {
 
 type Backend struct {
 	S3Backend
+	Config S3Config
 }
 
 func New(config interface{}) (backend *Backend) {
@@ -45,6 +46,7 @@ func New(config interface{}) (backend *Backend) {
 }
 
 func (backend *Backend) Init() error {
+
 	slog.Info("Initializing S3 backend", "config", backend.config)
 
 	// Create HTTP client (skip TLS verification if requested)

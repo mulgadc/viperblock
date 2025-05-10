@@ -14,12 +14,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -67,9 +69,20 @@ type VB struct {
 	Backend types.Backend
 }
 
+// CacheConfig holds configuration for the LRU cache
+type CacheConfig struct {
+	// Size in number of blocks
+	Size int
+	// Whether to use system memory percentage
+	UseSystemMemory bool
+	// Percentage of system memory to use (0-100)
+	SystemMemoryPercent int
+}
+
 type Cache struct {
-	mu   sync.RWMutex
-	Data map[uint64]BlockCache
+	mu     sync.RWMutex
+	lru    *lru.Cache[uint64, []byte]
+	config CacheConfig
 }
 
 type ObjectMap struct {
@@ -117,12 +130,70 @@ type WAL struct {
 	mu      sync.RWMutex
 }
 
+// getSystemMemory returns the total system memory in bytes
+func getSystemMemory() uint64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Sys
+}
+
+// calculateCacheSize calculates the number of blocks that can fit in the cache
+// based on the system memory and block size
+func calculateCacheSize(blockSize uint32, percent int) int {
+	if percent <= 0 || percent > 100 {
+		percent = 30 // default to 30%
+	}
+
+	systemMemory := getSystemMemory()
+	cacheMemory := (systemMemory * uint64(percent)) / 100
+
+	return int(cacheMemory / uint64(blockSize))
+}
+
+// SetCacheSize sets the size of the LRU cache in number of blocks
+func (vb *VB) SetCacheSize(size int, percentage int) error {
+	if size <= 0 {
+		return fmt.Errorf("cache size must be greater than 0")
+	}
+
+	vb.Cache.mu.Lock()
+	defer vb.Cache.mu.Unlock()
+
+	// Create new LRU cache with specified size
+	newCache, err := lru.New[uint64, []byte](size)
+	if err != nil {
+		return fmt.Errorf("failed to create new LRU cache: %v", err)
+	}
+
+	// Replace old cache with new one
+	vb.Cache.lru = newCache
+	vb.Cache.config.Size = size
+
+	if percentage > 0 {
+		vb.Cache.config.UseSystemMemory = true
+		vb.Cache.config.SystemMemoryPercent = percentage
+	} else {
+		vb.Cache.config.UseSystemMemory = false
+		vb.Cache.config.SystemMemoryPercent = 0
+	}
+
+	return nil
+}
+
+// SetCacheSystemMemory sets the cache size based on a percentage of system memory
+func (vb *VB) SetCacheSystemMemory(percent int) error {
+	if percent <= 0 || percent > 100 {
+		return fmt.Errorf("system memory percentage must be between 1 and 100")
+	}
+
+	size := calculateCacheSize(vb.BlockSize, percent)
+
+	return vb.SetCacheSize(size, percent)
+}
+
 func New(btype string, config interface{}) (vb *VB) {
-
-	//backend, err := backend.New("file", backend.FileConfig{BaseDir: "tests/data/input1"})
-
-	//backend := file.New(file.FileConfig{BaseDir: "tests/data/input1"})
-
+	var defaultBlockSize uint32 = 4 * 1024
+	var defaultObjBlockSize uint32 = 128 * 1024
 	var backend types.Backend
 	switch btype {
 	case "file":
@@ -131,34 +202,40 @@ func New(btype string, config interface{}) (vb *VB) {
 		backend = s3.New(config)
 	}
 
+	// Calculate initial cache size based on 30% of system memory
+	initialCacheSize := calculateCacheSize(defaultBlockSize, 30)
+
+	// Create LRU cache with calculated size
+	lruCache, err := lru.New[uint64, []byte](initialCacheSize)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create LRU cache: %v", err))
+	}
+
 	vb = &VB{
-		BlockSize: 4 * 1024,
-
-		ObjBlockSize: 128 * 1024,
-
-		//ObjBlockSize: 4 * 1024 * 1024,
-
+		BlockSize:     defaultBlockSize,
+		ObjBlockSize:  defaultObjBlockSize,
 		FlushInterval: 5 * time.Second,
 		FlushSize:     64 * 1024 * 1024,
-
-		Writes: Blocks{},
-		WAL:    WAL{BaseDir: "tmp/"},
-		Cache:  Cache{},
-
-		Version: 1,
-
-		WALMagic:   [4]byte{'V', 'B', 'W', 'L'},
-		ChunkMagic: [4]byte{'V', 'B', 'C', 'H'},
-
+		Writes:        Blocks{},
+		WAL:           WAL{BaseDir: "tmp/"},
+		Cache: Cache{
+			lru: lruCache,
+			config: CacheConfig{
+				Size:                initialCacheSize,
+				UseSystemMemory:     true,
+				SystemMemoryPercent: 30,
+			},
+		},
+		Version:        1,
+		WALMagic:       [4]byte{'V', 'B', 'W', 'L'},
+		ChunkMagic:     [4]byte{'V', 'B', 'C', 'H'},
 		BlocksToObject: BlocksToObject{},
-
-		Backend: backend,
+		Backend:        backend,
 	}
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
 
 	return vb
-
 }
 
 func (vb *VB) SetWALBaseDir(baseDir string) {
@@ -195,30 +272,28 @@ func (vb *VB) Close(file *os.File) error {
 }
 
 func (vb *VB) Write(block uint64, data []byte) (err error) {
-
-	//fmt.Println("WRITING BLOCK:", block, "DATA:", string(data))
-
 	// Validate length of data
 	if len(data) > int(vb.BlockSize) {
 		return fmt.Errorf("data length exceeds block size")
 	}
 
 	// Write raw data received, first to the main memory Block, which will be flushed to the WAL
-
-	// First, get a unique sequence number for the block using atomic operations (lock)
 	seqNum := vb.SeqNum.Add(1)
 
 	vb.Writes.mu.Lock()
-
 	vb.Writes.Blocks = append(vb.Writes.Blocks, Block{
 		SeqNum: seqNum,
 		Block:  block,
 		Data:   data,
 	})
-
 	vb.Writes.mu.Unlock()
-	return err
 
+	// Update the cache
+	vb.Cache.mu.Lock()
+	vb.Cache.lru.Add(block, data)
+	vb.Cache.mu.Unlock()
+
+	return nil
 }
 
 // Flush the main memory (writes) to the WAL
@@ -293,8 +368,6 @@ func (vb *VB) ReadWAL() (err error) {
 	// Scan through the file, reading the block number, offset, length, checksum, and block data
 	currentWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
 
-	fmt.Println("READING WAL:", currentWAL.Name())
-
 	defer vb.WAL.mu.RUnlock()
 
 	for {
@@ -331,13 +404,9 @@ func (vb *VB) ReadWAL() (err error) {
 		checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, headers[16:24])
 		checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, block.Data[:n])
 
-		//fmt.Println("checksum_validated:", checksum_validated)
-		//fmt.Println("checksum:", checksum)
-
 		if checksum_validated != checksum {
-			fmt.Println("checksum mismatch")
 			err2 := errors.New("checksum mismatch for block " + strconv.FormatUint(block.Block, 10) + " offset: " + strconv.FormatUint(block.Offset, 10))
-			fmt.Println(err2)
+			slog.Error("checksum mismatch", "error", err2)
 			return err2
 		}
 
@@ -368,19 +437,21 @@ func (vb *VB) WriteWALToChunk() (err error) {
 	defer pendingWAL.Close()
 
 	// Increment the WAL number
-	//nextWalNum := vb.WAL.WallNum.Add(1)
+	nextWalNum := vb.WAL.WallNum.Add(1)
 
 	// Create the next WAL file, and unlock, so other threads can continue to write to the new WAL, while we read from the pending WAL
-	//vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), nextWalNum))
+	vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), nextWalNum))
 
 	// First seek to the beginning of the pending WAL file
 	pendingWAL.Close()
 
-	pendingWAL2, err := os.OpenFile(fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), currentWALNum), os.O_RDWR, 0640)
+	filename := fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), currentWALNum)
+	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0640)
+	//fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), currentWALNum), os.O_RDWR, 0640)
 
 	if err != nil {
-		fmt.Println("ERROR OPENING WAL:", err)
-		os.Exit(1)
+		slog.Error("ERROR OPENING WAL:", "filename", filename, "error", err)
+		return err
 	}
 
 	//pendingWAL.Seek(0, 0)
@@ -398,7 +469,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 			if err == io.EOF {
 				break
 			}
-			fmt.Println("ERROR READING WAL:", err)
+			slog.Error("ERROR READING WAL:", "error", err)
 		}
 
 		// Validate the checksum
@@ -411,7 +482,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 		checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, data[28:])
 
 		if checksum_validated != checksum {
-			fmt.Println("checksum mismatch in WriteWALToChunk")
+			slog.Error("checksum mismatch in WriteWALToChunk", "checksum_validated", checksum_validated, "checksum", checksum)
 		}
 
 		// Add the block to the list
@@ -423,15 +494,11 @@ func (vb *VB) WriteWALToChunk() (err error) {
 			Data:   data[28:],
 		})
 
-		//fmt.Println(string(data[24:]))
-
 	}
 
 	// View the blocks
 	// Find any blocks that are the same, let the latest seqnum win
 	blocksMap := make(BlocksMap, len(blocks))
-
-	fmt.Println("Reading each block from pending WAL")
 
 	for _, block := range blocks {
 
@@ -474,7 +541,8 @@ func (vb *VB) WriteWALToChunk() (err error) {
 
 		// If buffer is full, write to file
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			fmt.Println("WRITING CHUNK:", vb.ObjectNum.Load())
+			slog.Debug("WRITING CHUNK:", "chunkIndex", vb.ObjectNum.Load())
+
 			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
 			if err != nil {
 				slog.Error("Failed to create chunk file: %v", err)
@@ -643,4 +711,34 @@ func (vb *VB) LoadState(filename string) error {
 	vb.WAL.WallNum.Store(state.WALNum)
 
 	return nil
+}
+
+// Read reads a block from the storage backend
+func (vb *VB) Read(block uint64) (data []byte, err error) {
+	// First check the cache
+	vb.Cache.mu.RLock()
+	if cachedData, ok := vb.Cache.lru.Get(block); ok {
+		vb.Cache.mu.RUnlock()
+		return cachedData, nil
+	}
+	vb.Cache.mu.RUnlock()
+
+	// Look up the block in the object map
+	objectID, objectOffset, err := vb.LookupBlockToObject(block)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read from the backend
+	data, err = vb.Backend.Read(objectID, uint32(objectOffset), vb.BlockSize)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update the cache with the read data
+	vb.Cache.mu.Lock()
+	vb.Cache.lru.Add(block, data)
+	vb.Cache.mu.Unlock()
+
+	return data, nil
 }
