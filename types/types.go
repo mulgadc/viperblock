@@ -11,4 +11,7 @@ type Backend interface {
 	Write(objectId uint64, headers *[]byte, data *[]byte) (err error)
 	Sync()
 	GetVolume() string
+	GetBackendType() string
+	GetHost() string
+	SetConfig(config interface{})
 }

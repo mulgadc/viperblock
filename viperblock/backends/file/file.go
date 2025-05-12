@@ -119,3 +119,15 @@ func (backend *Backend) Sync() {
 func (backend *Backend) GetVolume() string {
 	return backend.config.VolumeName
 }
+
+func (backend *Backend) GetBackendType() string {
+	return "file"
+}
+
+func (backend *Backend) SetConfig(config interface{}) {
+	backend.config = config.(FileConfig)
+}
+
+func (backend *Backend) GetHost() string {
+	return ""
+}

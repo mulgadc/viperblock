@@ -546,6 +546,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
 			if err != nil {
 				slog.Error("Failed to create chunk file: %v", err)
+				return err
 			}
 
 			chunkBuffer = chunkBuffer[:0] // Reset buffer
@@ -558,6 +559,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 		err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
 		if err != nil {
 			slog.Error("Failed to create chunk file: %v", err)
+			return err
 		}
 
 	}
@@ -581,7 +583,10 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	binary.BigEndian.PutUint32(headers[5:9], vb.BlockSize)
 
 	//vb.Backend.Open()
-	vb.Backend.Write(chunkIndex, &headers, chunkBuffer)
+	err = vb.Backend.Write(chunkIndex, &headers, chunkBuffer)
+	if err != nil {
+		return err
+	}
 
 	headerLen := len(headers)
 
@@ -741,4 +746,18 @@ func (vb *VB) Read(block uint64) (data []byte, err error) {
 	vb.Cache.mu.Unlock()
 
 	return data, nil
+}
+
+func (vb *VB) WALHeader(data []byte) []byte {
+	header := make([]byte, vb.WALHeaderSize())
+	copy(header[:len(vb.ChunkMagic)], vb.ChunkMagic[:])
+	binary.BigEndian.PutUint16(header[3:5], vb.Version)
+	binary.BigEndian.PutUint32(header[5:9], vb.BlockSize)
+	return header
+}
+
+// WALHeaderSize returns the size of the WAL header in bytes
+func (vb *VB) WALHeaderSize() int {
+	// Magic bytes (4) + Version (2) + BlockSize (4)
+	return len(vb.ChunkMagic) + binary.Size(vb.Version) + binary.Size(vb.BlockSize)
 }

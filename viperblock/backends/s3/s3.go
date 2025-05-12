@@ -95,6 +95,10 @@ func (backend *Backend) Open(fname string) error {
 
 func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 
+	if backend.config.S3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+
 	data = make([]byte, length)
 	// Open the specified file
 	filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
@@ -127,6 +131,10 @@ func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (dat
 
 func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (err error) {
 
+	if backend.config.S3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+
 	// Open the specified file
 	filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
 
@@ -151,4 +159,16 @@ func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (e
 
 func (backend *Backend) Sync() {
 	return
+}
+
+func (backend *Backend) GetBackendType() string {
+	return "s3"
+}
+
+func (backend *Backend) SetConfig(config interface{}) {
+	backend.config = config.(S3Config)
+}
+
+func (backend *Backend) GetHost() string {
+	return backend.config.Host
 }
