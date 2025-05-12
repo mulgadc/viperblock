@@ -545,7 +545,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 
 			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
 			if err != nil {
-				slog.Error("Failed to create chunk file: %v", err)
+				slog.Error("Failed to create chunk file", "error", err)
 				return err
 			}
 
@@ -558,7 +558,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 	if len(chunkBuffer) > 0 {
 		err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
 		if err != nil {
-			slog.Error("Failed to create chunk file: %v", err)
+			slog.Error("Failed to create chunk file", "error", err)
 			return err
 		}
 
