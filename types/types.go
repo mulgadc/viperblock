@@ -10,6 +10,7 @@ type Backend interface {
 	Read(objectId uint64, offset uint32, length uint32) (data []byte, err error)
 	Write(objectId uint64, headers *[]byte, data *[]byte) (err error)
 	Sync()
+	GetVolumeSize() uint64
 	GetVolume() string
 	GetBackendType() string
 	GetHost() string

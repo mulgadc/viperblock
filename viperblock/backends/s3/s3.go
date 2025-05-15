@@ -21,6 +21,7 @@ import (
 // 2. Define config structs
 type S3Config struct {
 	VolumeName string
+	VolumeSize uint64
 
 	Region    string
 	Bucket    string
@@ -83,6 +84,10 @@ func (backend *Backend) Init() error {
 	}
 
 	return nil
+}
+
+func (backend *Backend) GetVolumeSize() uint64 {
+	return backend.config.VolumeSize
 }
 
 func (backend *Backend) GetVolume() string {

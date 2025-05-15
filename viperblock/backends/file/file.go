@@ -14,6 +14,7 @@ import (
 type FileConfig struct {
 	BaseDir    string
 	VolumeName string
+	VolumeSize uint64
 }
 
 type FileBackend struct {
@@ -118,6 +119,10 @@ func (backend *Backend) Sync() {
 
 func (backend *Backend) GetVolume() string {
 	return backend.config.VolumeName
+}
+
+func (backend *Backend) GetVolumeSize() uint64 {
+	return backend.config.VolumeSize
 }
 
 func (backend *Backend) GetBackendType() string {

@@ -261,7 +261,7 @@ func main() {
 	vb.WriteWALToChunk()
 
 	// Serialize the BlocksToObject
-	err = vb.SerializeBlocksToObject(fmt.Sprintf("%s/blocks_to_object.json", *voldata))
+	err = vb.SaveBlockState(fmt.Sprintf("%s/blocks_to_object.json", *voldata))
 
 	if err != nil {
 		slog.Error("Could not serialize BlocksToObject", "error", err)
