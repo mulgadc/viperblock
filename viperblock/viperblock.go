@@ -22,7 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
@@ -56,6 +55,9 @@ type VB struct {
 
 	// Writes, incoming data stored in Blocks in main memory
 	Writes Blocks
+
+	// Pending writes to backend, when data flushed, WAL appended, and prior to backend upload completion (to avoid race conditions)
+	PendingBackendWrites Blocks
 
 	// Periodically writes (Blocks) are flushed to the WAL log (default 5s, or when 64MB written, or OS flushes)
 	WAL WAL
@@ -202,7 +204,7 @@ func (vb *VB) SetCacheSystemMemory(percent int) error {
 
 func New(btype string, config interface{}) (vb *VB) {
 	var defaultBlockSize uint32 = 4 * 1024
-	var defaultObjBlockSize uint32 = 128 * 1024
+	var defaultObjBlockSize uint32 = 1024 * 1024 * 4
 	var backend types.Backend
 	switch btype {
 	case "file":
@@ -303,6 +305,8 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 
 	slog.Info("\tVBWRITE:", "blockRequests", blockRequests, "block", block, "blockLen", blockLen)
 
+	vb.Writes.mu.Lock()
+
 	// Loop through each block request
 	for i := uint64(0); i < blockRequests; i++ {
 
@@ -311,50 +315,111 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)
 
+		blockCopy := make([]byte, vb.BlockSize)
+		copy(blockCopy, data[start:end])
+
 		slog.Error("\t\tBLOCKWRITE:", "currentBlock", currentBlock, "start", start, "end", end, "i", i)
 
 		// Write raw data received, first to the main memory Block, which will be flushed to the WAL
 		seqNum := vb.SeqNum.Add(1)
 
-		vb.Writes.mu.Lock()
 		vb.Writes.Blocks = append(vb.Writes.Blocks, Block{
 			SeqNum: seqNum,
 			Block:  currentBlock,
-			Data:   data[start:end],
+			Data:   blockCopy,
 		})
 
 		slog.Error("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
 
-		vb.Writes.mu.Unlock()
-
-		// Update the cache (lru has its own mutex)
-		//vb.Cache.mu.Lock()
-		vb.Cache.lru.Add(currentBlock, data[start:end])
-		//vb.Cache.mu.Unlock()
 	}
+
+	vb.Writes.mu.Unlock()
 
 	return nil
 }
 
 // Flush the main memory (writes) to the WAL
-func (vb *VB) Flush() (err error) {
+func (vb *VB) Flush() error {
+	vb.Writes.mu.Lock()
+	flushBlocks := make([]Block, len(vb.Writes.Blocks))
+	copy(flushBlocks, vb.Writes.Blocks)
+	vb.Writes.mu.Unlock()
+
+	// Map to track successfully flushed blocks
+	flushed := make(map[uint64]uint64) // block -> seqnum
+
+	for _, block := range flushBlocks {
+		slog.Info("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
+
+		if err := vb.WriteWAL(block); err != nil {
+			slog.Error("ERROR FLUSHING:", "block", block.Block, "error", err)
+			break
+		}
+
+		// Record successful flush
+		flushed[block.Block] = block.SeqNum
+	}
+
+	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
+	if len(flushed) > 0 {
+		vb.Writes.mu.Lock()
+
+		remaining := make([]Block, 0)
+		for _, b := range vb.Writes.Blocks {
+			if _, ok := flushed[b.Block]; !ok {
+				slog.Error("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
+				// Either this block wasn't flushed, or it was rewritten after flush started
+				remaining = append(remaining, b)
+			}
+		}
+
+		vb.Writes.Blocks = remaining
+		vb.Writes.mu.Unlock()
+	}
+
+	// Append successful flushed blocks to the PendingBackendWrites
+	vb.PendingBackendWrites.mu.Lock()
+	vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, flushBlocks...)
+
+	slog.Info("PENDING BACKEND WRITES:", "len", len(vb.PendingBackendWrites.Blocks))
+	//spew.Dump(vb.PendingBackendWrites.Blocks)
+
+	/*
+		for _, block := range flushBlocks {
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+		}
+	*/
+
+	vb.PendingBackendWrites.mu.Unlock()
+
+	if len(flushed) < len(flushBlocks) {
+		return fmt.Errorf("partial flush: %d of %d blocks flushed", len(flushed), len(flushBlocks))
+	}
+
+	return nil
+}
+
+func (vb *VB) Flush2() (err error) {
 
 	vb.Writes.mu.Lock()
+	flushBlocks := make([]Block, len(vb.Writes.Blocks))
+	copy(flushBlocks, vb.Writes.Blocks)
+	vb.Writes.Blocks = nil
+	vb.Writes.mu.Unlock()
 
-	for _, block := range vb.Writes.Blocks {
+	for _, block := range flushBlocks {
 		slog.Info("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
 
 		// Write the block to the WAL
-		vb.WriteWAL(block)
+		err = vb.WriteWAL(block)
+		if err != nil {
+			slog.Error("ERROR FLUSHING:", "error", err)
+			return err
+		}
 
 	}
 
-	// Once flushed, clear the main memory
-	vb.Writes.Blocks = nil
-
-	vb.Writes.mu.Unlock()
-
-	return err
+	return nil
 
 }
 
@@ -379,7 +444,7 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	// Write the block number as big endian
 	blockNumber := make([]byte, 8)
 	binary.BigEndian.PutUint64(blockNumber, block.Block)
-	slog.Info("WriteWAL > blockNumber", "blockNumber", blockNumber, "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
+	slog.Info("WriteWAL > blockNumber", "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
 
 	currentWAL.Write(blockNumber)
 
@@ -492,14 +557,11 @@ func (vb *VB) WriteWALToChunk() (err error) {
 
 	filename := fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), currentWALNum)
 	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0640)
-	//fmt.Sprintf("%s/%s/wal.%08d.bin", vb.WAL.BaseDir, vb.Backend.GetVolume(), currentWALNum), os.O_RDWR, 0640)
 
 	if err != nil {
 		slog.Error("ERROR OPENING WAL:", "filename", filename, "error", err)
 		return err
 	}
-
-	//pendingWAL.Seek(0, 0)
 
 	blocks := []Block{}
 
@@ -509,6 +571,14 @@ func (vb *VB) WriteWALToChunk() (err error) {
 		// Read the headers + data in one chunk
 		data := make([]byte, 28+4096)
 		_, err := pendingWAL2.Read(data)
+
+		// Check n is the size of the data expected
+		/*
+			if n != len(data) {
+				slog.Error("ERROR READING WAL:", "n", n, "expected", len(data))
+				return fmt.Errorf("incomplete read: got %d bytes, expected %d", n, len(data))
+			}
+		*/
 
 		if err != nil {
 			if err == io.EOF {
@@ -549,21 +619,17 @@ func (vb *VB) WriteWALToChunk() (err error) {
 
 	for _, block := range blocks {
 
-		//fmt.Println("SEQNUM:", block.SeqNum, "BLOCK:", block.Block, "LEN:", block.Len)
-
 		if _, ok := blocksMap[block.Block]; !ok {
-			//fmt.Println("BLOCK ADDED TO MAP:", block.Block)
 			blocksMap[block.Block] = block
 		} else {
-			//fmt.Println("BLOCK EXISTS IN MAP:", blocksMap[block.Block].SeqNum, "vs", block.SeqNum)
 			if blocksMap[block.Block].SeqNum < block.SeqNum {
-				//fmt.Println("BLOCK EXISTS, LATEST SEQNUM WINS:", block.SeqNum)
 				blocksMap[block.Block] = block
 			}
 		}
 
 	}
 
+	// Sort the blocks to write consecutive blocks together in the chunk file
 	var sortedBlocks []Block
 
 	for _, block := range blocksMap {
@@ -578,7 +644,6 @@ func (vb *VB) WriteWALToChunk() (err error) {
 
 	for _, block := range sortedBlocks {
 
-		//fmt.Println("LOOKUP:", k, "BLOCK:", block.Block, "LEN:", block.Len)
 		// Append block data to buffer
 		chunkBuffer = append(chunkBuffer, block.Data...)
 		matchedBlocks = append(matchedBlocks, Block{
@@ -586,7 +651,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 			Block:  block.Block,
 		})
 
-		// If buffer is full, write to file
+		// If buffer is full (default 4MB), write to file
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
 			slog.Debug("WRITING CHUNK:", "chunkIndex", vb.ObjectNum.Load())
 
@@ -611,10 +676,7 @@ func (vb *VB) WriteWALToChunk() (err error) {
 
 	}
 
-	// Next, read the pending WAL file, and write to the chunk file
-
 	return err
-
 }
 
 func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
@@ -629,11 +691,40 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	binary.BigEndian.PutUint16(headers[3:5], vb.Version)
 	binary.BigEndian.PutUint32(headers[5:9], vb.BlockSize)
 
-	//vb.Backend.Open()
 	err = vb.Backend.Write(chunkIndex, &headers, chunkBuffer)
 	if err != nil {
 		return err
 	}
+
+	// After upload completion, remove from PendingBackendWrites
+	// Clone a copy of the blocks
+	vb.PendingBackendWrites.mu.Lock()
+	pendingBackendWrites := make([]Block, len(vb.PendingBackendWrites.Blocks))
+	copy(pendingBackendWrites, vb.PendingBackendWrites.Blocks)
+
+	// Loop through the pending backend writes, and remove the blocks that have been written
+	for _, block := range pendingBackendWrites {
+		var matched bool = false
+		for _, matchedBlock := range *matchedBlocks {
+			if block.Block == matchedBlock.Block {
+				matched = true
+				break
+			}
+		}
+
+		// If the block is not in the matched blocks, append to the pending backend writes
+		if !matched {
+			//vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+		} else {
+			// Update the cache with the block data on successful write
+			//vb.Cache.lru.Add(block.Block, block.Data)
+		}
+	}
+
+	// Hack
+	vb.PendingBackendWrites.Blocks = make([]Block, 0)
+
+	vb.PendingBackendWrites.mu.Unlock()
 
 	headerLen := len(headers)
 
@@ -667,10 +758,10 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	}
 
-	vb.BlocksToObject.mu.Unlock()
-
 	// Increment the object number
 	vb.ObjectNum.Add(1)
+
+	vb.BlocksToObject.mu.Unlock()
 
 	return nil
 }
@@ -725,8 +816,6 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	vb.BlocksToObject.mu.RUnlock()
 
 	slog.Info("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
-
-	spew.Dump(vb.BlocksToObject.BlockLookup)
 
 	if ok {
 		return blockLookup.ObjectID, blockLookup.ObjectOffset, nil
@@ -789,7 +878,7 @@ func (vb *VB) LoadState(filename string) error {
 	return nil
 }
 
-func (vb *VB) Read2(block uint64, blockLen uint64) (data []byte, err error) {
+func (vb *VB) Read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// First check the block exists in our volume size
 	if block*uint64(vb.BlockSize) > vb.Backend.GetVolumeSize() {
@@ -822,6 +911,17 @@ func (vb *VB) Read2(block uint64, blockLen uint64) (data []byte, err error) {
 		}
 	}
 
+	// Preprocess pending writes (after WAL write to backend upload success/completion)
+	vb.PendingBackendWrites.mu.RLock()
+	pendingWritesCopy := make([]Block, len(vb.PendingBackendWrites.Blocks))
+	copy(pendingWritesCopy, vb.PendingBackendWrites.Blocks)
+	vb.PendingBackendWrites.mu.RUnlock()
+
+	latestPendingWrites := make(BlocksMap)
+	for _, wr := range pendingWritesCopy {
+		latestPendingWrites[wr.Block] = wr
+	}
+
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	for i := uint64(0); i < blockRequests; i++ {
@@ -829,33 +929,87 @@ func (vb *VB) Read2(block uint64, blockLen uint64) (data []byte, err error) {
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)
 
+		// If matched in our HOT writes, copy the data
 		if wr, ok := latestWrites[currentBlock]; ok {
+			slog.Info("[READ] HOT BLOCK:", "block", wr.Block, "seqnum", wr.SeqNum)
+
 			copy(data[start:end], clone(wr.Data))
 			continue
 		}
 
+		// Next, check the pending backend writes buffer
+		if lp, ok := latestPendingWrites[currentBlock]; ok {
+			slog.Info("[READ] PENDING BLOCK:", "block", lp.Block, "seqnum", lp.SeqNum)
+
+			copy(data[start:end], clone(lp.Data))
+			continue
+		}
+
+		// Next query the LRU cache if the data does not exist in the HOT write path, or pending write buffer.
+		if vb.Cache.config.Size > 0 {
+			if cachedData, ok := vb.Cache.lru.Get(currentBlock); ok {
+				slog.Info("[READ] LRU CACHE BLOCK:", "block", currentBlock)
+
+				copy(data[start:end], cachedData)
+				continue
+			}
+		}
+
+		// Next, fetch which object and offset the block is within
 		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
 			zeroBlockErr = ZeroBlock
+			slog.Info("[READ] ZERO BLOCK:", "block", currentBlock)
+
 			copy(data[start:end], make([]byte, vb.BlockSize)) // zero
 			continue
 		}
 
+		// Lastly, query the backend for the block data
 		blockData, err := vb.Backend.Read(objectID, objectOffset, vb.BlockSize)
 		if err != nil {
 			return nil, err
 		}
 
+		slog.Info("[READ] BACKEND BLOCK:", "block", currentBlock, "objectID", objectID, "objectOffset", objectOffset)
+
 		copy(data[start:end], blockData)
+
+		// Update the cache with the read data
+		vb.Cache.lru.Add(currentBlock, blockData)
+
 	}
 
 	return data, zeroBlockErr
 
 }
 
+func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
+	if offset+length > vb.Backend.GetVolumeSize() {
+		return nil, RequestOutOfRange
+	}
+
+	blockSize := uint64(vb.BlockSize)
+
+	// Calculate first and last block numbers
+	firstBlock := offset / blockSize
+	lastBlock := (offset + length - 1) / blockSize
+	blockCount := lastBlock - firstBlock + 1
+
+	// Read entire range of needed blocks
+	fullData, err := vb.Read(firstBlock, blockCount*blockSize)
+	if err != nil && err != ZeroBlock {
+		return nil, err
+	}
+
+	// Compute offset within the first block
+	innerOffset := offset % blockSize
+	return fullData[innerOffset : innerOffset+length], nil
+}
+
 // Read reads a block from the storage backend for desired length
 
-func (vb *VB) Read(block uint64, blockLen uint64) (data []byte, err error) {
+func (vb *VB) Read2(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// First check the block exists in our volume size
 	if block*uint64(vb.BlockSize) > vb.Backend.GetVolumeSize() {

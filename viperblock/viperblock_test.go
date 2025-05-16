@@ -3,6 +3,7 @@ package viperblock
 import (
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -26,11 +27,16 @@ type TestVB struct {
 }
 
 // BackendType represents the type of backend to use in tests
-type BackendType string
+type BackendTest struct {
+	Name        string
+	BackendType string
+	Config      interface{}
+	CacheConfig CacheConfig
+}
 
 const (
-	FileBackend BackendType = "file"
-	S3Backend   BackendType = "s3"
+	FileBackend string = "file"
+	S3Backend   string = "s3"
 
 	AccessKey string = "AKIAIOSFODNN7EXAMPLE"
 	SecretKey string = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -99,7 +105,7 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 }
 
 // setupTestVB creates a new VB instance for testing with the specified backend
-func setupTestVB(t *testing.T, testCase TestVB, backendType BackendType) (vb *VB, baseURL string, shutdown func(volName string), err error) {
+func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
 
 	// Create a temporary directory for test data
 	//tmpDir, err := os.MkdirTemp("", "viperblock_test_*")
@@ -115,7 +121,8 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendType) (vb *VB
 	})
 
 	var config interface{}
-	switch backendType {
+	switch backendType.BackendType {
+
 	case FileBackend:
 		config = file.FileConfig{
 			BaseDir:    tmpDir,
@@ -158,11 +165,14 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendType) (vb *VB
 		assert.NoError(t, err)
 
 	default:
-		t.Fatalf("unsupported backend type: %s", backendType)
+		t.Fatalf("unsupported backend type: %s", backendType.BackendType)
 	}
 
 	// Create a new Viperblock
-	vb = New(string(backendType), config)
+	vb = New(backendType.BackendType, config)
+
+	vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
+
 	assert.NotNil(t, vb)
 
 	vb.WAL.BaseDir = tmpDir
@@ -180,11 +190,55 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendType) (vb *VB
 
 // runWithBackends runs a test function with both file and S3 backends
 func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, vb *VB)) {
-	backends := []BackendType{S3Backend, FileBackend}
+	backends := []BackendTest{
+		{
+			Name:        "file",
+			BackendType: FileBackend,
+			Config:      file.FileConfig{BaseDir: "test_data"},
+			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+		},
+
+		{
+			Name:        "file_nocache",
+			BackendType: FileBackend,
+			Config:      file.FileConfig{BaseDir: "test_data"},
+			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
+		},
+
+		{
+			Name:        "s3",
+			BackendType: S3Backend,
+			Config: s3.S3Config{
+				VolumeName: "test_s3",
+				VolumeSize: volumeSize,
+				Region:     "ap-southeast-2",
+				Bucket:     "predastore",
+				AccessKey:  AccessKey,
+				SecretKey:  SecretKey,
+				Host:       "https://127.0.0.1:8443/",
+			},
+			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+		},
+
+		{
+			Name:        "s3_nocache",
+			BackendType: S3Backend,
+			Config: s3.S3Config{
+				VolumeName: "test_s3",
+				VolumeSize: volumeSize,
+				Region:     "ap-southeast-2",
+				Bucket:     "predastore",
+				AccessKey:  AccessKey,
+				SecretKey:  SecretKey,
+				Host:       "https://127.0.0.1:8443/",
+			},
+			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
+		},
+	}
 
 	for _, backendType := range backends {
-		t.Run(fmt.Sprintf("%s_%s", testName, backendType), func(t *testing.T) {
-			t.Log("Running test with backend:", backendType)
+		t.Run(fmt.Sprintf("%s_%s", testName, backendType.Name), func(t *testing.T) {
+			t.Log("Running test ", backendType.Name, " with backend:", backendType.BackendType)
 
 			vb, baseURL, shutdown, err := setupTestVB(t, TestVB{name: testName}, backendType)
 			if err != nil {
@@ -334,21 +388,10 @@ func TestWriteAndRead(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 
-				// Test Write
-				err := vb.Write(tc.blockID, tc.data)
-				if tc.expectErr {
-					assert.Error(t, err)
-					return
-				}
-				assert.NoError(t, err)
-
-				// Test Read
-				readData, err := vb.Read(tc.blockID, uint64(len(tc.data)))
-				assert.NoError(t, err)
-				assert.Equal(t, tc.data, readData)
+				// Check for errors on invalid reads first
 
 				// Read error, requested len not a multiple of vb.Blocksize
-				readData, err = vb.Read(tc.blockID, uint64(vb.BlockSize)+1)
+				readData, err := vb.Read(tc.blockID, uint64(vb.BlockSize)+1)
 				assert.ErrorIs(t, err, RequestBlockSize)
 				assert.Nil(t, readData)
 
@@ -366,6 +409,51 @@ func TestWriteAndRead(t *testing.T) {
 				readData, err = vb.Read((vb.Backend.GetVolumeSize()/uint64(vb.BlockSize))-1, uint64(vb.BlockSize))
 				assert.ErrorIs(t, err, ZeroBlock)
 				assert.Equal(t, make([]byte, vb.BlockSize), readData)
+
+				// NO FLUSH TEST
+				// Test Write (no flush)
+				err = vb.Write(tc.blockID, tc.data)
+				if tc.expectErr {
+					assert.Error(t, err)
+					return
+				}
+				assert.NoError(t, err)
+
+				// Test Read
+				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
+				assert.NoError(t, err)
+				assert.Equal(t, tc.data, readData)
+
+				// FLUSH TEST, prior to backend write (inflight cache should hit)
+				err = vb.Flush()
+				assert.NoError(t, err)
+
+				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
+				assert.NoError(t, err)
+				assert.Equal(t, tc.data, readData)
+
+				// Next, upload chunk to the backend
+				err = vb.WriteWALToChunk()
+				assert.NoError(t, err)
+
+				// Test read path again, should be removed from inflight cache
+				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
+				assert.NoError(t, err)
+				assert.Equal(t, tc.data, readData)
+
+				// If cache enabled, check the LRU cache
+				if vb.Cache.config.Size > 0 && len(tc.data) == 4096 {
+
+					t.Log("Checking cache for block", tc.blockID)
+
+					if cachedData, ok := vb.Cache.lru.Get(tc.blockID); ok {
+						slog.Info("CACHE HIT:", "block", tc.blockID)
+
+						assert.Equal(t, tc.data, cachedData)
+
+					}
+
+				}
 
 				// Next test a WAL write and read
 				/*
