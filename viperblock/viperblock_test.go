@@ -317,7 +317,7 @@ func TestNew(t *testing.T) {
 			vb := New(tc.name, tc.config)
 			assert.NotNil(t, vb)
 			assert.Equal(t, tc.blockSize, vb.BlockSize)
-			assert.Equal(t, uint32(128*1024), vb.ObjBlockSize)
+			assert.Equal(t, uint32(1024*1024*4), vb.ObjBlockSize)
 			assert.Equal(t, 5*time.Second, vb.FlushInterval)
 			assert.Equal(t, uint32(64*1024*1024), vb.FlushSize)
 
