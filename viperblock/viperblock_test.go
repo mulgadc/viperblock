@@ -1,9 +1,11 @@
 package viperblock
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -170,10 +172,10 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 	// Create a new Viperblock
 	vb = New(backendType.BackendType, config)
-
-	vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
-
 	assert.NotNil(t, vb)
+
+	err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
+	assert.NoError(t, err)
 
 	vb.WAL.BaseDir = tmpDir
 
@@ -349,44 +351,100 @@ func TestWriteAndRead(t *testing.T) {
 		copy(dataTenBlock[i*4096:(i+1)*4096], msg)
 	}
 
+	// Generate a random number between 20 and 50 with random data
+	randomDataBlockSize, _ := rand.Int(rand.Reader, big.NewInt(30))
+	randomDataBlock := make([]byte, 4096*int(randomDataBlockSize.Int64()))
+	for i := 0; i < int(randomDataBlockSize.Int64()); i++ {
+		rand.Read(randomDataBlock[i*4096 : (i+1)*4096])
+	}
+
 	testCases := []struct {
-		name      string
-		blockID   uint64
-		data      []byte
-		expectErr bool
+		name        string
+		blockID     uint64
+		data        []byte
+		expectErr   bool
+		endOfVolume bool
 	}{
 		{
-			name:      "write single valid block",
-			blockID:   0,
-			data:      dataSingleBlock,
-			expectErr: false,
+			name:        "write single valid block",
+			blockID:     0,
+			data:        dataSingleBlock,
+			expectErr:   false,
+			endOfVolume: false,
 		},
+
 		{
-			name:      "write empty data",
-			blockID:   1,
-			data:      make([]byte, 4096),
-			expectErr: false,
+			name:        "write single valid block end of volume",
+			blockID:     0,
+			data:        dataSingleBlock,
+			expectErr:   false,
+			endOfVolume: true,
+		},
+
+		{
+			name:        "write empty data",
+			blockID:     1,
+			data:        make([]byte, 4096),
+			expectErr:   false,
+			endOfVolume: false,
+		},
+
+		{
+			name:        "write 10x empty data",
+			blockID:     40,
+			data:        make([]byte, 4096*10),
+			expectErr:   false,
+			endOfVolume: false,
 		},
 		// Write double block
 
 		{
-			name:      "write double valid block",
-			blockID:   2,
-			data:      dataDoubleBlock,
-			expectErr: false,
+			name:        "write double valid block",
+			blockID:     2,
+			data:        dataDoubleBlock,
+			expectErr:   false,
+			endOfVolume: false,
 		},
 
 		{
-			name:      "write 10 valid blocks",
-			blockID:   10,
-			data:      dataTenBlock,
-			expectErr: false,
+			name:        "write 10 valid blocks",
+			blockID:     10,
+			data:        dataTenBlock,
+			expectErr:   false,
+			endOfVolume: false,
+		},
+
+		{
+
+			name:        "write various random valid blocks",
+			blockID:     200,
+			data:        randomDataBlock,
+			expectErr:   false,
+			endOfVolume: false,
+		},
+
+		{
+
+			name:        "write various random valid blocks",
+			blockID:     400,
+			data:        randomDataBlock,
+			expectErr:   false,
+			endOfVolume: true,
 		},
 	}
 
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
+
+				if tc.endOfVolume {
+					// Change the block size to write at the end of the volume
+					volumeEndBlock := vb.Backend.GetVolumeSize()/uint64(vb.BlockSize) - 1
+					t.Log("volumeEndBlock", volumeEndBlock)
+					tc.blockID = volumeEndBlock - uint64(len(tc.data)/int(vb.BlockSize))
+					t.Log("verfiy", tc.blockID*uint64(vb.BlockSize), ">", vb.Backend.GetVolumeSize())
+					t.Log("New BlockID", tc.blockID)
+				}
 
 				// Check for errors on invalid reads first
 
@@ -432,9 +490,45 @@ func TestWriteAndRead(t *testing.T) {
 				assert.NoError(t, err)
 				assert.Equal(t, tc.data, readData)
 
+				// Confirm inflight cache has the correct number of blocks
+				expectedInflight := len(tc.data) / int(vb.BlockSize)
+				assert.Equal(t, expectedInflight, len(vb.PendingBackendWrites.Blocks))
+
+				// Write a new request while inflight, should be stored in our HOT cache
+				inflightWrite := make([]byte, 4096)
+				msg := "inflight HOT write"
+				copy(inflightWrite[:len(msg)], msg)
+
+				var inflightBlock uint64 = 0
+
+				if tc.endOfVolume {
+					inflightBlock = tc.blockID - 200
+				} else {
+					inflightBlock = tc.blockID + 200
+				}
+
+				err = vb.Write(inflightBlock, inflightWrite)
+				assert.NoError(t, err)
+
 				// Next, upload chunk to the backend
 				err = vb.WriteWALToChunk()
 				assert.NoError(t, err)
+
+				// Confirm HOT cache has the one write after the flush
+				assert.Equal(t, 1, len(vb.Writes.Blocks))
+
+				// Flush again, so not to interfere with the next test
+				err = vb.Flush()
+				assert.NoError(t, err)
+
+				// Confirm single inflight write exists
+				assert.Equal(t, 1, len(vb.PendingBackendWrites.Blocks))
+
+				// Next, upload chunk to the backend
+				err = vb.WriteWALToChunk()
+				assert.NoError(t, err)
+
+				//spew.Dump(vb.Writes.Blocks)
 
 				// Test read path again, should be removed from inflight cache
 				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
@@ -442,16 +536,43 @@ func TestWriteAndRead(t *testing.T) {
 				assert.Equal(t, tc.data, readData)
 
 				// If cache enabled, check the LRU cache
-				if vb.Cache.config.Size > 0 && len(tc.data) == 4096 {
+				if vb.Cache.config.Size > 0 {
 
-					t.Log("Checking cache for block", tc.blockID)
+					var blockCount uint64 = 0
 
-					if cachedData, ok := vb.Cache.lru.Get(tc.blockID); ok {
-						slog.Info("CACHE HIT:", "block", tc.blockID)
+					// Loop through each 4096 block, confirm in the cache
+					for i := uint64(0); i < uint64(len(tc.data))/4096; i++ {
 
-						assert.Equal(t, tc.data, cachedData)
+						t.Log("Checking cache for block", tc.blockID+i)
+
+						if cachedData, ok := vb.Cache.lru.Get(tc.blockID + i); ok {
+							slog.Info("CACHE HIT:", "block", tc.blockID+i)
+
+							assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], cachedData)
+
+						}
+
+						blockCount += uint64(vb.BlockSize)
 
 					}
+
+				}
+
+				err = vb.SetCacheSize(1, 0)
+				assert.NoError(t, err)
+
+				// Next, validate each read is successful for each block size
+				var blockCount uint64 = 0
+
+				// Loop through each 4096 block, confirm in the cache
+				for i := uint64(0); i < uint64(len(tc.data))/4096; i++ {
+
+					readData, err = vb.Read(tc.blockID+i, uint64(vb.BlockSize))
+					assert.NoError(t, err)
+
+					assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], readData)
+
+					blockCount += uint64(vb.BlockSize)
 
 				}
 
@@ -837,7 +958,11 @@ func TestCacheConfiguration(t *testing.T) {
 
 			// Test invalid cache size
 			err = vb.SetCacheSize(0, 0)
-			assert.Error(t, err)
+			assert.NoError(t, err)
+			assert.Equal(t, 0, vb.Cache.config.Size)
+			assert.False(t, vb.Cache.config.UseSystemMemory)
+			assert.Equal(t, 0, vb.Cache.config.SystemMemoryPercent)
+
 			err = vb.SetCacheSize(-1, 0)
 			assert.Error(t, err)
 		})

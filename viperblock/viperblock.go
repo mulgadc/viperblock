@@ -163,8 +163,17 @@ func calculateCacheSize(blockSize uint32, percent int) int {
 
 // SetCacheSize sets the size of the LRU cache in number of blocks
 func (vb *VB) SetCacheSize(size int, percentage int) error {
-	if size <= 0 {
+
+	if size < 0 {
 		return fmt.Errorf("cache size must be greater than 0")
+	}
+
+	if size == 0 {
+		// Disable the cache
+		vb.Cache.config.Size = 0
+		vb.Cache.config.UseSystemMemory = false
+		vb.Cache.config.SystemMemoryPercent = 0
+		return nil
 	}
 
 	vb.Cache.mu.Lock()
@@ -702,6 +711,9 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	pendingBackendWrites := make([]Block, len(vb.PendingBackendWrites.Blocks))
 	copy(pendingBackendWrites, vb.PendingBackendWrites.Blocks)
 
+	// Reset the pending backend writes
+	vb.PendingBackendWrites.Blocks = make([]Block, 0)
+
 	// Loop through the pending backend writes, and remove the blocks that have been written
 	for _, block := range pendingBackendWrites {
 		var matched bool = false
@@ -714,15 +726,12 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 		// If the block is not in the matched blocks, append to the pending backend writes
 		if !matched {
-			//vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
 		} else {
 			// Update the cache with the block data on successful write
-			//vb.Cache.lru.Add(block.Block, block.Data)
+			vb.Cache.lru.Add(block.Block, block.Data)
 		}
 	}
-
-	// Hack
-	vb.PendingBackendWrites.Blocks = make([]Block, 0)
 
 	vb.PendingBackendWrites.mu.Unlock()
 
