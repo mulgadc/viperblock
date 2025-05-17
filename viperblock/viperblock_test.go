@@ -447,24 +447,19 @@ func TestWriteAndRead(t *testing.T) {
 				}
 
 				// Check for errors on invalid reads first
-
-				// Read error, requested len not a multiple of vb.Blocksize
-				readData, err := vb.Read(tc.blockID, uint64(vb.BlockSize)+1)
-				assert.ErrorIs(t, err, RequestBlockSize)
-				assert.Nil(t, readData)
-
 				// Test Read error for invalid block, beyond the volume size
-				readData, err = vb.Read(vb.Backend.GetVolumeSize()+1, uint64(vb.BlockSize))
+
+				readData, err := vb.ReadAt(vb.Backend.GetVolumeSize()+(2*uint64(vb.BlockSize)), uint64(vb.BlockSize))
 				assert.ErrorIs(t, err, RequestTooLarge)
 				assert.Nil(t, readData)
 
 				// Test Read error for invalid block, beyond the volume size
-				readData, err = vb.Read((vb.Backend.GetVolumeSize()/uint64(vb.BlockSize))-1, uint64(vb.BlockSize*2))
+				readData, err = vb.ReadAt(vb.Backend.GetVolumeSize()-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize*2))
 				assert.ErrorIs(t, err, RequestOutOfRange)
 				assert.Nil(t, readData)
 
 				// Test Read for a block that exists, but null (unallocated) data
-				readData, err = vb.Read((vb.Backend.GetVolumeSize()/uint64(vb.BlockSize))-1, uint64(vb.BlockSize))
+				readData, err = vb.ReadAt((vb.Backend.GetVolumeSize())-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize))
 				assert.ErrorIs(t, err, ZeroBlock)
 				assert.Equal(t, make([]byte, vb.BlockSize), readData)
 
@@ -478,15 +473,50 @@ func TestWriteAndRead(t *testing.T) {
 				assert.NoError(t, err)
 
 				// Test Read
-				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
+				readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
 				assert.NoError(t, err)
 				assert.Equal(t, tc.data, readData)
+
+				// Test Read
+				readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
+				assert.NoError(t, err)
+				assert.Equal(t, tc.data, readData)
+
+				// Test Read from 1024 bytes in the block
+				readData, err = vb.ReadAt((tc.blockID*uint64(vb.BlockSize))+1024, uint64(len(tc.data)-1024))
+				assert.NoError(t, err)
+				assert.Equal(t, tc.data[1024:], readData)
+
+				// Test Read for last 1024 bytes in the block
+				readData, err = vb.ReadAt((tc.blockID*uint64(vb.BlockSize))+(uint64(len(tc.data))-1024), uint64(1024))
+				assert.NoError(t, err)
+				assert.Equal(t, tc.data[uint64(len(tc.data))-1024:], readData)
+
+				// Test Read for last 1024 bytes in the block and another 1024 bytes in the next block if available
+				/*
+					if len(tc.data) > 9000 {
+
+						numBlocks := uint64(len(tc.data) / int(vb.BlockSize))
+
+						start := uint64((tc.blockID+numBlocks-1)*uint64(vb.BlockSize) + 1024)
+						end := uint64(2048)
+
+						// Read the last 2 blocks for 1024 at the 2nd last and 1024 bytes from the last block at the beginning of the last block
+						readData, err := vb.ReadAt(start, end)
+
+						assert.NoError(t, err)
+
+						compareStart := (numBlocks)*uint64(vb.BlockSize) - 1024
+						assert.Equal(t, tc.data[compareStart:], readData)
+
+					}
+				*/
 
 				// FLUSH TEST, prior to backend write (inflight cache should hit)
 				err = vb.Flush()
 				assert.NoError(t, err)
 
-				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
+				readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
 				assert.NoError(t, err)
 				assert.Equal(t, tc.data, readData)
 
@@ -531,7 +561,7 @@ func TestWriteAndRead(t *testing.T) {
 				//spew.Dump(vb.Writes.Blocks)
 
 				// Test read path again, should be removed from inflight cache
-				readData, err = vb.Read(tc.blockID, uint64(len(tc.data)))
+				readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
 				assert.NoError(t, err)
 				assert.Equal(t, tc.data, readData)
 
@@ -565,9 +595,13 @@ func TestWriteAndRead(t *testing.T) {
 				var blockCount uint64 = 0
 
 				// Loop through each 4096 block, confirm in the cache
-				for i := uint64(0); i < uint64(len(tc.data))/4096; i++ {
 
-					readData, err = vb.Read(tc.blockID+i, uint64(vb.BlockSize))
+				for i := uint64(0); i < uint64(len(tc.data))/uint64(vb.BlockSize); i++ {
+
+					//readData, err = vb.Read(tc.blockID+i, uint64(vb.BlockSize))
+
+					readData, err = vb.ReadAt((tc.blockID+i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+
 					assert.NoError(t, err)
 
 					assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], readData)
@@ -768,6 +802,45 @@ func TestFlushOperations(t *testing.T) {
 			// Test WriteWALToChunk
 			err = vb.WriteWALToChunk()
 			assert.NoError(t, err)
+		})
+
+	})
+}
+
+func TestConsecutiveBlockRead(t *testing.T) {
+
+	runWithBackends(t, "consecutive_block_read", func(t *testing.T, vb *VB) {
+
+		t.Run("Consecutive Block Read", func(t *testing.T) {
+
+			err := vb.SetCacheSize(0, 0)
+			assert.NoError(t, err)
+
+			// Write multiple blocks together
+			buffer := make([]byte, 4096*10)
+
+			for i := 0; i < 10; i++ {
+				// Add random data to the buffer
+				rand.Read(buffer[i*4096 : (i+1)*4096])
+			}
+
+			err = vb.Write(0, buffer)
+			assert.NoError(t, err)
+
+			// Test Flush
+			err = vb.Flush()
+			assert.NoError(t, err)
+
+			// Test WriteWALToChunk
+			err = vb.WriteWALToChunk()
+			assert.NoError(t, err)
+
+			// Read 4 blocks, confirm we get the correct data
+			data := make([]byte, vb.BlockSize*4)
+			readData, err := vb.ReadAt(0, uint64(len(data)))
+			assert.NoError(t, err)
+			assert.Equal(t, buffer[0:len(data)], readData)
+
 		})
 
 	})
@@ -1001,7 +1074,7 @@ func TestCacheConfiguration(t *testing.T) {
 
 			// Verify only the last 5 blocks are in cache
 			for i := uint64(0); i < 10; i++ {
-				data, err := vb.Read(i, uint64(vb.BlockSize))
+				data, err := vb.ReadAt(i*uint64(vb.BlockSize), uint64(vb.BlockSize))
 				if i < 5 {
 					// First 5 blocks should be evicted, and returned ZeroBlock error
 					assert.ErrorIs(t, err, ZeroBlock)

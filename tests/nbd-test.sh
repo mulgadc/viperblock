@@ -13,7 +13,7 @@ fi
 mkfs.ext4 /dev/nbd1
 tune2fs -l /dev/nbd1
 
-mount /dev/nbd1 /mnt/nbd1
+mount -o sync /dev/nbd1 /mnt/nbd1
 
 # Check no error returned
 if [ $? -ne 0 ]; then

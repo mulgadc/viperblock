@@ -100,6 +100,8 @@ func (backend *Backend) Open(fname string) error {
 
 func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 
+	slog.Info("[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
+
 	if backend.config.S3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
