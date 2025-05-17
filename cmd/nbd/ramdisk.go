@@ -76,8 +76,8 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)
 	vb = *viperblock.New("s3", cfg)
 
-	// Check
-	vb.SetCacheSize(1024, 0)
+	// Set 20% LRU memory from host
+	vb.SetCacheSize(0, 20)
 
 	// Generate a temp directory that ends in viperblock
 	voldata := "/tmp/viperblock"
@@ -113,6 +113,7 @@ func (c *RAMDiskConnection) GetSize() (uint64, error) {
 }
 
 // Clients are allowed to make multiple connections safely.
+// TODO: confirm changes
 func (c *RAMDiskConnection) CanMultiConn() (bool, error) {
 	return false, nil
 
@@ -138,38 +139,6 @@ func (c *RAMDiskConnection) PRead2(buf []byte, offset uint64,
 
 	copy(buf, data)
 	return nil
-	/*
-		buf, err := c.vb.Read(offset/uint64(c.vb.BlockSize), uint64(len(buf)))
-
-		if err != nil && err != viperblock.ZeroBlock {
-			return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
-		}
-
-	*/
-
-	/*
-		// Get the len of buf, divide by 4096 to get the number of chunks
-		bufLen := len(buf) / 4096
-
-		// Read each chunk and append to the buf for the next 4096 block, incrementing the offset each time
-		for i := 0; i < bufLen; i++ {
-			data, err := c.vb.Read(offset + uint64(i)*4096)
-			if err != nil {
-				return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
-			}
-
-			// Only copy the current 4096 chunk
-			copy(buf[i*4096:i*4096+4096], data)
-		}
-
-		//slog.Info("PREAD:", "offset", offset, "len", len(buf), "data", data)
-
-		//copy(buf, data)
-
-		//copy(buf, disk[offset:int(offset)+len(buf)])
-	*/
-
-	return nil
 }
 
 // Note that CanWrite is required in golang plugins, otherwise PWrite
@@ -192,41 +161,36 @@ func (c *RAMDiskConnection) PWrite(buf []byte, offset uint64,
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write data: %v", err)}
 	}
 
-	/*
-		slog.Info("FLUSHING")
+	return nil
+}
 
-		err = c.vb.Flush()
+func (c *RAMDiskConnection) CanZero() (bool, error) {
+	return true, nil
+}
 
-		if err != nil {
-			return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not flush data: %v", err)}
-		}
-	*/
+func (c *RAMDiskConnection) Zero(count uint32, offset uint64, flags uint32) error {
 
-	/*
-		//, "data", buf)
+	slog.Info("ZERO:", "len", count, "offset", offset)
 
-		// Split buffer write into 4096 chunks and increment the offset
-		for i := 0; i < len(buf); i += 4096 {
-			slog.Error("PWRITE:", "offset", offset+uint64(i), "len", 4096, "data", buf[i:i+4096])
-			err := c.vb.Write((offset/4096)+uint64(i), buf[i:i+4096])
-			if err != nil {
-				return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write data: %v", err)}
-			}
+	data := make([]byte, count)
 
-		}
+	err := c.vb.Write(offset/uint64(c.vb.BlockSize), data)
 
-		//	vb.Write(offset/4096, buf)
+	if err != nil {
+		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write zero data: %v", err)}
+	}
 
-		slog.Error("FLUSHING")
+	return nil
+}
 
-		err := c.vb.Flush()
+func (c *RAMDiskConnection) CanTrim() (bool, error) {
+	return true, nil
+}
 
-		if err != nil {
-			return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not flush data: %v", err)}
-		}
+func (c *RAMDiskConnection) Trim(count uint32, offset uint64, flags uint32) error {
 
-		//copy(disk[offset:int(offset)+len(buf)], buf)
-	*/
+	slog.Info("TRIM:", "len", count, "offset", offset)
+
 	return nil
 }
 
@@ -241,11 +205,9 @@ func (c *RAMDiskConnection) CanFlush() (bool, error) {
 // would make no sense to implement a Flush() callback.
 func (c *RAMDiskConnection) Flush(flags uint32) error {
 
-	//c.vb.SaveState("/tmp/viperblock/state.json")
-	//c.vb.SaveHotState("/tmp/viperblock/hotstate.json")
-	//c.vb.SaveBlockState("/tmp/viperblock/blockstate.json")
-
-	slog.Error("Flush called")
+	c.vb.SaveState("/tmp/viperblock/state.json")
+	c.vb.SaveHotState("/tmp/viperblock/hotstate.json")
+	c.vb.SaveBlockState("/tmp/viperblock/blockstate.json")
 
 	c.vb.Flush()
 

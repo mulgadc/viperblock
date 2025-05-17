@@ -267,7 +267,24 @@ func New(btype string, config interface{}) (vb *VB) {
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
 
+	vb.SetDebug(false)
+
 	return vb
+}
+
+func (vb *VB) SetDebug(debug bool) {
+
+	var level slog.Level
+	if debug {
+		level = slog.LevelDebug
+	} else {
+		level = slog.LevelError
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	}))
+	slog.SetDefault(logger)
 }
 
 func (vb *VB) SetWALBaseDir(baseDir string) {
@@ -339,7 +356,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 		blockCopy := make([]byte, vb.BlockSize)
 		copy(blockCopy, data[start:end])
 
-		slog.Error("\t\tBLOCKWRITE:", "currentBlock", currentBlock, "start", start, "end", end, "i", i)
+		slog.Info("\t\tBLOCKWRITE:", "currentBlock", currentBlock, "start", start, "end", end, "i", i)
 
 		// Write raw data received, first to the main memory Block, which will be flushed to the WAL
 		seqNum := vb.SeqNum.Add(1)
@@ -350,7 +367,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 			Data:   blockCopy,
 		})
 
-		slog.Error("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
+		slog.Info("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
 
 	}
 
@@ -370,7 +387,7 @@ func (vb *VB) Flush() error {
 	flushed := make(map[uint64]uint64) // block -> seqnum
 
 	for _, block := range flushBlocks {
-		slog.Info("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
+		slog.Debug("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
 
 		if err := vb.WriteWAL(block); err != nil {
 			slog.Error("ERROR FLUSHING:", "block", block.Block, "error", err)
@@ -388,7 +405,7 @@ func (vb *VB) Flush() error {
 		remaining := make([]Block, 0)
 		for _, b := range vb.Writes.Blocks {
 			if _, ok := flushed[b.Block]; !ok {
-				slog.Error("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
+				slog.Info("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
 				// Either this block wasn't flushed, or it was rewritten after flush started
 				remaining = append(remaining, b)
 			}
