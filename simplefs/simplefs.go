@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"sync"
+
+	"github.com/mulgadc/viperblock/viperblock"
 )
 
 type SimpleVolume struct {
@@ -34,7 +36,7 @@ type SimpleBlock struct {
 
 func New() *SimpleFS {
 	return &SimpleFS{
-		Blocksize: 4096,
+		Blocksize: uint64(viperblock.DefaultBlockSize),
 		Blocks:    make(map[string]SimpleBlock),
 	}
 }

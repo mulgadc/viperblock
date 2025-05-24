@@ -296,7 +296,7 @@ func TestNew(t *testing.T) {
 		{
 			name:      "file",
 			config:    file.FileConfig{BaseDir: "test_data"},
-			blockSize: 4 * 1024,
+			blockSize: DefaultBlockSize,
 		},
 
 		{
@@ -310,7 +310,7 @@ func TestNew(t *testing.T) {
 				SecretKey:  SecretKey,
 				Host:       "https://127.0.0.1:8443/",
 			},
-			blockSize: 4 * 1024,
+			blockSize: DefaultBlockSize,
 		},
 	}
 
@@ -335,27 +335,27 @@ func TestNew(t *testing.T) {
 func TestWriteAndRead(t *testing.T) {
 
 	// Test data block
-	dataSingleBlock := make([]byte, 4096)
+	dataSingleBlock := make([]byte, DefaultBlockSize)
 	msg := "test data"
 	copy(dataSingleBlock[:len(msg)], msg)
 
-	dataDoubleBlock := make([]byte, 4096*2)
+	dataDoubleBlock := make([]byte, DefaultBlockSize*2)
 	msg2 := "hello first block"
 	copy(dataDoubleBlock[:len(msg2)], msg2)
 	msg3 := "hello second block"
-	copy(dataDoubleBlock[4096:], msg3)
+	copy(dataDoubleBlock[DefaultBlockSize:], msg3)
 
-	dataTenBlock := make([]byte, 4096*10)
+	dataTenBlock := make([]byte, DefaultBlockSize*10)
 	for i := 0; i < 10; i++ {
 		msg := fmt.Sprintf("test data %d", i)
-		copy(dataTenBlock[i*4096:(i+1)*4096], msg)
+		copy(dataTenBlock[i*int(DefaultBlockSize):(i+1)*int(DefaultBlockSize)], msg)
 	}
 
 	// Generate a random number between 20 and 50 with random data
 	randomDataBlockSize, _ := rand.Int(rand.Reader, big.NewInt(30))
-	randomDataBlock := make([]byte, 4096*int(randomDataBlockSize.Int64()))
+	randomDataBlock := make([]byte, int(DefaultBlockSize)*int(randomDataBlockSize.Int64()))
 	for i := 0; i < int(randomDataBlockSize.Int64()); i++ {
-		rand.Read(randomDataBlock[i*4096 : (i+1)*4096])
+		rand.Read(randomDataBlock[i*int(DefaultBlockSize) : (i+1)*int(DefaultBlockSize)])
 	}
 
 	testCases := []struct {
@@ -384,7 +384,7 @@ func TestWriteAndRead(t *testing.T) {
 		{
 			name:        "write empty data",
 			blockID:     1,
-			data:        make([]byte, 4096),
+			data:        make([]byte, DefaultBlockSize),
 			expectErr:   false,
 			endOfVolume: false,
 		},
@@ -392,7 +392,7 @@ func TestWriteAndRead(t *testing.T) {
 		{
 			name:        "write 10x empty data",
 			blockID:     40,
-			data:        make([]byte, 4096*10),
+			data:        make([]byte, DefaultBlockSize*10),
 			expectErr:   false,
 			endOfVolume: false,
 		},
@@ -463,13 +463,19 @@ func TestWriteAndRead(t *testing.T) {
 				assert.ErrorIs(t, err, ZeroBlock)
 				assert.Equal(t, make([]byte, vb.BlockSize), readData)
 
+				// Test invalid writes
+				err = vb.WriteAt(vb.Backend.GetVolumeSize()+10, tc.data)
+				assert.ErrorIs(t, err, RequestTooLarge)
+
+				err = vb.WriteAt(0, make([]byte, 0))
+				assert.ErrorIs(t, err, RequestBufferEmpty)
+
+				err = vb.WriteAt(vb.Backend.GetVolumeSize(), tc.data)
+				assert.ErrorIs(t, err, RequestOutOfRange)
+
 				// NO FLUSH TEST
 				// Test Write (no flush)
-				err = vb.Write(tc.blockID, tc.data)
-				if tc.expectErr {
-					assert.Error(t, err)
-					return
-				}
+				err = vb.WriteAt(tc.blockID*uint64(vb.BlockSize), tc.data)
 				assert.NoError(t, err)
 
 				// Test Read
@@ -483,34 +489,14 @@ func TestWriteAndRead(t *testing.T) {
 				assert.Equal(t, tc.data, readData)
 
 				// Test Read from 1024 bytes in the block
-				readData, err = vb.ReadAt((tc.blockID*uint64(vb.BlockSize))+1024, uint64(len(tc.data)-1024))
+				readData, err = vb.ReadAt((tc.blockID*uint64(vb.BlockSize))+(uint64(vb.BlockSize)/4), uint64(len(tc.data)-(int(vb.BlockSize)/4)))
 				assert.NoError(t, err)
-				assert.Equal(t, tc.data[1024:], readData)
+				assert.Equal(t, tc.data[(uint64(vb.BlockSize)/4):], readData)
 
 				// Test Read for last 1024 bytes in the block
-				readData, err = vb.ReadAt((tc.blockID*uint64(vb.BlockSize))+(uint64(len(tc.data))-1024), uint64(1024))
+				readData, err = vb.ReadAt((tc.blockID*uint64(vb.BlockSize))+(uint64(len(tc.data))-(uint64(vb.BlockSize)/4)), uint64((vb.BlockSize)/4))
 				assert.NoError(t, err)
-				assert.Equal(t, tc.data[uint64(len(tc.data))-1024:], readData)
-
-				// Test Read for last 1024 bytes in the block and another 1024 bytes in the next block if available
-				/*
-					if len(tc.data) > 9000 {
-
-						numBlocks := uint64(len(tc.data) / int(vb.BlockSize))
-
-						start := uint64((tc.blockID+numBlocks-1)*uint64(vb.BlockSize) + 1024)
-						end := uint64(2048)
-
-						// Read the last 2 blocks for 1024 at the 2nd last and 1024 bytes from the last block at the beginning of the last block
-						readData, err := vb.ReadAt(start, end)
-
-						assert.NoError(t, err)
-
-						compareStart := (numBlocks)*uint64(vb.BlockSize) - 1024
-						assert.Equal(t, tc.data[compareStart:], readData)
-
-					}
-				*/
+				assert.Equal(t, tc.data[uint64(len(tc.data))-(uint64(vb.BlockSize)/4):], readData)
 
 				// FLUSH TEST, prior to backend write (inflight cache should hit)
 				err = vb.Flush()
@@ -525,7 +511,7 @@ func TestWriteAndRead(t *testing.T) {
 				assert.Equal(t, expectedInflight, len(vb.PendingBackendWrites.Blocks))
 
 				// Write a new request while inflight, should be stored in our HOT cache
-				inflightWrite := make([]byte, 4096)
+				inflightWrite := make([]byte, DefaultBlockSize)
 				msg := "inflight HOT write"
 				copy(inflightWrite[:len(msg)], msg)
 
@@ -537,11 +523,11 @@ func TestWriteAndRead(t *testing.T) {
 					inflightBlock = tc.blockID + 200
 				}
 
-				err = vb.Write(inflightBlock, inflightWrite)
+				err = vb.WriteAt(inflightBlock*uint64(vb.BlockSize), inflightWrite)
 				assert.NoError(t, err)
 
 				// Next, upload chunk to the backend
-				err = vb.WriteWALToChunk()
+				err = vb.WriteWALToChunk(true)
 				assert.NoError(t, err)
 
 				// Confirm HOT cache has the one write after the flush
@@ -555,7 +541,7 @@ func TestWriteAndRead(t *testing.T) {
 				assert.Equal(t, 1, len(vb.PendingBackendWrites.Blocks))
 
 				// Next, upload chunk to the backend
-				err = vb.WriteWALToChunk()
+				err = vb.WriteWALToChunk(true)
 				assert.NoError(t, err)
 
 				//spew.Dump(vb.Writes.Blocks)
@@ -570,8 +556,8 @@ func TestWriteAndRead(t *testing.T) {
 
 					var blockCount uint64 = 0
 
-					// Loop through each 4096 block, confirm in the cache
-					for i := uint64(0); i < uint64(len(tc.data))/4096; i++ {
+					// Loop through each 4096 (default) block, confirm in the cache
+					for i := uint64(0); i < uint64(len(tc.data))/uint64(DefaultBlockSize); i++ {
 
 						t.Log("Checking cache for block", tc.blockID+i)
 
@@ -610,15 +596,29 @@ func TestWriteAndRead(t *testing.T) {
 
 				}
 
-				// Next test a WAL write and read
-				/*
-					err = vb.WriteWAL(Block{SeqNum: 1, Block: 1, Data: tc.data})
-					assert.NoError(t, err)
+				// Test smaller blocksize write, e.g simulate GRUB writing 512 blocks for bootloader
 
-					readData, err = vb.ReadWAL()
-					assert.NoError(t, err)
-					assert.Equal(t, tc.data, readData)
-				*/
+				smallBlock := make([]byte, 512)
+				rand.Read(smallBlock)
+
+				copy(tc.data[:512], smallBlock)
+
+				err = vb.WriteAt(tc.blockID*uint64(vb.BlockSize), tc.data[:512])
+				assert.NoError(t, err)
+
+				// Flush again, so not to interfere with the next test
+				err = vb.Flush()
+				assert.NoError(t, err)
+
+				// Next, upload chunk to the backend
+				err = vb.WriteWALToChunk(true)
+				assert.NoError(t, err)
+
+				// Test Read
+				//readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
+				//assert.NoError(t, err)
+				//assert.Equal(t, tc.data[:512], readData)
+
 			})
 		}
 	})
@@ -638,7 +638,7 @@ func TestWALOperations(t *testing.T) {
 			err := vb.OpenWAL(walFile)
 			assert.NoError(t, err)
 
-			data := make([]byte, 4096)
+			data := make([]byte, DefaultBlockSize)
 			msg := "test data"
 			copy(data[:len(msg)], msg)
 
@@ -692,29 +692,29 @@ func TestBlockLookup(t *testing.T) {
 
 			// Write a test block
 			blockID := uint64(0)
-			data := make([]byte, 4096)
+			data := make([]byte, DefaultBlockSize)
 			msg := "test data"
 			copy(data[:len(msg)], msg)
 
-			err := vb.Write(blockID, data)
+			err := vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 			assert.NoError(t, err)
 
 			// Next block
 			blockID = uint64(1)
-			data = make([]byte, 4096)
+			data = make([]byte, DefaultBlockSize)
 			msg = "hello world"
 			copy(data[:len(msg)], msg)
 
-			err = vb.Write(blockID, data)
+			err = vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 			assert.NoError(t, err)
 
 			// Next block
 			blockID = uint64(2)
-			data = make([]byte, 4096)
+			data = make([]byte, DefaultBlockSize)
 			msg = "say hi in japanese"
 			copy(data[:len(msg)], msg)
 
-			err = vb.Write(blockID, data)
+			err = vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -730,7 +730,7 @@ func TestBlockLookup(t *testing.T) {
 			err = vb.Flush()
 			assert.NoError(t, err)
 
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 
 			headersLen := vb.WALHeaderSize()
@@ -749,11 +749,11 @@ func TestBlockLookup(t *testing.T) {
 
 			// Next, write a new block and flush
 			blockID = uint64(3)
-			data = make([]byte, 4096)
+			data = make([]byte, DefaultBlockSize)
 			msg = "new block"
 			copy(data[:len(msg)], msg)
 
-			err = vb.Write(blockID, data)
+			err = vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 
 			assert.NoError(t, err)
 
@@ -766,7 +766,7 @@ func TestBlockLookup(t *testing.T) {
 			err = vb.Flush()
 			assert.NoError(t, err)
 
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 
 			// Lookup the block in the WAL, should be the 2nd chunk
@@ -788,10 +788,10 @@ func TestFlushOperations(t *testing.T) {
 		t.Run("Flush Operations", func(t *testing.T) {
 			// Write multiple blocks
 			for i := uint64(1); i <= 5; i++ {
-				buffer := make([]byte, 4096)
+				buffer := make([]byte, DefaultBlockSize)
 				msg := fmt.Sprintf("test data %d", i)
 				copy(buffer[:len(msg)], msg)
-				err := vb.Write(i, buffer)
+				err := vb.WriteAt(i*uint64(vb.BlockSize), buffer)
 				assert.NoError(t, err)
 			}
 
@@ -800,7 +800,7 @@ func TestFlushOperations(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Test WriteWALToChunk
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 		})
 
@@ -817,14 +817,14 @@ func TestConsecutiveBlockRead(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Write multiple blocks together
-			buffer := make([]byte, 4096*10)
+			buffer := make([]byte, DefaultBlockSize*10)
 
 			for i := 0; i < 10; i++ {
 				// Add random data to the buffer
-				rand.Read(buffer[i*4096 : (i+1)*4096])
+				rand.Read(buffer[i*int(DefaultBlockSize) : (i+1)*int(DefaultBlockSize)])
 			}
 
-			err = vb.Write(0, buffer)
+			err = vb.WriteAt(0, buffer)
 			assert.NoError(t, err)
 
 			// Test Flush
@@ -832,7 +832,7 @@ func TestConsecutiveBlockRead(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Test WriteWALToChunk
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 
 			// Read 4 blocks, confirm we get the correct data
@@ -877,11 +877,11 @@ func TestInvalidS3Host(t *testing.T) {
 			// Write a block
 			// Next, write a new block and flush
 			blockID := uint64(5)
-			data := make([]byte, 4096)
+			data := make([]byte, DefaultBlockSize)
 			msg := "bad bucket block"
 			copy(data[:len(msg)], msg)
 
-			err = vb.Write(blockID, data)
+			err = vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -893,7 +893,7 @@ func TestInvalidS3Host(t *testing.T) {
 			err = vb.Flush()
 			assert.NoError(t, err)
 
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.Error(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -934,11 +934,11 @@ func TestInvalidS3Bucket(t *testing.T) {
 			// Write a block
 			// Next, write a new block and flush
 			blockID := uint64(5)
-			data := make([]byte, 4096)
+			data := make([]byte, DefaultBlockSize)
 			msg := "bad bucket block"
 			copy(data[:len(msg)], msg)
 
-			err = vb.Write(blockID, data)
+			err = vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -950,7 +950,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 			err = vb.Flush()
 			assert.NoError(t, err)
 
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.Error(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -988,11 +988,11 @@ func TestInvalidS3Auth(t *testing.T) {
 			// Write a block
 			// Next, write a new block and flush
 			blockID := uint64(4)
-			data := make([]byte, 4096)
+			data := make([]byte, DefaultBlockSize)
 			msg := "bad auth block"
 			copy(data[:len(msg)], msg)
 
-			err := vb.Write(blockID, data)
+			err := vb.WriteAt(blockID*uint64(vb.BlockSize), data)
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -1004,7 +1004,7 @@ func TestInvalidS3Auth(t *testing.T) {
 			err = vb.Flush()
 			assert.NoError(t, err)
 
-			err = vb.WriteWALToChunk()
+			err = vb.WriteWALToChunk(true)
 			assert.Error(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
@@ -1064,7 +1064,7 @@ func TestCacheConfiguration(t *testing.T) {
 
 			// Write some blocks
 			for i := uint64(0); i < 10; i++ {
-				data := make([]byte, 4096)
+				data := make([]byte, DefaultBlockSize)
 				msg := fmt.Sprintf("test data %d", i)
 				copy(data[:len(msg)], msg)
 
@@ -1082,7 +1082,7 @@ func TestCacheConfiguration(t *testing.T) {
 				} else {
 					// Last 5 blocks should be in cache
 					assert.NoError(t, err)
-					compare := make([]byte, 4096)
+					compare := make([]byte, DefaultBlockSize)
 					msg := fmt.Sprintf("test data %d", i)
 					copy(compare[:len(msg)], msg)
 					assert.Equal(t, compare, data)

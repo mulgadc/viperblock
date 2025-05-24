@@ -1,8 +1,13 @@
 #!/bin/sh
 
 umount /mnt/nbd1
+
 nbd-client -d /dev/nbd1
-nbd-client -N default 127.0.0.1 10809 /dev/nbd1
+
+#nbd-client -N default 127.0.0.1 10809 /dev/nbd1
+
+# Faster using Unix sockets
+nbd-client -N default -u /tmp/nbd1.sock /dev/nbd1
 
 # Check no error returned
 if [ $? -ne 0 ]; then

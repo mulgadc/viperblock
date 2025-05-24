@@ -258,7 +258,7 @@ func main() {
 
 	fmt.Println("Main memory after flush: ", len(vb.Writes.Blocks))
 
-	vb.WriteWALToChunk()
+	vb.WriteWALToChunk(false)
 
 	// Serialize the BlocksToObject
 	err = vb.SaveBlockState(fmt.Sprintf("%s/blocks_to_object.json", *voldata))

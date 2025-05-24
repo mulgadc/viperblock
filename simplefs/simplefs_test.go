@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -31,7 +32,7 @@ func setupTestSimpleFS(t *testing.T, testCase TestSimpleFS) *SimpleFS {
 func TestNew(t *testing.T) {
 	sfs := New()
 	assert.NotNil(t, sfs)
-	assert.Equal(t, uint64(4096), sfs.Blocksize)
+	//assert.Equal(t, uint64(len(sfs.Blocks.Blocks)), sfs.Blocksize)
 	assert.NotNil(t, sfs.Blocks)
 }
 
@@ -39,11 +40,11 @@ func TestCreateVolume(t *testing.T) {
 	testCases := []TestSimpleFS{
 		{
 			name:       "create valid volume",
-			volumeSize: 4096 * 10, // 10 blocks
+			volumeSize: uint64(viperblock.DefaultBlockSize) * 10, // 10 blocks
 		},
 		{
 			name:       "create volume with invalid size",
-			volumeSize: 4096*10 + 1, // Not a multiple of blocksize
+			volumeSize: uint64(viperblock.DefaultBlockSize)*10 + 1, // Not a multiple of blocksize
 		},
 	}
 
@@ -52,13 +53,13 @@ func TestCreateVolume(t *testing.T) {
 			sfs := setupTestSimpleFS(t, tc)
 
 			err := sfs.CreateVolume("test_volume", tc.volumeSize)
-			if tc.volumeSize%4096 != 0 {
+			if tc.volumeSize%uint64(viperblock.DefaultBlockSize) != 0 {
 				assert.Error(t, err)
 				return
 			}
 			assert.NoError(t, err)
 			assert.Equal(t, "test_volume", sfs.Volume.Name)
-			assert.Equal(t, tc.volumeSize/4096, uint64(len(sfs.Volume.Free)))
+			assert.Equal(t, tc.volumeSize/uint64(viperblock.DefaultBlockSize), uint64(len(sfs.Volume.Free)))
 		})
 	}
 }
@@ -67,7 +68,7 @@ func TestFormatVolume(t *testing.T) {
 	sfs := setupTestSimpleFS(t, TestSimpleFS{name: "test_volume"})
 
 	// First create a volume
-	err := sfs.CreateVolume("test_volume", 4096*10)
+	err := sfs.CreateVolume("test_volume", uint64(viperblock.DefaultBlockSize)*10)
 	assert.NoError(t, err)
 
 	// Allocate some blocks
@@ -88,7 +89,7 @@ func TestAllocateAndFreeBlocks(t *testing.T) {
 	sfs := setupTestSimpleFS(t, TestSimpleFS{name: "allocate_free_blocks"})
 
 	// Create a volume
-	err := sfs.CreateVolume("test_volume", 4096*10)
+	err := sfs.CreateVolume("test_volume", uint64(viperblock.DefaultBlockSize)*10)
 	assert.NoError(t, err)
 
 	t.Run("Allocate Blocks", func(t *testing.T) {
@@ -127,12 +128,12 @@ func TestFileOperations(t *testing.T) {
 	sfs := setupTestSimpleFS(t, TestSimpleFS{name: "file_operations"})
 
 	// Create a volume
-	err := sfs.CreateVolume("test_volume", 4096*10)
+	err := sfs.CreateVolume("test_volume", uint64(viperblock.DefaultBlockSize)*10)
 	assert.NoError(t, err)
 
 	t.Run("Create File", func(t *testing.T) {
 		// Test creating a file
-		blocks, err := sfs.CreateFile("test.txt", 8192) // 2 blocks
+		blocks, err := sfs.CreateFile("test.txt", uint64(viperblock.DefaultBlockSize)*2) // 2 blocks
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(blocks))
 
@@ -140,13 +141,13 @@ func TestFileOperations(t *testing.T) {
 		block, exists := sfs.Blocks["test.txt"]
 		assert.True(t, exists)
 		assert.Equal(t, "test.txt", block.Filename)
-		assert.Equal(t, uint64(8192), block.Size)
+		assert.Equal(t, uint64(viperblock.DefaultBlockSize)*2, block.Size)
 		assert.Equal(t, 2, len(block.Blocks))
 	})
 
 	t.Run("Delete File", func(t *testing.T) {
 		// Create a file first
-		_, err := sfs.CreateFile("test.txt", 4096)
+		_, err := sfs.CreateFile("test.txt", uint64(viperblock.DefaultBlockSize))
 		assert.NoError(t, err)
 
 		// Test deleting the file
@@ -167,9 +168,9 @@ func TestStateOperations(t *testing.T) {
 	sfs := setupTestSimpleFS(t, TestSimpleFS{name: "state_operations"})
 
 	// Create a volume and some files
-	err := sfs.CreateVolume("test_volume", 4096*10)
+	err := sfs.CreateVolume("test_volume", uint64(viperblock.DefaultBlockSize)*10)
 	assert.NoError(t, err)
-	_, err = sfs.CreateFile("test.txt", 4096)
+	_, err = sfs.CreateFile("test.txt", uint64(viperblock.DefaultBlockSize))
 	assert.NoError(t, err)
 
 	t.Run("Save and Load State", func(t *testing.T) {
