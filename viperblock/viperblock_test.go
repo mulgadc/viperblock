@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
-	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -54,9 +53,6 @@ const (
 // - an error if startup failed
 func startTestServer(t *testing.T, host string) (shutdown func(volName string), err error) {
 
-	// Create and configure the S3 server
-	s3server := predastore.New()
-
 	// Get the current directory
 	dir, err := os.Getwd()
 	require.NoError(t, err, "Failed to get current directory")
@@ -64,7 +60,16 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 	// Go down one directory from the current directory
 	dir = filepath.Join(dir, "..")
 
-	err = s3server.ReadConfig(filepath.Join(dir, "tests/config/server.toml"), dir)
+	predastoreConfig := predastore.Config{
+		BasePath:   dir,
+		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
+		Debug:      false,
+	}
+
+	// Create and configure the S3 server
+	s3server := predastore.New(&predastoreConfig)
+
+	err = s3server.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
 
 	// Setup routes
@@ -83,7 +88,7 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 			// Only log, don't panic, to avoid crashing test
 			assert.NoError(t, err)
 
-			t.Logf("fiber server exited: %v\n", err)
+			//t.Logf("fiber server exited: %v\n", err)
 
 		}
 
@@ -98,7 +103,67 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 		// Remove the test volume
 		tmpVolume := fmt.Sprintf("%s/%s", s3server.Buckets[0].Pathname, volName)
 
-		t.Log(fmt.Sprintf("Removing %s", tmpVolume))
+		//t.Log(fmt.Sprintf("Removing %s", tmpVolume))
+		os.RemoveAll(tmpVolume)
+
+	}
+
+	return shutdown, nil
+}
+
+func startTestServerBench(b *testing.B, host string) (shutdown func(volName string), err error) {
+
+	// Get the current directory
+	dir, err := os.Getwd()
+	require.NoError(b, err, "Failed to get current directory")
+
+	// Go down one directory from the current directory
+	dir = filepath.Join(dir, "..")
+
+	predastoreConfig := predastore.Config{
+		BasePath:   dir,
+		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
+		Debug:      false,
+	}
+
+	// Create and configure the S3 server
+	s3server := predastore.New(&predastoreConfig)
+
+	err = s3server.ReadConfig()
+	require.NoError(b, err, "Failed to read config file")
+
+	// Setup routes
+	app := s3server.SetupRoutes()
+
+	// Channel to track when server is running
+	started := make(chan struct{})
+
+	require.NoError(b, err, "Failed to get free port")
+
+	go func() {
+		close(started) // notify that listener is active
+
+		// Start the Fiber app directly with ListenTLS
+		if err := app.ListenTLS(fmt.Sprintf("%s", host), "../config/server.pem", "../config/server.key"); err != nil {
+			// Only log, don't panic, to avoid crashing test
+			assert.NoError(b, err)
+
+			b.Logf("fiber server exited: %v\n", err)
+
+		}
+
+	}()
+
+	// Wait for listener to bind
+	<-started
+
+	shutdown = func(volName string) {
+		_ = app.Shutdown()
+
+		// Remove the test volume
+		tmpVolume := fmt.Sprintf("%s/%s", s3server.Buckets[0].Pathname, volName)
+
+		//b.Log(fmt.Sprintf("Removing %s", tmpVolume))
 		os.RemoveAll(tmpVolume)
 
 	}
@@ -116,7 +181,7 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 	t.Cleanup(func() {
 		if vb != nil {
-			t.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
+			//t.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
 			os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
 		}
 
@@ -133,12 +198,12 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		}
 
 		shutdown = func(volName string) {
-			t.Logf("Shutdown for file handler %s", volName)
+			//t.Logf("Shutdown for file handler %s", volName)
 		}
 
 	case S3Backend:
 
-		t.Log("S3 backend not found, setting up S3 server")
+		//t.Log("S3 backend not found, setting up S3 server")
 
 		host, err := getFreePort()
 		assert.NoError(t, err)
@@ -186,6 +251,89 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	err = vb.Backend.Init()
 
 	assert.NoError(t, err)
+
+	return vb, baseURL, shutdown, nil
+}
+
+func setupTestVBBench(b *testing.B, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
+
+	// Create a temporary directory for test data
+	//tmpDir, err := os.MkdirTemp("", "viperblock_test_*")
+	tmpDir := os.TempDir()
+	testVol := fmt.Sprintf("test_volume_%d", time.Now().UnixNano())
+
+	b.Cleanup(func() {
+		if vb != nil {
+			//b.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
+			os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
+		}
+
+	})
+
+	var config interface{}
+	switch backendType.BackendType {
+
+	case FileBackend:
+		config = file.FileConfig{
+			BaseDir:    tmpDir,
+			VolumeName: testVol,
+			VolumeSize: volumeSize,
+		}
+
+		shutdown = func(volName string) {
+			//b.Logf("Shutdown for file handler %s", volName)
+		}
+
+	case S3Backend:
+
+		//b.Log("S3 backend not found, setting up S3 server")
+
+		host, err := getFreePort()
+		assert.NoError(b, err)
+
+		config = s3.S3Config{
+			VolumeName: testVol,
+			VolumeSize: volumeSize,
+			Region:     "ap-southeast-2",
+			Bucket:     "predastore",
+			AccessKey:  AccessKey,
+			SecretKey:  SecretKey,
+			Host:       fmt.Sprintf("https://%s", host),
+		}
+
+		shutdown, err = startTestServerBench(b, host)
+		if err != nil {
+			b.Fatalf("failed to start server: %v", err)
+		}
+
+		// Wait until server is responsive
+		ok := waitForServer(config.(s3.S3Config).Host, 2*time.Second)
+		if !ok {
+			b.Fatalf("server did not respond in time")
+		}
+
+		assert.NoError(b, err)
+
+	default:
+		b.Fatalf("unsupported backend type: %s", backendType.BackendType)
+	}
+
+	// Create a new Viperblock
+	vb = New(backendType.BackendType, config)
+	assert.NotNil(b, vb)
+
+	err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
+	assert.NoError(b, err)
+
+	vb.WAL.BaseDir = tmpDir
+
+	err = vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
+
+	assert.NoError(b, err)
+
+	err = vb.Backend.Init()
+
+	assert.NoError(b, err)
 
 	return vb, baseURL, shutdown, nil
 }
@@ -240,7 +388,8 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 
 	for _, backendType := range backends {
 		t.Run(fmt.Sprintf("%s_%s", testName, backendType.Name), func(t *testing.T) {
-			t.Log("Running test ", backendType.Name, " with backend:", backendType.BackendType)
+
+			//t.Log("Running test ", backendType.Name, " with backend:", backendType.BackendType)
 
 			vb, baseURL, shutdown, err := setupTestVB(t, TestVB{name: testName}, backendType)
 			if err != nil {
@@ -255,41 +404,69 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 	}
 }
 
-// setupTestVB creates a new VB instance for testing
-/*
-func setupTestVB(t *testing.T, testCase TestVB) *VB {
-	// Create a temporary directory for test data
-	//tmpDir, err := os.MkdirTemp("tmp/", "")
-	//assert.NoError(t, err)
+func runWithBackendsBench(b *testing.B, testName string, testFunc func(b *testing.B, vb *VB)) {
+	backends := []BackendTest{
+		{
+			Name:        "file",
+			BackendType: FileBackend,
+			Config:      file.FileConfig{BaseDir: "test_data"},
+			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+		},
 
-	// Get the last directory pathname
-	//testVol := filepath.Base(tmpDir)
-	tmpDir := os.TempDir()
-	testVol := fmt.Sprintf("test_volume_%d", time.Now().UnixNano())
+		{
+			Name:        "file_nocache",
+			BackendType: FileBackend,
+			Config:      file.FileConfig{BaseDir: "test_data"},
+			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
+		},
 
-	//tmpDir := "tmp/"
+		{
+			Name:        "s3",
+			BackendType: S3Backend,
+			Config: s3.S3Config{
+				VolumeName: "test_s3",
+				VolumeSize: volumeSize,
+				Region:     "ap-southeast-2",
+				Bucket:     "predastore",
+				AccessKey:  AccessKey,
+				SecretKey:  SecretKey,
+				Host:       "https://127.0.0.1:8443/",
+			},
+			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+		},
 
-	t.Cleanup(func() {
-		os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
-	})
-
-	// Create test configuration
-	config := file.FileConfig{
-		BaseDir:    tmpDir,
-		VolumeName: testVol,
+		{
+			Name:        "s3_nocache",
+			BackendType: S3Backend,
+			Config: s3.S3Config{
+				VolumeName: "test_s3",
+				VolumeSize: volumeSize,
+				Region:     "ap-southeast-2",
+				Bucket:     "predastore",
+				AccessKey:  AccessKey,
+				SecretKey:  SecretKey,
+				Host:       "https://127.0.0.1:8443/",
+			},
+			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
+		},
 	}
 
-	vb := New("file", config)
-	vb.WAL.BaseDir = tmpDir
-	assert.NotNil(t, vb)
+	for _, backendType := range backends {
+		b.Run(fmt.Sprintf("%s_%s", testName, backendType.Name), func(b *testing.B) {
+			//b.Log("Running test ", backendType.Name, " with backend:", backendType.BackendType)
 
-	err := vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
+			vb, baseURL, shutdown, err := setupTestVBBench(b, TestVB{name: testName}, backendType)
+			if err != nil {
+				b.Fatalf("failed to setup test VB: %v baseURL: %s", err, baseURL)
+			}
 
-	assert.NoError(t, err)
+			testFunc(b, vb)
 
-	return vb
+			defer shutdown(vb.Backend.GetVolume())
+
+		})
+	}
 }
-*/
 
 func TestNew(t *testing.T) {
 	testCases := []TestVB{
@@ -440,10 +617,10 @@ func TestWriteAndRead(t *testing.T) {
 				if tc.endOfVolume {
 					// Change the block size to write at the end of the volume
 					volumeEndBlock := vb.Backend.GetVolumeSize()/uint64(vb.BlockSize) - 1
-					t.Log("volumeEndBlock", volumeEndBlock)
+					//t.Log("volumeEndBlock", volumeEndBlock)
 					tc.blockID = volumeEndBlock - uint64(len(tc.data)/int(vb.BlockSize))
-					t.Log("verfiy", tc.blockID*uint64(vb.BlockSize), ">", vb.Backend.GetVolumeSize())
-					t.Log("New BlockID", tc.blockID)
+					//t.Log("verfiy", tc.blockID*uint64(vb.BlockSize), ">", vb.Backend.GetVolumeSize())
+					//t.Log("New BlockID", tc.blockID)
 				}
 
 				// Check for errors on invalid reads first
@@ -559,10 +736,10 @@ func TestWriteAndRead(t *testing.T) {
 					// Loop through each 4096 (default) block, confirm in the cache
 					for i := uint64(0); i < uint64(len(tc.data))/uint64(DefaultBlockSize); i++ {
 
-						t.Log("Checking cache for block", tc.blockID+i)
+						//t.Log("Checking cache for block", tc.blockID+i)
 
 						if cachedData, ok := vb.Cache.lru.Get(tc.blockID + i); ok {
-							slog.Info("CACHE HIT:", "block", tc.blockID+i)
+							//slog.Info("CACHE HIT:", "block", tc.blockID+i)
 
 							assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], cachedData)
 
@@ -742,7 +919,7 @@ func TestBlockLookup(t *testing.T) {
 				assert.Equal(t, objectID, uint64(0))
 				offset := uint32(vb.BlockSize)*uint32(block) + uint32(headersLen)
 				assert.Equal(t, offset, objectOffset)
-				t.Log("offset", offset, "objectOffset", objectOffset)
+				//t.Log("offset", offset, "objectOffset", objectOffset)
 
 				assert.NotZero(t, objectOffset)
 			}
@@ -1120,4 +1297,70 @@ func waitForServer(url string, timeout time.Duration) bool {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return false
+}
+
+// BENCHMARKS
+
+func Benchmark_SeqWrite(b *testing.B) {
+
+	tests := []struct {
+		Name  string
+		Data  []byte
+		Flush bool
+	}{
+		//{Name: "1024", Data: make([]byte, 1024)},
+		//{Name: "2048", Data: make([]byte, 2048)},
+		{Name: "4KB", Data: make([]byte, 4096), Flush: false},
+		{Name: "8KB", Data: make([]byte, 8192), Flush: false},
+		{Name: "16KB", Data: make([]byte, 16384), Flush: false},
+		{Name: "32KB", Data: make([]byte, 32768), Flush: false},
+		{Name: "64KB", Data: make([]byte, 65536), Flush: false},
+		{Name: "128KB", Data: make([]byte, 131072), Flush: false},
+
+		{Name: "4KB_flush", Data: make([]byte, 4096), Flush: true},
+		{Name: "8KB_flush", Data: make([]byte, 8192), Flush: true},
+		{Name: "16KB_flush", Data: make([]byte, 16384), Flush: true},
+		{Name: "32KB_flush", Data: make([]byte, 32768), Flush: true},
+		{Name: "64KB_flush", Data: make([]byte, 65536), Flush: true},
+		{Name: "128KB_flush", Data: make([]byte, 131072), Flush: true},
+	}
+
+	// Read a sample dataset
+	for _, test := range tests {
+
+		_, err := rand.Read(test.Data)
+		assert.NoError(b, err)
+
+		b.Run(test.Name, func(b *testing.B) {
+
+			runWithBackendsBench(b, fmt.Sprintf("flush_%t", test.Flush), func(b *testing.B, vb *VB) {
+
+				for i := 0; i < b.N; i++ {
+					err := vb.WriteAt(0, test.Data)
+					assert.NoError(b, err)
+
+					if test.Flush {
+						err := vb.Flush()
+						assert.NoError(b, err)
+					}
+				}
+
+				// Flush previous writes
+
+				err := vb.Flush()
+				//assert.NoError(b, err)
+
+				err = vb.WriteWALToChunk(true)
+				assert.NoError(b, err)
+
+				// Flush again to ensure no blocks are remaining
+				err = vb.Flush()
+				assert.NoError(b, err)
+
+			})
+
+		})
+
+	}
+
 }

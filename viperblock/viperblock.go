@@ -5,6 +5,7 @@
 package viperblock
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
+	"golang.org/x/sync/errgroup"
 )
 
 const DefaultBlockSize uint32 = 4096
@@ -110,6 +112,11 @@ type Block struct {
 	Data   []byte
 }
 
+type BlockOptimised struct {
+	SeqNum uint64
+	Index  int
+}
+
 type Blocks struct {
 	Blocks []Block
 	mu     sync.RWMutex
@@ -141,6 +148,8 @@ type ConsecutiveBlock struct {
 type ConsecutiveBlocks []ConsecutiveBlock
 
 type BlocksMap map[uint64]Block
+
+type BlocksMapOptimised map[uint64]BlockOptimised
 
 type WAL struct {
 	DB      []*os.File
@@ -505,6 +514,7 @@ func (vb *VB) Flush() error {
 		remaining := make([]Block, 0)
 		for _, b := range vb.Writes.Blocks {
 			if _, ok := flushed[b.Block]; !ok {
+				fmt.Println("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
 				slog.Info("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
 				// Either this block wasn't flushed, or it was rewritten after flush started
 				remaining = append(remaining, b)
@@ -770,38 +780,41 @@ func (vb *VB) WriteWALToChunk(force bool) (err error) {
 
 	}
 
-	// View the blocks
 	// Find any blocks that are the same, let the latest seqnum win
-	blocksMap := make(BlocksMap, len(blocks))
+	//blocksMap := make(BlocksMap, len(blocks))
 
-	for _, block := range blocks {
+	blocksMap := make(BlocksMapOptimised, len(blocks))
 
-		if _, ok := blocksMap[block.Block]; !ok {
-			blocksMap[block.Block] = block
-		} else {
-			if blocksMap[block.Block].SeqNum < block.SeqNum {
-				blocksMap[block.Block] = block
+	for index, block := range blocks {
+		if existing, ok := blocksMap[block.Block]; !ok || existing.SeqNum < block.SeqNum {
+
+			blocksMap[block.Block] = BlockOptimised{
+				SeqNum: block.SeqNum,
+				Index:  index,
 			}
 		}
-
 	}
 
 	// Sort the blocks to write consecutive blocks together in the chunk file
-	var sortedBlocks []Block
-
+	sortedBlocks := make([]*Block, 0, len(blocksMap))
 	for _, block := range blocksMap {
-		sortedBlocks = append(sortedBlocks, block)
+		sortedBlocks = append(sortedBlocks, &blocks[block.Index])
 	}
-
 	sort.Slice(sortedBlocks, func(i, j int) bool { return sortedBlocks[i].Block < sortedBlocks[j].Block })
 
 	// Next, given the blocks are deduplicated, and now sorted, write each block to the chunk file in ObjBlockSize chunk sizes
-	var chunkBuffer = make([]byte, 0, vb.ObjBlockSize)
-	var matchedBlocks = make([]Block, 0)
+	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
+	matchedBlocks := make([]Block, 0, len(sortedBlocks))
 
+	//wg := &sync.WaitGroup{}
+
+	// Create an errgroup.Group together with a cancellable context.
+	// If any function run by eg.Go returns an error, eg.Wait() will return that error,
+	// AND the context 'ctx' will be cancelled.
+	eg, _ := errgroup.WithContext(context.Background())
+
+	// Loop through the blocks, and write them to the chunk file
 	for _, block := range sortedBlocks {
-
-		// Append block data to buffer
 		chunkBuffer = append(chunkBuffer, block.Data...)
 		matchedBlocks = append(matchedBlocks, Block{
 			SeqNum: block.SeqNum,
@@ -812,35 +825,166 @@ func (vb *VB) WriteWALToChunk(force bool) (err error) {
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
 			slog.Debug("WRITING CHUNK:", "chunkIndex", vb.ObjectNum.Load())
 
-			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
-			if err != nil {
-				slog.Error("Failed to create chunk file", "error", err)
-				//vb.WAL.mu.Unlock()
+			eg.Go(func() error {
+				err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+				if err != nil {
+					slog.Error("Failed to create chunk file", "error", err)
+					//vb.WAL.mu.Unlock()
 
-				return err
-			}
+					// Push to ErrGroup
+					return err
+				}
+				return nil
+			})
 
 			chunkBuffer = chunkBuffer[:0] // Reset buffer
-			matchedBlocks = make([]Block, 0)
+			matchedBlocks = matchedBlocks[:0]
 		}
 	}
 
 	// Write any remaining data as the last chunk
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
-		if err != nil {
-			slog.Error("Failed to create chunk file", "error", err)
-			//vb.WAL.mu.Unlock()
+		eg.Go(func() error {
 
+			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+			if err != nil {
+				slog.Error("Failed to create chunk file", "error", err)
+				//vb.WAL.mu.Unlock()
+				// Push to ErrGroup
+				return err
+			}
+			return nil
+		})
+
+	}
+
+	err = eg.Wait()
+	//vb.WAL.mu.Unlock()
+
+	return err
+}
+
+/*
+func (vb *VB) writeChunks(sortedBlocks *[]Block, currentWALNum uint64) (err error) {
+
+	// Calculate the number of blocks that can fit into vb.ObjBlockSize
+	numBlocks := int(vb.ObjBlockSize) / int(vb.BlockSize)
+
+	currentBlocks := int(len(*sortedBlocks)*int(vb.BlockSize)) / int(vb.ObjBlockSize)
+
+	// Calculate the remainder of the blocks that don't fit into vb.ObjBlockSize
+	remainder := len(*sortedBlocks) * int(vb.BlockSize) % numBlocks
+
+	fmt.Println("currentBlocks", currentBlocks, "numBlocks", numBlocks, "remainder", remainder)
+
+	for i := uint32(0); i < uint32(currentBlocks); i += uint32(numBlocks) {
+
+		// Calculate the start and end block numbers
+		startBlock := i * vb.BlockSize
+		endBlock := (i + 1) * uint32(numBlocks)
+
+		fmt.Println("\t", "startBlock", startBlock, "endBlock", endBlock)
+
+		// Generate headers
+		headers := make([]byte, 10)
+		copy(headers[:3], vb.ChunkMagic[:])
+
+		binary.BigEndian.PutUint16(headers[3:5], vb.Version)
+		binary.BigEndian.PutUint32(headers[5:9], vb.BlockSize)
+
+		err = vb.Backend.Write(vb.ObjectNum.Load(), &headers, sortedBlocks[startBlock:endBlock])
+		if err != nil {
 			return err
 		}
 
 	}
 
-	//vb.WAL.mu.Unlock()
+	// Generate headers
+	headers := make([]byte, 10)
+	copy(headers[:3], vb.ChunkMagic[:])
 
-	return err
+	binary.BigEndian.PutUint16(headers[3:5], vb.Version)
+	binary.BigEndian.PutUint32(headers[5:9], vb.BlockSize)
+
+	err = vb.Backend.Write(chunkIndex, &headers, chunkBuffer)
+	if err != nil {
+		return err
+	}
+
+	// After upload completion, remove from PendingBackendWrites
+	// Clone a copy of the blocks
+	vb.PendingBackendWrites.mu.Lock()
+	pendingBackendWrites := make([]Block, len(vb.PendingBackendWrites.Blocks))
+	copy(pendingBackendWrites, vb.PendingBackendWrites.Blocks)
+
+	// Reset the pending backend writes
+	vb.PendingBackendWrites.Blocks = make([]Block, 0)
+
+	// Loop through the pending backend writes, and remove the blocks that have been written
+	for _, block := range pendingBackendWrites {
+		var matched bool = false
+		for _, matchedBlock := range *matchedBlocks {
+			if block.Block == matchedBlock.Block {
+				matched = true
+				break
+			}
+		}
+
+		// If the block is not in the matched blocks, append to the pending backend writes
+		if !matched {
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+		} else {
+			// Update the cache with the block data on successful write
+
+			if vb.Cache.config.Size > 0 {
+				vb.Cache.lru.Add(block.Block, block.Data)
+			}
+		}
+	}
+
+	vb.PendingBackendWrites.mu.Unlock()
+
+	headerLen := len(headers)
+
+	// Loop through the chunk buffer, and write each block to the file
+	i := 0
+
+	vb.BlocksToObject.mu.Lock()
+	for k, block := range *matchedBlocks {
+
+		// Find out how many consecutive blocks there are
+		numBlocks := 1
+		for j := k + 1; j < len(*matchedBlocks); j++ {
+
+			if (*matchedBlocks)[j].Block == (*matchedBlocks)[j-1].Block+1 {
+				numBlocks++
+			} else {
+				break
+			}
+
+		}
+
+		// TODO: Optimise for number of consecutive blocks to reduce the memory size
+		vb.BlocksToObject.BlockLookup[block.Block] = BlockLookup{
+			StartBlock:   block.Block,
+			NumBlocks:    uint16(numBlocks),
+			ObjectID:     chunkIndex,
+			ObjectOffset: uint32(headerLen + (i * int(vb.BlockSize))),
+		}
+
+		i++
+
+	}
+
+	// Increment the object number
+	vb.ObjectNum.Add(1)
+
+	vb.BlocksToObject.mu.Unlock()
+
+	return nil
+
 }
+*/
 
 func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 

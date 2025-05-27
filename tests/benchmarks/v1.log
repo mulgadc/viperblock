@@ -1,0 +1,139 @@
+ben@ben-QEMU-Virtual-Machine:~/Development/viperblock$ go test -benchmem -run=^$ -bench ^Benchmark_SeqWrite$ github.com/mulgadc/viperblock/viperblock 
+goos: linux
+goarch: arm64
+pkg: github.com/mulgadc/viperblock/viperblock
+Benchmark_SeqWrite/4KB/flush_false_file-3         	  126502	      9653 ns/op	   10073 B/op	       9 allocs/op
+Benchmark_SeqWrite/4KB/flush_false_file_nocache-3 	  172810	      8429 ns/op	    9974 B/op	       9 allocs/op
+Benchmark_SeqWrite/4KB/flush_false_s3-3           	  188244	      8180 ns/op	   10057 B/op	       9 allocs/op
+Benchmark_SeqWrite/4KB/flush_false_s3_nocache-3   	  138806	      7629 ns/op	   10004 B/op	       9 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_file-3         	   90808	     14280 ns/op	   19925 B/op	      18 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_file_nocache-3 	   93450	     13626 ns/op	   19886 B/op	      18 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_s3-3           	   78928	     15516 ns/op	   20141 B/op	      18 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_s3_nocache-3   	   77865	     15399 ns/op	   20162 B/op	      18 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_file-3        	   46888	     29112 ns/op	   39812 B/op	      35 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_file_nocache-3         	   42108	     29145 ns/op	   40115 B/op	      35 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_s3-3                   	   42856	     32433 ns/op	   40077 B/op	      35 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_s3_nocache-3           	   42762	     31835 ns/op	   40084 B/op	      35 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_file-3                 	   21208	     59985 ns/op	   80235 B/op	      68 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_file_nocache-3         	   23176	     56759 ns/op	   79733 B/op	      68 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_s3-3                   	   20436	     60683 ns/op	   80495 B/op	      68 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_s3_nocache-3           	   20524	     61941 ns/op	   80469 B/op	      68 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_file-3                 	   11198	    112066 ns/op	  160020 B/op	     133 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_file_nocache-3         	   11067	    113143 ns/op	  160153 B/op	     133 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_s3-3                   	    9945	    126254 ns/op	  161515 B/op	     133 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_s3_nocache-3           	   11680	    125896 ns/op	  159630 B/op	     133 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_file-3                	    4950	    212629 ns/op	  323156 B/op	     262 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_file_nocache-3        	    4855	    221337 ns/op	  323655 B/op	     262 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_s3-3                  	    4647	    229854 ns/op	  320523 B/op	     262 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_s3_nocache-3          	    4026	    251190 ns/op	  324035 B/op	     263 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_file-3             	  163669	      7651 ns/op	   10038 B/op	      11 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_file_nocache-3     	  170520	      7363 ns/op	   10007 B/op	      11 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_s3-3               	  145911	      8735 ns/op	    9991 B/op	      12 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_s3_nocache-3       	  170068	      8746 ns/op	   10012 B/op	      12 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_file-3             	   88642	     15138 ns/op	   19967 B/op	      21 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_file_nocache-3     	   89422	     14638 ns/op	   19954 B/op	      21 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_s3-3               	   83840	     15259 ns/op	   20055 B/op	      21 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_s3_nocache-3       	   76922	     16448 ns/op	   20189 B/op	      21 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_file-3            	   44846	     30865 ns/op	   39941 B/op	      38 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_file_nocache-3    	   45703	     30057 ns/op	   39889 B/op	      38 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_s3-3              	   43255	     33871 ns/op	   40058 B/op	      38 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_s3_nocache-3      	   34671	     33228 ns/op	   40173 B/op	      38 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_file-3            	   21798	     63763 ns/op	   80083 B/op	      71 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_file_nocache-3    	   22720	     60880 ns/op	   79849 B/op	      71 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_s3-3              	   15840	     68221 ns/op	   80967 B/op	      71 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_s3_nocache-3      	   16881	     66229 ns/op	   80557 B/op	      71 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_file-3            	    9014	    121778 ns/op	  161600 B/op	     141 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_file_nocache-3    	    9247	    118856 ns/op	  161309 B/op	     141 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_s3-3              	    9927	    138043 ns/op	  162741 B/op	     141 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_s3_nocache-3      	   10243	    127439 ns/op	  162349 B/op	     141 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_file-3           	    5157	    236977 ns/op	  324779 B/op	     272 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_file_nocache-3   	    4850	    232194 ns/op	  326317 B/op	     272 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_s3-3             	    4246	    269949 ns/op	  325306 B/op	     273 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_s3_nocache-3     	    5216	    280785 ns/op	  324715 B/op	     272 allocs/op
+PASS
+ok  	github.com/mulgadc/viperblock/viperblock	93.224s
+ben@ben-QEMU-Virtual-Machine:~/Development/viperblock$ uname -a
+Linux ben-QEMU-Virtual-Machine 6.14.0-15-generic #15-Ubuntu SMP PREEMPT_DYNAMIC Sun Apr  6 14:37:51 UTC 2025 aarch64 aarch64 aarch64 GNU/Linux
+ben@ben-QEMU-Virtual-Machine:~/Development/viperblock$ cat /proc/cpuinfo 
+processor	: 0
+BogoMIPS	: 48.00
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp flagm2 frint
+CPU implementer	: 0x61
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0x000
+CPU revision	: 0
+
+processor	: 1
+BogoMIPS	: 48.00
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp flagm2 frint
+CPU implementer	: 0x61
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0x000
+CPU revision	: 0
+
+processor	: 2
+BogoMIPS	: 48.00
+Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp flagm2 frint
+CPU implementer	: 0x61
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0x000
+CPU revision	: 0
+
+ben@ben-QEMU-Virtual-Machine:~/Development/viperblock$ cat /proc/meminfo 
+MemTotal:        7582916 kB
+MemFree:         6014156 kB
+MemAvailable:    6410012 kB
+Buffers:           56708 kB
+Cached:           491312 kB
+SwapCached:       444844 kB
+Active:           858432 kB
+Inactive:         306472 kB
+Active(anon):     533124 kB
+Inactive(anon):   110820 kB
+Active(file):     325308 kB
+Inactive(file):   195652 kB
+Unevictable:       27120 kB
+Mlocked:               0 kB
+SwapTotal:       3992572 kB
+SwapFree:        2733160 kB
+Zswap:                 0 kB
+Zswapped:              0 kB
+Dirty:                 8 kB
+Writeback:             0 kB
+AnonPages:        528908 kB
+Mapped:           108432 kB
+Shmem:             27148 kB
+KReclaimable:     102620 kB
+Slab:             271128 kB
+SReclaimable:     102620 kB
+SUnreclaim:       168508 kB
+KernelStack:        9872 kB
+ShadowCallStack:    2480 kB
+PageTables:        31012 kB
+SecPageTables:         0 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:     7784028 kB
+Committed_AS:    6200216 kB
+VmallocTotal:   135288315904 kB
+VmallocUsed:       28436 kB
+VmallocChunk:          0 kB
+Percpu:             1680 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:         0 kB
+FilePmdMapped:         0 kB
+CmaTotal:          32768 kB
+CmaFree:           27784 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
