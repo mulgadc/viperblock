@@ -147,7 +147,7 @@ func main() {
 
 	walNum := vb.WAL.WallNum.Add(1)
 
-	err = vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", *voldata, vb.Backend.GetVolume(), walNum))
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", *voldata, vb.Backend.GetVolume(), walNum))
 
 	if err != nil {
 		slog.Error("Could not open WAL", "error", err)

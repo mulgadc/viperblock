@@ -61,9 +61,10 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 	dir = filepath.Join(dir, "..")
 
 	predastoreConfig := predastore.Config{
-		BasePath:   dir,
-		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
-		Debug:      false,
+		BasePath:       dir,
+		ConfigPath:     filepath.Join(dir, "tests/config/server.toml"),
+		Debug:          false,
+		DisableLogging: true,
 	}
 
 	// Create and configure the S3 server
@@ -121,9 +122,10 @@ func startTestServerBench(b *testing.B, host string) (shutdown func(volName stri
 	dir = filepath.Join(dir, "..")
 
 	predastoreConfig := predastore.Config{
-		BasePath:   dir,
-		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
-		Debug:      false,
+		BasePath:       dir,
+		ConfigPath:     filepath.Join(dir, "tests/config/server.toml"),
+		Debug:          false,
+		DisableLogging: true,
 	}
 
 	// Create and configure the S3 server
@@ -181,8 +183,8 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 	t.Cleanup(func() {
 		if vb != nil {
-			//t.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
-			os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
+			t.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
+			//os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
 		}
 
 	})
@@ -243,9 +245,11 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	assert.NoError(t, err)
 
 	vb.WAL.BaseDir = tmpDir
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
+	assert.NoError(t, err)
 
-	err = vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
-
+	vb.BlockToObjectWAL.BaseDir = tmpDir
+	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/block2obj.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
 	assert.NoError(t, err)
 
 	err = vb.Backend.Init()
@@ -327,8 +331,12 @@ func setupTestVBBench(b *testing.B, testCase TestVB, backendType BackendTest) (v
 
 	vb.WAL.BaseDir = tmpDir
 
-	err = vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
 
+	assert.NoError(b, err)
+
+	vb.BlockToObjectWAL.BaseDir = tmpDir
+	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/block2obj.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
 	assert.NoError(b, err)
 
 	err = vb.Backend.Init()
@@ -812,7 +820,7 @@ func TestWALOperations(t *testing.T) {
 			walFile := filepath.Join(vb.WAL.BaseDir, fmt.Sprintf("test.%s.wal", time.Now().Format("20060102150405")))
 
 			// Test OpenWAL
-			err := vb.OpenWAL(walFile)
+			err := vb.OpenWAL(&vb.WAL, walFile)
 			assert.NoError(t, err)
 
 			data := make([]byte, DefaultBlockSize)
@@ -910,7 +918,7 @@ func TestBlockLookup(t *testing.T) {
 			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 
-			headersLen := vb.WALHeaderSize()
+			headersLen := vb.ChunkHeaderSize() //10 //vb.WALHeaderSize()
 
 			// Test LookupBlockToObject
 			for _, block := range []uint64{0, 1, 2} {
@@ -1245,7 +1253,7 @@ func TestCacheConfiguration(t *testing.T) {
 				msg := fmt.Sprintf("test data %d", i)
 				copy(data[:len(msg)], msg)
 
-				err := vb.Write(i, data)
+				err := vb.WriteAt(i*uint64(vb.BlockSize), data)
 				assert.NoError(t, err)
 			}
 

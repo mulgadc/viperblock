@@ -1,0 +1,53 @@
+goos: linux
+goarch: arm64
+pkg: github.com/mulgadc/viperblock/viperblock
+Benchmark_SeqWrite/4KB/flush_false_file-3         	  120745	      8897 ns/op	    9998 B/op	       7 allocs/op
+Benchmark_SeqWrite/4KB/flush_false_file_nocache-3 	  172524	      8687 ns/op	    9890 B/op	       7 allocs/op
+Benchmark_SeqWrite/4KB/flush_false_s3-3           	  181927	      7808 ns/op	    9859 B/op	       7 allocs/op
+Benchmark_SeqWrite/4KB/flush_false_s3_nocache-3   	  130270	      7955 ns/op	    9946 B/op	       7 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_file-3         	   91191	     14899 ns/op	   19757 B/op	      14 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_file_nocache-3 	   89853	     14176 ns/op	   19776 B/op	      14 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_s3-3           	   76005	     16456 ns/op	   20013 B/op	      14 allocs/op
+Benchmark_SeqWrite/8KB/flush_false_s3_nocache-3   	   73692	     16580 ns/op	   19775 B/op	      14 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_file-3        	   46851	     32027 ns/op	   39496 B/op	      27 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_file_nocache-3         	   42912	     28397 ns/op	   39719 B/op	      27 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_s3-3                   	   30798	     32539 ns/op	   40098 B/op	      27 allocs/op
+Benchmark_SeqWrite/16KB/flush_false_s3_nocache-3           	   31574	     34291 ns/op	   40023 B/op	      27 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_file-3                 	   22651	     61213 ns/op	   79207 B/op	      52 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_file_nocache-3         	   23526	     57666 ns/op	   80140 B/op	      52 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_s3-3                   	   22122	     62531 ns/op	   79359 B/op	      52 allocs/op
+Benchmark_SeqWrite/32KB/flush_false_s3_nocache-3           	   17367	     66311 ns/op	   79564 B/op	      52 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_file-3                 	    8906	    113877 ns/op	  158960 B/op	     101 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_file_nocache-3         	   10741	    110939 ns/op	  159140 B/op	     101 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_s3-3                   	    9430	    138442 ns/op	  160704 B/op	     101 allocs/op
+Benchmark_SeqWrite/64KB/flush_false_s3_nocache-3           	    9213	    126783 ns/op	  158707 B/op	     101 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_file-3                	    4761	    228845 ns/op	  321183 B/op	     198 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_file_nocache-3        	    4995	    223673 ns/op	  320062 B/op	     198 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_s3-3                  	    5286	    247836 ns/op	  319028 B/op	     198 allocs/op
+Benchmark_SeqWrite/128KB/flush_false_s3_nocache-3          	    4696	    252128 ns/op	  321759 B/op	     199 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_file-3             	  165474	      7464 ns/op	    9942 B/op	      10 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_file_nocache-3     	  155905	      7516 ns/op	    9984 B/op	      10 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_s3-3               	  129837	      9042 ns/op	    9972 B/op	      10 allocs/op
+Benchmark_SeqWrite/4KB_flush/flush_true_s3_nocache-3       	  157566	      8711 ns/op	    9980 B/op	      10 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_file-3             	   84417	     15214 ns/op	   19865 B/op	      17 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_file_nocache-3     	   83313	     14927 ns/op	   19883 B/op	      17 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_s3-3               	   71385	     16795 ns/op	   19823 B/op	      17 allocs/op
+Benchmark_SeqWrite/8KB_flush/flush_true_s3_nocache-3       	   67876	     16890 ns/op	   19891 B/op	      17 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_file-3            	   43116	     31219 ns/op	   39714 B/op	      30 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_file_nocache-3    	   42879	     30462 ns/op	   39728 B/op	      30 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_s3-3              	   40381	     32666 ns/op	   39907 B/op	      30 allocs/op
+Benchmark_SeqWrite/16KB_flush/flush_true_s3_nocache-3      	   33991	     34111 ns/op	   39820 B/op	      30 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_file-3            	   21619	     63536 ns/op	   79454 B/op	      55 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_file_nocache-3    	   21858	     61257 ns/op	   79397 B/op	      55 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_s3-3              	   18652	     66754 ns/op	   79200 B/op	      55 allocs/op
+Benchmark_SeqWrite/32KB_flush/flush_true_s3_nocache-3      	   15956	     73461 ns/op	   80047 B/op	      55 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_file-3            	    9246	    120592 ns/op	  159775 B/op	     109 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_file_nocache-3    	   10485	    120055 ns/op	  160597 B/op	     109 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_s3-3              	    8630	    126893 ns/op	  160586 B/op	     109 allocs/op
+Benchmark_SeqWrite/64KB_flush/flush_true_s3_nocache-3      	    8396	    128786 ns/op	  160888 B/op	     109 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_file-3           	    4220	    243574 ns/op	  321898 B/op	     208 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_file_nocache-3   	    4900	    241720 ns/op	  323141 B/op	     208 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_s3-3             	    4862	    270622 ns/op	  323559 B/op	     208 allocs/op
+Benchmark_SeqWrite/128KB_flush/flush_true_s3_nocache-3     	    5228	    275949 ns/op	  321895 B/op	     208 allocs/op
+PASS
+ok  	github.com/mulgadc/viperblock/viperblock	94.331s
