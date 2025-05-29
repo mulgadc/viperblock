@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/mulgadc/viperblock/types"
 )
 
 // 2. Define config structs
@@ -86,19 +87,11 @@ func (backend *Backend) Init() error {
 	return nil
 }
 
-func (backend *Backend) GetVolumeSize() uint64 {
-	return backend.config.VolumeSize
-}
-
-func (backend *Backend) GetVolume() string {
-	return backend.config.VolumeName
-}
-
 func (backend *Backend) Open(fname string) error {
 	return nil
 }
 
-func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 
 	slog.Info("[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
 
@@ -108,16 +101,22 @@ func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (dat
 
 	data = make([]byte, length)
 	// Open the specified file
-	filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
+	//filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
+
+	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	// Fetch the object from S3 with a byte range
 	requestObject := &s3.GetObjectInput{
 		Bucket: aws.String(backend.config.Bucket),
 		Key:    aws.String(filename),
-		// Account for the 10 byte header metadata at the beginning of each block
-		Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset-10, offset+length-1)),
 	}
 
+	// Append an offset if defined (TODO: confirm improvements)
+	if offset > 0 {
+		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset-10, offset+length-1))
+	}
+
+	// TODO: Add ctx support and retry from S3 timeout/500/etc
 	textResult, err := backend.config.S3Client.GetObject(requestObject)
 
 	if err != nil {
@@ -131,19 +130,21 @@ func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (dat
 	}
 
 	// Copy the res to the data for the specified length
-	copy(data, res)
+	//copy(data, res)
 
-	return data, nil
+	return res, nil
 }
 
-func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (err error) {
+func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
 
 	if backend.config.S3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
 
+	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
+
 	// Open the specified file
-	filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
+	//filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
 
 	// Create a new S3 object
 	object := &s3.PutObjectInput{

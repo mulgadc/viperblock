@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 
 	"github.com/mulgadc/viperblock/simplefs"
+	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -147,7 +148,7 @@ func main() {
 
 	walNum := vb.WAL.WallNum.Add(1)
 
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", *voldata, vb.Backend.GetVolume(), walNum))
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", *voldata, vb.GetVolume(), walNum))
 
 	if err != nil {
 		slog.Error("Could not open WAL", "error", err)
@@ -290,7 +291,7 @@ func main() {
 				os.Exit(1)
 			}
 
-			data, err := vb.Backend.Read(objectID, objectOffset, uint32(sfs.Blocksize))
+			data, err := vb.Backend.Read(types.FileTypeChunk, objectID, objectOffset, uint32(sfs.Blocksize))
 
 			// Position in the buffer where this block should go
 			pos := i * int(sfs.Blocksize)

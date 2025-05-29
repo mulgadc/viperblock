@@ -8,13 +8,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+
+	"github.com/mulgadc/viperblock/types"
 )
 
 // 2. Define config structs
 type FileConfig struct {
-	BaseDir    string
 	VolumeName string
 	VolumeSize uint64
+	BaseDir    string
 }
 
 type FileBackend struct {
@@ -42,6 +44,36 @@ func (backend *Backend) Init() error {
 		return err
 	}
 
+	dirPath := fmt.Sprintf("%s/%s", backend.config.BaseDir, backend.config.VolumeName)
+
+	// Create the directory structure
+	err := os.MkdirAll(dirPath, 0755)
+
+	if err != nil {
+		slog.Error("Failed to create directory", "error", err)
+		return err
+	}
+
+	// Create the directory structure
+
+	dirs := []string{
+		"chunks",
+		"checkpoints",
+		"wal",
+		"wal/chunks",
+		"wal/blocks",
+	}
+
+	for _, dir := range dirs {
+		dirPath := fmt.Sprintf("%s/%s/%s", backend.config.BaseDir, backend.config.VolumeName, dir)
+		// Create all parent dirs
+		err := os.MkdirAll(dirPath, 0755)
+		if err != nil {
+			slog.Error("Failed to create directory", "error", err)
+			return err
+		}
+	}
+
 	return nil
 
 }
@@ -61,10 +93,12 @@ func (backend *Backend) Open(fname string) (err error) {
 
 }
 
-func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 
 	// Open the specified file
-	filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
+	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
+	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0640)
 
 	if err != nil {
@@ -73,7 +107,16 @@ func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (dat
 
 	defer f.Close()
 
-	// Read the block
+	// If the length is undefined, read the entire file (e.g config file, or block2object state)
+	if length == 0 {
+		stat, err := os.Stat(filename)
+		if err != nil {
+			return nil, err
+		}
+		length = uint32(stat.Size())
+	}
+
+	// Read the specified block for the length
 	data = make([]byte, length)
 	_, err = f.ReadAt(data, int64(offset))
 
@@ -81,17 +124,16 @@ func (backend *Backend) Read(objectId uint64, offset uint32, length uint32) (dat
 		return nil, err
 	}
 
-	//fmt.Println("Reading block")
-
 	return data, nil
 
 }
 
-func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (err error) {
+func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
 
 	// TODO Improve
-	filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
+	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
+	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
 	//fmt.Println("CREATING CHUNK FILE:", filename)
 
 	file, err := os.Create(filename)
@@ -102,10 +144,26 @@ func (backend *Backend) Write(objectId uint64, headers *[]byte, data *[]byte) (e
 	}
 
 	//fmt.Println("Writing headers & block")
-	file.Write(*headers)
-	file.Write(*data)
+	_, err = file.Write(*headers)
 
-	file.Close()
+	if err != nil {
+		slog.Error("Failed to write headers", "error", err)
+		return err
+	}
+
+	_, err = file.Write(*data)
+
+	if err != nil {
+		slog.Error("Failed to write data", "error", err)
+		return err
+	}
+
+	err = file.Close()
+
+	if err != nil {
+		slog.Error("Failed to close file", "error", err)
+		return err
+	}
 
 	return nil
 
@@ -115,14 +173,6 @@ func (backend *Backend) Sync() {
 
 	//fmt.Println("Syncing block")
 
-}
-
-func (backend *Backend) GetVolume() string {
-	return backend.config.VolumeName
-}
-
-func (backend *Backend) GetVolumeSize() uint64 {
-	return backend.config.VolumeSize
 }
 
 func (backend *Backend) GetBackendType() string {

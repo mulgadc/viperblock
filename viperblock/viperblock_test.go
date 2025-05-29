@@ -241,19 +241,18 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	vb = New(backendType.BackendType, config)
 	assert.NotNil(t, vb)
 
+	err = vb.Backend.Init()
+	assert.NoError(t, err)
+
 	err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
 	assert.NoError(t, err)
 
 	vb.WAL.BaseDir = tmpDir
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", tmpDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
 	assert.NoError(t, err)
 
 	vb.BlockToObjectWAL.BaseDir = tmpDir
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/block2obj.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
-	assert.NoError(t, err)
-
-	err = vb.Backend.Init()
-
+	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/wal/blocks/block2obj.%08d.bin", tmpDir, vb.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
 	assert.NoError(t, err)
 
 	return vb, baseURL, shutdown, nil
@@ -331,12 +330,12 @@ func setupTestVBBench(b *testing.B, testCase TestVB, backendType BackendTest) (v
 
 	vb.WAL.BaseDir = tmpDir
 
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.WAL.WallNum.Load()))
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
 
 	assert.NoError(b, err)
 
 	vb.BlockToObjectWAL.BaseDir = tmpDir
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/block2obj.%08d.bin", tmpDir, vb.Backend.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
+	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/block2obj.%08d.bin", tmpDir, vb.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
 	assert.NoError(b, err)
 
 	err = vb.Backend.Init()
@@ -406,7 +405,7 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 
 			testFunc(t, vb)
 
-			defer shutdown(vb.Backend.GetVolume())
+			defer shutdown(vb.GetVolume())
 
 		})
 	}
@@ -470,7 +469,7 @@ func runWithBackendsBench(b *testing.B, testName string, testFunc func(b *testin
 
 			testFunc(b, vb)
 
-			defer shutdown(vb.Backend.GetVolume())
+			defer shutdown(vb.GetVolume())
 
 		})
 	}
@@ -624,7 +623,7 @@ func TestWriteAndRead(t *testing.T) {
 
 				if tc.endOfVolume {
 					// Change the block size to write at the end of the volume
-					volumeEndBlock := vb.Backend.GetVolumeSize()/uint64(vb.BlockSize) - 1
+					volumeEndBlock := vb.GetVolumeSize()/uint64(vb.BlockSize) - 1
 					//t.Log("volumeEndBlock", volumeEndBlock)
 					tc.blockID = volumeEndBlock - uint64(len(tc.data)/int(vb.BlockSize))
 					//t.Log("verfiy", tc.blockID*uint64(vb.BlockSize), ">", vb.Backend.GetVolumeSize())
@@ -634,28 +633,28 @@ func TestWriteAndRead(t *testing.T) {
 				// Check for errors on invalid reads first
 				// Test Read error for invalid block, beyond the volume size
 
-				readData, err := vb.ReadAt(vb.Backend.GetVolumeSize()+(2*uint64(vb.BlockSize)), uint64(vb.BlockSize))
+				readData, err := vb.ReadAt(vb.GetVolumeSize()+(2*uint64(vb.BlockSize)), uint64(vb.BlockSize))
 				assert.ErrorIs(t, err, RequestTooLarge)
 				assert.Nil(t, readData)
 
 				// Test Read error for invalid block, beyond the volume size
-				readData, err = vb.ReadAt(vb.Backend.GetVolumeSize()-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize*2))
+				readData, err = vb.ReadAt(vb.GetVolumeSize()-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize*2))
 				assert.ErrorIs(t, err, RequestOutOfRange)
 				assert.Nil(t, readData)
 
 				// Test Read for a block that exists, but null (unallocated) data
-				readData, err = vb.ReadAt((vb.Backend.GetVolumeSize())-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize))
+				readData, err = vb.ReadAt((vb.GetVolumeSize())-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize))
 				assert.ErrorIs(t, err, ZeroBlock)
 				assert.Equal(t, make([]byte, vb.BlockSize), readData)
 
 				// Test invalid writes
-				err = vb.WriteAt(vb.Backend.GetVolumeSize()+10, tc.data)
+				err = vb.WriteAt(vb.GetVolumeSize()+10, tc.data)
 				assert.ErrorIs(t, err, RequestTooLarge)
 
 				err = vb.WriteAt(0, make([]byte, 0))
 				assert.ErrorIs(t, err, RequestBufferEmpty)
 
-				err = vb.WriteAt(vb.Backend.GetVolumeSize(), tc.data)
+				err = vb.WriteAt(vb.GetVolumeSize(), tc.data)
 				assert.ErrorIs(t, err, RequestOutOfRange)
 
 				// NO FLUSH TEST
@@ -799,13 +798,45 @@ func TestWriteAndRead(t *testing.T) {
 				err = vb.WriteWALToChunk(true)
 				assert.NoError(t, err)
 
+				// Gracefully close VB and save state to disk
+				err = vb.Close()
+				assert.NoError(t, err)
+
 				// Test Read
 				//readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
 				//assert.NoError(t, err)
 				//assert.Equal(t, tc.data[:512], readData)
 
 			})
+
 		}
+
+		prevBlockSize := vb.BlockSize
+		prevObjBlockSize := vb.ObjBlockSize
+		prevSeqNum := vb.SeqNum.Load()
+		prevObjectNum := vb.ObjectNum.Load()
+		prevWALNum := vb.WAL.WallNum.Load()
+
+		// Next, copy the state to compare
+		compareState := vb.BlocksToObject.BlockLookup
+
+		// Reset the state, reload from disk
+		vb.Reset()
+
+		vb.LoadState(fmt.Sprintf("%s/%s/state.json", vb.BlockToObjectWAL.BaseDir, vb.GetVolume()))
+
+		// Compare the state matches as expected
+		assert.Equal(t, prevBlockSize, vb.BlockSize)
+		assert.Equal(t, prevObjBlockSize, vb.ObjBlockSize)
+		assert.Equal(t, prevSeqNum, vb.SeqNum.Load())
+		assert.Equal(t, prevObjectNum, vb.ObjectNum.Load())
+		assert.Equal(t, prevWALNum, vb.WAL.WallNum.Load())
+
+		//vb.LoadBlockState("/tmp/viperblock/blockstate.json")
+		vb.LoadBlockStateBinary(fmt.Sprintf("%s/%s/blockstate.bin", vb.BlockToObjectWAL.BaseDir, vb.GetVolume()))
+
+		// Compare they are the same
+		assert.Equal(t, compareState, vb.BlocksToObject.BlockLookup)
 	})
 }
 
@@ -864,7 +895,7 @@ func TestStateOperations(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Remove the state file
-			os.Remove(stateFile)
+			// os.Remove(stateFile)
 		})
 
 	})
@@ -1047,7 +1078,7 @@ func TestInvalidS3Host(t *testing.T) {
 			assert.NoError(t, err)
 
 			vb.Backend.SetConfig(s3.S3Config{
-				VolumeName: vb.Backend.GetVolume(),
+				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
 				Bucket:     "bad_bucket",
@@ -1104,7 +1135,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 		t.Run("Use Invalid S3 Bucket", func(t *testing.T) {
 
 			vb.Backend.SetConfig(s3.S3Config{
-				VolumeName: vb.Backend.GetVolume(),
+				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
 				Bucket:     "bad_bucket",
@@ -1161,7 +1192,7 @@ func TestInvalidS3Auth(t *testing.T) {
 		t.Run("Use Invalid S3 Auth", func(t *testing.T) {
 
 			vb.Backend.SetConfig(s3.S3Config{
-				VolumeName: vb.Backend.GetVolume(),
+				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
 				Bucket:     "test_bucket",
