@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/stretchr/testify/assert"
@@ -189,14 +190,15 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 	})
 
-	var config interface{}
+	var backendConfig interface{}
 	switch backendType.BackendType {
 
 	case FileBackend:
-		config = file.FileConfig{
-			BaseDir:    tmpDir,
+		backendConfig = file.FileConfig{
 			VolumeName: testVol,
 			VolumeSize: volumeSize,
+
+			BaseDir: tmpDir,
 		}
 
 		shutdown = func(volName string) {
@@ -210,14 +212,15 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		host, err := getFreePort()
 		assert.NoError(t, err)
 
-		config = s3.S3Config{
+		backendConfig = s3.S3Config{
 			VolumeName: testVol,
 			VolumeSize: volumeSize,
-			Region:     "ap-southeast-2",
-			Bucket:     "predastore",
-			AccessKey:  AccessKey,
-			SecretKey:  SecretKey,
-			Host:       fmt.Sprintf("https://%s", host),
+
+			Region:    "ap-southeast-2",
+			Bucket:    "predastore",
+			AccessKey: AccessKey,
+			SecretKey: SecretKey,
+			Host:      fmt.Sprintf("https://%s", host),
 		}
 
 		shutdown, err = startTestServer(t, host)
@@ -226,7 +229,7 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		}
 
 		// Wait until server is responsive
-		ok := waitForServer(config.(s3.S3Config).Host, 2*time.Second)
+		ok := waitForServer(backendConfig.(s3.S3Config).Host, 2*time.Second)
 		if !ok {
 			t.Fatalf("server did not respond in time")
 		}
@@ -237,27 +240,44 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		t.Fatalf("unsupported backend type: %s", backendType.BackendType)
 	}
 
+	vbconfig := VB{
+		VolumeName: testVol,
+		VolumeSize: volumeSize,
+		BaseDir:    fmt.Sprintf("%s/%s", tmpDir, "viperblock"),
+		Cache: Cache{
+			Config: CacheConfig{
+				Size:                backendType.CacheConfig.Size,
+				UseSystemMemory:     backendType.CacheConfig.UseSystemMemory,
+				SystemMemoryPercent: backendType.CacheConfig.SystemMemoryPercent,
+			},
+		},
+	}
+
 	// Create a new Viperblock
-	vb = New(backendType.BackendType, config)
+	vb, err = New(vbconfig, backendType.BackendType, backendConfig)
+	assert.NoError(t, err)
 	assert.NotNil(t, vb)
+
+	//err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
+	//assert.NoError(t, err)
 
 	err = vb.Backend.Init()
 	assert.NoError(t, err)
 
-	err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
+	//vb.WAL.BaseDir = tmpDir
+	// TODO: Simplify, setup in Init?
+	//err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
 	assert.NoError(t, err)
 
-	vb.WAL.BaseDir = tmpDir
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", tmpDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
-	assert.NoError(t, err)
-
-	vb.BlockToObjectWAL.BaseDir = tmpDir
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/wal/blocks/block2obj.%08d.bin", tmpDir, vb.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
+	//vb.BlockToObjectWAL.BaseDir = tmpDir
+	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
 	assert.NoError(t, err)
 
 	return vb, baseURL, shutdown, nil
 }
 
+/*
 func setupTestVBBench(b *testing.B, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
 
 	// Create a temporary directory for test data
@@ -344,6 +364,7 @@ func setupTestVBBench(b *testing.B, testCase TestVB, backendType BackendTest) (v
 
 	return vb, baseURL, shutdown, nil
 }
+*/
 
 // runWithBackends runs a test function with both file and S3 backends
 func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, vb *VB)) {
@@ -411,6 +432,7 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 	}
 }
 
+/*
 func runWithBackendsBench(b *testing.B, testName string, testFunc func(b *testing.B, vb *VB)) {
 	backends := []BackendTest{
 		{
@@ -474,12 +496,17 @@ func runWithBackendsBench(b *testing.B, testName string, testFunc func(b *testin
 		})
 	}
 }
+*/
 
 func TestNew(t *testing.T) {
 	testCases := []TestVB{
 		{
-			name:      "file",
-			config:    file.FileConfig{BaseDir: "test_data"},
+			name: "file",
+			config: file.FileConfig{
+				BaseDir:    "test_data",
+				VolumeName: "test_s3",
+				VolumeSize: volumeSize,
+			},
 			blockSize: DefaultBlockSize,
 		},
 
@@ -500,12 +527,13 @@ func TestNew(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			vb := New(tc.name, tc.config)
+			vb, err := New(VB{VolumeName: "test", VolumeSize: 1024 * 1024}, tc.name, tc.config)
+			assert.NoError(t, err)
 			assert.NotNil(t, vb)
 			assert.Equal(t, tc.blockSize, vb.BlockSize)
-			assert.Equal(t, uint32(1024*1024*4), vb.ObjBlockSize)
-			assert.Equal(t, 5*time.Second, vb.FlushInterval)
-			assert.Equal(t, uint32(64*1024*1024), vb.FlushSize)
+			assert.Equal(t, uint32(DefaultObjBlockSize), vb.ObjBlockSize)
+			assert.Equal(t, DefaultFlushInterval, vb.FlushInterval)
+			assert.Equal(t, DefaultFlushSize, vb.FlushSize)
 
 			if tc.name == "s3" {
 				assert.IsType(t, &s3.Backend{}, vb.Backend)
@@ -736,7 +764,7 @@ func TestWriteAndRead(t *testing.T) {
 				assert.Equal(t, tc.data, readData)
 
 				// If cache enabled, check the LRU cache
-				if vb.Cache.config.Size > 0 {
+				if vb.Cache.Config.Size > 0 {
 
 					var blockCount uint64 = 0
 
@@ -823,7 +851,7 @@ func TestWriteAndRead(t *testing.T) {
 		// Reset the state, reload from disk
 		vb.Reset()
 
-		vb.LoadState(fmt.Sprintf("%s/%s/state.json", vb.BlockToObjectWAL.BaseDir, vb.GetVolume()))
+		vb.LoadState()
 
 		// Compare the state matches as expected
 		assert.Equal(t, prevBlockSize, vb.BlockSize)
@@ -833,7 +861,7 @@ func TestWriteAndRead(t *testing.T) {
 		assert.Equal(t, prevWALNum, vb.WAL.WallNum.Load())
 
 		//vb.LoadBlockState("/tmp/viperblock/blockstate.json")
-		vb.LoadBlockStateBinary(fmt.Sprintf("%s/%s/blockstate.bin", vb.BlockToObjectWAL.BaseDir, vb.GetVolume()))
+		vb.LoadBlockState()
 
 		// Compare they are the same
 		assert.Equal(t, compareState, vb.BlocksToObject.BlockLookup)
@@ -884,14 +912,14 @@ func TestStateOperations(t *testing.T) {
 		t.Run("Save and Load State", func(t *testing.T) {
 
 			// Create with unique timestamp
-			stateFile := filepath.Join(vb.WAL.BaseDir, fmt.Sprintf("state.%s.json", time.Now().Format("20060102150405")))
+			//stateFile := filepath.Join(vb.WAL.BaseDir, fmt.Sprintf("state.%s.json", time.Now().Format("20060102150405")))
 
 			// Test SaveState
-			err := vb.SaveState(stateFile)
+			err := vb.SaveState()
 			assert.NoError(t, err)
 
 			// Test LoadState
-			err = vb.LoadState(stateFile)
+			err = vb.LoadState()
 			assert.NoError(t, err)
 
 			// Remove the state file
@@ -1241,16 +1269,16 @@ func TestCacheConfiguration(t *testing.T) {
 			// Test setting cache size
 			err := vb.SetCacheSize(1000, 0)
 			assert.NoError(t, err)
-			assert.Equal(t, 1000, vb.Cache.config.Size)
-			assert.False(t, vb.Cache.config.UseSystemMemory)
-			assert.Equal(t, 0, vb.Cache.config.SystemMemoryPercent)
+			assert.Equal(t, 1000, vb.Cache.Config.Size)
+			assert.False(t, vb.Cache.Config.UseSystemMemory)
+			assert.Equal(t, 0, vb.Cache.Config.SystemMemoryPercent)
 
 			// Test invalid cache size
 			err = vb.SetCacheSize(0, 0)
 			assert.NoError(t, err)
-			assert.Equal(t, 0, vb.Cache.config.Size)
-			assert.False(t, vb.Cache.config.UseSystemMemory)
-			assert.Equal(t, 0, vb.Cache.config.SystemMemoryPercent)
+			assert.Equal(t, 0, vb.Cache.Config.Size)
+			assert.False(t, vb.Cache.Config.UseSystemMemory)
+			assert.Equal(t, 0, vb.Cache.Config.SystemMemoryPercent)
 
 			err = vb.SetCacheSize(-1, 0)
 			assert.Error(t, err)
@@ -1260,9 +1288,9 @@ func TestCacheConfiguration(t *testing.T) {
 			// Test setting cache size based on system memory
 			err := vb.SetCacheSystemMemory(50)
 			assert.NoError(t, err)
-			assert.True(t, vb.Cache.config.UseSystemMemory)
-			assert.Equal(t, 50, vb.Cache.config.SystemMemoryPercent)
-			assert.Greater(t, vb.Cache.config.Size, 0)
+			assert.True(t, vb.Cache.Config.UseSystemMemory)
+			assert.Equal(t, 50, vb.Cache.Config.SystemMemoryPercent)
+			assert.Greater(t, vb.Cache.Config.Size, 0)
 
 			// Test invalid percentages
 			err = vb.SetCacheSystemMemory(0)
@@ -1338,8 +1366,9 @@ func waitForServer(url string, timeout time.Duration) bool {
 	return false
 }
 
-// BENCHMARKS
+// BENCHMARKS: TODO, use generics for shared test/bench environment setup
 
+/*
 func Benchmark_SeqWrite(b *testing.B) {
 
 	tests := []struct {
@@ -1403,3 +1432,4 @@ func Benchmark_SeqWrite(b *testing.B) {
 	}
 
 }
+*/

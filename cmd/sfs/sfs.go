@@ -32,7 +32,7 @@ func main() {
 	// Optionally specify the state file, or init to create a new volume with specified size
 	sfsstate := flag.String("sfsstate", "", "SFS (filesystem) state file to load")
 
-	vbstate := flag.String("vbstate", "", "Viperblock state file to load")
+	//vbstate := flag.String("vbstate", "", "Viperblock state file to load")
 
 	createvol := flag.Bool("createvol", false, "Initialize a new volume with specified vol argument")
 
@@ -73,7 +73,7 @@ func main() {
 		// Check if the directory exists
 		if _, err := os.Stat(*voldata); os.IsNotExist(err) {
 			fmt.Println("Volume data directory does not exist, creating it")
-			os.MkdirAll(*voldata, 0755)
+			os.MkdirAll(*voldata, 0750)
 		}
 	}
 
@@ -121,7 +121,11 @@ func main() {
 	}
 
 	fmt.Println("Creating Viperblock backend with btype, config", *btype, cfg)
-	vb := viperblock.New(*btype, cfg)
+	vb, err := viperblock.New(viperblock.VB{}, *btype, cfg)
+	if err != nil {
+		slog.Error("Could not create Viperblock", "error", err)
+		os.Exit(1)
+	}
 
 	// Initialize the backend
 	err = vb.Backend.Init()
@@ -130,19 +134,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *vbstate != "" {
-		// First load the existing state
+	err = vb.LoadState()
 
-		if _, err := os.Stat(*vbstate); os.IsNotExist(err) {
-			fmt.Println("State file does not exist, will create a new one on save")
-		} else {
-			err = vb.LoadState(*vbstate)
-			if err != nil {
-				fmt.Println(err)
-			}
-		}
-
+	if err != nil {
+		fmt.Println(err)
 	}
+
+	/*
+		if *vbstate != "" {
+			// First load the existing state
+
+			if _, err := os.Stat(*vbstate); os.IsNotExist(err) {
+				fmt.Println("State file does not exist, will create a new one on save")
+			} else {
+				err = vb.LoadState()
+				if err != nil {
+					fmt.Println(err)
+				}
+			}
+
+		}
+	*/
 
 	vb.SetWALBaseDir(*voldata)
 
@@ -262,7 +274,7 @@ func main() {
 	vb.WriteWALToChunk(false)
 
 	// Serialize the BlocksToObject
-	err = vb.SaveBlockState(fmt.Sprintf("%s/blocks_to_object.json", *voldata))
+	err = vb.SaveBlockState()
 
 	if err != nil {
 		slog.Error("Could not serialize BlocksToObject", "error", err)
@@ -350,7 +362,7 @@ func main() {
 	}
 
 	// Save the state
-	vb.SaveState(*vbstate)
+	vb.SaveState()
 
 	// Export the WAL number and chunk number
 	fmt.Println("WAL number", vb.WAL.WallNum.Load())

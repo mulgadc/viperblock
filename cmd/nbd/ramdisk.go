@@ -10,8 +10,8 @@ import (
 import (
 	"fmt"
 	"log/slog"
-	"os"
 
+	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 )
@@ -24,32 +24,80 @@ type RAMDiskPlugin struct {
 
 type RAMDiskConnection struct {
 	nbdkit.Connection
-	vb viperblock.VB
+	vb *viperblock.VB
 }
 
 var size uint64
-var size_set = false
+
+var volume string
+var bucket string
+var region string
+var access_key string
+var secret_key string
+var host string
+
+var base_dir string
+
 var disk []byte
 
-var vb viperblock.VB
-
 func (p *RAMDiskPlugin) Config(key string, value string) error {
+
+	// Config options
+	// size (bytes)
+	// volume (string)
+	// bucket (string)
+
 	if key == "size" {
 		var err error
 		size, err = strconv.ParseUint(value, 0, 64)
 		if err != nil {
 			return err
 		}
-		size_set = true
+		return nil
+	} else if key == "volume" {
+		volume = value
+		return nil
+	} else if key == "bucket" {
+		bucket = value
+		return nil
+	} else if key == "region" {
+		region = value
+		return nil
+	} else if key == "access_key" {
+		access_key = value
+		return nil
+	} else if key == "secret_key" {
+		secret_key = value
+	} else if key == "host" {
+		host = value
+		return nil
+	} else if key == "base_dir" {
+		base_dir = value
 		return nil
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
 	}
+
+	return nil
 }
 
 func (p *RAMDiskPlugin) ConfigComplete() error {
-	if !size_set {
+	if size == 0 {
 		return nbdkit.PluginError{Errmsg: "size parameter is required"}
+	} else if volume == "" {
+		return nbdkit.PluginError{Errmsg: "volume parameter is required"}
+	} else if bucket == "" {
+		return nbdkit.PluginError{Errmsg: "bucket parameter is required"}
+	} else if region == "" {
+		return nbdkit.PluginError{Errmsg: "region parameter is required"}
+	} else if access_key == "" {
+		return nbdkit.PluginError{Errmsg: "access_key parameter is required"}
+	} else if secret_key == "" {
+		return nbdkit.PluginError{Errmsg: "secret_key parameter is required"}
+	} else if base_dir == "" {
+		return nbdkit.PluginError{Errmsg: "base_dir parameter is required"}
+	} else if host == "" {
+		return nbdkit.PluginError{Errmsg: "host parameter is required"}
 	}
 	return nil
 }
@@ -64,39 +112,39 @@ func (p *RAMDiskPlugin) GetReady() error {
 func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 
 	cfg := s3.S3Config{
-		VolumeName: "test",
+		VolumeName: volume,
 		VolumeSize: size,
-		Bucket:     "predastore",
-		Region:     "ap-southeast-2",
-		AccessKey:  "AKIAIOSFODNN7EXAMPLE",
-		SecretKey:  "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-		Host:       "https://127.0.0.1:8443",
+		Bucket:     bucket,
+		Region:     region,
+		AccessKey:  access_key,
+		SecretKey:  secret_key,
+		Host:       host,
+	}
+
+	vbconfig := viperblock.VB{
+		VolumeName: volume,
+		VolumeSize: size,
+		BaseDir:    base_dir,
+		Cache: viperblock.Cache{
+			Config: viperblock.CacheConfig{
+				Size: 20,
+			},
+		},
 	}
 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)
-	vb = *viperblock.New("s3", cfg)
+	vb, err := viperblock.New(vbconfig, "s3", cfg)
+	if err != nil {
+		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
+	}
+
+	vb.SetDebug(true)
 
 	// Set 20% LRU memory from host
-	vb.SetCacheSize(0, 20)
+	//vb.SetCacheSize(0, 20)
 
 	// Generate a temp directory that ends in viperblock
-	voldata := "/tmp/viperblock"
-
-	// For testing, purge, and create
-
-	os.RemoveAll(voldata)
-
-	os.MkdirAll(voldata, 0755)
-
-	vb.SetWALBaseDir(voldata)
-
-	walNum := vb.WAL.WallNum.Add(1)
-
-	err := vb.OpenWAL(fmt.Sprintf("%s/%s/wal.%08d.bin", voldata, vb.Backend.GetVolume(), walNum))
-
-	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: "Could not open WAL"}
-	}
+	//voldata := "/tmp/viperblock"
 
 	// Initialize the backend
 	err = vb.Backend.Init()
@@ -104,13 +152,54 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: "Could not initialize backend"}
 	}
 
+	var walNum uint64
+
+	// First, fetch the state from the remote backend
+	err = vb.LoadState()
+
+	if err != nil {
+		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load state: %v", err)}
+	}
+
+	err = vb.LoadBlockState()
+
+	if err != nil {
+		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
+	}
+
+	walNum = vb.WAL.WallNum.Add(1)
+	slog.Info("Loaded WAL number", "walNum", walNum)
+
+	// Open the chunk WAL
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
+
+	if err != nil {
+		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open WAL: %v", err)}
+	}
+
+	// Open the block to object WAL
+	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
+
+	if err != nil {
+		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
+	}
+
 	return &RAMDiskConnection{vb: vb}, nil
 }
 
 func (c *RAMDiskConnection) GetSize() (uint64, error) {
-	return size, nil
+	return c.vb.GetVolumeSize(), nil
 
 }
+
+/*
+func (c *RAMDiskConnection) BlockSize() (int32, int32, int32, error) {
+	fmt.Println("***BlockSize")
+	// Min, preferred, maximum
+	return int32(4096), int32(4096), int32(4096), nil
+	//return 512, 512, 512, nil
+}
+*/
 
 // Clients are allowed to make multiple connections safely.
 // TODO: confirm changes
@@ -122,17 +211,6 @@ func (c *RAMDiskConnection) CanMultiConn() (bool, error) {
 func (c *RAMDiskConnection) PRead(buf []byte, offset uint64, flags uint32) error {
 	slog.Info("PREAD:", "offset", offset, "len", len(buf))
 	data, err := c.vb.ReadAt(offset, uint64(len(buf)))
-	if err != nil && err != viperblock.ZeroBlock {
-		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
-	}
-	copy(buf, data)
-	return nil
-}
-
-func (c *RAMDiskConnection) PRead2(buf []byte, offset uint64,
-	flags uint32) error {
-
-	data, err := c.vb.ReadAt(offset/uint64(c.vb.BlockSize), uint64(len(buf)))
 	if err != nil && err != viperblock.ZeroBlock {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
 	}
@@ -150,12 +228,12 @@ func (c *RAMDiskConnection) CanWrite() (bool, error) {
 func (c *RAMDiskConnection) PWrite(buf []byte, offset uint64,
 	flags uint32) error {
 
-	slog.Info("PWRITE:", "len", len(buf), "offset", offset)
+	//slog.Info("PWRITE:", "len", len(buf), "offset", offset)
 
 	data := make([]byte, len(buf))
 
 	copy(data, buf)
-	err := c.vb.Write(offset/uint64(c.vb.BlockSize), data)
+	err := c.vb.WriteAt(offset, data)
 
 	if err != nil {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write data: %v", err)}
@@ -205,13 +283,13 @@ func (c *RAMDiskConnection) CanFlush() (bool, error) {
 // would make no sense to implement a Flush() callback.
 func (c *RAMDiskConnection) Flush(flags uint32) error {
 
-	c.vb.SaveState("/tmp/viperblock/state.json")
-	c.vb.SaveHotState("/tmp/viperblock/hotstate.json")
-	c.vb.SaveBlockState("/tmp/viperblock/blockstate.json")
+	//c.vb.SaveState("/tmp/viperblock/state.json")
+	//c.vb.SaveHotState("/tmp/viperblock/hotstate.json")
+	//c.vb.SaveBlockState("/tmp/viperblock/blockstate.json")
 
 	c.vb.Flush()
 
-	err := c.vb.WriteWALToChunk()
+	err := c.vb.WriteWALToChunk(false)
 
 	if err != nil {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not Write WAL to Chunk: %v", err)}
@@ -219,6 +297,20 @@ func (c *RAMDiskConnection) Flush(flags uint32) error {
 
 	return nil
 
+}
+
+func (c *RAMDiskConnection) Close() {
+
+	slog.Info("Close, flushing block state to disk")
+
+	// Gracefully close VB and save state to disk
+	err := c.vb.Close()
+
+	if err != nil {
+		slog.Error("Could not close VB", "err", err)
+	}
+
+	return
 }
 
 //----------------------------------------------------------------------

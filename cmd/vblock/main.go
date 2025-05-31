@@ -40,7 +40,7 @@ func main() {
 	}
 
 	// Connect to the specified Viperblock store
-	vb := viperblock.New("s3", cfg)
+	vb, err := viperblock.New(viperblock.VB{}, "s3", cfg)
 
 	if err != nil {
 		log.Fatalf("Failed to connect to Viperblock store: %v", err)
@@ -110,8 +110,8 @@ func main() {
 	vb.WriteWALToChunk(true)
 
 	// Write state to disk
-	vb.SaveState("/tmp/viperblock/state.json")
-	vb.SaveHotState("/tmp/viperblock/hotstate.json")
-	vb.SaveBlockState("/tmp/viperblock/blockstate.json")
+	vb.SaveState()
+	//vb.SaveHotState("/tmp/viperblock/hotstate.json")
+	//vb.SaveBlockState("/tmp/viperblock/blockstate.json")
 
 }
