@@ -299,20 +299,27 @@ func New(config VB, btype string, backendConfig interface{}) (vb *VB, err error)
 		config.FlushSize = DefaultFlushSize
 	}
 
+	var lruCache *lru.Cache[uint64, []byte]
+
 	if config.Cache.Config.Size == 0 {
-		config.Cache.Config.Size = calculateCacheSize(config.BlockSize, 30)
-		config.Cache.Config.UseSystemMemory = true
-		config.Cache.Config.SystemMemoryPercent = 30
+		//config.Cache.Config.Size = calculateCacheSize(config.BlockSize, 30)
+		//config.Cache.Config.UseSystemMemory = true
+		//config.Cache.Config.SystemMemoryPercent = 30
+		config.Cache.Config.UseSystemMemory = false
+		config.Cache.Config.SystemMemoryPercent = 0
+
+	} else {
+
+		// Create LRU cache with calculated size
+		lruCache, err = lru.New[uint64, []byte](config.Cache.Config.Size)
+		if err != nil {
+			panic(fmt.Sprintf("failed to create LRU cache: %v", err))
+		}
+
 	}
 
 	// Calculate initial cache size based on 30% of system memory
 	//initialCacheSize := calculateCacheSize(config.BlockSize, 30)
-
-	// Create LRU cache with calculated size
-	lruCache, err := lru.New[uint64, []byte](config.Cache.Config.Size)
-	if err != nil {
-		panic(fmt.Sprintf("failed to create LRU cache: %v", err))
-	}
 
 	vb = &VB{
 		VolumeName:       config.VolumeName,
@@ -477,7 +484,8 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 		var blockData []byte
 		if writeStart > 0 || writeEnd < blockSize {
 
-			existing, err := vb.ReadAt(b, blockSize)
+			existing, err := vb.ReadAt(b*blockSize, blockSize)
+
 			if err != nil && err != ZeroBlock {
 				return fmt.Errorf("failed to read block %d for RMW: %w", b, err)
 			}
@@ -582,7 +590,6 @@ func (vb *VB) Flush() error {
 	flushed := make(map[uint64]uint64) // block -> seqnum
 
 	for _, block := range flushBlocks {
-		slog.Debug("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
 
 		if err := vb.WriteWAL(block); err != nil {
 			slog.Error("ERROR FLUSHING:", "block", block.Block, "error", err)
@@ -808,8 +815,6 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 		return err
 	}
 
-	slog.Debug("WriteBlockWAL complete")
-
 	return nil
 }
 
@@ -990,7 +995,6 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 		// If buffer is full (default 4MB), write to file
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			slog.Debug("WRITING CHUNK:", "chunkIndex", vb.ObjectNum.Load())
 			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
 			if err != nil {
 				slog.Error("Failed to create chunk file", "error", err)
@@ -1190,9 +1194,7 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	}
 
-	slog.Debug("BlocksToObject, pre unlock")
 	vb.BlocksToObject.mu.Unlock()
-	slog.Debug("BlocksToObject, post unlock")
 
 	// Lastly, write the Block objects to it's own WAL for redundancy and checkpointing.
 	err = vb.WriteBlockWAL(&BlockObjectsToWAL)
@@ -1202,8 +1204,6 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	// Increment the object number
 	vb.ObjectNum.Add(1)
-
-	slog.Debug("BlocksToObject, complete")
 
 	return nil
 }
@@ -1386,7 +1386,7 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 
 	vb.BlocksToObject.mu.RUnlock()
 
-	slog.Info("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
+	slog.Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
 
 	if ok {
 		return blockLookup.ObjectID, blockLookup.ObjectOffset, nil
@@ -1522,7 +1522,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	data = make([]byte, blockLen)
 
 	// Preprocess latest writes
-	slog.Debug("Preprocess latest writes")
 	vb.Writes.mu.RLock()
 	writesCopy := make([]Block, len(vb.Writes.Blocks))
 	copy(writesCopy, vb.Writes.Blocks)
@@ -1536,7 +1535,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	}
 
 	// Preprocess pending writes (after WAL write to backend upload success/completion)
-	slog.Debug("Preprocess pending writes")
 	vb.PendingBackendWrites.mu.RLock()
 	pendingWritesCopy := make([]Block, len(vb.PendingBackendWrites.Blocks))
 	copy(pendingWritesCopy, vb.PendingBackendWrites.Blocks)
@@ -1550,8 +1548,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	var consecutiveBlocks ConsecutiveBlocks
-
-	slog.Debug("Read blocks", "block", block, "blockRequests", blockRequests)
 
 	for i := uint64(0); i < blockRequests; i++ {
 		currentBlock := block + i
@@ -1704,9 +1700,7 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 	blockCount := lastBlock - firstBlock + 1
 
 	// Read entire range of needed blocks
-	slog.Debug("Reading blocks", "firstBlock", firstBlock, "lastBlock", lastBlock, "blockCount", blockCount, "blockSize", blockSize)
 	fullData, err := vb.read(firstBlock, blockCount*blockSize)
-	slog.Debug("Complete", "len", len(fullData))
 
 	if err != nil && err != ZeroBlock {
 		return nil, err
