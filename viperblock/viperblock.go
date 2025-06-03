@@ -544,7 +544,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
-	slog.Info("\tVBWRITE:", "blockRequests", blockRequests, "block", block, "blockLen", blockLen)
+	//slog.Info("\tVBWRITE:", "blockRequests", blockRequests, "block", block, "blockLen", blockLen)
 
 	vb.Writes.mu.Lock()
 
@@ -559,7 +559,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 		blockCopy := make([]byte, vb.BlockSize)
 		copy(blockCopy, data[start:end])
 
-		slog.Info("\t\tBLOCKWRITE:", "currentBlock", currentBlock, "start", start, "end", end, "i", i)
+		//slog.Info("\t\tBLOCKWRITE:", "currentBlock", currentBlock, "start", start, "end", end, "i", i)
 
 		// Write raw data received, first to the main memory Block, which will be flushed to the WAL
 		seqNum := vb.SeqNum.Add(1)
@@ -570,7 +570,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 			Data:   blockCopy,
 		})
 
-		slog.Info("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
+		//slog.Info("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
 
 	}
 
@@ -607,7 +607,7 @@ func (vb *VB) Flush() error {
 		remaining := make([]Block, 0)
 		for _, b := range vb.Writes.Blocks {
 			if _, ok := flushed[b.Block]; !ok {
-				slog.Info("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
+				//slog.Info("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
 				// Either this block wasn't flushed, or it was rewritten after flush started
 				remaining = append(remaining, b)
 			}
@@ -621,7 +621,7 @@ func (vb *VB) Flush() error {
 	vb.PendingBackendWrites.mu.Lock()
 	vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, flushBlocks...)
 
-	slog.Info("PENDING BACKEND WRITES:", "len", len(vb.PendingBackendWrites.Blocks))
+	//slog.Info("PENDING BACKEND WRITES:", "len", len(vb.PendingBackendWrites.Blocks))
 	//spew.Dump(vb.PendingBackendWrites.Blocks)
 
 	/*
@@ -648,7 +648,7 @@ func (vb *VB) Flush2() (err error) {
 	vb.Writes.mu.Unlock()
 
 	for _, block := range flushBlocks {
-		slog.Info("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
+		//slog.Info("FLUSH:", "block", block.Block, "seqnum", block.SeqNum)
 
 		// Write the block to the WAL
 		err = vb.WriteWAL(block)
@@ -670,7 +670,7 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	// Get the current WAL file
 	currentWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
 
-	slog.Info("WRITE WAL:", "currentWAL", currentWAL)
+	//slog.Info("WRITE WAL:", "currentWAL", currentWAL)
 
 	// Format for each block in the WAL
 	// [seq_number, uint64][block_number, uint64][block_length, uint64][checksum, uint32][block_data, []byte]
@@ -684,7 +684,7 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	// Write the block number as big endian
 	blockNumber := make([]byte, 8)
 	binary.BigEndian.PutUint64(blockNumber, block.Block)
-	slog.Info("WriteWAL > blockNumber", "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
+	//slog.Info("WriteWAL > blockNumber", "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
 
 	currentWAL.Write(blockNumber)
 
@@ -782,14 +782,14 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 	// Get the current WAL file
 	currentWAL := vb.BlockToObjectWAL.DB[len(vb.BlockToObjectWAL.DB)-1]
 
-	slog.Info("Writing to Block WAL file", "filename", currentWAL.Name())
+	//slog.Info("Writing to Block WAL file", "filename", currentWAL.Name())
 
 	// Format for each block in the BlockWAL
 	// [start_block, uint64][num_blocks, uint16][object_id, uint64][object_offset, uint32][checksum, uint32]
 	// big endian
 
 	for _, block := range *blocks {
-		slog.Info("Writing block to BlockWAL", "block", block)
+		//slog.Info("Writing block to BlockWAL", "block", block)
 
 		data := vb.writeBlockWalChunk(&block)
 
@@ -1111,7 +1111,7 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
 
-	slog.Info("Creating chunk file", "chunkIndex", chunkIndex, "currentWALNum", currentWALNum)
+	//slog.Info("Creating chunk file", "chunkIndex", chunkIndex, "currentWALNum", currentWALNum)
 
 	headers := vb.ChunkHeader()
 
@@ -1186,7 +1186,7 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 		// TODO: Optimise for number of consecutive blocks to reduce the memory size
 		vb.BlocksToObject.BlockLookup[block.Block] = newBlock
 
-		slog.Info("Added block to BlockLookup", "block", block.Block, "newBlock", newBlock)
+		//slog.Info("Added block to BlockLookup", "block", block.Block, "newBlock", newBlock)
 
 		BlockObjectsToWAL = append(BlockObjectsToWAL, newBlock)
 
@@ -1391,7 +1391,7 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	if ok {
 		return blockLookup.ObjectID, blockLookup.ObjectOffset, nil
 	} else {
-		return 0, 0, fmt.Errorf("block not found")
+		return 0, 0, ZeroBlock
 	}
 
 }
@@ -1446,15 +1446,15 @@ func (vb *VB) LoadState() error {
 		slog.Info("No state found in local file, using backend state", "error", err)
 	}
 
-	slog.Info("Loaded state", "state", state)
+	//slog.Info("Loaded state", "state", state)
 
 	// Step 2. Query the state from the backend
 	stateBackend, err := vb.LoadStateRequest("")
 
-	slog.Info("Loaded backend state", "state", stateBackend)
+	//slog.Info("Loaded backend state", "state", stateBackend)
 
 	if err != nil {
-		slog.Info("No state found in backend, using local state", "error", err)
+		slog.Warn("No state found in backend, using local state", "error", err)
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
@@ -1556,7 +1556,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 		// If matched in our HOT writes, copy the data
 		if wr, ok := latestWrites[currentBlock]; ok {
-			slog.Info("[READ] HOT BLOCK:", "block", wr.Block, "seqnum", wr.SeqNum)
+			//slog.Info("[READ] HOT BLOCK:", "block", wr.Block, "seqnum", wr.SeqNum)
 
 			copy(data[start:end], clone(wr.Data))
 			continue
@@ -1564,7 +1564,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 		// Next, check the pending backend writes buffer
 		if lp, ok := latestPendingWrites[currentBlock]; ok {
-			slog.Info("[READ] PENDING BLOCK:", "block", lp.Block, "seqnum", lp.SeqNum)
+			//slog.Info("[READ] PENDING BLOCK:", "block", lp.Block, "seqnum", lp.SeqNum)
 
 			copy(data[start:end], clone(lp.Data))
 			continue
@@ -1573,7 +1573,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Next query the LRU cache if the data does not exist in the HOT write path, or pending write buffer.
 		if vb.Cache.Config.Size > 0 {
 			if cachedData, ok := vb.Cache.lru.Get(currentBlock); ok {
-				slog.Info("[READ] LRU CACHE BLOCK:", "block", currentBlock)
+				//slog.Info("[READ] LRU CACHE BLOCK:", "block", currentBlock)
 
 				copy(data[start:end], cachedData)
 				continue

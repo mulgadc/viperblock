@@ -35,8 +35,8 @@ var region string
 var access_key string
 var secret_key string
 var host string
-
 var base_dir string
+var cache_size int = 20
 
 var disk []byte
 
@@ -73,6 +73,13 @@ func (p *RAMDiskPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "base_dir" {
 		base_dir = value
+		return nil
+	} else if key == "cache_size" {
+		var err error
+		cache_size, err = strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
 		return nil
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
@@ -127,7 +134,7 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 		BaseDir:    base_dir,
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
-				Size: 20,
+				Size: cache_size,
 			},
 		},
 	}
@@ -138,7 +145,7 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
 
-	vb.SetDebug(true)
+	//vb.SetDebug(true)
 
 	// Set 20% LRU memory from host
 	//vb.SetCacheSize(0, 20)
