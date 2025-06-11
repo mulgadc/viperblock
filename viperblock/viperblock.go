@@ -6,7 +6,9 @@ package viperblock
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +50,8 @@ type VBState struct {
 	BlockToObjectWALNum uint64
 
 	Version uint16
+
+	VolumeConfig VolumeConfig
 }
 
 type VB struct {
@@ -91,6 +95,8 @@ type VB struct {
 	Backend types.Backend
 
 	BaseDir string
+
+	VolumeConfig VolumeConfig
 }
 
 // CacheConfig holds configuration for the LRU cache
@@ -180,6 +186,43 @@ type ChunkWork struct {
 	currentWALNum uint64
 	chunkBuffer   []byte
 	matchedBlocks []Block
+}
+
+type VolumeConfig struct {
+	VolumeMetadata VolumeMetadata `json:"VolumeMetadata"`
+	AMIMetadata    AMIMetadata    `json:"AMIMetadata"`
+}
+
+// Meta-data
+type VolumeMetadata struct {
+	VolumeID         string // e.g. "vol-0abcd1234ef567890"
+	VolumeName       string // Optional name for UI or tagging
+	TenantID         string // For multi-tenant support
+	SizeGiB          uint64 // Volume size in GiB
+	State            string // "creating", "available", "in-use", "deleted"
+	CreatedAt        time.Time
+	AvailabilityZone string            // Optional: "us-west-1a"
+	AttachedInstance string            // Instance ID (if any)
+	DeviceName       string            // e.g. "/dev/nbd1"
+	VolumeType       string            // e.g. "gp3", "io1"
+	IOPS             int               // For provisioned volumes
+	Tags             map[string]string // User-defined metadata
+	SnapshotID       string            // If created from a snapshot
+	IsEncrypted      bool              // Encryption flag
+}
+
+type AMIMetadata struct {
+	ImageID         string // e.g. "ami-0fbce8adcf7e5166f"
+	Name            string // e.g. "debian-12-cloud"
+	Description     string
+	Architecture    string // "x86_64", "arm64"
+	PlatformDetails string // "Linux/UNIX"
+	CreationDate    time.Time
+	RootDeviceType  string            // "ebs"
+	Virtualization  string            // "hvm"
+	ImageOwnerAlias string            // e.g. "hive"
+	VolumeSizeGiB   uint64            // Size of the root image
+	Tags            map[string]string // Metadata tags
 }
 
 // Error messages
@@ -345,6 +388,7 @@ func New(config VB, btype string, backendConfig interface{}) (vb *VB, err error)
 		BlocksToObject: BlocksToObject{},
 		Backend:        backend,
 		BaseDir:        config.BaseDir,
+		VolumeConfig:   config.VolumeConfig,
 	}
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
@@ -419,7 +463,7 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 	// Append the latest "hot" WAL file to the DB
 	wal.DB = append(wal.DB, file)
 
-	slog.Debug("OpenWAL complete, new WAL", "file", file)
+	slog.Debug("OpenWAL complete, new WAL", "file", *file)
 
 	return err
 
@@ -1411,6 +1455,7 @@ func (vb *VB) SaveState() error {
 		WALNum:              vb.WAL.WallNum.Load(),
 		BlockToObjectWALNum: vb.BlockToObjectWAL.WallNum.Load(),
 		Version:             vb.Version,
+		VolumeConfig:        vb.VolumeConfig,
 	}
 
 	// Save as JSON
@@ -1845,4 +1890,17 @@ func clone(in []byte) []byte {
 	out := make([]byte, len(in))
 	copy(out, in)
 	return out
+}
+
+func GenerateVolumeID(voltype, name, bucket string, timestamp int64) string {
+	// Combine the fields
+	input := fmt.Sprintf("%-s-%s-%s-%d", voltype, name, bucket, timestamp)
+
+	// Create SHA-256 hash
+	hash := sha256.Sum256([]byte(input))
+
+	// Convert first 17 characters of hex
+	shortHash := hex.EncodeToString(hash[:])[:17]
+
+	return fmt.Sprintf("%s-%s", voltype, shortHash)
 }

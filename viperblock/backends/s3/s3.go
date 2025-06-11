@@ -153,9 +153,9 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 		Body:   bytes.NewReader(*data),
 	}
 
-	output, err := backend.config.S3Client.PutObject(object)
+	_, err = backend.config.S3Client.PutObject(object)
 
-	slog.Info("Write object", "output", output)
+	//slog.Info("Write object", "output", output)
 
 	if err != nil {
 		slog.Error("Error writing object", "error", err)

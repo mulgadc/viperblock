@@ -1,0 +1,21 @@
+{
+    "VolumeMetadata": {
+        "VolumeID": "",
+        "VolumeName": "vm-root",
+        "TenantID": "tenant-001",
+        "SizeGiB": 0,
+        "State": "available",
+        "CreatedAt": "",
+        "AvailabilityZone": "edge-zone-1a",
+        "AttachedInstance": "",
+        "DeviceName": "/dev/nbd1",
+        "VolumeType": "gp3",
+        "IOPS": 3000,
+        "Tags": {
+            "env": "prod",
+            "team": "infra"
+        },
+        "SnapshotID": "",
+        "IsEncrypted": false
+    }
+}

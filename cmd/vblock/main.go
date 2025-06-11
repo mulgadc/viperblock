@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
@@ -26,6 +28,7 @@ func main() {
 	secret_key := flag.String("secret_key", "", "S3 secret key")
 	host := flag.String("host", "https://127.0.0.1:8443", "S3 host")
 	base_dir := flag.String("base_dir", "/tmp/vb/", "base directory for viperblock")
+	metadata := flag.String("metadata", "", "metadata (JSON) file to describe volume or AMI")
 
 	flag.Parse()
 
@@ -67,16 +70,94 @@ func main() {
 		log.Fatalf("Required argument base_dir is missing")
 	}
 
-	/*
-		required := []string{"file", "size", "volume", "bucket", "region", "access_key", "secret_key", "host", "base_dir"}
-		for _, arg := range required {
-			if flag.Lookup(arg) == nil {
-				log.Fatalf("Required argument %s is missing", arg)
-			}
-		}
-	*/
+	var volumeConfig viperblock.VolumeConfig
 
-	fmt.Println("Opening file", *file)
+	if *metadata != "" {
+
+		fmt.Println("Reading metadata from file", *metadata)
+		// Check file exists
+		if _, err := os.Stat(*metadata); os.IsNotExist(err) {
+			log.Fatalf("Metadata file %s does not exist", *metadata)
+		}
+
+		// Read the metadata file
+		metadata, err := os.ReadFile(*metadata)
+
+		if err != nil {
+			log.Fatalf("Failed to read metadata file: %v", err)
+		}
+
+		// Parse the metadata
+		err = json.Unmarshal(metadata, &volumeConfig)
+		if err != nil {
+			log.Fatalf("Failed to parse metadata: %v", err)
+		}
+
+	}
+
+	// Pre-fill meta-data if any fields are missing
+	if volumeConfig.VolumeMetadata.VolumeID == "" {
+		volumeConfig.VolumeMetadata.VolumeID = viperblock.GenerateVolumeID("vol", *volume, *bucket, time.Now().Unix())
+	}
+
+	if volumeConfig.VolumeMetadata.VolumeName == "" {
+		volumeConfig.VolumeMetadata.VolumeName = *volume
+	}
+
+	if volumeConfig.VolumeMetadata.SizeGiB == 0 {
+		volumeConfig.VolumeMetadata.SizeGiB = uint64(*size)
+	}
+
+	if volumeConfig.VolumeMetadata.State == "" {
+		volumeConfig.VolumeMetadata.State = "available"
+	}
+
+	if volumeConfig.VolumeMetadata.CreatedAt.IsZero() {
+		volumeConfig.VolumeMetadata.CreatedAt = time.Now()
+	}
+
+	if volumeConfig.VolumeMetadata.AvailabilityZone == "" {
+		volumeConfig.VolumeMetadata.AvailabilityZone = *region
+	}
+
+	// First, check if `AMIMetadata` is defined, otherwise skip
+	if volumeConfig.AMIMetadata.Name != "" {
+
+		// Check AMI config and set defaults
+		if volumeConfig.AMIMetadata.ImageID == "" {
+			volumeConfig.AMIMetadata.ImageID = viperblock.GenerateVolumeID("ami", *volume, *bucket, time.Now().Unix())
+		}
+
+		if volumeConfig.AMIMetadata.CreationDate.IsZero() {
+			volumeConfig.AMIMetadata.CreationDate = time.Now()
+		}
+
+		if volumeConfig.AMIMetadata.Architecture == "" {
+			volumeConfig.AMIMetadata.Architecture = "x86_64"
+		}
+
+		if volumeConfig.AMIMetadata.PlatformDetails == "" {
+			volumeConfig.AMIMetadata.PlatformDetails = "Linux/UNIX"
+		}
+
+		if volumeConfig.AMIMetadata.RootDeviceType == "" {
+			volumeConfig.AMIMetadata.RootDeviceType = "ebs"
+		}
+
+		if volumeConfig.AMIMetadata.Virtualization == "" {
+			volumeConfig.AMIMetadata.Virtualization = "hvm"
+		}
+
+		if volumeConfig.AMIMetadata.ImageOwnerAlias == "" {
+			volumeConfig.AMIMetadata.ImageOwnerAlias = "hive"
+		}
+
+		if volumeConfig.AMIMetadata.VolumeSizeGiB == 0 {
+			// Convert from bytes to GiB
+			volumeConfig.AMIMetadata.VolumeSizeGiB = uint64(*size) / 1024 / 1024 / 1024
+		}
+
+	}
 
 	f, err := os.OpenFile(*file, os.O_RDONLY, 0)
 	if err != nil {
@@ -103,6 +184,7 @@ func main() {
 				Size: 0,
 			},
 		},
+		VolumeConfig: volumeConfig,
 	}
 
 	vb, err := viperblock.New(vbconfig, "s3", cfg)
@@ -159,7 +241,7 @@ func main() {
 
 		// Check if the input is a Zero block
 		if bytes.Equal(buf[:n], nullBlock) {
-			fmt.Printf("Null block found at %d, skipping\n", block)
+			//fmt.Printf("Null block found at %d, skipping\n", block)
 			block++
 			continue
 		}

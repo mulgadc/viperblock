@@ -1,0 +1,29 @@
+{
+    "VolumeMetadata": {
+        "VolumeID": "",
+        "VolumeName": "debian-12.10.0-ami",
+        "TenantID": "tenant-001",
+        "SizeGiB": 0,
+        "State": "available",
+        "AvailabilityZone": "ap-southeast-2",
+        "AttachedInstance": "",
+        "DeviceName": "",
+        "VolumeType": "gp3",
+        "IOPS": 1000,
+        "Tags": null,
+        "SnapshotID": "",
+        "IsEncrypted": false
+    },
+    "AMIMetadata": {
+        "ImageID": "",
+        "Name": "debian-12.10.0",
+        "Description": "Debian 12.10.0 minimal cloud image prepared for Hive",
+        "Architecture": "arm64",
+        "PlatformDetails": "Linux/UNIX",
+        "RootDeviceType": "ebs",
+        "Virtualization": "hvm",
+        "ImageOwnerAlias": "hive",
+        "VolumeSizeGiB": 0,
+        "Tags": null
+    }
+}
