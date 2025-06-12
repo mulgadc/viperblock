@@ -159,6 +159,14 @@ func main() {
 
 	}
 
+	var volID string
+
+	if volumeConfig.AMIMetadata.ImageID != "" {
+		volID = volumeConfig.AMIMetadata.ImageID
+	} else {
+		volID = volumeConfig.VolumeMetadata.VolumeID
+	}
+
 	f, err := os.OpenFile(*file, os.O_RDONLY, 0)
 	if err != nil {
 		log.Fatalf("Failed to open disk file: %v", err)
@@ -166,7 +174,7 @@ func main() {
 	defer f.Close()
 
 	cfg := s3.S3Config{
-		VolumeName: *volume,
+		VolumeName: volID,
 		VolumeSize: uint64(*size),
 		Bucket:     *bucket,
 		Region:     *region,
@@ -176,7 +184,7 @@ func main() {
 	}
 
 	vbconfig := viperblock.VB{
-		VolumeName: *volume,
+		VolumeName: volID,
 		VolumeSize: uint64(*size),
 		BaseDir:    *base_dir,
 		Cache: viperblock.Cache{

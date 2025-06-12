@@ -185,6 +185,11 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	t.Cleanup(func() {
 		if vb != nil {
 			t.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
+
+			err = vb.RemoveLocalFiles()
+
+			assert.NoError(t, err)
+
 			//os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
 		}
 
@@ -540,6 +545,10 @@ func TestNew(t *testing.T) {
 			} else {
 				assert.IsType(t, &file.Backend{}, vb.Backend)
 			}
+
+			err = vb.RemoveLocalFiles()
+			assert.NoError(t, err)
+
 		})
 	}
 }

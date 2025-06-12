@@ -1801,6 +1801,21 @@ func (vb *VB) Close() error {
 
 }
 
+// Remove local WAL and block state files, connection must be closed first.
+func (vb *VB) RemoveLocalFiles() (err error) {
+
+	localPath := filepath.Join(vb.BaseDir, vb.GetVolume())
+
+	slog.Info("Removing local files", "path", localPath)
+
+	vb.WAL.mu.Lock()
+	err = os.RemoveAll(localPath)
+	vb.WAL.mu.Unlock()
+
+	return err
+
+}
+
 func (vb *VB) GetVolumeSize() uint64 {
 	return vb.VolumeSize
 }
