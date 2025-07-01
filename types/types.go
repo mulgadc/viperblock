@@ -26,6 +26,7 @@ const (
 	FileTypeBlockCheckpoint
 	FileTypeWALChunk
 	FileTypeWALBlock
+	FileTypeSSHAuthKey
 )
 
 // getFilePath returns the appropriate S3 path based on file type and objectId
