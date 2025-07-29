@@ -15,6 +15,7 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1503,8 +1504,10 @@ func (vb *VB) LoadState() error {
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
-		slog.Error("Invalid state, block size or object block size is 0. Not syncing config")
-		return nil
+		errMsg := "Invalid state, block size or object block size is 0. Not syncing config"
+		slog.Error(errMsg)
+		err = errors.New(errMsg)
+		return err
 	}
 
 	// Step 3. Compare the two states, the state with the highest SeqNum is the correct state
@@ -1918,4 +1921,14 @@ func GenerateVolumeID(voltype, name, bucket string, timestamp int64) string {
 	shortHash := hex.EncodeToString(hash[:])[:17]
 
 	return fmt.Sprintf("%s-%s", voltype, shortHash)
+}
+
+// FindFreePort allocates a free TCP port from the OS
+func FindFreePort() (string, error) {
+	l, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		return "", err
+	}
+	defer l.Close()
+	return l.Addr().String(), nil
 }

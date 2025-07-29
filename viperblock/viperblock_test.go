@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math/big"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -61,17 +60,10 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 	// Go down one directory from the current directory
 	dir = filepath.Join(dir, "..")
 
-	predastoreConfig := predastore.Config{
-		BasePath:       dir,
-		ConfigPath:     filepath.Join(dir, "tests/config/server.toml"),
-		Debug:          false,
-		DisableLogging: true,
-	}
-
 	// Create and configure the S3 server
-	s3server := predastore.New(&predastoreConfig)
+	s3server := predastore.New()
 
-	err = s3server.ReadConfig()
+	err = s3server.ReadConfig(filepath.Join(dir, "tests/config/server.toml"), dir)
 	require.NoError(t, err, "Failed to read config file")
 
 	// Setup routes
@@ -122,17 +114,10 @@ func startTestServerBench(b *testing.B, host string) (shutdown func(volName stri
 	// Go down one directory from the current directory
 	dir = filepath.Join(dir, "..")
 
-	predastoreConfig := predastore.Config{
-		BasePath:       dir,
-		ConfigPath:     filepath.Join(dir, "tests/config/server.toml"),
-		Debug:          false,
-		DisableLogging: true,
-	}
-
 	// Create and configure the S3 server
-	s3server := predastore.New(&predastoreConfig)
+	s3server := predastore.New()
 
-	err = s3server.ReadConfig()
+	err = s3server.ReadConfig(filepath.Join(dir, "tests/config/server.toml"), dir)
 	require.NoError(b, err, "Failed to read config file")
 
 	// Setup routes
@@ -214,7 +199,7 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 		//t.Log("S3 backend not found, setting up S3 server")
 
-		host, err := getFreePort()
+		host, err := FindFreePort()
 		assert.NoError(t, err)
 
 		backendConfig = s3.S3Config{
@@ -1111,7 +1096,7 @@ func TestInvalidS3Host(t *testing.T) {
 		t.Run("Use Invalid S3 Bucket", func(t *testing.T) {
 
 			// Get a temp free port
-			tempPort, err := getFreePort()
+			tempPort, err := FindFreePort()
 			assert.NoError(t, err)
 
 			vb.Backend.SetConfig(s3.S3Config{
@@ -1344,16 +1329,6 @@ func TestCacheConfiguration(t *testing.T) {
 		})
 
 	})
-}
-
-// getFreePort allocates a free TCP port from the OS
-func getFreePort() (string, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return "", err
-	}
-	defer l.Close()
-	return l.Addr().String(), nil
 }
 
 // waitForServer polls the URL until it responds or times out
