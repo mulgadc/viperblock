@@ -177,3 +177,22 @@ Compare byte differences
 
 diff efi_partition-nbd0.hex efi_partition-nbd8.hex
 
+# QEMU x84
+
+Example
+
+```
+qemu-system-x86_64 \
+   -enable-kvm \
+   -nographic \
+   -M ubuntu \
+   -cpu host \
+   -smp 4 \
+   -m 3000 \
+   -drive file=/usr/share/ovmf/OVMF.fd,if=pflash,format=raw \
+   -drive file=nbd://127.0.0.1:34305/default,format=raw,if=virtio \
+   -drive file=nbd://127.0.0.1:39449/default,format=raw,if=none,media=disk,id=debian \
+   -device virtio-blk-pci,drive=debian,bootindex=1 \
+   -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+   -device virtio-rng-pci
+```

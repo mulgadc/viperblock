@@ -4,6 +4,8 @@ go 1.23.0
 
 //toolchain go1.24.3
 
+replace libguestfs.org/nbdkit => ./nbd/libguestfs.org/nbdkit
+
 //replace github.com/mulgadc/predastore => /home/ben/Development/predastore
 
 require (
@@ -12,6 +14,8 @@ require (
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/sync v0.14.0
 )
+
+require libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000 // indirect
 
 require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
