@@ -25,6 +25,35 @@ make bench          # Run benchmarks
 make clean          # Clean build artifacts (removes ./bin/sfs)
 ```
 
+### **MANDATORY: Unit Testing Requirements**
+
+**⚠️ CRITICAL: Always run unit tests before any commit or push operation.**
+
+```bash
+# REQUIRED before any git commit or push
+make test           # Must pass with zero failures (uses LOG_IGNORE=1)
+
+# Example workflow:
+make test                    # Verify all tests pass (file and S3 backends)
+git add .                    # Stage changes
+git commit -m "..."          # Only after tests pass
+git push origin main         # Only after tests pass
+```
+
+**Testing Policy:**
+- **All unit tests MUST pass** before committing changes
+- **No exceptions** - failing tests block commits
+- Tests include file backend, S3 backend, and memory backend scenarios
+- Tests must complete without errors, panics, or memory leaks
+- Use `make test` which runs with `LOG_IGNORE=1` to suppress test logs
+- If tests fail, fix issues before proceeding with git operations
+
+**Test Coverage:**
+- Block read/write operations across all backend types
+- WAL (Write-Ahead Log) functionality and replay
+- Volume creation, formatting, and state management
+- Integration tests with Predastore S3 backend
+
 ### Key Binaries
 - `./bin/sfs` - Simple File System demo with Viperblock integration
 - `./bin/vblock` - Viperblock management utility
