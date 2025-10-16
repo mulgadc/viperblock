@@ -106,6 +106,14 @@ This architecture makes Viperblock suitable for high-performance, durable block 
 
 ## Getting Started
 
+### Dependencies
+
+Install required `nbdkit` 
+
+```
+sudo apt install nbdkit nbdkit-plugin-dev
+```
+
 ### Installation
 
 Clone the repository and navigate to the project directory:
