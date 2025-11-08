@@ -267,95 +267,6 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	return vb, baseURL, shutdown, nil
 }
 
-/*
-func setupTestVBBench(b *testing.B, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
-
-	// Create a temporary directory for test data
-	//tmpDir, err := os.MkdirTemp("", "viperblock_test_*")
-	tmpDir := os.TempDir()
-	testVol := fmt.Sprintf("test_volume_%d", time.Now().UnixNano())
-
-	b.Cleanup(func() {
-		if vb != nil {
-			//b.Log("Removing VB WAL files: ", vb.WAL.BaseDir, testVol)
-			os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
-		}
-
-	})
-
-	var config interface{}
-	switch backendType.BackendType {
-
-	case FileBackend:
-		config = file.FileConfig{
-			BaseDir:    tmpDir,
-			VolumeName: testVol,
-			VolumeSize: volumeSize,
-		}
-
-		shutdown = func(volName string) {
-			//b.Logf("Shutdown for file handler %s", volName)
-		}
-
-	case S3Backend:
-
-		//b.Log("S3 backend not found, setting up S3 server")
-
-		host, err := getFreePort()
-		assert.NoError(b, err)
-
-		config = s3.S3Config{
-			VolumeName: testVol,
-			VolumeSize: volumeSize,
-			Region:     "ap-southeast-2",
-			Bucket:     "predastore",
-			AccessKey:  AccessKey,
-			SecretKey:  SecretKey,
-			Host:       fmt.Sprintf("https://%s", host),
-		}
-
-		shutdown, err = startTestServerBench(b, host)
-		if err != nil {
-			b.Fatalf("failed to start server: %v", err)
-		}
-
-		// Wait until server is responsive
-		ok := waitForServer(config.(s3.S3Config).Host, 2*time.Second)
-		if !ok {
-			b.Fatalf("server did not respond in time")
-		}
-
-		assert.NoError(b, err)
-
-	default:
-		b.Fatalf("unsupported backend type: %s", backendType.BackendType)
-	}
-
-	// Create a new Viperblock
-	vb = New(backendType.BackendType, config)
-	assert.NotNil(b, vb)
-
-	err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
-	assert.NoError(b, err)
-
-	vb.WAL.BaseDir = tmpDir
-
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", tmpDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
-
-	assert.NoError(b, err)
-
-	vb.BlockToObjectWAL.BaseDir = tmpDir
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/block2obj.%08d.bin", tmpDir, vb.GetVolume(), vb.BlockToObjectWAL.WallNum.Load()))
-	assert.NoError(b, err)
-
-	err = vb.Backend.Init()
-
-	assert.NoError(b, err)
-
-	return vb, baseURL, shutdown, nil
-}
-*/
-
 // runWithBackends runs a test function with both file and S3 backends
 func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, vb *VB)) {
 	backends := []BackendTest{
@@ -421,72 +332,6 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 		})
 	}
 }
-
-/*
-func runWithBackendsBench(b *testing.B, testName string, testFunc func(b *testing.B, vb *VB)) {
-	backends := []BackendTest{
-		{
-			Name:        "file",
-			BackendType: FileBackend,
-			Config:      file.FileConfig{BaseDir: "test_data"},
-			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
-		},
-
-		{
-			Name:        "file_nocache",
-			BackendType: FileBackend,
-			Config:      file.FileConfig{BaseDir: "test_data"},
-			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
-		},
-
-		{
-			Name:        "s3",
-			BackendType: S3Backend,
-			Config: s3.S3Config{
-				VolumeName: "test_s3",
-				VolumeSize: volumeSize,
-				Region:     "ap-southeast-2",
-				Bucket:     "predastore",
-				AccessKey:  AccessKey,
-				SecretKey:  SecretKey,
-				Host:       "https://127.0.0.1:8443/",
-			},
-			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
-		},
-
-		{
-			Name:        "s3_nocache",
-			BackendType: S3Backend,
-			Config: s3.S3Config{
-				VolumeName: "test_s3",
-				VolumeSize: volumeSize,
-				Region:     "ap-southeast-2",
-				Bucket:     "predastore",
-				AccessKey:  AccessKey,
-				SecretKey:  SecretKey,
-				Host:       "https://127.0.0.1:8443/",
-			},
-			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
-		},
-	}
-
-	for _, backendType := range backends {
-		b.Run(fmt.Sprintf("%s_%s", testName, backendType.Name), func(b *testing.B) {
-			//b.Log("Running test ", backendType.Name, " with backend:", backendType.BackendType)
-
-			vb, baseURL, shutdown, err := setupTestVBBench(b, TestVB{name: testName}, backendType)
-			if err != nil {
-				b.Fatalf("failed to setup test VB: %v baseURL: %s", err, baseURL)
-			}
-
-			testFunc(b, vb)
-
-			defer shutdown(vb.GetVolume())
-
-		})
-	}
-}
-*/
 
 func TestNew(t *testing.T) {
 	testCases := []TestVB{
@@ -1256,6 +1101,46 @@ func TestInvalidS3Auth(t *testing.T) {
 	})
 
 }
+
+// Test image import from local disk file
+func TestImportDiskImage(t *testing.T) {
+
+	runWithBackends(t, "s3_import_disk_image", func(t *testing.T, vb *VB) {
+
+		// Skip if file backend
+		if vb.Backend.GetBackendType() == "file" {
+			t.Skip("Skipping test for file backend")
+		}
+
+		t.Run("Valid Import Disk Image", func(t *testing.T) {
+
+			s3Config := &s3.S3Config{
+				VolumeName: vb.VolumeName,
+				VolumeSize: vb.VolumeSize,
+
+				Region:    "ap-southeast-2",
+				Bucket:    "predastore",
+				AccessKey: AccessKey,
+				SecretKey: SecretKey,
+				Host:      fmt.Sprintf("https://%s", vb.Backend.GetHost()),
+			}
+
+			fmt.Println(s3Config)
+			vbConfig := &VB{
+				VolumeConfig: VolumeConfig{},
+			}
+
+			fmt.Println(vbConfig)
+			// Get a temp free port
+			//utils.ImportDiskImage(s3Config, vbConfig, "../tests/unit-test-disk-image.raw")
+			err := vb.Backend.Init()
+			assert.NoError(t, err)
+
+		})
+
+	})
+}
+
 func TestCacheConfiguration(t *testing.T) {
 
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {

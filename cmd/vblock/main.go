@@ -1,18 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"time"
 
-	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
+	"github.com/mulgadc/viperblock/viperblock/utils"
 )
 
 func main() {
@@ -95,70 +92,6 @@ func main() {
 
 	}
 
-	// Pre-fill meta-data if any fields are missing
-	if volumeConfig.VolumeMetadata.VolumeID == "" {
-		volumeConfig.VolumeMetadata.VolumeID = viperblock.GenerateVolumeID("vol", *volume, *bucket, time.Now().Unix())
-	}
-
-	if volumeConfig.VolumeMetadata.VolumeName == "" {
-		volumeConfig.VolumeMetadata.VolumeName = *volume
-	}
-
-	if volumeConfig.VolumeMetadata.SizeGiB == 0 {
-		volumeConfig.VolumeMetadata.SizeGiB = uint64(*size)
-	}
-
-	if volumeConfig.VolumeMetadata.State == "" {
-		volumeConfig.VolumeMetadata.State = "available"
-	}
-
-	if volumeConfig.VolumeMetadata.CreatedAt.IsZero() {
-		volumeConfig.VolumeMetadata.CreatedAt = time.Now()
-	}
-
-	if volumeConfig.VolumeMetadata.AvailabilityZone == "" {
-		volumeConfig.VolumeMetadata.AvailabilityZone = *region
-	}
-
-	// First, check if `AMIMetadata` is defined, otherwise skip
-	if volumeConfig.AMIMetadata.Name != "" {
-
-		// Check AMI config and set defaults
-		if volumeConfig.AMIMetadata.ImageID == "" {
-			volumeConfig.AMIMetadata.ImageID = viperblock.GenerateVolumeID("ami", *volume, *bucket, time.Now().Unix())
-		}
-
-		if volumeConfig.AMIMetadata.CreationDate.IsZero() {
-			volumeConfig.AMIMetadata.CreationDate = time.Now()
-		}
-
-		if volumeConfig.AMIMetadata.Architecture == "" {
-			volumeConfig.AMIMetadata.Architecture = "x86_64"
-		}
-
-		if volumeConfig.AMIMetadata.PlatformDetails == "" {
-			volumeConfig.AMIMetadata.PlatformDetails = "Linux/UNIX"
-		}
-
-		if volumeConfig.AMIMetadata.RootDeviceType == "" {
-			volumeConfig.AMIMetadata.RootDeviceType = "ebs"
-		}
-
-		if volumeConfig.AMIMetadata.Virtualization == "" {
-			volumeConfig.AMIMetadata.Virtualization = "hvm"
-		}
-
-		if volumeConfig.AMIMetadata.ImageOwnerAlias == "" {
-			volumeConfig.AMIMetadata.ImageOwnerAlias = "hive"
-		}
-
-		if volumeConfig.AMIMetadata.VolumeSizeGiB == 0 {
-			// Convert from bytes to GiB
-			volumeConfig.AMIMetadata.VolumeSizeGiB = uint64(*size) / 1024 / 1024 / 1024
-		}
-
-	}
-
 	var volID string
 
 	if volumeConfig.AMIMetadata.ImageID != "" {
@@ -167,13 +100,7 @@ func main() {
 		volID = volumeConfig.VolumeMetadata.VolumeID
 	}
 
-	f, err := os.OpenFile(*file, os.O_RDONLY, 0)
-	if err != nil {
-		log.Fatalf("Failed to open disk file: %v", err)
-	}
-	defer f.Close()
-
-	cfg := s3.S3Config{
+	s3Config := s3.S3Config{
 		VolumeName: volID,
 		VolumeSize: uint64(*size),
 		Bucket:     *bucket,
@@ -183,7 +110,7 @@ func main() {
 		Host:       *host,
 	}
 
-	vbconfig := viperblock.VB{
+	vbConfig := viperblock.VB{
 		VolumeName: volID,
 		VolumeSize: uint64(*size),
 		BaseDir:    *base_dir,
@@ -195,97 +122,11 @@ func main() {
 		VolumeConfig: volumeConfig,
 	}
 
-	vb, err := viperblock.New(vbconfig, "s3", cfg)
-	if err != nil {
-		log.Fatalf("Failed to connect to Viperblock store: %v", err)
-	}
-
-	vb.SetDebug(true)
-
-	// Initialize the backend
-	err = vb.Backend.Init()
-	if err != nil {
-		log.Fatalf("Failed to initialize backend: %v", err)
-	}
-
-	//var walNum uint64
-
-	// First, fetch the state from the remote backend
-	err = vb.LoadState()
+	err := utils.ImportDiskImage(&s3Config, &vbConfig, *file)
 
 	if err != nil {
-		log.Fatalf("Failed to load state: %v", err)
+		log.Fatalf("Failed to import disk image: %v", err)
 	}
 
-	err = vb.LoadBlockState()
-
-	if err != nil {
-		log.Fatalf("Failed to load block state: %v", err)
-	}
-
-	// Open the chunk WAL
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
-
-	if err != nil {
-		log.Fatalf("Failed to load WAL: %v", err)
-	}
-
-	// Open the block to object WAL
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
-
-	if err != nil {
-		log.Fatalf("Failed to load block WAL: %v", err)
-	}
-
-	var block uint64 = 0
-
-	buf := make([]byte, vb.BlockSize)
-
-	nullBlock := make([]byte, vb.BlockSize)
-
-	for {
-
-		n, err := f.Read(buf)
-
-		// Check if the input is a Zero block
-		if bytes.Equal(buf[:n], nullBlock) {
-			//fmt.Printf("Null block found at %d, skipping\n", block)
-			block++
-			continue
-		}
-
-		//fmt.Println("Read", "block", block, "n", n, "err", err)
-
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			log.Fatalf("Failed to read disk file: %v", err)
-		}
-
-		vb.WriteAt(block*uint64(vb.BlockSize), buf[:n])
-
-		//fmt.Println("Write", "block", hex.EncodeToString(buf[:n]))
-
-		block++
-
-		// Flush every 4MB
-		if block%uint64(vb.BlockSize) == 0 {
-			fmt.Println("Flush", "block", block)
-			vb.Flush()
-			vb.WriteWALToChunk(true)
-		}
-
-	}
-
-	err = vb.Close()
-	if err != nil {
-		log.Fatalf("Failed to close Viperblock store: %v", err)
-	}
-
-	// Write state to disk
-	//vb.SaveState()
-	//vb.SaveHotState("/tmp/viperblock/hotstate.json")
-	//vb.SaveBlockState("/tmp/viperblock/blockstate.json")
-
+	fmt.Println("Successfully imported disk image to Viperblock store")
 }
