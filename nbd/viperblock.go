@@ -16,13 +16,13 @@ import (
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 )
 
-var pluginName = "ramdisk"
+var pluginName = "viperblock"
 
-type RAMDiskPlugin struct {
+type ViperBlockPlugin struct {
 	nbdkit.Plugin
 }
 
-type RAMDiskConnection struct {
+type ViperBlockConnection struct {
 	nbdkit.Connection
 	vb *viperblock.VB
 }
@@ -40,7 +40,7 @@ var cache_size int = 20
 
 var disk []byte
 
-func (p *RAMDiskPlugin) Config(key string, value string) error {
+func (p *ViperBlockPlugin) Config(key string, value string) error {
 
 	// Config options
 	// size (bytes)
@@ -88,7 +88,7 @@ func (p *RAMDiskPlugin) Config(key string, value string) error {
 	return nil
 }
 
-func (p *RAMDiskPlugin) ConfigComplete() error {
+func (p *ViperBlockPlugin) ConfigComplete() error {
 	if size == 0 {
 		return nbdkit.PluginError{Errmsg: "size parameter is required"}
 	} else if volume == "" {
@@ -109,14 +109,14 @@ func (p *RAMDiskPlugin) ConfigComplete() error {
 	return nil
 }
 
-func (p *RAMDiskPlugin) GetReady() error {
+func (p *ViperBlockPlugin) GetReady() error {
 	// Allocate the RAM disk.
 	//disk = make([]byte, size)
 
 	return nil
 }
 
-func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 
 	cfg := s3.S3Config{
 		VolumeName: volume,
@@ -142,7 +142,7 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)
 	vb, err := viperblock.New(vbconfig, "s3", cfg)
 	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
 
 	//vb.SetDebug(true)
@@ -156,7 +156,7 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	// Initialize the backend
 	err = vb.Backend.Init()
 	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: "Could not initialize backend"}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: "Could not initialize backend"}
 	}
 
 	var walNum uint64
@@ -165,13 +165,13 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	err = vb.LoadState()
 
 	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load state: %v", err)}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load state: %v", err)}
 	}
 
 	err = vb.LoadBlockState()
 
 	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
 	}
 
 	walNum = vb.WAL.WallNum.Add(1)
@@ -181,41 +181,32 @@ func (p *RAMDiskPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) 
 	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
 
 	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open WAL: %v", err)}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open WAL: %v", err)}
 	}
 
 	// Open the block to object WAL
 	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
 
 	if err != nil {
-		return &RAMDiskConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
 	}
 
-	return &RAMDiskConnection{vb: vb}, nil
+	return &ViperBlockConnection{vb: vb}, nil
 }
 
-func (c *RAMDiskConnection) GetSize() (uint64, error) {
+func (c *ViperBlockConnection) GetSize() (uint64, error) {
 	return c.vb.GetVolumeSize(), nil
 
 }
 
-/*
-func (c *RAMDiskConnection) BlockSize() (int32, int32, int32, error) {
-	fmt.Println("***BlockSize")
-	// Min, preferred, maximum
-	return int32(4096), int32(4096), int32(4096), nil
-	//return 512, 512, 512, nil
-}
-*/
-
 // Clients are allowed to make multiple connections safely.
 // TODO: confirm changes
-func (c *RAMDiskConnection) CanMultiConn() (bool, error) {
+func (c *ViperBlockConnection) CanMultiConn() (bool, error) {
 	return false, nil
 
 }
 
-func (c *RAMDiskConnection) PRead(buf []byte, offset uint64, flags uint32) error {
+func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) error {
 	slog.Info("PREAD:", "offset", offset, "len", len(buf))
 	data, err := c.vb.ReadAt(offset, uint64(len(buf)))
 	if err != nil && err != viperblock.ZeroBlock {
@@ -228,11 +219,11 @@ func (c *RAMDiskConnection) PRead(buf []byte, offset uint64, flags uint32) error
 
 // Note that CanWrite is required in golang plugins, otherwise PWrite
 // will never be called.
-func (c *RAMDiskConnection) CanWrite() (bool, error) {
+func (c *ViperBlockConnection) CanWrite() (bool, error) {
 	return true, nil
 }
 
-func (c *RAMDiskConnection) PWrite(buf []byte, offset uint64,
+func (c *ViperBlockConnection) PWrite(buf []byte, offset uint64,
 	flags uint32) error {
 
 	//slog.Info("PWRITE:", "len", len(buf), "offset", offset)
@@ -249,11 +240,11 @@ func (c *RAMDiskConnection) PWrite(buf []byte, offset uint64,
 	return nil
 }
 
-func (c *RAMDiskConnection) CanZero() (bool, error) {
+func (c *ViperBlockConnection) CanZero() (bool, error) {
 	return true, nil
 }
 
-func (c *RAMDiskConnection) Zero(count uint32, offset uint64, flags uint32) error {
+func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) error {
 
 	slog.Info("ZERO:", "len", count, "offset", offset)
 
@@ -268,11 +259,11 @@ func (c *RAMDiskConnection) Zero(count uint32, offset uint64, flags uint32) erro
 	return nil
 }
 
-func (c *RAMDiskConnection) CanTrim() (bool, error) {
+func (c *ViperBlockConnection) CanTrim() (bool, error) {
 	return true, nil
 }
 
-func (c *RAMDiskConnection) Trim(count uint32, offset uint64, flags uint32) error {
+func (c *ViperBlockConnection) Trim(count uint32, offset uint64, flags uint32) error {
 
 	slog.Info("TRIM:", "len", count, "offset", offset)
 
@@ -281,18 +272,11 @@ func (c *RAMDiskConnection) Trim(count uint32, offset uint64, flags uint32) erro
 
 // Note that CanFlush() is required in golang plugins that implement
 // Flush(), otherwise Flush() will never be called.
-func (c *RAMDiskConnection) CanFlush() (bool, error) {
+func (c *ViperBlockConnection) CanFlush() (bool, error) {
 	return true, nil
 }
 
-// This is only an example, but if this was a real plugin, because
-// these disks are transient and deleted when the client exits, it
-// would make no sense to implement a Flush() callback.
-func (c *RAMDiskConnection) Flush(flags uint32) error {
-
-	//c.vb.SaveState("/tmp/viperblock/state.json")
-	//c.vb.SaveHotState("/tmp/viperblock/hotstate.json")
-	//c.vb.SaveBlockState("/tmp/viperblock/blockstate.json")
+func (c *ViperBlockConnection) Flush(flags uint32) error {
 
 	c.vb.Flush()
 
@@ -306,7 +290,7 @@ func (c *RAMDiskConnection) Flush(flags uint32) error {
 
 }
 
-func (c *RAMDiskConnection) Close() {
+func (c *ViperBlockConnection) Close() {
 
 	slog.Info("Close, flushing block state to disk")
 
@@ -333,7 +317,7 @@ func plugin_init() unsafe.Pointer {
 	// ...
 
 	// Then you must call the following function.
-	return nbdkit.PluginInitialize(pluginName, &RAMDiskPlugin{})
+	return nbdkit.PluginInitialize(pluginName, &ViperBlockPlugin{})
 }
 
 // This is never(?) called, but must exist.
