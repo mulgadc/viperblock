@@ -710,6 +710,10 @@ func (vb *VB) Flush2() (err error) {
 
 func (vb *VB) WriteWAL(block Block) (err error) {
 
+	// Pre-allocate record buffer (28 byte header + data)
+	recordSize := 28 + len(block.Data)
+	record := make([]byte, recordSize)
+
 	vb.WAL.mu.Lock()
 
 	// Get the current WAL file
@@ -722,34 +726,49 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	// big endian
 
 	// Write the block number as big endian
-	blockSeq := make([]byte, 8)
-	binary.BigEndian.PutUint64(blockSeq, block.SeqNum)
-	currentWAL.Write(blockSeq)
+	binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
+
+	//blockSeq := make([]byte, 8)
+	//binary.BigEndian.PutUint64(blockSeq, block.SeqNum)
+	//currentWAL.Write(blockSeq)
 
 	// Write the block number as big endian
-	blockNumber := make([]byte, 8)
-	binary.BigEndian.PutUint64(blockNumber, block.Block)
-	//slog.Info("WriteWAL > blockNumber", "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
+	binary.BigEndian.PutUint64(record[8:16], block.Block)
 
-	currentWAL.Write(blockNumber)
+	//blockNumber := make([]byte, 8)
+	//binary.BigEndian.PutUint64(blockNumber, block.Block)
+	//slog.Info("WriteWAL > blockNumber", "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
+	//currentWAL.Write(blockNumber)
 
 	// TODO: Optimise
-	blockLength := make([]byte, 8)
-	binary.BigEndian.PutUint64(blockLength, uint64(len(block.Data)))
-	currentWAL.Write(blockLength)
+	// Write the block length as big endian
+	binary.BigEndian.PutUint64(record[16:24], block.Len)
+
+	//blockLength := make([]byte, 8)
+	//binary.BigEndian.PutUint64(blockLength, uint64(len(block.Data)))
+	//currentWAL.Write(blockLength)
 
 	// Calculate a CRC32 checksum of the block data and headers
-	checksum := crc32.ChecksumIEEE(append(blockSeq, blockNumber...))
-	checksum = crc32.Update(checksum, crc32.IEEETable, blockLength)
+	checksum := crc32.ChecksumIEEE(record[0:24])
 	checksum = crc32.Update(checksum, crc32.IEEETable, block.Data)
 
 	// Write the checksum as big endian
-	checksumBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(checksumBytes, checksum)
-	currentWAL.Write(checksumBytes)
+	binary.BigEndian.PutUint32(record[24:28], checksum)
+
+	//checksumBytes := make([]byte, 4)
+	//binary.BigEndian.PutUint32(checksumBytes, checksum)
+	//currentWAL.Write(checksumBytes)
 
 	// Next, write the block data
-	currentWAL.Write(block.Data)
+	copy(record[28:], block.Data)
+
+	// Optimistation, write a single time to reduce O_SYNC calls (slow) per finished block
+	n, err := currentWAL.Write(record)
+
+	if n != recordSize {
+		slog.Error("ERROR WRITING BLOCK TO WAL: incomplete write", "n", n, "expected", recordSize)
+		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes", n, recordSize)
+	}
 
 	vb.WAL.mu.Unlock()
 	return err
