@@ -1166,36 +1166,31 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	}
 
 	// After upload completion, remove from PendingBackendWrites
-	// Clone a copy of the blocks
+	// Build a hash map of matched block numbers for O(1) lookup instead of O(n²)
+	matchedBlockMap := make(map[uint64]struct{}, len(*matchedBlocks))
+	for _, mb := range *matchedBlocks {
+		matchedBlockMap[mb.Block] = struct{}{}
+	}
+
 	vb.PendingBackendWrites.mu.Lock()
 
-	pendingBackendWrites := make([]Block, len(vb.PendingBackendWrites.Blocks))
-	copy(pendingBackendWrites, vb.PendingBackendWrites.Blocks)
-
-	// Reset the pending backend writes
-	vb.PendingBackendWrites.Blocks = make([]Block, 0)
-
-	// Loop through the pending backend writes, and remove the blocks that have been written
-	for _, block := range pendingBackendWrites {
-		var matched bool = false
-		for _, matchedBlock := range *matchedBlocks {
-			if block.Block == matchedBlock.Block {
-				matched = true
-				break
-			}
-		}
-
-		// If the block is not in the matched blocks, append to the pending backend writes
-		if !matched {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+	// Filter pending writes in-place using the hash map for O(n) complexity
+	// We iterate through the slice once, keeping non-matched blocks at the front
+	n := 0
+	for _, block := range vb.PendingBackendWrites.Blocks {
+		if _, matched := matchedBlockMap[block.Block]; !matched {
+			// Block not in matched set, keep it in pending writes
+			vb.PendingBackendWrites.Blocks[n] = block
+			n++
 		} else {
-			// Update the cache with the block data on successful write
-
+			// Block was successfully written to backend, update cache
 			if vb.Cache.Config.Size > 0 {
 				vb.Cache.lru.Add(block.Block, block.Data)
 			}
 		}
 	}
+	// Truncate the slice to remove processed blocks
+	vb.PendingBackendWrites.Blocks = vb.PendingBackendWrites.Blocks[:n]
 
 	vb.PendingBackendWrites.mu.Unlock()
 
