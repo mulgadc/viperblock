@@ -765,12 +765,13 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	// Optimistation, write a single time to reduce O_SYNC calls (slow) per finished block
 	n, err := currentWAL.Write(record)
 
+	vb.WAL.mu.Unlock()
+
 	if n != recordSize {
 		slog.Error("ERROR WRITING BLOCK TO WAL: incomplete write", "n", n, "expected", recordSize)
 		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes", n, recordSize)
 	}
 
-	vb.WAL.mu.Unlock()
 	return err
 }
 
@@ -883,40 +884,20 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 }
 
 func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
-
-	data = make([]byte, 0)
+	data = make([]byte, 26)
 
 	// Write the start block
-	startBlock := make([]byte, 8)
-	binary.BigEndian.PutUint64(startBlock, block.StartBlock)
-	data = append(data, startBlock...)
-	//_, err = currentWAL.Write(startBlock)
-
-	numBlocks := make([]byte, 2)
-	binary.BigEndian.PutUint16(numBlocks, block.NumBlocks)
-	data = append(data, numBlocks...)
-
-	objectID := make([]byte, 8)
-	binary.BigEndian.PutUint64(objectID, block.ObjectID)
-	data = append(data, objectID...)
-
-	objectOffset := make([]byte, 4)
-	binary.BigEndian.PutUint32(objectOffset, block.ObjectOffset)
-	data = append(data, objectOffset...)
+	binary.BigEndian.PutUint64(data[0:8], block.StartBlock)
+	binary.BigEndian.PutUint16(data[8:10], block.NumBlocks)
+	binary.BigEndian.PutUint64(data[10:18], block.ObjectID)
+	binary.BigEndian.PutUint32(data[18:22], block.ObjectOffset)
 
 	// Calculate a CRC32 checksum of the block data and headers
-	checksum := crc32.ChecksumIEEE(append(startBlock, numBlocks...))
-	checksum = crc32.Update(checksum, crc32.IEEETable, objectID)
-	checksum = crc32.Update(checksum, crc32.IEEETable, objectOffset)
+	checksum := crc32.ChecksumIEEE(data[0:22])
 
-	checksumBytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(checksumBytes, checksum)
-	data = append(data, checksumBytes...)
-
-	//_, err = currentWAL.Write(checksumBytes)
+	binary.BigEndian.PutUint32(data[22:26], checksum)
 
 	return data
-
 }
 
 func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
@@ -1013,9 +994,9 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 		// Validate checksum
 		checksum := binary.BigEndian.Uint32(data[24:28])
-		checksumValidated := crc32.ChecksumIEEE(data[:8])
-		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[8:16])
-		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[16:24])
+
+		checksumValidated := crc32.ChecksumIEEE(data[:24])
+		// Skip the checksum (24:28), just the data next
 		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[28:])
 
 		if checksumValidated != checksum {
