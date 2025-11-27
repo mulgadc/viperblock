@@ -1,5 +1,29 @@
 GO_PROJECT_NAME := viperblock
 
+# Where to install Go tools
+GOBIN ?= $(shell go env GOBIN)
+ifeq ($(GOBIN),)
+  GOBIN := $(shell go env GOPATH)/bin
+endif
+
+GOVULNCHECK := $(GOBIN)/govulncheck
+
+# Install govulncheck only if the binary is missing / out of date
+$(GOVULNCHECK):
+	go install golang.org/x/vuln/cmd/govulncheck@latest
+
+GOSECCHECK := $(GOBIN)/gosec
+
+# Install gosec only if the binary is missing / out of date
+$(GOSECCHECK):
+	go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+GOSTATICCHECK := $(GOBIN)/staticcheck
+
+# Install govulncheck only if the binary is missing / out of date
+$(GOSTATICCHECK):
+	go install honnef.co/go/tools/cmd/staticcheck@latest
+
 build:
 	$(MAKE) go_build
 	$(MAKE) go_build_nbd
@@ -27,6 +51,7 @@ go_build_nbd:
 test:
 	@echo "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -v ./...
+	$(GOVULNCHECK) ./...
 
 bench:
 	@echo "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
@@ -58,11 +83,30 @@ bench:
 
 #docker_test: docker docker_compose_up test docker_compose_down docker_clean
 
+
+security:
+	@echo "\n....Running security checks for $(GO_PROJECT_NAME)...."
+
+	$(GOVULNCHECK) ./... > tests/govulncheck-report.txt || true
+	@echo "Govulncheck report saved to tests/govulncheck-report.txt"
+
+# Note we exclude nbdkit, gosec cgo/issue "[gosec] 2025/11/27 19:34:05 Panic when running SSA analyzer on package: nbdkit. Panic: runtime error: invalid memory address or nil pointer dereference"
+	$(GOSECCHECK) -exclude-dir nbd/libguestfs.org/nbdkit ./... > tests/gosec-report.txt || true
+	@echo "Gosec report saved to tests/gosec-report.txt"
+
+	$(GOSTATICCHECK) ./...  > tests/staticcheck-report.txt || true
+	@echo "Staticcheck report saved to tests/staticcheck-report.txt"
+	
+	go vet ./... 2>&1 | tee tests/govet-report.txt || true
+	@echo "Go vet report saved to tests/govet-report.txt"
+
 run:
 	$(MAKE) go_build
 	$(MAKE) go_run
 
 clean:
 	rm ./bin/sfs
+	rm ./bin/vblock
+	rm ./lib/nbdkit-viperblock-plugin.so
 
-.PHONY: go_build go_run build run test
+.PHONY: go_build go_run build run test security

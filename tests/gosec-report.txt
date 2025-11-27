@@ -1,0 +1,498 @@
+Results:
+
+Golang errors in file: [/Users/benduncan/Development/mulga/viperblock/nbd/viperblock.go]:
+
+  > [line 4 : column 2] - could not import C (no metadata for C)
+
+
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:306[0m] - G115 (CWE-190): integer overflow conversion uint64 -> uint32 (Confidence: MEDIUM, Severity: HIGH)
+    305: 
+  > 306: 			data, err := vb.Backend.Read(types.FileTypeChunk, objectID, objectOffset, uint32(sfs.Blocksize))
+    307: 
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:812[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    811: 
+  > 812: 		if n != int(block.Len) {
+    813: 			return fmt.Errorf("incomplete read: got %d bytes, expected %d", n, block.Len)
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:254[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    253: 
+  > 254: 	return int(cacheMemory / uint64(blockSize))
+    255: }
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/simplefs/simplefs.go:98[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    97: 
+  > 98: 	for i := 0; i < int(size); i++ {
+    99: 		blocks[i] = sfs.Volume.Free[i]
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/simplefs/simplefs.go:94[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    93: 	//fmt.Println("Allocating blocks", len(sfs.Volume.Free), size)
+  > 94: 	if len(sfs.Volume.Free) < int(size) {
+    95: 		return nil, fmt.Errorf("not enough free blocks")
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:316[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    315: 			bytesToCopy := int(sfs.Blocksize)
+  > 316: 			if (pos + int(sfs.Blocksize)) > len(fileBuffer) {
+    317: 				bytesToCopy = len(fileBuffer) - pos
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:315[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    314: 			// How much we can copy from this block
+  > 315: 			bytesToCopy := int(sfs.Blocksize)
+    316: 			if (pos + int(sfs.Blocksize)) > len(fileBuffer) {
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:309[0m] - G115 (CWE-190): integer overflow conversion uint64 -> int (Confidence: MEDIUM, Severity: HIGH)
+    308: 			// Position in the buffer where this block should go
+  > 309: 			pos := i * int(sfs.Blocksize)
+    310: 			if pos >= len(fileBuffer) {
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1881[0m] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    1880: 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
+  > 1881: 	binary.BigEndian.PutUint64(header[6:14], uint64(time.Now().Unix()))
+    1882: 	return header
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1865[0m] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    1864: 	binary.BigEndian.PutUint32(header[6:10], vb.BlockSize)
+  > 1865: 	binary.BigEndian.PutUint64(header[10:18], uint64(time.Now().Unix()))
+    1866: 	return header
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/utils/utils.go:94[0m] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    93: 			// Convert from bytes to GiB
+  > 94: 			vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB = uint64(fileInfo.Size()) / 1024 / 1024 / 1024
+    95: 		}
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/utils/utils.go:45[0m] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    44: 	if vbConfig.VolumeConfig.VolumeMetadata.SizeGiB == 0 {
+  > 45: 		vbConfig.VolumeConfig.VolumeMetadata.SizeGiB = uint64(fileInfo.Size()) / 1024 / 1024 / 1024
+    46: 	}
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:204[0m] - G115 (CWE-190): integer overflow conversion int64 -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    203: 		// Create a file
+  > 204: 		blocks, err := sfs.CreateFile(path, uint64(info.Size()))
+    205: 		if err != nil {
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/file/file.go:116[0m] - G115 (CWE-190): integer overflow conversion int64 -> uint32 (Confidence: MEDIUM, Severity: HIGH)
+    115: 		}
+  > 116: 		length = uint32(stat.Size())
+    117: 	}
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:252[0m] - G115 (CWE-190): integer overflow conversion int -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    251: 	systemMemory := getSystemMemory()
+  > 252: 	cacheMemory := (systemMemory * uint64(percent)) / 100
+    253: 
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/vblock/main.go:115[0m] - G115 (CWE-190): integer overflow conversion int -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    114: 		VolumeName: volID,
+  > 115: 		VolumeSize: uint64(*size),
+    116: 		BaseDir:    *base_dir,
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/cmd/vblock/main.go:105[0m] - G115 (CWE-190): integer overflow conversion int -> uint64 (Confidence: MEDIUM, Severity: HIGH)
+    104: 		VolumeName: volID,
+  > 105: 		VolumeSize: uint64(*size),
+    106: 		Bucket:     *bucket,
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1223[0m] - G115 (CWE-190): integer overflow conversion int -> uint32 (Confidence: MEDIUM, Severity: HIGH)
+    1222: 			ObjectID:     chunkIndex,
+  > 1223: 			ObjectOffset: uint32(headerLen + (i * int(vb.BlockSize))),
+    1224: 		}
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1682[0m] - G115 (CWE-190): integer overflow conversion int -> uint16 (Confidence: MEDIUM, Severity: HIGH)
+    1681: 			StartBlock:    consecutiveBlocks[i].StartBlock,
+  > 1682: 			NumBlocks:     uint16(numBlocks),
+    1683: 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1221[0m] - G115 (CWE-190): integer overflow conversion int -> uint16 (Confidence: MEDIUM, Severity: HIGH)
+    1220: 			StartBlock:   block.Block,
+  > 1221: 			NumBlocks:    uint16(numBlocks),
+    1222: 			ObjectID:     chunkIndex,
+
+Autofix: 
+
+[[97;41m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/s3/s3.go:57[0m] - G402 (CWE-295): TLS InsecureSkipVerify set true. (Confidence: HIGH, Severity: HIGH)
+    56: 
+  > 57: 	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+    58: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1536[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    1535: 	if filename != "" {
+  > 1536: 		jsonData, err = os.ReadFile(filename)
+    1537: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1353[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    1352: 	} else {
+  > 1353: 		checkpoint, err = os.ReadFile(filename)
+    1354: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1306[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    1305: 	filepath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))
+  > 1306: 	file, err := os.Create(filepath)
+    1307: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1256[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    1255: 	// Write the BlocksToObject to a file as a binary file
+  > 1256: 	file, err := os.Create(filename)
+    1257: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:962[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    961: 	//filename := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), currentWALNum)
+  > 962: 	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0640)
+    963: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:442[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    441: 	// Create the file if it doesn't exist, make sure writes and committed immediately
+  > 442: 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR|syscall.O_SYNC, 0640)
+    443: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/utils/utils.go:19[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    18: 	// Confirm filename can be opened
+  > 19: 	f, err := os.OpenFile(filename, os.O_RDONLY, 0)
+    20: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/file/file.go:139[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    138: 
+  > 139: 	file, err := os.Create(filename)
+    140: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/file/file.go:102[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    101: 
+  > 102: 	f, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+    103: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/simplefs/simplefs.go:197[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    196: 	// Read from file
+  > 197: 	jsonData, err := os.ReadFile(filename)
+    198: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:212[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    211: 
+  > 212: 		finput, err := os.Open(path)
+    213: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:962[0m] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    961: 	//filename := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), currentWALNum)
+  > 962: 	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0640)
+    963: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:442[0m] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    441: 	// Create the file if it doesn't exist, make sure writes and committed immediately
+  > 442: 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR|syscall.O_SYNC, 0640)
+    443: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/file/file.go:102[0m] - G302 (CWE-276): Expect file permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    101: 
+  > 102: 	f, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+    103: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/file/file.go:70[0m] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    69: 		// Create all parent dirs
+  > 70: 		err := os.MkdirAll(dirPath, 0755)
+    71: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/backends/file/file.go:50[0m] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    49: 	// Create the directory structure
+  > 50: 	err := os.MkdirAll(dirPath, 0755)
+    51: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1465[0m] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    1464: 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
+  > 1465: 	err = os.WriteFile(filename, jsonData, 0640)
+    1466: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/simplefs/simplefs.go:183[0m] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    182: 	// Write to file
+  > 183: 	err = os.WriteFile(filename, jsonData, 0644)
+    184: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1923[0m] - G102 (CWE-200): Binds to all network interfaces (Confidence: HIGH, Severity: MEDIUM)
+    1922: func FindFreePort() (string, error) {
+  > 1923: 	l, err := net.Listen("tcp", "0.0.0.0:0")
+    1924: 	if err != nil {
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1761[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    1760: 
+  > 1761: 	vb.Flush()
+    1762: 	err := vb.WriteWALToChunk(true)
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1315[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    1314: 	// Write the file locally
+  > 1315: 	file.Write(checkpoint)
+    1316: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:1263[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    1262: 	// Write the BlocksToObject to the file as JSON
+  > 1263: 	json.NewEncoder(file).Encode(vb.Writes.Blocks)
+    1264: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:958[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    957: 	// Close and reopen the pending WAL for reading
+  > 958: 	pendingWAL.Close()
+    959: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:439[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    438: 	// Create the directory if it doesn't exist
+  > 439: 	os.MkdirAll(filepath.Dir(filename), 0750)
+    440: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:403[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    402: 	// Create the checkpoint directory if it doesn't exist
+  > 403: 	os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750)
+    404: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/viperblock.go:400[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    399: 	// Create the base directory if it doesn't exist
+  > 400: 	os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume()), 0750)
+    401: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/utils/utils.go:178[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    177: 			vb.Flush()
+  > 178: 			vb.WriteWALToChunk(true)
+    179: 		}
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/utils/utils.go:177[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    176: 			fmt.Println("Flush", "block", block)
+  > 177: 			vb.Flush()
+    178: 			vb.WriteWALToChunk(true)
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/viperblock/utils/utils.go:168[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    167: 
+  > 168: 		vb.WriteAt(block*uint64(vb.BlockSize), buf[:n])
+    169: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/simplefs/simplefs.go:162[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    161: 
+  > 162: 	sfs.FreeBlocks(sfs.Blocks[pathname].Blocks)
+    163: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/simplefs/simplefs.go:133[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    132: 	if _, ok := sfs.Blocks[pathname]; ok {
+  > 133: 		sfs.FreeBlocks(sfs.Blocks[pathname].Blocks)
+    134: 		delete(sfs.Blocks, pathname)
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/nbd/viperblock.go:281[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    280: 
+  > 281: 	c.vb.Flush()
+    282: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:365[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    364: 	// Save the state
+  > 365: 	vb.SaveState()
+    366: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:274[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    273: 
+  > 274: 	vb.WriteWALToChunk(false)
+    275: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:270[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    269: 
+  > 270: 	vb.Flush()
+    271: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:247[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    246: 			// Append the currentBlock and raw data to main memory
+  > 247: 			vb.Write(blocks[currentBlock], buffer)
+    248: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:191-261[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    190: 	// Next, iterate over the directory and traverse the directory tree
+  > 191: 	filepath.Walk(*fname, func(path string, info os.FileInfo, err error) error {
+  > 192: 
+  > 193: 		// Skip directories
+  > 194: 		if info.IsDir() {
+  > 195: 			return nil
+  > 196: 		}
+  > 197: 
+  > 198: 		fmt.Println(path)
+  > 199: 		if err != nil {
+  > 200: 			return err
+  > 201: 		}
+  > 202: 
+  > 203: 		// Create a file
+  > 204: 		blocks, err := sfs.CreateFile(path, uint64(info.Size()))
+  > 205: 		if err != nil {
+  > 206: 			slog.Error("Could not create file", "error", err)
+  > 207: 			return err
+  > 208: 		}
+  > 209: 
+  > 210: 		fmt.Println(blocks)
+  > 211: 
+  > 212: 		finput, err := os.Open(path)
+  > 213: 
+  > 214: 		if err != nil {
+  > 215: 			fmt.Println(err)
+  > 216: 			return err
+  > 217: 		}
+  > 218: 
+  > 219: 		currentBlock := 0
+  > 220: 
+  > 221: 		hash := sha256.New()
+  > 222: 
+  > 223: 		// Read the input file, and write to the block storage main memory
+  > 224: 		totalLen := 0
+  > 225: 
+  > 226: 		for {
+  > 227: 
+  > 228: 			// Read 4kb chunks
+  > 229: 			buffer := make([]byte, vb.BlockSize)
+  > 230: 
+  > 231: 			// Read a 4KB chunk
+  > 232: 			n, err := finput.Read(buffer)
+  > 233: 
+  > 234: 			// Calculate the SHA256 of the buffer for each loop
+  > 235: 			hash.Write(buffer[:n])
+  > 236: 
+  > 237: 			totalLen += n
+  > 238: 
+  > 239: 			if err != nil {
+  > 240: 				if err == io.EOF {
+  > 241: 					break
+  > 242: 				}
+  > 243: 				slog.Error("File input error", "error", err)
+  > 244: 			}
+  > 245: 
+  > 246: 			// Append the currentBlock and raw data to main memory
+  > 247: 			vb.Write(blocks[currentBlock], buffer)
+  > 248: 
+  > 249: 			currentBlock++
+  > 250: 
+  > 251: 		}
+  > 252: 
+  > 253: 		entry := SHA256{}
+  > 254: 		entry.Checksum = hex.EncodeToString(hash.Sum(nil))
+  > 255: 		entry.Len = totalLen
+  > 256: 		entry.Filename = path
+  > 257: 
+  > 258: 		localSHA256[path] = entry
+  > 259: 
+  > 260: 		return nil
+  > 261: 	})
+    262: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/viperblock/cmd/sfs/sfs.go:76[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    75: 			fmt.Println("Volume data directory does not exist, creating it")
+  > 76: 			os.MkdirAll(*voldata, 0750)
+    77: 		}
+
+Autofix: 
+
+[1;36mSummary:[0m
+  Gosec  : dev
+  Files  : 12
+  Lines  : 3641
+  Nosec  : 0
+  Issues : [1;31m59[0m
+
