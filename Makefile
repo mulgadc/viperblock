@@ -48,7 +48,7 @@ go_build_nbd:
 #	@echo "\n....Running $(GO_PROJECT_NAME)...."
 #	$(GOPATH)/bin/$(GO_PROJECT_NAME)
 
-test:
+test: $(GOVULNCHECK)
 	@echo "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -v ./...
 	$(GOVULNCHECK) ./...
@@ -84,7 +84,7 @@ bench:
 #docker_test: docker docker_compose_up test docker_compose_down docker_clean
 
 
-security:
+security: $(GOVULNCHECK) $(GOSECCHECK) $(GOSTATICCHECK)
 	@echo "\n....Running security checks for $(GO_PROJECT_NAME)...."
 
 	$(GOVULNCHECK) ./... > tests/govulncheck-report.txt || true
