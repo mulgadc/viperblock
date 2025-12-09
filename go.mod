@@ -1,6 +1,6 @@
 module github.com/mulgadc/viperblock
 
-go 1.25
+go 1.25.5
 
 //toolchain go1.24.3
 
@@ -13,8 +13,6 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/stretchr/testify v1.9.0
 )
-
-require libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000 // indirect
 
 require (
 	github.com/andybalholm/brotli v1.1.1 // indirect
