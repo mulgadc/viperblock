@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -439,7 +438,8 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 	os.MkdirAll(filepath.Dir(filename), 0750)
 
 	// Create the file if it doesn't exist, make sure writes and committed immediately
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR|syscall.O_SYNC, 0640)
+	// Removed syscall.O_SYNC, TODO implement buffer, sync every 250ms / 1MB data
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
 
 	// Append the WAL header, format
 	// Check our type
