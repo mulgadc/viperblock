@@ -108,7 +108,7 @@ This architecture makes Viperblock suitable for high-performance, durable block 
 
 ### Dependencies
 
-Install required `nbdkit` 
+Install required `nbdkit`
 
 ```
 sudo apt install nbdkit nbdkit-plugin-dev
@@ -175,6 +175,14 @@ For more information on command-line options, run:
 ## Contributing
 
 Contributions are welcome! Please fork the repository and submit a pull request.
+
+## Research
+
+The following research papers aided the design and implementation of Viperblock, a huge thank you to the authors for their contributions.
+
+- Hajkazemi, Mohammad Hossein, et al. "Beating the i/o bottleneck: a case for log-structured virtual disks." Proceedings of the Seventeenth European Conference on Computer Systems. 2022. https://doi.org/10.1145/3492321.3524271
+- Zhou, Diyu, et al. "Enabling high-performance and secure userspace nvm file systems with the trio architecture." Proceedings of the 29th Symposium on Operating Systems Principles. 2023. https://doi.org/10.1145/3600006.3613171
+- Li, Huiba, et al. "Ursa: Hybrid block storage for cloud-scale virtual disks." Proceedings of the Fourteenth EuroSys Conference 2019. 2019. https://doi.org/10.1145/3302424.3303967
 
 ## License
 
