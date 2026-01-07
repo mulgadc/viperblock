@@ -1,8 +1,0 @@
-# github.com/mulgadc/viperblock/viperblock/utils
-# [github.com/mulgadc/viperblock/viperblock/utils]
-viperblock/utils/utils.go:99:28: call of viperblock.New copies lock value: github.com/mulgadc/viperblock/viperblock.VB contains sync/atomic.Uint64 contains sync/atomic.noCopy
-# github.com/mulgadc/viperblock/viperblock
-# [github.com/mulgadc/viperblock/viperblock]
-viperblock/viperblock.go:307:17: New passes lock by value: github.com/mulgadc/viperblock/viperblock.VB contains sync/atomic.Uint64 contains sync/atomic.noCopy
-viperblock/viperblock_test.go:249:16: call of New copies lock value: github.com/mulgadc/viperblock/viperblock.VB contains sync/atomic.Uint64 contains sync/atomic.noCopy
-viperblock/viperblock.go:845:2: unreachable code
