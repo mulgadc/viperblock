@@ -246,7 +246,7 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	}
 
 	// Create a new Viperblock
-	vb, err = New(vbconfig, backendType.BackendType, backendConfig)
+	vb, err = New(&vbconfig, backendType.BackendType, backendConfig)
 	assert.NoError(t, err)
 	assert.NotNil(t, vb)
 
@@ -364,7 +364,7 @@ func TestNew(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			vb, err := New(VB{VolumeName: "test", VolumeSize: 1024 * 1024}, tc.name, tc.config)
+			vb, err := New(&VB{VolumeName: "test", VolumeSize: 1024 * 1024}, tc.name, tc.config)
 			assert.NoError(t, err)
 			assert.NotNil(t, vb)
 			assert.Equal(t, tc.blockSize, vb.BlockSize)

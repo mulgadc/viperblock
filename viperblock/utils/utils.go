@@ -96,7 +96,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 	}
 
-	vb, err := viperblock.New(*vbConfig, "s3", *s3Config)
+	vb, err := viperblock.New(vbConfig, "s3", *s3Config)
 	if err != nil {
 		return fmt.Errorf("failed to connect to Viperblock store: %v", err)
 	}

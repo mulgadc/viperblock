@@ -2,3 +2,4 @@
 lib/nbdkit-viperblock-plugin.so
 tmp/
 tests/*-report.txt
+bin/

@@ -303,8 +303,12 @@ func (vb *VB) SetCacheSystemMemory(percent int) error {
 	return vb.SetCacheSize(size, percent)
 }
 
-func New(config VB, btype string, backendConfig interface{}) (vb *VB, err error) {
+func New(config *VB, btype string, backendConfig interface{}) (vb *VB, err error) {
 	var backend types.Backend
+
+	if config == nil {
+		return nil, fmt.Errorf("config must not be nil")
+	}
 
 	// Volume name and size are set by the backend
 	if config.VolumeName == "" || config.VolumeSize == 0 {

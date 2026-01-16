@@ -108,9 +108,10 @@ func main() {
 
 	var cfg interface{}
 
-	if *btype == "file" {
+	switch *btype {
+	case "file":
 		cfg = file.FileConfig{BaseDir: *voldata, VolumeName: *vol}
-	} else if *btype == "s3" {
+	case "s3":
 		cfg = s3.S3Config{
 			Bucket:    aws_bucket,
 			Region:    aws_region,
@@ -121,7 +122,7 @@ func main() {
 	}
 
 	fmt.Println("Creating Viperblock backend with btype, config", *btype, cfg)
-	vb, err := viperblock.New(viperblock.VB{}, *btype, cfg)
+	vb, err := viperblock.New(&viperblock.VB{VolumeName: *vol, VolumeSize: *volsize}, *btype, cfg)
 	if err != nil {
 		slog.Error("Could not create Viperblock", "error", err)
 		os.Exit(1)

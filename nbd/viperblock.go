@@ -140,7 +140,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	}
 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)
-	vb, err := viperblock.New(vbconfig, "s3", cfg)
+	vb, err := viperblock.New(&vbconfig, "s3", cfg)
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
