@@ -228,11 +228,11 @@ type AMIMetadata struct {
 
 // Error messages
 
-var ZeroBlock = errors.New("zero block")
-var RequestTooLarge = errors.New("request too large")
-var RequestOutOfRange = errors.New("request out of range")
-var RequestBlockSize = errors.New("request must be a multiple of block size")
-var RequestBufferEmpty = errors.New("request requires a buffer > 0")
+var ErrZeroBlock = errors.New("zero block")
+var ErrRequestTooLarge = errors.New("request too large")
+var ErrRequestOutOfRange = errors.New("request out of range")
+var ErrRequestBlockSize = errors.New("request must be a multiple of block size")
+var ErrRequestBufferEmpty = errors.New("request requires a buffer > 0")
 
 // getSystemMemory returns the total system memory in bytes
 func getSystemMemory() uint64 {
@@ -479,12 +479,12 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
-		return RequestTooLarge
+		return ErrRequestTooLarge
 	}
 
 	// Check if the request is within range
 	if offset+uint64(len(data)) > vb.GetVolumeSize() {
-		return RequestOutOfRange
+		return ErrRequestOutOfRange
 	}
 
 	blockSize := uint64(vb.BlockSize)
@@ -492,14 +492,14 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 
 	// Request buffer must be > 0
 	if dataLen == 0 {
-		return RequestBufferEmpty
+		return ErrRequestBufferEmpty
 	}
 
 	// Check blockLen a multiple of a blocksize
 	// No longer required, WriteAt can handle different block sizes (default 4096)
 	// Issue was with GRUB which requires 512 blocksize to write bootloader, ignorning the block size specified for the volume.
 	//if blockLen%uint64(vb.BlockSize) != 0 {
-	//	return RequestBlockSize
+	//	return ErrRequestBlockSize
 	//}
 
 	startBlock := offset / blockSize
@@ -536,7 +536,7 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 
 			existing, err := vb.ReadAt(b*blockSize, blockSize)
 
-			if err != nil && err != ZeroBlock {
+			if err != nil && err != ErrZeroBlock {
 				return fmt.Errorf("failed to read block %d for RMW: %w", b, err)
 			}
 			blockData = make([]byte, blockSize)
@@ -579,17 +579,17 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 
 	// First check the block exists in our volume size
 	if block*uint64(vb.BlockSize) > vb.GetVolumeSize() {
-		return RequestTooLarge
+		return ErrRequestTooLarge
 	}
 
 	// Check if the request is within range
 	if block*uint64(vb.BlockSize)+blockLen > vb.GetVolumeSize() {
-		return RequestOutOfRange
+		return ErrRequestOutOfRange
 	}
 
 	// Check blockLen a multiple of a blocksize
 	if blockLen%uint64(vb.BlockSize) != 0 {
-		return RequestBlockSize
+		return ErrRequestBlockSize
 	}
 
 	blockRequests := blockLen / uint64(vb.BlockSize)
@@ -1436,7 +1436,7 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	if ok {
 		return blockLookup.ObjectID, blockLookup.ObjectOffset, nil
 	} else {
-		return 0, 0, ZeroBlock
+		return 0, 0, ErrZeroBlock
 	}
 
 }
@@ -1504,7 +1504,7 @@ func (vb *VB) LoadState() error {
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
-		errMsg := "Invalid state, block size or object block size is 0. Not syncing config"
+		errMsg := "invalid state, block size or object block size is 0. Not syncing config"
 		slog.Error(errMsg)
 		err = errors.New(errMsg)
 		return err
@@ -1563,7 +1563,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// Check blockLen a multiple of a blocksize
 	if blockLen%uint64(vb.BlockSize) != 0 {
-		return nil, RequestBlockSize
+		return nil, ErrRequestBlockSize
 	}
 
 	var zeroBlockErr error
@@ -1631,7 +1631,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Next, fetch which object and offset the block is within
 		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
-			zeroBlockErr = ZeroBlock
+			zeroBlockErr = ErrZeroBlock
 			slog.Info("[READ] ZERO BLOCK:", "block", currentBlock)
 
 			copy(data[start:end], make([]byte, vb.BlockSize)) // zero
@@ -1733,11 +1733,11 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
-		return nil, RequestTooLarge
+		return nil, ErrRequestTooLarge
 	}
 
 	if offset+length > vb.GetVolumeSize() {
-		return nil, RequestOutOfRange
+		return nil, ErrRequestOutOfRange
 	}
 
 	blockSize := uint64(vb.BlockSize)
@@ -1750,7 +1750,7 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 	// Read entire range of needed blocks
 	fullData, err := vb.read(firstBlock, blockCount*blockSize)
 
-	if err != nil && err != ZeroBlock {
+	if err != nil && err != ErrZeroBlock {
 		return nil, err
 	}
 

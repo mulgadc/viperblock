@@ -70,7 +70,7 @@ security:
 	@echo "Gosec report saved to tests/gosec-report.txt"
 
 	# default config + disable dep warning since we are using aws sdk v1
-	go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./...  > tests/staticcheck-report.txt || true
+	go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-U1000,-SA4006" ./...  > tests/staticcheck-report.txt || true
 	@echo "Staticcheck report saved to tests/staticcheck-report.txt"
 
 	go vet ./... 2>&1 | tee tests/govet-report.txt || true

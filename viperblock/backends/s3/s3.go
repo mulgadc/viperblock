@@ -99,7 +99,7 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
 
-	data = make([]byte, length)
+	// data = make([]byte, length)
 	// Open the specified file
 	//filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
 
@@ -166,7 +166,6 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (backend *Backend) Sync() {
-	return
 }
 
 func (backend *Backend) GetBackendType() string {

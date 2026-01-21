@@ -183,10 +183,9 @@ func main() {
 	}
 
 	// SHA256 comparisons for the local files and block storage version
-	var localSHA256 map[string]SHA256
-	//var blockSHA256 map[string]string
+	localSHA256 := make(map[string]SHA256)
 
-	localSHA256 = make(map[string]SHA256)
+	//var blockSHA256 map[string]string
 	//blockSHA256 = make(map[string]string)
 
 	// Next, iterate over the directory and traverse the directory tree
@@ -325,12 +324,6 @@ func main() {
 				slog.Error("Could not read block", "error", err)
 				os.Exit(1)
 			}
-
-			if err != nil {
-				slog.Error("Could not lookup block to object", "error", err)
-				os.Exit(1)
-			}
-
 		}
 
 		// Compare the SHA256 of the local file to the block storage version

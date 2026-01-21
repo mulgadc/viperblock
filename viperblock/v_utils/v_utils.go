@@ -113,12 +113,13 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	//var walNum uint64
 
 	// First, fetch the state from the remote backend
-	err = vb.LoadState()
+	_ = vb.LoadState()
+	// err = vb.LoadState()
 
-	if err != nil {
-		// Soft error, since volume may be new
-		//return fmt.Errorf("failed to load state: %v", err)
-	}
+	// if err != nil {
+	// 	// Soft error, since volume may be new
+	// 	//return fmt.Errorf("failed to load state: %v", err)
+	// }
 
 	err = vb.LoadBlockState()
 

@@ -80,7 +80,7 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 		close(started) // notify that listener is active
 
 		// Start the Fiber app directly with ListenTLS
-		if err := app.ListenTLS(fmt.Sprintf("%s", host), "../config/server.pem", "../config/server.key"); err != nil {
+		if err := app.ListenTLS(host, "../config/server.pem", "../config/server.key"); err != nil {
 			// Only log, don't panic, to avoid crashing test
 			assert.NoError(t, err)
 
@@ -100,60 +100,6 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 		tmpVolume := fmt.Sprintf("%s/%s", s3server.Buckets[0].Pathname, volName)
 
 		//t.Log(fmt.Sprintf("Removing %s", tmpVolume))
-		os.RemoveAll(tmpVolume)
-
-	}
-
-	return shutdown, nil
-}
-
-func startTestServerBench(b *testing.B, host string) (shutdown func(volName string), err error) {
-
-	// Get the current directory
-	dir, err := os.Getwd()
-	require.NoError(b, err, "Failed to get current directory")
-
-	// Go down one directory from the current directory
-	dir = filepath.Join(dir, "..")
-
-	// Create and configure the S3 server
-	s3server := predastore.New()
-
-	err = s3server.ReadConfig(filepath.Join(dir, "tests/config/server.toml"), dir)
-	require.NoError(b, err, "Failed to read config file")
-
-	// Setup routes
-	app := s3server.SetupRoutes()
-
-	// Channel to track when server is running
-	started := make(chan struct{})
-
-	require.NoError(b, err, "Failed to get free port")
-
-	go func() {
-		close(started) // notify that listener is active
-
-		// Start the Fiber app directly with ListenTLS
-		if err := app.ListenTLS(fmt.Sprintf("%s", host), "../config/server.pem", "../config/server.key"); err != nil {
-			// Only log, don't panic, to avoid crashing test
-			assert.NoError(b, err)
-
-			b.Logf("fiber server exited: %v\n", err)
-
-		}
-
-	}()
-
-	// Wait for listener to bind
-	<-started
-
-	shutdown = func(volName string) {
-		_ = app.Shutdown()
-
-		// Remove the test volume
-		tmpVolume := fmt.Sprintf("%s/%s", s3server.Buckets[0].Pathname, volName)
-
-		//b.Log(fmt.Sprintf("Removing %s", tmpVolume))
 		os.RemoveAll(tmpVolume)
 
 	}
@@ -503,28 +449,28 @@ func TestWriteAndRead(t *testing.T) {
 				// Test Read error for invalid block, beyond the volume size
 
 				readData, err := vb.ReadAt(vb.GetVolumeSize()+(2*uint64(vb.BlockSize)), uint64(vb.BlockSize))
-				assert.ErrorIs(t, err, RequestTooLarge)
+				assert.ErrorIs(t, err, ErrRequestTooLarge)
 				assert.Nil(t, readData)
 
 				// Test Read error for invalid block, beyond the volume size
 				readData, err = vb.ReadAt(vb.GetVolumeSize()-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize*2))
-				assert.ErrorIs(t, err, RequestOutOfRange)
+				assert.ErrorIs(t, err, ErrRequestOutOfRange)
 				assert.Nil(t, readData)
 
 				// Test Read for a block that exists, but null (unallocated) data
 				readData, err = vb.ReadAt((vb.GetVolumeSize())-(1*uint64(vb.BlockSize)), uint64(vb.BlockSize))
-				assert.ErrorIs(t, err, ZeroBlock)
+				assert.ErrorIs(t, err, ErrZeroBlock)
 				assert.Equal(t, make([]byte, vb.BlockSize), readData)
 
 				// Test invalid writes
 				err = vb.WriteAt(vb.GetVolumeSize()+10, tc.data)
-				assert.ErrorIs(t, err, RequestTooLarge)
+				assert.ErrorIs(t, err, ErrRequestTooLarge)
 
 				err = vb.WriteAt(0, make([]byte, 0))
-				assert.ErrorIs(t, err, RequestBufferEmpty)
+				assert.ErrorIs(t, err, ErrRequestBufferEmpty)
 
 				err = vb.WriteAt(vb.GetVolumeSize(), tc.data)
-				assert.ErrorIs(t, err, RequestOutOfRange)
+				assert.ErrorIs(t, err, ErrRequestOutOfRange)
 
 				// NO FLUSH TEST
 				// Test Write (no flush)
@@ -1201,8 +1147,8 @@ func TestCacheConfiguration(t *testing.T) {
 			for i := uint64(0); i < 10; i++ {
 				data, err := vb.ReadAt(i*uint64(vb.BlockSize), uint64(vb.BlockSize))
 				if i < 5 {
-					// First 5 blocks should be evicted, and returned ZeroBlock error
-					assert.ErrorIs(t, err, ZeroBlock)
+					// First 5 blocks should be evicted, and returned ErrZeroBlock error
+					assert.ErrorIs(t, err, ErrZeroBlock)
 					//assert.Error(t, err)
 				} else {
 					// Last 5 blocks should be in cache

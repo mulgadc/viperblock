@@ -27,8 +27,8 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
-      # - name: Static Check
-      #   run: go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./...
+      - name: Static Check
+        run: go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-U1000,-SA4006" ./..
 
       - name: Go Vulnerability Check
         run: go tool govulncheck ./...

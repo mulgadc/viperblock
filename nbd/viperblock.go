@@ -209,7 +209,7 @@ func (c *ViperBlockConnection) CanMultiConn() (bool, error) {
 func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) error {
 	slog.Info("PREAD:", "offset", offset, "len", len(buf))
 	data, err := c.vb.ReadAt(offset, uint64(len(buf)))
-	if err != nil && err != viperblock.ZeroBlock {
+	if err != nil && err != viperblock.ErrZeroBlock {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
 	}
 
