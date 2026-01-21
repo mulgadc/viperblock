@@ -37,4 +37,4 @@ jobs:
       #   run: go tool gosec -exclude-dir nbd/libguestfs.org/nbdkit -exclude-generated ./...
 
       - name: Build
-        run: make build
+        run: make go_build
