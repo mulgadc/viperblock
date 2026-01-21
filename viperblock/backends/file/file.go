@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/utils"
 )
 
 // 2. Define config structs
@@ -113,7 +114,7 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		if err != nil {
 			return nil, err
 		}
-		length = uint32(stat.Size())
+		length = utils.SafeInt64ToUint32(stat.Size())
 	}
 
 	// Read the specified block for the length

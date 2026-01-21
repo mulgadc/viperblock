@@ -1,4 +1,4 @@
-package utils
+package v_utils
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 )
@@ -42,7 +43,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	}
 
 	if vbConfig.VolumeConfig.VolumeMetadata.SizeGiB == 0 {
-		vbConfig.VolumeConfig.VolumeMetadata.SizeGiB = uint64(fileInfo.Size()) / 1024 / 1024 / 1024
+		vbConfig.VolumeConfig.VolumeMetadata.SizeGiB = utils.SafeInt64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
 	}
 
 	if vbConfig.VolumeConfig.VolumeMetadata.State == "" {
@@ -91,7 +92,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 		if vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB == 0 {
 			// Convert from bytes to GiB
-			vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB = uint64(fileInfo.Size()) / 1024 / 1024 / 1024
+			vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB = utils.SafeInt64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
 		}
 
 	}

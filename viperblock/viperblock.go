@@ -27,6 +27,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 )
@@ -248,9 +249,9 @@ func calculateCacheSize(blockSize uint32, percent int) int {
 	}
 
 	systemMemory := getSystemMemory()
-	cacheMemory := (systemMemory * uint64(percent)) / 100
+	cacheMemory := (systemMemory * utils.SafeIntToUint64(percent)) / 100
 
-	return int(cacheMemory / uint64(blockSize))
+	return utils.SafeUint64ToInt(cacheMemory / uint64(blockSize))
 }
 
 // SetCacheSize sets the size of the LRU cache in number of blocks
@@ -813,7 +814,7 @@ func (vb *VB) ReadWAL() (err error) {
 		// TODO: Optimise, read entire block at once, from the header magic that tells us the length
 		n, err = currentWAL.Read(block.Data)
 
-		if n != int(block.Len) {
+		if n != utils.SafeUint64ToInt(block.Len) {
 			return fmt.Errorf("incomplete read: got %d bytes, expected %d", n, block.Len)
 		}
 
@@ -846,45 +847,45 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 
 	return
 
-	vb.BlockToObjectWAL.mu.Lock()
+	// vb.BlockToObjectWAL.mu.Lock()
 
-	// Get the current WAL file
-	currentWAL := vb.BlockToObjectWAL.DB[len(vb.BlockToObjectWAL.DB)-1]
+	// // Get the current WAL file
+	// currentWAL := vb.BlockToObjectWAL.DB[len(vb.BlockToObjectWAL.DB)-1]
 
-	//slog.Info("Writing to Block WAL file", "filename", currentWAL.Name())
+	// //slog.Info("Writing to Block WAL file", "filename", currentWAL.Name())
 
-	// Format for each block in the BlockWAL
-	// [start_block, uint64][num_blocks, uint16][object_id, uint64][object_offset, uint32][checksum, uint32]
-	// big endian
+	// // Format for each block in the BlockWAL
+	// // [start_block, uint64][num_blocks, uint16][object_id, uint64][object_offset, uint32][checksum, uint32]
+	// // big endian
 
-	for _, block := range *blocks {
-		//slog.Info("Writing block to BlockWAL", "block", block)
+	// for _, block := range *blocks {
+	// 	//slog.Info("Writing block to BlockWAL", "block", block)
 
-		data := vb.writeBlockWalChunk(&block)
+	// 	data := vb.writeBlockWalChunk(&block)
 
-		_, err := currentWAL.Write(data)
+	// 	_, err := currentWAL.Write(data)
 
-		if err != nil {
-			slog.Error("ERROR WRITING BLOCK TO BLOCK WAL:", "error", err)
-			vb.BlockToObjectWAL.mu.Unlock()
-			return err
-		}
+	// 	if err != nil {
+	// 		slog.Error("ERROR WRITING BLOCK TO BLOCK WAL:", "error", err)
+	// 		vb.BlockToObjectWAL.mu.Unlock()
+	// 		return err
+	// 	}
 
-	}
+	// }
 
-	vb.BlockToObjectWAL.mu.Unlock()
+	// vb.BlockToObjectWAL.mu.Unlock()
 
-	// Cycle to the next Block WAL file
-	// Create the Block WAL
-	nextBlockWalNum := vb.BlockToObjectWAL.WallNum.Add(1)
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, nextBlockWalNum, vb.GetVolume())))
-	//	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/wal/blocks/blocks.%08d.bin", vb.BlockToObjectWAL.BaseDir, vb.GetVolume(), nextBlockWalNum))
-	if err != nil {
-		slog.Error("ERROR OPENING BLOCK WAL:", "error", err)
-		return err
-	}
+	// // Cycle to the next Block WAL file
+	// // Create the Block WAL
+	// nextBlockWalNum := vb.BlockToObjectWAL.WallNum.Add(1)
+	// err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, nextBlockWalNum, vb.GetVolume())))
+	// //	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s/wal/blocks/blocks.%08d.bin", vb.BlockToObjectWAL.BaseDir, vb.GetVolume(), nextBlockWalNum))
+	// if err != nil {
+	// 	slog.Error("ERROR OPENING BLOCK WAL:", "error", err)
+	// 	return err
+	// }
 
-	return nil
+	// return nil
 }
 
 func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
@@ -1222,9 +1223,9 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 		newBlock := BlockLookup{
 			StartBlock:   block.Block,
-			NumBlocks:    uint16(numBlocks),
+			NumBlocks:    utils.SafeIntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
-			ObjectOffset: uint32(headerLen + (i * int(vb.BlockSize))),
+			ObjectOffset: utils.SafeIntToUint32(headerLen + (i * int(vb.BlockSize))),
 		}
 
 		// TODO: Optimise for number of consecutive blocks to reduce the memory size
@@ -1683,7 +1684,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
-			NumBlocks:     uint16(numBlocks),
+			NumBlocks:     utils.SafeIntToUint16(numBlocks),
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
@@ -1866,7 +1867,7 @@ func (vb *VB) WALHeader() []byte {
 	copy(header[:len(vb.WAL.WALMagic)], vb.WAL.WALMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
 	binary.BigEndian.PutUint32(header[6:10], vb.BlockSize)
-	binary.BigEndian.PutUint64(header[10:18], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint64(header[10:18], utils.SafeInt64ToUint64(time.Now().Unix()))
 	return header
 }
 
@@ -1882,7 +1883,7 @@ func (vb *VB) BlockToObjectWALHeader() []byte {
 	slog.Info("Writing BlockToObjectWALHeader", "header", header, "size", vb.BlockToObjectWALHeaderSize())
 	copy(header[:len(vb.BlockToObjectWAL.WALMagic)], vb.BlockToObjectWAL.WALMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
-	binary.BigEndian.PutUint64(header[6:14], uint64(time.Now().Unix()))
+	binary.BigEndian.PutUint64(header[6:14], utils.SafeInt64ToUint64(time.Now().Unix()))
 	return header
 }
 

@@ -1134,7 +1134,7 @@ func TestImportDiskImage(t *testing.T) {
 
 			fmt.Println(vbConfig)
 			// Get a temp free port
-			//utils.ImportDiskImage(s3Config, vbConfig, "../tests/unit-test-disk-image.raw")
+			//v_utils.ImportDiskImage(s3Config, vbConfig, "../tests/unit-test-disk-image.raw")
 			err := vb.Backend.Init()
 			assert.NoError(t, err)
 

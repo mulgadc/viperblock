@@ -7,9 +7,10 @@ import (
 	"log"
 	"os"
 
+	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
-	"github.com/mulgadc/viperblock/viperblock/utils"
+	"github.com/mulgadc/viperblock/viperblock/v_utils"
 )
 
 func main() {
@@ -102,7 +103,7 @@ func main() {
 
 	s3Config := s3.S3Config{
 		VolumeName: volID,
-		VolumeSize: uint64(*size),
+		VolumeSize: utils.SafeIntToUint64(*size),
 		Bucket:     *bucket,
 		Region:     *region,
 		AccessKey:  *access_key,
@@ -112,7 +113,7 @@ func main() {
 
 	vbConfig := viperblock.VB{
 		VolumeName: volID,
-		VolumeSize: uint64(*size),
+		VolumeSize: utils.SafeIntToUint64(*size),
 		BaseDir:    *base_dir,
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
@@ -122,7 +123,7 @@ func main() {
 		VolumeConfig: volumeConfig,
 	}
 
-	err := utils.ImportDiskImage(&s3Config, &vbConfig, *file)
+	err := v_utils.ImportDiskImage(&s3Config, &vbConfig, *file)
 
 	if err != nil {
 		log.Fatalf("Failed to import disk image: %v", err)

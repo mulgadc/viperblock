@@ -16,6 +16,7 @@ import (
 
 	"github.com/mulgadc/viperblock/simplefs"
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -202,7 +203,7 @@ func main() {
 		}
 
 		// Create a file
-		blocks, err := sfs.CreateFile(path, uint64(info.Size()))
+		blocks, err := sfs.CreateFile(path, utils.SafeInt64ToUint64(info.Size()))
 		if err != nil {
 			slog.Error("Could not create file", "error", err)
 			return err
@@ -304,17 +305,17 @@ func main() {
 				os.Exit(1)
 			}
 
-			data, err := vb.Backend.Read(types.FileTypeChunk, objectID, objectOffset, uint32(sfs.Blocksize))
+			data, err := vb.Backend.Read(types.FileTypeChunk, objectID, objectOffset, utils.SafeUint64ToUint32(sfs.Blocksize))
 
 			// Position in the buffer where this block should go
-			pos := i * int(sfs.Blocksize)
+			pos := i * utils.SafeUint64ToInt(sfs.Blocksize)
 			if pos >= len(fileBuffer) {
 				break // Don't write past the buffer
 			}
 
 			// How much we can copy from this block
-			bytesToCopy := int(sfs.Blocksize)
-			if (pos + int(sfs.Blocksize)) > len(fileBuffer) {
+			bytesToCopy := utils.SafeUint64ToInt(sfs.Blocksize)
+			if (pos + utils.SafeUint64ToInt(sfs.Blocksize)) > len(fileBuffer) {
 				bytesToCopy = len(fileBuffer) - pos
 			}
 
