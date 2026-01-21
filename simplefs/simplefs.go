@@ -57,7 +57,7 @@ func (sfs *SimpleFS) CreateVolume(name string, size uint64) error {
 	sfs.Volume.Used = make(map[uint64]bool)
 	sfs.Volume.Free = make([]uint64, totalBlocks)
 
-	for i := uint64(0); i < totalBlocks; i++ {
+	for i := range totalBlocks {
 		sfs.Volume.Free[i] = i
 	}
 

@@ -25,7 +25,7 @@ import (
 // TestVB is a helper struct to hold test cases
 type TestVB struct {
 	name      string
-	config    interface{}
+	config    any
 	blockSize uint32
 }
 
@@ -33,7 +33,7 @@ type TestVB struct {
 type BackendTest struct {
 	Name        string
 	BackendType string
-	Config      interface{}
+	Config      any
 	CacheConfig CacheConfig
 }
 
@@ -128,7 +128,7 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 	})
 
-	var backendConfig interface{}
+	var backendConfig any
 	switch backendType.BackendType {
 
 	case FileBackend:
@@ -345,7 +345,7 @@ func TestWriteAndRead(t *testing.T) {
 	copy(dataDoubleBlock[DefaultBlockSize:], msg3)
 
 	dataTenBlock := make([]byte, DefaultBlockSize*10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		msg := fmt.Sprintf("test data %d", i)
 		copy(dataTenBlock[i*int(DefaultBlockSize):(i+1)*int(DefaultBlockSize)], msg)
 	}
@@ -850,7 +850,7 @@ func TestConsecutiveBlockRead(t *testing.T) {
 			// Write multiple blocks together
 			buffer := make([]byte, DefaultBlockSize*10)
 
-			for i := 0; i < 10; i++ {
+			for i := range 10 {
 				// Add random data to the buffer
 				rand.Read(buffer[i*int(DefaultBlockSize) : (i+1)*int(DefaultBlockSize)])
 			}
@@ -1134,7 +1134,7 @@ func TestCacheConfiguration(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Write some blocks
-			for i := uint64(0); i < 10; i++ {
+			for i := range uint64(10) {
 				data := make([]byte, DefaultBlockSize)
 				msg := fmt.Sprintf("test data %d", i)
 				copy(data[:len(msg)], msg)
@@ -1144,7 +1144,7 @@ func TestCacheConfiguration(t *testing.T) {
 			}
 
 			// Verify only the last 5 blocks are in cache
-			for i := uint64(0); i < 10; i++ {
+			for i := range uint64(10) {
 				data, err := vb.ReadAt(i*uint64(vb.BlockSize), uint64(vb.BlockSize))
 				if i < 5 {
 					// First 5 blocks should be evicted, and returned ErrZeroBlock error
@@ -1174,7 +1174,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 
 		t.Run("Basic Deduplication", func(t *testing.T) {
 			// Write some blocks and flush to populate PendingBackendWrites
-			for i := uint64(0); i < 10; i++ {
+			for i := range uint64(10) {
 				data := make([]byte, DefaultBlockSize)
 				msg := fmt.Sprintf("block_%d", i)
 				copy(data[:len(msg)], msg)
@@ -1204,7 +1204,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 			assert.Equal(t, 0, remainingCount, "PendingBackendWrites should be empty after chunk creation")
 
 			// Verify blocks are readable from backend
-			for i := uint64(0); i < 10; i++ {
+			for i := range uint64(10) {
 				data, err := vb.ReadAt(i*uint64(vb.BlockSize), uint64(vb.BlockSize))
 				assert.NoError(t, err)
 				expected := make([]byte, DefaultBlockSize)
@@ -1348,7 +1348,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 			numBlocks := 256
 
 			// Write many blocks starting at block 400 to avoid conflicts
-			for i := 0; i < numBlocks; i++ {
+			for i := range numBlocks {
 				data := make([]byte, DefaultBlockSize)
 				msg := fmt.Sprintf("perf_block_%d", i)
 				copy(data[:len(msg)], msg)
@@ -1404,7 +1404,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 			}
 
 			// Write same block multiple times (5 writes to block 700)
-			for j := 0; j < 5; j++ {
+			for j := range 5 {
 				data := make([]byte, DefaultBlockSize)
 				msg := fmt.Sprintf("overwrite_%d", j)
 				copy(data[:len(msg)], msg)

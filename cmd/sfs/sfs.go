@@ -107,7 +107,7 @@ func main() {
 
 	// Create the viperblock backend
 
-	var cfg interface{}
+	var cfg any
 
 	switch *btype {
 	case "file":

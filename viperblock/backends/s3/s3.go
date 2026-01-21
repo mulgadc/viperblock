@@ -43,7 +43,7 @@ type Backend struct {
 	Config S3Config
 }
 
-func New(config interface{}) (backend *Backend) {
+func New(config any) (backend *Backend) {
 	return &Backend{S3Backend: S3Backend{config: config.(S3Config)}}
 }
 
@@ -172,7 +172,7 @@ func (backend *Backend) GetBackendType() string {
 	return "s3"
 }
 
-func (backend *Backend) SetConfig(config interface{}) {
+func (backend *Backend) SetConfig(config any) {
 	backend.config = config.(S3Config)
 }
 

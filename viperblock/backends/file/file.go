@@ -29,7 +29,7 @@ type Backend struct {
 }
 
 // 3. Implement WithConfig for each backend
-func New(config interface{}) (backend *Backend) {
+func New(config any) (backend *Backend) {
 
 	return &Backend{FileBackend: FileBackend{config: config.(FileConfig)}}
 
@@ -180,7 +180,7 @@ func (backend *Backend) GetBackendType() string {
 	return "file"
 }
 
-func (backend *Backend) SetConfig(config interface{}) {
+func (backend *Backend) SetConfig(config any) {
 	backend.config = config.(FileConfig)
 }
 

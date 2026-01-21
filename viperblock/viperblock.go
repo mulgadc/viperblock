@@ -304,7 +304,7 @@ func (vb *VB) SetCacheSystemMemory(percent int) error {
 	return vb.SetCacheSize(size, percent)
 }
 
-func New(config *VB, btype string, backendConfig interface{}) (vb *VB, err error) {
+func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	var backend types.Backend
 
 	if config == nil {
@@ -599,7 +599,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 	vb.Writes.mu.Lock()
 
 	// Loop through each block request
-	for i := uint64(0); i < blockRequests; i++ {
+	for i := range blockRequests {
 
 		currentBlock := block + i
 
@@ -1597,7 +1597,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	var consecutiveBlocks ConsecutiveBlocks
 
-	for i := uint64(0); i < blockRequests; i++ {
+	for i := range blockRequests {
 		currentBlock := block + i
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)

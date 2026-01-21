@@ -14,7 +14,7 @@ type Backend interface {
 	Sync()
 	GetBackendType() string
 	GetHost() string
-	SetConfig(config interface{})
+	SetConfig(config any)
 }
 
 // FileType represents the type of file being written to S3
