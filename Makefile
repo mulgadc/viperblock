@@ -1,29 +1,5 @@
 GO_PROJECT_NAME := viperblock
 
-# Where to install Go tools
-GOBIN ?= $(shell go env GOBIN)
-ifeq ($(GOBIN),)
-  GOBIN := $(shell go env GOPATH)/bin
-endif
-
-GOVULNCHECK := $(GOBIN)/govulncheck
-
-# Install govulncheck only if the binary is missing / out of date
-$(GOVULNCHECK):
-	go install golang.org/x/vuln/cmd/govulncheck@latest
-
-GOSECCHECK := $(GOBIN)/gosec
-
-# Install gosec only if the binary is missing / out of date
-$(GOSECCHECK):
-	go install github.com/securego/gosec/v2/cmd/gosec@latest
-
-GOSTATICCHECK := $(GOBIN)/staticcheck
-
-# Install govulncheck only if the binary is missing / out of date
-$(GOSTATICCHECK):
-	go install honnef.co/go/tools/cmd/staticcheck@latest
-
 build:
 	$(MAKE) go_build
 	$(MAKE) go_build_nbd
@@ -48,10 +24,9 @@ go_build_nbd:
 #	@echo "\n....Running $(GO_PROJECT_NAME)...."
 #	$(GOPATH)/bin/$(GO_PROJECT_NAME)
 
-test: $(GOVULNCHECK)
+test:
 	@echo "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -v ./...
-	$(GOVULNCHECK) ./...
 
 bench:
 	@echo "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
@@ -84,18 +59,18 @@ bench:
 #docker_test: docker docker_compose_up test docker_compose_down docker_clean
 
 
-security: $(GOVULNCHECK) $(GOSECCHECK) $(GOSTATICCHECK)
+security:
 	@echo "\n....Running security checks for $(GO_PROJECT_NAME)...."
 
-	$(GOVULNCHECK) ./... > tests/govulncheck-report.txt || true
+	go tool govulncheck ./... > tests/govulncheck-report.txt || true
 	@echo "Govulncheck report saved to tests/govulncheck-report.txt"
 
 # Note we exclude nbdkit, gosec cgo/issue "[gosec] 2025/11/27 19:34:05 Panic when running SSA analyzer on package: nbdkit. Panic: runtime error: invalid memory address or nil pointer dereference"
-	$(GOSECCHECK) -exclude-dir nbd/libguestfs.org/nbdkit ./... > tests/gosec-report.txt || true
+	go tool gosec -exclude-dir nbd/libguestfs.org/nbdkit -exclude-generated ./... > tests/gosec-report.txt || true
 	@echo "Gosec report saved to tests/gosec-report.txt"
 
 	# default config + disable dep warning since we are using aws sdk v1
-	$(GOSTATICCHECK) -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./...  > tests/staticcheck-report.txt || true
+	go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./...  > tests/staticcheck-report.txt || true
 	@echo "Staticcheck report saved to tests/staticcheck-report.txt"
 
 	go vet ./... 2>&1 | tee tests/govet-report.txt || true
