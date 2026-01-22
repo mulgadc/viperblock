@@ -36,6 +36,7 @@ const DefaultBlockSize uint32 = 4096
 const DefaultObjBlockSize uint32 = 1024 * 1024 * 4
 const DefaultFlushInterval time.Duration = 5 * time.Second
 const DefaultFlushSize uint32 = 64 * 1024 * 1024
+const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
 
 type VBState struct {
 	VolumeName string
@@ -64,6 +65,15 @@ type VB struct {
 
 	FlushInterval time.Duration
 	FlushSize     uint32
+
+	// WALSyncInterval controls periodic fsync of WAL to disk (default 200ms)
+	// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
+	WALSyncInterval time.Duration
+
+	// WAL syncer control (background goroutine for periodic fsync)
+	walSyncTicker *time.Ticker
+	walSyncStop   chan struct{}
+	walSyncDone   chan struct{}
 
 	// Sequence number for the next block to be written
 	SeqNum atomic.Uint64
@@ -178,6 +188,10 @@ type WAL struct {
 	WallNum  atomic.Uint64
 	BaseDir  string
 	WALMagic [4]byte
+
+	// dirty tracks whether there are unflushed writes since last sync
+	// Uses atomic for lock-free access from write path and sync goroutine
+	dirty atomic.Bool
 
 	mu sync.RWMutex
 }
@@ -347,6 +361,11 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.FlushSize = DefaultFlushSize
 	}
 
+	// WALSyncInterval: 0 means use default, negative means disabled
+	if config.WALSyncInterval == 0 {
+		config.WALSyncInterval = DefaultWALSyncInterval
+	}
+
 	var lruCache *lru.Cache[uint64, []byte]
 
 	if config.Cache.Config.Size == 0 {
@@ -376,6 +395,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		ObjBlockSize:     config.ObjBlockSize,
 		FlushInterval:    config.FlushInterval,
 		FlushSize:        config.FlushSize,
+		WALSyncInterval:  config.WALSyncInterval,
 		Writes:           Blocks{},
 		WAL:              WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'L'}},
 		BlockToObjectWAL: WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
@@ -406,6 +426,9 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	// Create the checkpoint directory if it doesn't exist
 	os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750)
 
+	// Start background WAL syncer for periodic fsync (if interval > 0)
+	vb.StartWALSyncer()
+
 	return vb, nil
 }
 
@@ -430,6 +453,90 @@ func (vb *VB) SetWALBaseDir(baseDir string) {
 
 func (vb *VB) SetBlockWALBaseDir(baseDir string) {
 	vb.BlockToObjectWAL.BaseDir = baseDir
+}
+
+// StartWALSyncer starts a background goroutine that periodically fsyncs the WAL to disk.
+// This implements the "group commit" pattern used by PostgreSQL (wal_writer_delay),
+// BadgerDB (SyncWrites with ticker), and MongoDB (journalCommitInterval).
+//
+// The syncer only performs fsync when there are dirty (unflushed) writes,
+// avoiding unnecessary disk I/O when the system is idle.
+func (vb *VB) StartWALSyncer() {
+	if vb.WALSyncInterval <= 0 {
+		slog.Debug("WAL syncer disabled (interval <= 0)")
+		return
+	}
+
+	vb.walSyncStop = make(chan struct{})
+	vb.walSyncDone = make(chan struct{})
+	vb.walSyncTicker = time.NewTicker(vb.WALSyncInterval)
+
+	go func() {
+		defer close(vb.walSyncDone)
+		defer vb.walSyncTicker.Stop()
+
+		for {
+			select {
+			case <-vb.walSyncTicker.C:
+				vb.syncWALIfDirty()
+			case <-vb.walSyncStop:
+				// Final sync before shutdown
+				vb.syncWALIfDirty()
+				return
+			}
+		}
+	}()
+
+	slog.Debug("WAL syncer started", "interval", vb.WALSyncInterval)
+}
+
+// StopWALSyncer gracefully stops the background WAL sync goroutine.
+// It signals the goroutine to stop and waits for it to complete its final sync.
+func (vb *VB) StopWALSyncer() {
+	if vb.walSyncStop == nil {
+		return
+	}
+
+	close(vb.walSyncStop)
+	<-vb.walSyncDone
+
+	vb.walSyncStop = nil
+	vb.walSyncDone = nil
+	vb.walSyncTicker = nil
+
+	slog.Debug("WAL syncer stopped")
+}
+
+// syncWALIfDirty performs fsync on the active WAL file if there are pending writes.
+// This is the core of the periodic sync mechanism - it checks the dirty flag
+// and only syncs when necessary to avoid unnecessary I/O.
+//
+// Note: Only the last file in vb.WAL.DB is the active WAL being written to.
+// Previous files are closed after WriteWALToChunk processes them.
+func (vb *VB) syncWALIfDirty() {
+	// Fast path: check dirty flag without lock
+	if !vb.WAL.dirty.Load() {
+		return
+	}
+
+	// Clear dirty flag before sync (writes during sync will re-set it)
+	vb.WAL.dirty.Store(false)
+
+	vb.WAL.mu.RLock()
+	defer vb.WAL.mu.RUnlock()
+
+	// Only sync the current active WAL (last in slice)
+	// Previous WAL files are already closed after chunking
+	if len(vb.WAL.DB) > 0 {
+		activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
+		if activeWAL != nil {
+			if err := activeWAL.Sync(); err != nil {
+				slog.Error("WAL sync failed", "error", err)
+				// Re-mark as dirty so next tick retries
+				vb.WAL.dirty.Store(true)
+			}
+		}
+	}
 }
 
 // WAL functions
@@ -770,6 +877,9 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	// Optimistation, write a single time to reduce O_SYNC calls (slow) per finished block
 	n, err := currentWAL.Write(record)
 
+	// Mark WAL as dirty for periodic sync goroutine
+	vb.WAL.dirty.Store(true)
+
 	vb.WAL.mu.Unlock()
 
 	if n != recordSize {
@@ -959,7 +1069,11 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		return err
 	}
 
-	// Close and reopen the pending WAL for reading
+	// Sync and close the pending WAL, then reopen for reading
+	// Sync ensures all buffered writes are flushed to disk before we read
+	if err := pendingWAL.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL before chunking: %w", err)
+	}
 	pendingWAL.Close()
 
 	filename := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, currentWALNum, vb.GetVolume()))
@@ -1005,6 +1119,13 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[28:])
 
 		if checksumValidated != checksum {
+
+			pos, err := pendingWAL2.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return fmt.Errorf("error seeking in WriteWALToChunk: %v", err)
+			}
+
+			slog.Error("checksum mismatch in WriteWALToChunk", "filename", filename, "pos", pos, "checksum", checksum, "checksumValidated", checksumValidated)
 			return fmt.Errorf("checksum mismatch in WriteWALToChunk")
 		}
 
@@ -1763,6 +1884,9 @@ func (vb *VB) Close() error {
 
 	slog.Info("VB Close, flushing block state to disk")
 
+	// Stop the WAL syncer goroutine (performs final sync before stopping)
+	vb.StopWALSyncer()
+
 	vb.Flush()
 	err := vb.WriteWALToChunk(true)
 
@@ -1798,6 +1922,15 @@ func (vb *VB) Close() error {
 	if err != nil {
 		slog.Error("Could not save block state", "err", err)
 		return err
+	}
+
+	// Remove local WAL and block state files, upload/sync in prior steps.
+	// TODO: Consider retention policy for local files, and remove older files
+	// TODO: Consider rebuilding the checkpoint locally if the file is corrupted or missing on the remote S3.
+
+	err = vb.RemoveLocalFiles()
+	if err != nil {
+		slog.Error("Failed to remove local files", "err", err)
 	}
 
 	return nil
