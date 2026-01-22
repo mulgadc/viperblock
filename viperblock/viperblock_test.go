@@ -182,6 +182,9 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		VolumeName: testVol,
 		VolumeSize: volumeSize,
 		BaseDir:    fmt.Sprintf("%s/%s", tmpDir, "viperblock"),
+		// Disable periodic WAL syncer in tests for deterministic behavior
+		// Tests that need to verify syncer behavior should use setupTestVBWithSyncer
+		WALSyncInterval: -1,
 		Cache: Cache{
 			Config: CacheConfig{
 				Size:                backendType.CacheConfig.Size,
@@ -613,42 +616,39 @@ func TestWriteAndRead(t *testing.T) {
 				err = vb.WriteWALToChunk(true)
 				assert.NoError(t, err)
 
-				// Gracefully close VB and save state to disk
-				err = vb.Close()
-				assert.NoError(t, err)
-
-				// Test Read
-				//readData, err = vb.ReadAt(tc.blockID*uint64(vb.BlockSize), uint64(len(tc.data)))
-				//assert.NoError(t, err)
-				//assert.Equal(t, tc.data[:512], readData)
-
 			})
 
 		}
 
+		// Capture state BEFORE Close() for comparison after reload
 		prevBlockSize := vb.BlockSize
 		prevObjBlockSize := vb.ObjBlockSize
 		prevSeqNum := vb.SeqNum.Load()
 		prevObjectNum := vb.ObjectNum.Load()
 		prevWALNum := vb.WAL.WallNum.Load()
-
-		// Next, copy the state to compare
 		compareState := vb.BlocksToObject.BlockLookup
 
-		// Reset the state, reload from disk
+		// Gracefully close VB and save state to disk (only once after all subtests)
+		// Note: Close() removes local files after uploading state to backend
+		err := vb.Close()
+		assert.NoError(t, err)
+
+		// Reset the state, reload from disk/backend
 		vb.Reset()
 
-		vb.LoadState()
+		err = vb.LoadState()
+		assert.NoError(t, err)
 
 		// Compare the state matches as expected
 		assert.Equal(t, prevBlockSize, vb.BlockSize)
 		assert.Equal(t, prevObjBlockSize, vb.ObjBlockSize)
 		assert.Equal(t, prevSeqNum, vb.SeqNum.Load())
 		assert.Equal(t, prevObjectNum, vb.ObjectNum.Load())
-		assert.Equal(t, prevWALNum, vb.WAL.WallNum.Load())
+		// Note: WALNum is incremented by Close() -> WriteWALToChunk, so it will be +1
+		assert.Equal(t, prevWALNum+1, vb.WAL.WallNum.Load())
 
-		//vb.LoadBlockState("/tmp/viperblock/blockstate.json")
-		vb.LoadBlockState()
+		err = vb.LoadBlockState()
+		assert.NoError(t, err)
 
 		// Compare they are the same
 		assert.Equal(t, compareState, vb.BlocksToObject.BlockLookup)
@@ -691,6 +691,205 @@ func TestWALOperations(t *testing.T) {
 		})
 
 	})
+}
+
+// TestWALPeriodicSync tests the periodic WAL fsync functionality
+// following patterns from PostgreSQL (wal_writer_delay), BadgerDB, and MongoDB
+func TestWALPeriodicSync(t *testing.T) {
+	tmpDir := os.TempDir()
+
+	testCases := []struct {
+		name            string
+		syncInterval    time.Duration
+		expectSyncerRun bool
+	}{
+		{
+			name:            "syncer_enabled_50ms",
+			syncInterval:    50 * time.Millisecond,
+			expectSyncerRun: true,
+		},
+		{
+			name:            "syncer_disabled_negative",
+			syncInterval:    -1,
+			expectSyncerRun: false,
+		},
+		{
+			name:            "syncer_default_200ms",
+			syncInterval:    0, // 0 means use default (200ms)
+			expectSyncerRun: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testVol := fmt.Sprintf("test_wal_sync_%d", time.Now().UnixNano())
+
+			backendConfig := file.FileConfig{
+				VolumeName: testVol,
+				VolumeSize: volumeSize,
+				BaseDir:    tmpDir,
+			}
+
+			vbconfig := VB{
+				VolumeName:      testVol,
+				VolumeSize:      volumeSize,
+				BaseDir:         fmt.Sprintf("%s/%s", tmpDir, "viperblock"),
+				WALSyncInterval: tc.syncInterval,
+			}
+
+			vb, err := New(&vbconfig, FileBackend, backendConfig)
+			require.NoError(t, err)
+			require.NotNil(t, vb)
+
+			t.Cleanup(func() {
+				vb.StopWALSyncer()
+				os.RemoveAll(filepath.Join(vb.BaseDir, testVol))
+			})
+
+			// Verify syncer state matches expectation
+			if tc.expectSyncerRun {
+				assert.NotNil(t, vb.walSyncStop, "syncer should be running")
+				assert.NotNil(t, vb.walSyncDone, "syncer done channel should exist")
+				assert.NotNil(t, vb.walSyncTicker, "syncer ticker should exist")
+			} else {
+				assert.Nil(t, vb.walSyncStop, "syncer should not be running")
+				assert.Nil(t, vb.walSyncDone, "syncer done channel should not exist")
+				assert.Nil(t, vb.walSyncTicker, "syncer ticker should not exist")
+			}
+
+			// Initialize backend and open WAL
+			err = vb.Backend.Init()
+			require.NoError(t, err)
+
+			err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
+				vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+			require.NoError(t, err)
+
+			// Write some data
+			data := make([]byte, DefaultBlockSize)
+			copy(data, "test periodic sync data")
+
+			err = vb.WriteAt(0, data)
+			require.NoError(t, err)
+
+			// Flush to WAL
+			err = vb.Flush()
+			require.NoError(t, err)
+
+			if tc.expectSyncerRun {
+				// Verify dirty flag was set
+				// Note: dirty flag may already be cleared by syncer, so we write again
+				err = vb.WriteAt(uint64(vb.BlockSize), data)
+				require.NoError(t, err)
+				err = vb.Flush()
+				require.NoError(t, err)
+
+				// Check dirty flag is set (syncer hasn't run yet if interval > test duration)
+				if tc.syncInterval >= 50*time.Millisecond {
+					assert.True(t, vb.WAL.dirty.Load(), "dirty flag should be set after write")
+				}
+
+				// Wait for syncer to run (interval + small buffer)
+				waitTime := tc.syncInterval
+				if tc.syncInterval == 0 {
+					waitTime = DefaultWALSyncInterval
+				}
+				time.Sleep(waitTime + 20*time.Millisecond)
+
+				// Dirty flag should be cleared by syncer
+				assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after sync")
+			}
+
+			// Test graceful shutdown
+			vb.StopWALSyncer()
+			assert.Nil(t, vb.walSyncStop, "syncer should be stopped")
+			assert.Nil(t, vb.walSyncDone, "done channel should be nil after stop")
+
+			// Verify double-stop is safe (idempotent)
+			vb.StopWALSyncer() // Should not panic
+		})
+	}
+}
+
+// TestWALSyncerConcurrency tests that the syncer handles concurrent writes correctly
+func TestWALSyncerConcurrency(t *testing.T) {
+	tmpDir := os.TempDir()
+	testVol := fmt.Sprintf("test_wal_sync_concurrent_%d", time.Now().UnixNano())
+
+	backendConfig := file.FileConfig{
+		VolumeName: testVol,
+		VolumeSize: volumeSize,
+		BaseDir:    tmpDir,
+	}
+
+	vbconfig := VB{
+		VolumeName:      testVol,
+		VolumeSize:      volumeSize,
+		BaseDir:         fmt.Sprintf("%s/%s", tmpDir, "viperblock"),
+		WALSyncInterval: 25 * time.Millisecond, // Fast sync for testing
+	}
+
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		vb.StopWALSyncer()
+		os.RemoveAll(filepath.Join(vb.BaseDir, testVol))
+	})
+
+	err = vb.Backend.Init()
+	require.NoError(t, err)
+
+	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
+		vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+	require.NoError(t, err)
+
+	// Concurrent writes while syncer is running
+	var wg sync.WaitGroup
+	numWriters := 4
+	writesPerWriter := 10
+
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			for j := 0; j < writesPerWriter; j++ {
+				data := make([]byte, DefaultBlockSize)
+				copy(data, fmt.Sprintf("writer_%d_write_%d", writerID, j))
+
+				blockID := uint64(writerID*writesPerWriter+j) * uint64(vb.BlockSize)
+				err := vb.WriteAt(blockID, data)
+				assert.NoError(t, err)
+
+				// Small sleep to interleave with syncer
+				time.Sleep(5 * time.Millisecond)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Flush remaining writes
+	err = vb.Flush()
+	require.NoError(t, err)
+
+	// Wait for final sync
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify no data corruption - dirty flag should be clear
+	assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after all syncs")
+
+	// Verify writes are readable
+	for i := 0; i < numWriters; i++ {
+		for j := 0; j < writesPerWriter; j++ {
+			blockID := uint64(i*writesPerWriter+j) * uint64(vb.BlockSize)
+			readData, err := vb.ReadAt(blockID, uint64(vb.BlockSize))
+			assert.NoError(t, err)
+
+			expected := fmt.Sprintf("writer_%d_write_%d", i, j)
+			assert.Equal(t, expected, string(readData[:len(expected)]))
+		}
+	}
 }
 
 func TestStateOperations(t *testing.T) {
