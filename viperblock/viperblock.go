@@ -1695,13 +1695,14 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	var zeroBlockErr error
 	data = make([]byte, blockLen)
 
-	// Preprocess latest writes
+	// Preprocess latest writes - pre-allocate map to avoid rehashing
 	vb.Writes.mu.RLock()
-	writesCopy := make([]Block, len(vb.Writes.Blocks))
+	writesLen := len(vb.Writes.Blocks)
+	writesCopy := make([]Block, writesLen)
 	copy(writesCopy, vb.Writes.Blocks)
 	vb.Writes.mu.RUnlock()
 
-	latestWrites := make(BlocksMap)
+	latestWrites := make(BlocksMap, writesLen) // Pre-allocate with capacity
 	for _, wr := range writesCopy {
 		if prev, ok := latestWrites[wr.Block]; !ok || wr.SeqNum > prev.SeqNum {
 			latestWrites[wr.Block] = wr
@@ -1710,11 +1711,12 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// Preprocess pending writes (after WAL write to backend upload success/completion)
 	vb.PendingBackendWrites.mu.RLock()
-	pendingWritesCopy := make([]Block, len(vb.PendingBackendWrites.Blocks))
+	pendingLen := len(vb.PendingBackendWrites.Blocks)
+	pendingWritesCopy := make([]Block, pendingLen)
 	copy(pendingWritesCopy, vb.PendingBackendWrites.Blocks)
 	vb.PendingBackendWrites.mu.RUnlock()
 
-	latestPendingWrites := make(BlocksMap)
+	latestPendingWrites := make(BlocksMap, pendingLen) // Pre-allocate with capacity
 	for _, wr := range pendingWritesCopy {
 		latestPendingWrites[wr.Block] = wr
 	}
@@ -1781,8 +1783,8 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	// Loop through all consecutive blocks that are required to fetch from the backend
 	var consecutiveBlocksToRead ConsecutiveBlocks
 
-	// Store which consecutive blocks we have already read
-	consecutiveBlocksRead := make(map[uint64]bool)
+	// Store which consecutive blocks we have already read - pre-allocate
+	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
 
 	for i := 0; i < len(consecutiveBlocks); i++ {
 		slog.Info("[READ] CONSECUTIVE BLOCK:", "startBlock", consecutiveBlocks[i].StartBlock, "numBlocks", consecutiveBlocks[i].NumBlocks, "offsetStart", consecutiveBlocks[i].OffsetStart, "offsetEnd", consecutiveBlocks[i].OffsetEnd, "objectID", consecutiveBlocks[i].ObjectID, "objectOffset", consecutiveBlocks[i].ObjectOffset)

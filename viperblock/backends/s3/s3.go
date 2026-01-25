@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/viperblock/types"
+	"golang.org/x/net/http2"
 )
 
 // 2. Define config structs
@@ -52,27 +53,49 @@ func (backend *Backend) Init() error {
 
 	slog.Info("Initializing S3 backend", "config", backend.config)
 
-	// Create HTTP client with connection pooling for high-throughput workloads.
-	// Default MaxIdleConnsPerHost is 2, which causes TLS handshakes for nearly
-	// every request under concurrent load. Increasing this allows connection reuse.
+	// Create HTTP client with HTTP/2 support for connection multiplexing.
+	// HTTP/2 allows multiple requests over a single TCP connection, eliminating
+	// TLS handshake overhead for each request.
+	//
+	// IMPORTANT: When using a custom TLSClientConfig, you MUST call
+	// http2.ConfigureTransport() to properly enable HTTP/2.
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			// Enable TLS session resumption for faster reconnects if HTTP/2 fails
+			ClientSessionCache: tls.NewLRUClientSessionCache(256),
+			// Ensure HTTP/2 ALPN is advertised
+			NextProtos: []string{"h2", "http/1.1"},
+		},
 
-		// Connection pool settings - critical for performance
-		MaxIdleConns:        100,              // Total idle connections across all hosts
-		MaxIdleConnsPerHost: 100,              // Idle connections per host (default: 2)
-		MaxConnsPerHost:     100,              // Max total connections per host (0 = unlimited)
-		IdleConnTimeout:     90 * time.Second, // How long idle connections stay in pool
+		// Connection pool settings - still useful as HTTP/2 fallback
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		MaxConnsPerHost:     0,
+		IdleConnTimeout:     120 * time.Second,
+
+		// Keep-alive settings
+		DisableKeepAlives: false,
+
+		// ForceAttemptHTTP2 alone is NOT enough with custom TLSClientConfig!
+		// We must also call http2.ConfigureTransport() below.
+		ForceAttemptHTTP2: true,
 
 		// Timeouts
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// CRITICAL: Configure HTTP/2 support with custom TLS config
+	// Without this, the transport falls back to HTTP/1.1
+	if err := http2.ConfigureTransport(tr); err != nil {
+		slog.Warn("Failed to configure HTTP/2, falling back to HTTP/1.1", "error", err)
 	}
 
 	client := &http.Client{
 		Transport: tr,
-		Timeout:   60 * time.Second, // Overall request timeout
+		Timeout:   120 * time.Second,
 	}
 
 	// Use the AWS SDK to initialize the S3 backend

@@ -40,6 +40,13 @@ var cache_size int = 20
 
 var disk []byte
 
+// NOTE: For profiling viperblock/nbdkit, use Linux perf instead of Go pprof.
+// Go's pprof does NOT work correctly when running as a CGO shared library.
+//
+// Usage:
+//   perf record -g -p $(pgrep -f nbdkit) -- sleep 60
+//   perf report
+
 func (p *ViperBlockPlugin) Config(key string, value string) error {
 
 	// Config options
@@ -110,9 +117,6 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 }
 
 func (p *ViperBlockPlugin) GetReady() error {
-	// Allocate the RAM disk.
-	//disk = make([]byte, size)
-
 	return nil
 }
 
@@ -300,8 +304,6 @@ func (c *ViperBlockConnection) Close() {
 	if err != nil {
 		slog.Error("Could not close VB", "err", err)
 	}
-
-	return
 }
 
 //----------------------------------------------------------------------

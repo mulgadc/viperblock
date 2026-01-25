@@ -1,6 +1,7 @@
 package viperblock
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
@@ -49,8 +50,7 @@ const (
 
 //var s3server predastore.Config
 
-// startTestServer starts the Fiber app and returns:
-// - the base URL (e.g., "http://127.0.0.1:3000")
+// startTestServer starts the HTTP/2 server and returns:
 // - a shutdown function to cleanly stop the server
 // - an error if startup failed
 func startTestServer(t *testing.T, host string) (shutdown func(volName string), err error) {
@@ -63,45 +63,46 @@ func startTestServer(t *testing.T, host string) (shutdown func(volName string), 
 	dir = filepath.Join(dir, "..")
 
 	// Create and configure the S3 server
-	s3server := predastore.New()
+	s3server := predastore.New(&predastore.Config{
+		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
+	})
 
-	err = s3server.ReadConfig(filepath.Join(dir, "tests/config/server.toml"), dir)
+	err = s3server.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
 
-	// Setup routes
-	app := s3server.SetupRoutes()
+	// Create HTTP/2 server
+	server := predastore.NewHTTP2Server(s3server)
 
-	// Channel to track when server is running
-	started := make(chan struct{})
-
-	require.NoError(t, err, "Failed to get free port")
+	// Channel to signal server startup error
+	serverErr := make(chan error, 1)
 
 	go func() {
-		close(started) // notify that listener is active
-
-		// Start the Fiber app directly with ListenTLS
-		if err := app.ListenTLS(host, "../config/server.pem", "../config/server.key"); err != nil {
-			// Only log, don't panic, to avoid crashing test
-			assert.NoError(t, err)
-
-			//t.Logf("fiber server exited: %v\n", err)
-
+		// Start the HTTP/2 server
+		if err := server.ListenAndServe(host, "../config/server.pem", "../config/server.key"); err != nil {
+			// http.ErrServerClosed is expected when Shutdown() is called
+			if err != http.ErrServerClosed {
+				serverErr <- err
+			}
 		}
-
 	}()
 
-	// Wait for listener to bind
-	<-started
+	// Give the server a moment to start, then check for immediate errors
+	select {
+	case err := <-serverErr:
+		return nil, fmt.Errorf("server failed to start: %w", err)
+	case <-time.After(50 * time.Millisecond):
+		// Server started successfully (or is starting)
+	}
 
 	shutdown = func(volName string) {
-		_ = app.Shutdown()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
 
 		// Remove the test volume
 		tmpVolume := fmt.Sprintf("%s/%s", s3server.Buckets[0].Pathname, volName)
 
-		//t.Log(fmt.Sprintf("Removing %s", tmpVolume))
 		os.RemoveAll(tmpVolume)
-
 	}
 
 	return shutdown, nil
@@ -353,10 +354,11 @@ func TestWriteAndRead(t *testing.T) {
 		copy(dataTenBlock[i*int(DefaultBlockSize):(i+1)*int(DefaultBlockSize)], msg)
 	}
 
-	// Generate a random number between 20 and 50 with random data
-	randomDataBlockSize, _ := rand.Int(rand.Reader, big.NewInt(30))
-	randomDataBlock := make([]byte, int(DefaultBlockSize)*int(randomDataBlockSize.Int64()))
-	for i := 0; i < int(randomDataBlockSize.Int64()); i++ {
+	// Generate a random number between 1 and 30 with random data
+	randomDataBlockSizeInt, _ := rand.Int(rand.Reader, big.NewInt(30))
+	randomDataBlockSize := randomDataBlockSizeInt.Int64() + 1 // Ensure at least 1 block
+	randomDataBlock := make([]byte, int(DefaultBlockSize)*int(randomDataBlockSize))
+	for i := 0; i < int(randomDataBlockSize); i++ {
 		rand.Read(randomDataBlock[i*int(DefaultBlockSize) : (i+1)*int(DefaultBlockSize)])
 	}
 
