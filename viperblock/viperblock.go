@@ -418,7 +418,12 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
 
-	vb.SetDebug(false)
+	if os.Getenv("VIPERBLOCK_DEBUG") == "1" {
+		vb.SetDebug(true)
+	} else {
+		vb.SetDebug(false)
+
+	}
 
 	// Create the base directory if it doesn't exist
 	os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume()), 0750)
@@ -1830,7 +1835,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		}
 
 		slog.Info("[READ] COPYING BLOCK DATA:", "start", start, "end", end)
-		slog.Info("[READ] BLOCK DATA:", "blockData", blockData[:32])
+		//slog.Info("[READ] BLOCK DATA:", "blockData", blockData[:32])
 		slog.Info("[READ] DATA:", "data len", len(data))
 		copy(data[start:end], blockData)
 		//copy(data[consecutiveBlockStart:consecutiveBlockOffset], blockData)

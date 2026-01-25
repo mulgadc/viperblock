@@ -1,3 +1,5 @@
+go.work
+go.work.sum
 .DS_Store
 lib/nbdkit-viperblock-plugin.so
 tmp/

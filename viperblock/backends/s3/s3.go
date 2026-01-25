@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -51,12 +52,28 @@ func (backend *Backend) Init() error {
 
 	slog.Info("Initializing S3 backend", "config", backend.config)
 
-	// Create HTTP client (skip TLS verification if requested)
-	client := &http.Client{}
+	// Create HTTP client with connection pooling for high-throughput workloads.
+	// Default MaxIdleConnsPerHost is 2, which causes TLS handshakes for nearly
+	// every request under concurrent load. Increasing this allows connection reuse.
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 
-	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		// Connection pool settings - critical for performance
+		MaxIdleConns:        100,              // Total idle connections across all hosts
+		MaxIdleConnsPerHost: 100,              // Idle connections per host (default: 2)
+		MaxConnsPerHost:     100,              // Max total connections per host (0 = unlimited)
+		IdleConnTimeout:     90 * time.Second, // How long idle connections stay in pool
 
-	client = &http.Client{Transport: tr}
+		// Timeouts
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   60 * time.Second, // Overall request timeout
+	}
 
 	// Use the AWS SDK to initialize the S3 backend
 	sess, err := session.NewSession(&aws.Config{
@@ -99,10 +116,6 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
 
-	// data = make([]byte, length)
-	// Open the specified file
-	//filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
-
 	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	// Fetch the object from S3 with a byte range
@@ -111,10 +124,11 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		Key:    aws.String(filename),
 	}
 
-	// Append an offset if defined (TODO: confirm improvements)
-	if offset > 0 {
-		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset-10, offset+length-1))
-	}
+	// Always use Range header for efficient partial reads
+	// Request exactly the bytes we need: offset to offset+length-1
+	requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+
+	slog.Debug("[S3 READ] Requesting range", "range", *requestObject.Range)
 
 	// TODO: Add ctx support and retry from S3 timeout/500/etc
 	textResult, err := backend.config.S3Client.GetObject(requestObject)
@@ -122,6 +136,7 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 	if err != nil {
 		return nil, err
 	}
+	defer textResult.Body.Close()
 
 	res, err := io.ReadAll(textResult.Body)
 
@@ -129,9 +144,8 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		return nil, err
 	}
 
-	// Copy the res to the data for the specified length
-	//copy(data, res)
-
+	// The response should contain exactly the bytes we requested
+	// No slicing needed since we requested the exact range
 	return res, nil
 }
 
@@ -143,14 +157,22 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 
 	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
-	// Open the specified file
-	//filename := fmt.Sprintf("%s/chunk.%08d.bin", backend.config.VolumeName, objectId)
+	// Combine headers and data to match file backend behavior
+	// The BlockLookup offsets include header size, so we must write headers+data
+	var body []byte
+	if headers != nil && len(*headers) > 0 {
+		body = make([]byte, len(*headers)+len(*data))
+		copy(body[:len(*headers)], *headers)
+		copy(body[len(*headers):], *data)
+	} else {
+		body = *data
+	}
 
 	// Create a new S3 object
 	object := &s3.PutObjectInput{
 		Bucket: aws.String(backend.config.Bucket),
 		Key:    aws.String(filename),
-		Body:   bytes.NewReader(*data),
+		Body:   bytes.NewReader(body),
 	}
 
 	_, err = backend.config.S3Client.PutObject(object)
