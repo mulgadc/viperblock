@@ -42,11 +42,48 @@ const (
 	FileBackend string = "file"
 	S3Backend   string = "s3"
 
-	AccessKey string = "AKIAIOSFODNN7EXAMPLE"
-	SecretKey string = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	// Default test credentials for local predastore test server (matches tests/config/server.toml)
+	DefaultTestAccessKey string = "AKIAIOSFODNN7EXAMPLE"
+	DefaultTestSecretKey string = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 	volumeSize uint64 = 8 * 1024 * 1024
 )
+
+// Test credentials - defaults for local predastore server, can be overridden via ENV vars
+var (
+	AccessKey string
+	SecretKey string
+)
+
+func init() {
+	AccessKey, SecretKey = loadTestCredentials()
+}
+
+// loadTestCredentials loads AWS credentials.
+// Uses ENV vars if set, otherwise falls back to defaults for local predastore test server.
+func loadTestCredentials() (accessKey, secretKey string) {
+	// Check environment variables first (allows override for different test scenarios)
+	accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+
+	// Also check alternative env var names
+	if accessKey == "" {
+		accessKey = os.Getenv("AWS_ACCESS_KEY")
+	}
+	if secretKey == "" {
+		secretKey = os.Getenv("AWS_SECRET_KEY")
+	}
+
+	// Fall back to defaults for local predastore test server
+	if accessKey == "" {
+		accessKey = DefaultTestAccessKey
+	}
+	if secretKey == "" {
+		secretKey = DefaultTestSecretKey
+	}
+
+	return accessKey, secretKey
+}
 
 //var s3server predastore.Config
 
@@ -145,7 +182,6 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		}
 
 	case S3Backend:
-
 		//t.Log("S3 backend not found, setting up S3 server")
 
 		host, err := FindFreePort()

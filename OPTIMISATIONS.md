@@ -941,3 +941,154 @@ The current performance issues stem primarily from **O_SYNC on every WAL write**
 **For CPU/memory improvements without touching durability**: Implement sync.Pool for WAL buffers, fix the O(n²) deduplication, and use single-allocation serialization. These provide significant gains with no durability trade-off.
 
 For maximum benefit, implement the full batch write pipeline with configurable durability modes, allowing users to choose their performance/safety tradeoff based on their use case.
+
+---
+
+## Unified Block Store (IMPLEMENTED)
+
+### Problem Statement
+
+The original read path consumed 46% CPU in `mapassign_fast64` because it rebuilt lookup maps on every read operation. With 4 separate data structures (Writes, PendingBackendWrites, Cache, BlocksToObject), each read performed O(n) preprocessing of all pending writes:
+
+```go
+// OLD CODE - O(n) map rebuild on every read
+latestWrites := make(BlocksMap, writesLen)
+for _, wr := range writesCopy {
+    if prev, ok := latestWrites[wr.Block]; !ok || wr.SeqNum > prev.SeqNum {
+        latestWrites[wr.Block] = wr
+    }
+}
+```
+
+### Solution
+
+The Unified Block Store (`blockstore.go`) replaces the 4 separate data structures with a single sharded index that provides O(1) lookups and is updated incrementally on writes (not rebuilt on reads).
+
+### Block States
+
+```
+Empty -> Hot -> Pending -> Persisted <-> Cached
+         ^                    |
+         |____________________|  (new write)
+```
+
+- **Empty**: Block has never been written (zero block)
+- **Hot**: In active write buffer (not yet WAL'd)
+- **Pending**: WAL'd, awaiting backend upload
+- **Persisted**: On backend storage
+- **Cached**: Clean copy from backend in LRU cache
+
+### Key Design Decisions
+
+1. **Sharded Index**: 16 shards with independent RWMutex reduces lock contention by 16x
+2. **Persistent Write Index**: Updated on write, not rebuilt on read
+3. **Fast Path**: Single-block reads bypass batch processing via `ReadSingle()`
+4. **State Machine**: Clear transitions between block states with atomic updates
+
+### Implementation Files
+
+- `viperblock/viperblock/blockstore.go` - Core UnifiedBlockStore implementation
+- `viperblock/viperblock/blockstore_test.go` - Tests and benchmarks
+- `viperblock/viperblock/arena.go` - Memory arena for write data (reduces GC)
+- `viperblock/viperblock/viperblock.go` - Integration with VB struct
+
+### API
+
+```go
+// Create a new block store
+bs := NewUnifiedBlockStore(4096) // 4KB block size
+
+// O(1) write - updates index immediately
+seqNum := bs.Write(blockNum, data)
+
+// O(1) read - single lookup, no map rebuilding
+data, state, err := bs.ReadSingle(blockNum)
+
+// State transitions
+bs.MarkPending(blockNum)                        // Hot -> Pending
+bs.MarkPersisted(blockNum, objectID, offset)    // Pending -> Persisted
+bs.Cache(blockNum, data)                        // Persisted -> Cached
+bs.EvictCache(blockNum)                         // Cached -> Persisted
+```
+
+### Enabling the Block Store
+
+The BlockStore can be enabled/disabled at runtime for safe migration:
+
+```go
+// Enable optimized path
+vb.EnableBlockStore()
+
+// Disable and use legacy path
+vb.DisableBlockStore()
+
+// Sync state from legacy data structures
+vb.SyncBlockStoreFromLegacy()
+```
+
+Or enable during VB creation:
+
+```go
+config := &VB{
+    VolumeName:    "test-vol",
+    VolumeSize:    1024 * 1024 * 1024,
+    UseBlockStore: true,
+}
+vb, _ := New(config, "file", backendConfig)
+```
+
+### Expected Performance
+
+| Metric | Before | After |
+|--------|--------|-------|
+| `mapassign_fast64` CPU | 46% | < 5% |
+| Read latency | O(n) | O(1) |
+| Per-read allocations | 2 maps + copies | 1 result copy |
+| Lock contention | Single global | 16 shards |
+
+### Memory Arena
+
+The `arena.go` provides a bump-pointer allocator for write data to reduce GC pressure:
+
+```go
+arena := NewArena(4096) // 4KB blocks
+
+// Allocate from arena (O(1), no GC until slab full)
+buf := arena.Alloc()
+
+// Or allocate and copy in one step
+buf := arena.AllocCopy(data)
+```
+
+Features:
+- 4MB slabs (matches ObjBlockSize)
+- Reference counting for slab reuse
+- Compaction of empty slabs
+- Optional pooling via `PooledArena` for frequently reused buffers
+
+### Verification
+
+```bash
+# Run unit tests
+cd viperblock && LOG_IGNORE=1 go test -v ./viperblock/... -run BlockStore
+
+# Run benchmarks
+cd viperblock && go test -bench=BlockStore -benchmem ./viperblock/...
+
+# Compare old vs new approach
+go test -bench=OldVsNew -benchmem ./viperblock/...
+```
+
+### Rollback Plan
+
+The implementation uses a phased approach for safe rollback:
+
+1. BlockStore runs alongside existing structures
+2. `UseBlockStore` flag controls which path is used
+3. Can disable BlockStore and revert to legacy at any time
+4. Legacy data structures are always kept in sync
+
+```go
+// Disable BlockStore and use legacy path
+vb.DisableBlockStore()
+```

@@ -99,6 +99,15 @@ type VB struct {
 	// In-memory cache of recently used blocks from read/write operations
 	Cache Cache
 
+	// UnifiedBlockStore provides O(1) block lookups with sharded locking
+	// Replaces Writes, PendingBackendWrites, Cache, and BlocksToObject lookups
+	// when UseBlockStore is true
+	BlockStore *UnifiedBlockStore
+
+	// UseBlockStore enables the unified block store for read/write operations
+	// When false, uses legacy data structures for backward compatibility
+	UseBlockStore bool
+
 	Version uint16
 
 	ChunkMagic [4]byte
@@ -414,6 +423,10 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		Backend:        backend,
 		BaseDir:        config.BaseDir,
 		VolumeConfig:   config.VolumeConfig,
+
+		// Initialize UnifiedBlockStore for O(1) lookups (enabled by default)
+		BlockStore:    NewUnifiedBlockStore(config.BlockSize),
+		UseBlockStore: true,
 	}
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
@@ -673,14 +686,12 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 	vb.Writes.Blocks = append(vb.Writes.Blocks, writes...)
 	vb.Writes.mu.Unlock()
 
-	// Optionally update cache
-	/*
-		if vb.Cache.config.Size > 0 {
-			for _, block := range writes {
-				vb.Cache.lru.Add(block.Block, block.Data)
-			}
+	// Also update BlockStore if enabled (for O(1) read lookups)
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		for _, block := range writes {
+			vb.BlockStore.WriteWithSeqNum(block.Block, block.Data, block.SeqNum)
 		}
-	*/
+	}
 
 	return nil
 }
@@ -732,6 +743,11 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 			Data:   blockCopy,
 		})
 
+		// Also update BlockStore if enabled (for O(1) read lookups)
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			vb.BlockStore.WriteWithSeqNum(currentBlock, blockCopy, seqNum)
+		}
+
 		//slog.Info("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
 
 	}
@@ -760,6 +776,11 @@ func (vb *VB) Flush() error {
 
 		// Record successful flush
 		flushed[block.Block] = block.SeqNum
+
+		// Mark block as Pending in BlockStore (Hot -> Pending transition)
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			vb.BlockStore.MarkPending(block.Block)
+		}
 	}
 
 	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
@@ -1361,6 +1382,11 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 		BlockObjectsToWAL = append(BlockObjectsToWAL, newBlock)
 
+		// Update BlockStore: transition from Pending to Persisted
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset)
+		}
+
 		i++
 
 	}
@@ -1539,6 +1565,11 @@ func (vb *VB) LoadBlockState() (err error) {
 
 		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
 
+		// Also update BlockStore if enabled
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, 0)
+		}
+
 		offset += 26
 
 	}
@@ -1641,6 +1672,8 @@ func (vb *VB) LoadState() error {
 		state = stateBackend
 	}
 
+	// TODO: Add improved test cases for state.json corruption and edge cases
+
 	vb.VolumeName = state.VolumeName
 	vb.VolumeSize = state.VolumeSize
 	vb.BlockSize = state.BlockSize
@@ -1686,6 +1719,10 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 
 // Private function to read a block from the storage backend, use ReadAt for public access
 func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
+	// Use optimized BlockStore path if enabled
+	if vb.UseBlockStore {
+		return vb.readBlockStore(block, blockLen)
+	}
 
 	// Check blockLen a multiple of a blocksize
 	if blockLen%uint64(vb.BlockSize) != 0 {
@@ -1760,13 +1797,13 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
 			zeroBlockErr = ErrZeroBlock
-			slog.Info("[READ] ZERO BLOCK:", "block", currentBlock)
+			slog.Debug("[READ] ZERO BLOCK:", "block", currentBlock)
 
 			copy(data[start:end], make([]byte, vb.BlockSize)) // zero
 			continue
 		}
 
-		slog.Info("[READ] OBJECT ID:", "objectID", objectID, "objectOffset", objectOffset)
+		slog.Debug("[READ] OBJECT ID:", "objectID", objectID, "objectOffset", objectOffset)
 
 		consecutiveBlocks = append(consecutiveBlocks, ConsecutiveBlock{
 			BlockPosition: i,
@@ -1787,11 +1824,11 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
 
 	for i := 0; i < len(consecutiveBlocks); i++ {
-		slog.Info("[READ] CONSECUTIVE BLOCK:", "startBlock", consecutiveBlocks[i].StartBlock, "numBlocks", consecutiveBlocks[i].NumBlocks, "offsetStart", consecutiveBlocks[i].OffsetStart, "offsetEnd", consecutiveBlocks[i].OffsetEnd, "objectID", consecutiveBlocks[i].ObjectID, "objectOffset", consecutiveBlocks[i].ObjectOffset)
+		slog.Debug("[READ] CONSECUTIVE BLOCK:", "startBlock", consecutiveBlocks[i].StartBlock, "numBlocks", consecutiveBlocks[i].NumBlocks, "offsetStart", consecutiveBlocks[i].OffsetStart, "offsetEnd", consecutiveBlocks[i].OffsetEnd, "objectID", consecutiveBlocks[i].ObjectID, "objectOffset", consecutiveBlocks[i].ObjectOffset)
 
 		// Skip if this blocks belongs to a previous consecutive block
 		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
-			slog.Info("[READ] SKIPPING CONSECUTIVE BLOCK READ:", "startBlock", consecutiveBlocks[i].StartBlock)
+			slog.Debug("[READ] SKIPPING CONSECUTIVE BLOCK READ:", "startBlock", consecutiveBlocks[i].StartBlock)
 			continue
 		}
 
@@ -1822,7 +1859,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// Next, read our consecutive blocks from the backend
 	for _, cb := range consecutiveBlocksToRead {
-		slog.Info("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "offsetStart", cb.OffsetStart, "offsetEnd", cb.OffsetEnd, "objectID", cb.ObjectID, "objectOffset", cb.ObjectOffset)
+		slog.Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "offsetStart", cb.OffsetStart, "offsetEnd", cb.OffsetEnd, "objectID", cb.ObjectID, "objectOffset", cb.ObjectOffset)
 
 		// Account for our extra 10 bytes of metadata per block
 		//consecutiveBlockStart := cb.BlockPosition * uint64(vb.BlockSize)
@@ -1836,9 +1873,9 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			return nil, err
 		}
 
-		slog.Info("[READ] COPYING BLOCK DATA:", "start", start, "end", end)
-		//slog.Info("[READ] BLOCK DATA:", "blockData", blockData[:32])
-		slog.Info("[READ] DATA:", "data len", len(data))
+		slog.Debug("[READ] COPYING BLOCK DATA:", "start", start, "end", end)
+		//slog.Debug("[READ] BLOCK DATA:", "blockData", blockData[:32])
+		slog.Debug("[READ] DATA:", "data len", len(data))
 		copy(data[start:end], blockData)
 		//copy(data[consecutiveBlockStart:consecutiveBlockOffset], blockData)
 
@@ -1981,7 +2018,15 @@ func (vb *VB) Reset() error {
 	vb.PendingBackendWrites.Blocks = make([]Block, 0)
 	vb.PendingBackendWrites.mu.Unlock()
 
-	vb.Cache.lru.Purge()
+	if vb.Cache.lru != nil {
+		vb.Cache.lru.Purge()
+	}
+
+	// Reset BlockStore if enabled
+	if vb.BlockStore != nil {
+		vb.BlockStore.Clear()
+		vb.BlockStore.SetSeqNum(0)
+	}
 
 	// Reset SeqNum and ObjectNum
 	vb.SeqNum.Store(0)
@@ -2071,4 +2116,289 @@ func FindFreePort() (string, error) {
 	}
 	defer l.Close()
 	return l.Addr().String(), nil
+}
+
+// EnableBlockStore enables the unified block store for O(1) lookups
+func (vb *VB) EnableBlockStore() {
+	vb.UseBlockStore = true
+	slog.Info("BlockStore enabled")
+}
+
+// DisableBlockStore disables the unified block store and uses legacy data structures
+func (vb *VB) DisableBlockStore() {
+	vb.UseBlockStore = false
+	slog.Info("BlockStore disabled")
+}
+
+// readBlockStore is the optimized read path using UnifiedBlockStore
+// Provides O(1) lookups instead of O(n) map rebuilding per read
+func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err error) {
+	// Check blockLen is a multiple of blocksize
+	if blockLen%uint64(vb.BlockSize) != 0 {
+		return nil, ErrRequestBlockSize
+	}
+
+	var zeroBlockErr error
+	data = make([]byte, blockLen)
+	blockRequests := blockLen / uint64(vb.BlockSize)
+
+	var consecutiveBlocks ConsecutiveBlocks
+
+	for i := uint64(0); i < blockRequests; i++ {
+		currentBlock := block + i
+		start := i * uint64(vb.BlockSize)
+		end := start + uint64(vb.BlockSize)
+
+		// O(1) lookup using BlockStore
+		blockData, state, err := vb.BlockStore.ReadSingle(currentBlock)
+
+		switch state {
+		case BlockStateHot, BlockStatePending, BlockStateCached:
+			// Data is available in memory
+			copy(data[start:end], blockData)
+
+		case BlockStatePersisted:
+			// Need to fetch from backend
+			entry, ok := vb.BlockStore.ReadBlock(currentBlock)
+			if !ok {
+				// Should not happen if state was Persisted
+				zeroBlockErr = ErrZeroBlock
+				continue
+			}
+
+			consecutiveBlocks = append(consecutiveBlocks, ConsecutiveBlock{
+				BlockPosition: i,
+				StartBlock:    currentBlock,
+				NumBlocks:     1,
+				OffsetStart:   start,
+				OffsetEnd:     end,
+				ObjectID:      entry.ObjectID,
+				ObjectOffset:  entry.ObjectOffset,
+			})
+
+		case BlockStateEmpty:
+			// Zero block - already zeroed in data slice
+			if err == ErrZeroBlock {
+				zeroBlockErr = ErrZeroBlock
+			}
+		}
+	}
+
+	// Fetch consecutive blocks from backend (same logic as legacy read)
+	if len(consecutiveBlocks) > 0 {
+		err = vb.fetchConsecutiveBlocksFromBackend(consecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return data, zeroBlockErr
+}
+
+// fetchConsecutiveBlocksFromBackend fetches blocks from backend storage
+// Used by both legacy and BlockStore read paths
+func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+	var consecutiveBlocksToRead ConsecutiveBlocks
+	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
+
+	for i := 0; i < len(consecutiveBlocks); i++ {
+		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
+			continue
+		}
+
+		numBlocks := 1
+		for j := i + 1; j < len(consecutiveBlocks); j++ {
+			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) &&
+				consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+				numBlocks++
+				consecutiveBlocksRead[consecutiveBlocks[j].StartBlock] = true
+			} else {
+				break
+			}
+		}
+
+		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
+			BlockPosition: consecutiveBlocks[i].BlockPosition,
+			StartBlock:    consecutiveBlocks[i].StartBlock,
+			NumBlocks:     utils.SafeIntToUint16(numBlocks),
+			OffsetStart:   consecutiveBlocks[i].OffsetStart,
+			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
+			ObjectID:      consecutiveBlocks[i].ObjectID,
+			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
+		})
+	}
+
+	for _, cb := range consecutiveBlocksToRead {
+		slog.Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
+
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * uint32(vb.BlockSize)
+		start := cb.BlockPosition * uint64(vb.BlockSize)
+		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
+
+		blockData, err := vb.Backend.Read(types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		if err != nil {
+			return err
+		}
+
+		copy(data[start:end], blockData)
+
+		// Cache blocks in BlockStore
+		if vb.UseBlockStore {
+			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
+				currentBlock := cb.StartBlock + i
+				blockStart := i * uint64(vb.BlockSize)
+				blockEnd := blockStart + uint64(vb.BlockSize)
+				vb.BlockStore.Cache(currentBlock, blockData[blockStart:blockEnd])
+			}
+		}
+
+		// Also update legacy LRU cache if enabled
+		if vb.Cache.Config.Size > 0 {
+			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
+				currentBlock := cb.StartBlock + i
+				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
+			}
+		}
+	}
+
+	return nil
+}
+
+// WriteBlockStore writes a block using the unified block store
+func (vb *VB) WriteBlockStore(block uint64, data []byte) (err error) {
+	blockLen := uint64(len(data))
+
+	if block*uint64(vb.BlockSize) > vb.GetVolumeSize() {
+		return ErrRequestTooLarge
+	}
+
+	if block*uint64(vb.BlockSize)+blockLen > vb.GetVolumeSize() {
+		return ErrRequestOutOfRange
+	}
+
+	if blockLen%uint64(vb.BlockSize) != 0 {
+		return ErrRequestBlockSize
+	}
+
+	blockRequests := blockLen / uint64(vb.BlockSize)
+
+	for i := uint64(0); i < blockRequests; i++ {
+		currentBlock := block + i
+		start := i * uint64(vb.BlockSize)
+		end := start + uint64(vb.BlockSize)
+
+		// Write to BlockStore (returns seqNum)
+		seqNum := vb.BlockStore.Write(currentBlock, data[start:end])
+
+		// Also update main SeqNum for compatibility
+		for {
+			current := vb.SeqNum.Load()
+			if seqNum <= current {
+				break
+			}
+			if vb.SeqNum.CompareAndSwap(current, seqNum) {
+				break
+			}
+		}
+
+		// Also write to legacy Writes buffer for WAL compatibility
+		vb.Writes.mu.Lock()
+		blockCopy := make([]byte, vb.BlockSize)
+		copy(blockCopy, data[start:end])
+		vb.Writes.Blocks = append(vb.Writes.Blocks, Block{
+			SeqNum: seqNum,
+			Block:  currentBlock,
+			Data:   blockCopy,
+		})
+		vb.Writes.mu.Unlock()
+	}
+
+	return nil
+}
+
+// FlushBlockStore flushes hot blocks using the BlockStore path
+func (vb *VB) FlushBlockStore() error {
+	// Get all hot blocks from BlockStore
+	hotBlocks := vb.BlockStore.GetHotBlocks()
+
+	if len(hotBlocks) == 0 {
+		return nil
+	}
+
+	flushed := make(map[uint64]uint64) // block -> seqnum
+
+	for _, block := range hotBlocks {
+		if err := vb.WriteWAL(block); err != nil {
+			slog.Error("ERROR FLUSHING:", "block", block.Block, "error", err)
+			break
+		}
+
+		flushed[block.Block] = block.SeqNum
+		// Transition to Pending in BlockStore
+		vb.BlockStore.MarkPending(block.Block)
+	}
+
+	// Also update legacy Writes buffer for compatibility
+	if len(flushed) > 0 {
+		vb.Writes.mu.Lock()
+		remaining := make([]Block, 0)
+		for _, b := range vb.Writes.Blocks {
+			if _, ok := flushed[b.Block]; !ok {
+				remaining = append(remaining, b)
+			}
+		}
+		vb.Writes.Blocks = remaining
+		vb.Writes.mu.Unlock()
+
+		// Append to pending backend writes for legacy compatibility
+		vb.PendingBackendWrites.mu.Lock()
+		vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, hotBlocks...)
+		vb.PendingBackendWrites.mu.Unlock()
+	}
+
+	if len(flushed) < len(hotBlocks) {
+		return fmt.Errorf("partial flush: %d of %d blocks flushed", len(flushed), len(hotBlocks))
+	}
+
+	return nil
+}
+
+// SyncBlockStoreFromLegacy synchronizes BlockStore state from legacy data structures
+// Used during migration or recovery
+func (vb *VB) SyncBlockStoreFromLegacy() {
+	// Sync from Writes
+	vb.Writes.mu.RLock()
+	for _, block := range vb.Writes.Blocks {
+		vb.BlockStore.WriteWithSeqNum(block.Block, block.Data, block.SeqNum)
+	}
+	vb.Writes.mu.RUnlock()
+
+	// Sync from PendingBackendWrites
+	vb.PendingBackendWrites.mu.RLock()
+	for _, block := range vb.PendingBackendWrites.Blocks {
+		vb.BlockStore.WriteWithSeqNum(block.Block, block.Data, block.SeqNum)
+		vb.BlockStore.MarkPending(block.Block)
+	}
+	vb.PendingBackendWrites.mu.RUnlock()
+
+	// Sync from BlocksToObject
+	vb.BlocksToObject.mu.RLock()
+	for blockNum, lookup := range vb.BlocksToObject.BlockLookup {
+		vb.BlockStore.SetPersisted(blockNum, lookup.ObjectID, lookup.ObjectOffset, 0)
+	}
+	vb.BlocksToObject.mu.RUnlock()
+
+	// Sync sequence number
+	vb.BlockStore.SetSeqNum(vb.SeqNum.Load())
+
+	slog.Info("BlockStore synchronized from legacy data structures",
+		"blocks", vb.BlockStore.Count())
+}
+
+// GetBlockStoreStats returns statistics from the BlockStore
+func (vb *VB) GetBlockStoreStats() (reads, writes, cacheHits, cacheMiss uint64) {
+	if vb.BlockStore == nil {
+		return 0, 0, 0, 0
+	}
+	return vb.BlockStore.GetStats()
 }

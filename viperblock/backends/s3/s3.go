@@ -147,11 +147,15 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		Key:    aws.String(filename),
 	}
 
-	// Always use Range header for efficient partial reads
-	// Request exactly the bytes we need: offset to offset+length-1
-	requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-
-	slog.Debug("[S3 READ] Requesting range", "range", *requestObject.Range)
+	// Use Range header for partial reads, but skip for full file reads (length=0)
+	// When length=0, read the entire file (used for config.json and other metadata)
+	if length > 0 {
+		// Request exactly the bytes we need: offset to offset+length-1
+		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+		slog.Debug("[S3 READ] Requesting range", "range", *requestObject.Range)
+	} else {
+		slog.Debug("[S3 READ] Reading entire file", "key", filename)
+	}
 
 	// TODO: Add ctx support and retry from S3 timeout/500/etc
 	textResult, err := backend.config.S3Client.GetObject(requestObject)
