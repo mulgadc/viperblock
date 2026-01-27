@@ -35,6 +35,7 @@ require (
 	github.com/quic-go/quic-go v0.57.1 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect
+	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000 // indirect
 )
 
 require (
