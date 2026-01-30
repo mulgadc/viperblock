@@ -1672,6 +1672,20 @@ func (vb *VB) LoadState() error {
 		state = stateBackend
 	}
 
+	// Reconcile VolumeSize with VolumeConfig.SizeGiB (safety net for resize).
+	// After ModifyVolume updates SizeGiB, VBState.VolumeSize may be stale.
+	// The VolumeConfig's SizeGiB (set by ModifyVolume) takes precedence.
+	configSizeBytes := uint64(state.VolumeConfig.VolumeMetadata.SizeGiB) * 1024 * 1024 * 1024
+	if configSizeBytes > 0 && configSizeBytes > state.VolumeSize {
+		slog.Info("LoadState: reconciling VolumeSize from VolumeConfig.SizeGiB",
+			"oldSize", state.VolumeSize, "newSize", configSizeBytes,
+			"sizeGiB", state.VolumeConfig.VolumeMetadata.SizeGiB)
+		state.VolumeSize = configSizeBytes
+	} else if configSizeBytes > 0 && configSizeBytes < state.VolumeSize {
+		slog.Warn("LoadState: VolumeConfig.SizeGiB < VBState.VolumeSize (shrink not supported, keeping current size)",
+			"configSize", configSizeBytes, "stateSize", state.VolumeSize)
+	}
+
 	// TODO: Add improved test cases for state.json corruption and edge cases
 
 	vb.VolumeName = state.VolumeName
