@@ -1698,6 +1698,7 @@ func (vb *VB) LoadState() error {
 	vb.BlockToObjectWAL.WallNum.Store(state.BlockToObjectWALNum)
 
 	vb.Version = state.Version
+	vb.VolumeConfig = state.VolumeConfig
 
 	slog.Debug("Loaded state", "state", state)
 
