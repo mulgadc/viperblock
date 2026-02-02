@@ -225,6 +225,7 @@ type VolumeMetadata struct {
 	SizeGiB          uint64 // Volume size in GiB
 	State            string // "creating", "available", "in-use", "deleted"
 	CreatedAt        time.Time
+	AttachedAt       time.Time         // When volume was attached to instance
 	AvailabilityZone string            // Optional: "us-west-1a"
 	AttachedInstance string            // Instance ID (if any)
 	DeviceName       string            // e.g. "/dev/nbd1"
