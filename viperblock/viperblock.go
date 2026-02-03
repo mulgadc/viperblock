@@ -232,8 +232,9 @@ type VolumeMetadata struct {
 	VolumeType       string            // e.g. "gp3", "io1"
 	IOPS             int               // For provisioned volumes
 	Tags             map[string]string // User-defined metadata
-	SnapshotID       string            // If created from a snapshot
-	IsEncrypted      bool              // Encryption flag
+	SnapshotID          string            // If created from a snapshot
+	IsEncrypted         bool              // Encryption flag
+	DeleteOnTermination bool              // Whether to delete volume when instance terminates
 }
 
 type AMIMetadata struct {
