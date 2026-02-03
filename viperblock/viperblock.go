@@ -1646,31 +1646,28 @@ func (vb *VB) SaveState() error {
 func (vb *VB) LoadState() error {
 
 	// Step 1. Query the state locally
-	state, err := vb.LoadStateRequest(fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume())))
-	if err != nil {
-		slog.Info("No state found in local file, using backend state", "error", err)
+	state, localErr := vb.LoadStateRequest(fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume())))
+	if localErr != nil {
+		slog.Info("No state found in local file, using backend state", "error", localErr)
 	}
 
-	//slog.Info("Loaded state", "state", state)
-
 	// Step 2. Query the state from the backend
-	stateBackend, err := vb.LoadStateRequest("")
+	stateBackend, backendErr := vb.LoadStateRequest("")
 
-	//slog.Info("Loaded backend state", "state", stateBackend)
-
-	if err != nil {
-		slog.Warn("No state found in backend, using local state", "error", err)
+	if backendErr != nil {
+		slog.Warn("No state found in backend, using local state", "error", backendErr)
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
 		errMsg := "invalid state, block size or object block size is 0. Not syncing config"
 		slog.Error(errMsg)
-		err = errors.New(errMsg)
-		return err
+		return errors.New(errMsg)
 	}
 
-	// Step 3. Compare the two states, the state with the highest SeqNum is the correct state
-	if stateBackend.SeqNum > state.SeqNum {
+	// Step 3. Compare the two states, the state with the highest SeqNum is the correct state.
+	// When local state failed to load (e.g. no local file for a newly created volume),
+	// always prefer the backend state regardless of SeqNum.
+	if localErr != nil || stateBackend.SeqNum > state.SeqNum {
 		state = stateBackend
 	}
 
