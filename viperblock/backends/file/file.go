@@ -231,9 +231,11 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 		}
 	}
 
-	if _, err = file.Write(*data); err != nil {
-		file.Close()
-		return err
+	if data != nil {
+		if _, err = file.Write(*data); err != nil {
+			file.Close()
+			return err
+		}
 	}
 
 	return file.Close()

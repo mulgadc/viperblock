@@ -372,23 +372,3 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 
 	return clone
 }
-
-// createCloneDirs creates the local directory structure needed for a clone volume.
-func createCloneDirs(vb *VB) error {
-	dirs := []string{
-		fmt.Sprintf("%s/%s", vb.BaseDir, vb.VolumeName),
-		fmt.Sprintf("%s/%s/checkpoints", vb.BaseDir, vb.VolumeName),
-		fmt.Sprintf("%s/%s/wal/chunks", vb.BaseDir, vb.VolumeName),
-		fmt.Sprintf("%s/%s/wal/blocks", vb.BaseDir, vb.VolumeName),
-	}
-	for _, dir := range dirs {
-		if err := mkdirAll(dir); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func mkdirAll(path string) error {
-	return os.MkdirAll(path, 0750)
-}

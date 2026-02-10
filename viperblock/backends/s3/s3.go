@@ -188,10 +188,16 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	// The BlockLookup offsets include header size, so we must write headers+data
 	var body []byte
 	if headers != nil && len(*headers) > 0 {
-		body = make([]byte, len(*headers)+len(*data))
+		dataLen := 0
+		if data != nil {
+			dataLen = len(*data)
+		}
+		body = make([]byte, len(*headers)+dataLen)
 		copy(body[:len(*headers)], *headers)
-		copy(body[len(*headers):], *data)
-	} else {
+		if data != nil {
+			copy(body[len(*headers):], *data)
+		}
+	} else if data != nil {
 		body = *data
 	}
 
@@ -255,10 +261,16 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 
 	var body []byte
 	if headers != nil && len(*headers) > 0 {
-		body = make([]byte, len(*headers)+len(*data))
+		dataLen := 0
+		if data != nil {
+			dataLen = len(*data)
+		}
+		body = make([]byte, len(*headers)+dataLen)
 		copy(body[:len(*headers)], *headers)
-		copy(body[len(*headers):], *data)
-	} else {
+		if data != nil {
+			copy(body[len(*headers):], *data)
+		}
+	} else if data != nil {
 		body = *data
 	}
 

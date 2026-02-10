@@ -678,7 +678,7 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 
 			existing, err := vb.ReadAt(b*blockSize, blockSize)
 
-			if err != nil && err != ErrZeroBlock {
+			if err != nil && !errors.Is(err, ErrZeroBlock) {
 				return fmt.Errorf("failed to read block %d for RMW: %w", b, err)
 			}
 			blockData = make([]byte, blockSize)
@@ -777,9 +777,14 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 // Flush the main memory (writes) to the WAL
 func (vb *VB) Flush() error {
 	vb.Writes.mu.Lock()
+	defer vb.Writes.mu.Unlock()
+	return vb.flushLocked()
+}
+
+// flushLocked flushes hot writes to WAL. Caller must hold vb.Writes.mu.Lock().
+func (vb *VB) flushLocked() error {
 	flushBlocks := make([]Block, len(vb.Writes.Blocks))
 	copy(flushBlocks, vb.Writes.Blocks)
-	vb.Writes.mu.Unlock()
 
 	// Map to track successfully flushed blocks
 	flushed := make(map[uint64]uint64) // block -> seqnum
@@ -802,8 +807,6 @@ func (vb *VB) Flush() error {
 
 	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
 	if len(flushed) > 0 {
-		vb.Writes.mu.Lock()
-
 		remaining := make([]Block, 0)
 		for _, b := range vb.Writes.Blocks {
 			if _, ok := flushed[b.Block]; !ok {
@@ -814,7 +817,6 @@ func (vb *VB) Flush() error {
 		}
 
 		vb.Writes.Blocks = remaining
-		vb.Writes.mu.Unlock()
 	}
 
 	// Append successful flushed blocks to the PendingBackendWrites
@@ -1715,14 +1717,14 @@ func (vb *VB) LoadState() error {
 
 	vb.Version = state.Version
 	vb.VolumeConfig = state.VolumeConfig
-	vb.SnapshotID = state.SnapshotID
-	vb.SourceVolumeName = state.SourceVolumeName
 
-	// If this volume was created from a snapshot, load the base block map
-	if vb.SnapshotID != "" {
-		if err := vb.OpenFromSnapshot(vb.SnapshotID); err != nil {
-			slog.Error("Failed to load snapshot base map", "snapshotID", vb.SnapshotID, "error", err)
-			return fmt.Errorf("failed to load snapshot %s: %w", vb.SnapshotID, err)
+	// If this volume was created from a snapshot, load the base block map.
+	// OpenFromSnapshot sets SnapshotID and SourceVolumeName from the snapshot
+	// config, so we don't set them separately to avoid two sources of truth.
+	if state.SnapshotID != "" {
+		if err := vb.OpenFromSnapshot(state.SnapshotID); err != nil {
+			slog.Error("Failed to load snapshot base map", "snapshotID", state.SnapshotID, "error", err)
+			return fmt.Errorf("failed to load snapshot %s: %w", state.SnapshotID, err)
 		}
 	}
 
@@ -1838,8 +1840,11 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Next, fetch which object and offset the block is within
 		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
+			if !errors.Is(err, ErrZeroBlock) {
+				return nil, fmt.Errorf("LookupBlockToObject block %d: %w", currentBlock, err)
+			}
 			// Block not in our own map -- check snapshot base map
-			if err == ErrZeroBlock && vb.BaseBlockMap != nil {
+			if vb.BaseBlockMap != nil {
 				baseObjectID, baseObjectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
 				if baseErr == nil {
 					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
@@ -2245,7 +2250,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 		case BlockStateEmpty:
 			// Block not in our own map -- check snapshot base map
-			if err == ErrZeroBlock && vb.BaseBlockMap != nil {
+			if vb.BaseBlockMap != nil {
 				objectID, objectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
 				if baseErr == nil {
 					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
@@ -2260,7 +2265,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 					continue
 				}
 			}
-			if err == ErrZeroBlock {
+			if errors.Is(err, ErrZeroBlock) {
 				zeroBlockErr = ErrZeroBlock
 			}
 		}
@@ -2357,6 +2362,9 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
 // Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
 func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+	if sourceVolume == "" {
+		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
+	}
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
 
@@ -2396,7 +2404,12 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 
 		blockData, err := vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
-			return err
+			return fmt.Errorf("ReadFrom source %s object %d: %w", sourceVolume, cb.ObjectID, err)
+		}
+
+		expectedLen := int(consecutiveBlockOffset)
+		if len(blockData) != expectedLen {
+			return fmt.Errorf("ReadFrom source %s object %d: short read: got %d bytes, expected %d", sourceVolume, cb.ObjectID, len(blockData), expectedLen)
 		}
 
 		copy(data[start:end], blockData)

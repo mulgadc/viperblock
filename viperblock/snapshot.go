@@ -23,6 +23,7 @@ type SnapshotState struct {
 	ObjectNum        uint64    `json:"ObjectNum"`
 	BlockSize        uint32    `json:"BlockSize"`
 	ObjBlockSize     uint32    `json:"ObjBlockSize"`
+	BlockCount       uint64    `json:"BlockCount"`
 	CreatedAt        time.Time `json:"CreatedAt"`
 }
 
@@ -33,8 +34,13 @@ type SnapshotState struct {
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	slog.Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
 
+	// Hold the write lock for the entire snapshot operation to prevent new
+	// writes from arriving between flush and block map serialization.
+	vb.Writes.mu.Lock()
+	defer vb.Writes.mu.Unlock()
+
 	// 1. Flush hot writes to WAL, then persist WAL to chunk files on backend
-	if err := vb.Flush(); err != nil {
+	if err := vb.flushLocked(); err != nil {
 		return nil, fmt.Errorf("snapshot flush failed: %w", err)
 	}
 	if err := vb.WriteWALToChunk(true); err != nil {
@@ -43,6 +49,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 
 	// 2. Serialize the current block-to-object map as the snapshot checkpoint
 	vb.BlocksToObject.mu.RLock()
+	blockCount := uint64(len(vb.BlocksToObject.BlockLookup))
 	checkpoint := vb.BlockToObjectWALHeader()
 	for _, block := range vb.BlocksToObject.BlockLookup {
 		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
@@ -63,6 +70,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		ObjectNum:        vb.ObjectNum.Load(),
 		BlockSize:        vb.BlockSize,
 		ObjBlockSize:     vb.ObjBlockSize,
+		BlockCount:       blockCount,
 		CreatedAt:        time.Now(),
 	}
 
@@ -115,22 +123,31 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, string, 
 		return nil, "", fmt.Errorf("snapshot checkpoint version mismatch")
 	}
 
-	// 4. Deserialize block lookup entries
+	// 4. Validate checkpoint size: must contain only complete 26-byte entries after header
+	dataSize := len(checkpoint) - headerSize
+	if dataSize%26 != 0 {
+		return nil, "", fmt.Errorf("snapshot checkpoint has %d trailing bytes (data section %d bytes is not a multiple of 26-byte entries)", dataSize%26, dataSize)
+	}
+
+	// 5. Deserialize block lookup entries
 	baseMap := &BlocksToObject{
 		BlockLookup: make(map[uint64]BlockLookup),
 	}
 
 	offset := headerSize
-	for offset < len(checkpoint) {
-		if offset+26 > len(checkpoint) {
-			break
-		}
+	for offset+26 <= len(checkpoint) {
 		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+26])
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to read snapshot block entry: %w", err)
+			return nil, "", fmt.Errorf("failed to read snapshot block entry at offset %d: %w", offset, err)
 		}
 		baseMap.BlockLookup[block.StartBlock] = block
 		offset += 26
+	}
+
+	// 6. Validate block count against metadata if available (BlockCount > 0 means
+	// the snapshot was created with the block count field present)
+	if snap.BlockCount > 0 && uint64(len(baseMap.BlockLookup)) != snap.BlockCount {
+		return nil, "", fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, len(baseMap.BlockLookup))
 	}
 
 	slog.Info("LoadSnapshotBlockMap: loaded",
@@ -149,6 +166,10 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 	baseMap, sourceVolume, err := vb.LoadSnapshotBlockMap(snapshotID)
 	if err != nil {
 		return err
+	}
+
+	if sourceVolume == "" {
+		return fmt.Errorf("snapshot %s has empty SourceVolumeName", snapshotID)
 	}
 
 	vb.BaseBlockMap = baseMap
