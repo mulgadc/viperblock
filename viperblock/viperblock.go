@@ -1087,6 +1087,10 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 func (vb *VB) WriteWALToChunk(force bool) error {
 	// First, lock, and close the current WAL file
 	vb.WAL.mu.Lock()
+	if len(vb.WAL.DB) == 0 {
+		vb.WAL.mu.Unlock()
+		return nil
+	}
 	currentWALNum := vb.WAL.WallNum.Load()
 	pendingWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
 
