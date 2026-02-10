@@ -1942,6 +1942,300 @@ func TestRecoverLocalWALsDedup(t *testing.T) {
 	})
 }
 
+func TestRecoverLocalWALsSeqNumAdvancement(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_seqnum", func(t *testing.T, vb *VB) {
+		t.Run("SeqNum advances to recovered maximum", func(t *testing.T) {
+			// Write several blocks to create WAL entries with known SeqNums
+			for i := range 5 {
+				data := make([]byte, DefaultBlockSize)
+				msg := fmt.Sprintf("seqnum_block_%d", i)
+				copy(data[:len(msg)], msg)
+				err := vb.WriteAt(uint64(i)*uint64(vb.BlockSize), data)
+				require.NoError(t, err)
+			}
+
+			err := vb.Flush()
+			require.NoError(t, err)
+
+			// Record the SeqNum before crash
+			precrashSeqNum := vb.SeqNum.Load()
+			require.Greater(t, precrashSeqNum, uint64(0), "SeqNum should be non-zero after writes")
+
+			// Simulate crash: reset in-memory state
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			// Reset SeqNum to simulate full restart
+			vb.SeqNum.Store(0)
+
+			err = vb.RecoverLocalWALs()
+			require.NoError(t, err)
+
+			// SeqNum should be advanced to at least the pre-crash value
+			assert.GreaterOrEqual(t, vb.SeqNum.Load(), precrashSeqNum,
+				"SeqNum should be advanced to at least the pre-crash maximum")
+		})
+	})
+}
+
+func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_checksum", func(t *testing.T, vb *VB) {
+		t.Run("Mid-record checksum corruption recovers blocks before corrupt record", func(t *testing.T) {
+			// Write 3 blocks and flush to WAL
+			testData := make([][]byte, 3)
+			for i := range 3 {
+				testData[i] = make([]byte, DefaultBlockSize)
+				msg := fmt.Sprintf("checksum_block_%d", i)
+				copy(testData[i][:len(msg)], msg)
+				err := vb.WriteAt(uint64(i)*uint64(vb.BlockSize), testData[i])
+				require.NoError(t, err)
+			}
+
+			err := vb.Flush()
+			require.NoError(t, err)
+
+			// Find the WAL file and corrupt the 3rd record's checksum
+			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+			entries, err := os.ReadDir(walDir)
+			require.NoError(t, err)
+			require.NotEmpty(t, entries)
+
+			lastWAL := filepath.Join(walDir, entries[len(entries)-1].Name())
+			walData, err := os.ReadFile(lastWAL)
+			require.NoError(t, err)
+
+			headerSize := vb.WALHeaderSize()
+			recordSize := 28 + int(vb.BlockSize)
+
+			// Corrupt the checksum (bytes 24-28) of the 3rd record
+			thirdRecordStart := headerSize + 2*recordSize
+			require.Less(t, thirdRecordStart+28, len(walData), "WAL file should contain 3 records")
+			walData[thirdRecordStart+24] ^= 0xFF
+			walData[thirdRecordStart+25] ^= 0xFF
+
+			err = os.WriteFile(lastWAL, walData, 0640)
+			require.NoError(t, err)
+
+			// Reset in-memory state (simulate crash)
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			// Recovery should succeed and recover the first 2 blocks
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// Verify first 2 blocks are recovered
+			for i := range 2 {
+				data, err := vb.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+				assert.NoError(t, err, "Block %d should be recovered before corrupt record", i)
+				assert.Equal(t, testData[i], data, "Block %d data mismatch", i)
+			}
+
+			// Block 2 (the 3rd block) should NOT be recovered
+			_, _, err = vb.LookupBlockToObject(2)
+			assert.Error(t, err, "Block 2 should not be recovered due to checksum corruption")
+		})
+	})
+}
+
+func TestRecoverLocalWALsFileCleanup(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_cleanup", func(t *testing.T, vb *VB) {
+		t.Run("WAL files are removed after successful recovery", func(t *testing.T) {
+			// Write blocks and flush to WAL
+			data := make([]byte, DefaultBlockSize)
+			copy(data, "cleanup_test")
+			err := vb.WriteAt(0, data)
+			require.NoError(t, err)
+
+			err = vb.Flush()
+			require.NoError(t, err)
+
+			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+			entries, err := os.ReadDir(walDir)
+			require.NoError(t, err)
+			require.NotEmpty(t, entries, "WAL files should exist before recovery")
+
+			// Simulate crash
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			err = vb.RecoverLocalWALs()
+			require.NoError(t, err)
+
+			// Verify WAL directory is clean
+			entries, err = os.ReadDir(walDir)
+			require.NoError(t, err)
+			assert.Empty(t, entries, "WAL files should be removed after successful recovery")
+		})
+	})
+}
+
+func TestRecoverLocalWALsBlockStoreSync(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_blockstore", func(t *testing.T, vb *VB) {
+		t.Run("BlockStore is synced with correct SeqNums after recovery", func(t *testing.T) {
+			if !vb.UseBlockStore || vb.BlockStore == nil {
+				t.Skip("BlockStore not enabled for this backend")
+			}
+
+			// Write blocks to create WAL entries
+			testData := make([][]byte, 3)
+			for i := range 3 {
+				testData[i] = make([]byte, DefaultBlockSize)
+				msg := fmt.Sprintf("blockstore_block_%d", i)
+				copy(testData[i][:len(msg)], msg)
+				err := vb.WriteAt(uint64(i)*uint64(vb.BlockSize), testData[i])
+				require.NoError(t, err)
+			}
+
+			err := vb.Flush()
+			require.NoError(t, err)
+
+			// Simulate crash
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+
+			err = vb.RecoverLocalWALs()
+			require.NoError(t, err)
+
+			// Verify BlockStore entries are in Persisted state with non-zero SeqNum
+			for i := range 3 {
+				entry, exists := vb.BlockStore.ReadBlock(uint64(i))
+				assert.True(t, exists, "Block %d should exist in BlockStore after recovery", i)
+				if exists {
+					assert.Equal(t, BlockStatePersisted, entry.State,
+						"Block %d should be in Persisted state", i)
+					assert.Greater(t, entry.SeqNum, uint64(0),
+						"Block %d should have non-zero SeqNum in BlockStore", i)
+				}
+			}
+		})
+	})
+}
+
+func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_corrupt_header", func(t *testing.T, vb *VB) {
+		t.Run("Corrupt header file is skipped, valid file is recovered", func(t *testing.T) {
+			// Write blocks and flush to create a valid WAL file
+			testData := make([]byte, DefaultBlockSize)
+			copy(testData, "valid_file_data")
+			err := vb.WriteAt(0, testData)
+			require.NoError(t, err)
+
+			err = vb.Flush()
+			require.NoError(t, err)
+
+			// Create a corrupt WAL file with bad magic bytes (sort before the valid one)
+			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+			corruptFile := filepath.Join(walDir, "000000000000_corrupt.wal")
+			err = os.WriteFile(corruptFile, []byte{0xBA, 0xAD, 0xF0, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 0640)
+			require.NoError(t, err)
+
+			// Simulate crash
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			// Recovery should succeed — skip corrupt file, recover from valid one
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// Verify valid block is recovered
+			data, err := vb.ReadAt(0, uint64(vb.BlockSize))
+			assert.NoError(t, err)
+			assert.Equal(t, testData, data, "Block from valid WAL should be recovered")
+
+			// Verify the corrupt file is NOT deleted (kept for retry)
+			_, err = os.Stat(corruptFile)
+			assert.NoError(t, err, "Corrupt WAL file should be kept for retry, not deleted")
+		})
+	})
+}
+
+func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_all_corrupt", func(t *testing.T, vb *VB) {
+		t.Run("All files with corrupt headers results in no-op recovery", func(t *testing.T) {
+			// Remove any existing WAL files
+			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+			entries, err := os.ReadDir(walDir)
+			if err == nil {
+				for _, entry := range entries {
+					os.Remove(filepath.Join(walDir, entry.Name()))
+				}
+			}
+
+			// Create two WAL files with bad magic bytes
+			for i := range 2 {
+				fname := filepath.Join(walDir, fmt.Sprintf("corrupt_%d.wal", i))
+				err := os.WriteFile(fname, []byte{0xBA, 0xAD, 0xF0, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, 0640)
+				require.NoError(t, err)
+			}
+
+			// Recovery should succeed as a no-op (all files fail to read)
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// BlocksToObject should be empty
+			vb.BlocksToObject.mu.RLock()
+			count := len(vb.BlocksToObject.BlockLookup)
+			vb.BlocksToObject.mu.RUnlock()
+			assert.Equal(t, 0, count, "BlocksToObject should remain empty when all WALs are corrupt")
+
+			// Corrupt files should NOT be deleted (kept for retry)
+			entries, err = os.ReadDir(walDir)
+			require.NoError(t, err)
+			assert.Equal(t, 2, len(entries), "Corrupt WAL files should be kept for retry")
+		})
+	})
+}
+
 // waitForServer polls the URL until it responds or times out
 func waitForServer(url string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)

@@ -1620,6 +1620,10 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
 		return nil, 0, fmt.Errorf("WAL version mismatch in %s", filename)
 	}
+	walBlockSize := binary.BigEndian.Uint32(header[6:10])
+	if walBlockSize != vb.BlockSize {
+		return nil, 0, fmt.Errorf("WAL blocksize mismatch in %s: WAL has %d, expected %d", filename, walBlockSize, vb.BlockSize)
+	}
 
 	var blocks []Block
 	var maxSeqNum uint64
@@ -1627,10 +1631,9 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 
 	for {
 		record := make([]byte, recordSize)
-		_, err := io.ReadFull(f, record)
-		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
+		if _, err := io.ReadFull(f, record); err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				slog.Warn("WAL recovery: I/O error reading record, stopping", "file", filename, "error", err, "valid_records_so_far", len(blocks))
 			}
 			break
 		}
@@ -1641,27 +1644,20 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, record[28:])
 
 		if checksumValidated != checksum {
-			slog.Info("WAL recovery: checksum mismatch, stopping read", "file", filename)
+			slog.Warn("WAL recovery: checksum mismatch, stopping read", "file", filename, "valid_records_so_far", len(blocks))
 			break
 		}
 
 		seqNum := binary.BigEndian.Uint64(record[:8])
-		blockNum := binary.BigEndian.Uint64(record[8:16])
-		blockLen := binary.BigEndian.Uint64(record[16:24])
-
-		data := make([]byte, len(record[28:]))
-		copy(data, record[28:])
 
 		blocks = append(blocks, Block{
 			SeqNum: seqNum,
-			Block:  blockNum,
-			Len:    blockLen,
-			Data:   data,
+			Block:  binary.BigEndian.Uint64(record[8:16]),
+			Len:    binary.BigEndian.Uint64(record[16:24]),
+			Data:   append([]byte{}, record[28:]...),
 		})
 
-		if seqNum > maxSeqNum {
-			maxSeqNum = seqNum
-		}
+		maxSeqNum = max(maxSeqNum, seqNum)
 	}
 
 	return blocks, maxSeqNum, nil
@@ -1705,23 +1701,23 @@ func (vb *VB) RecoverLocalWALs() error {
 	// Read all valid blocks from all WAL files
 	var allBlocks []Block
 	var maxSeqNum uint64
+	var successFiles []string // only delete files we successfully read
 
 	for _, fname := range walFiles {
 		fullPath := filepath.Join(walDir, fname)
 		blocks, fileMaxSeq, err := vb.readWALFileForRecovery(fullPath)
 		if err != nil {
-			slog.Error("WAL recovery: failed to read WAL file, skipping", "file", fname, "error", err)
+			slog.Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
 			continue
 		}
+		successFiles = append(successFiles, fname)
 		allBlocks = append(allBlocks, blocks...)
-		if fileMaxSeq > maxSeqNum {
-			maxSeqNum = fileMaxSeq
-		}
+		maxSeqNum = max(maxSeqNum, fileMaxSeq)
 	}
 
 	if len(allBlocks) == 0 {
 		slog.Info("WAL recovery: no valid blocks found in orphaned WAL files, cleaning up")
-		for _, fname := range walFiles {
+		for _, fname := range successFiles {
 			os.Remove(filepath.Join(walDir, fname))
 		}
 		return nil
@@ -1776,8 +1772,10 @@ func (vb *VB) RecoverLocalWALs() error {
 	// won't work during recovery (blocks aren't in Pending state in BlockStore)
 	if vb.UseBlockStore && vb.BlockStore != nil {
 		vb.BlocksToObject.mu.RLock()
-		for blockNum, lookup := range vb.BlocksToObject.BlockLookup {
-			vb.BlockStore.SetPersisted(blockNum, lookup.ObjectID, lookup.ObjectOffset, 0)
+		for _, block := range sortedBlocks {
+			if lookup, ok := vb.BlocksToObject.BlockLookup[block.Block]; ok {
+				vb.BlockStore.SetPersisted(block.Block, lookup.ObjectID, lookup.ObjectOffset, block.SeqNum)
+			}
 		}
 		vb.BlocksToObject.mu.RUnlock()
 	}
@@ -1801,9 +1799,11 @@ func (vb *VB) RecoverLocalWALs() error {
 		return fmt.Errorf("WAL recovery: failed to save block state: %w", err)
 	}
 
-	// Remove replayed WAL files
-	for _, fname := range walFiles {
-		os.Remove(filepath.Join(walDir, fname))
+	// Remove only successfully-read WAL files (keep failed ones for retry)
+	for _, fname := range successFiles {
+		if err := os.Remove(filepath.Join(walDir, fname)); err != nil {
+			slog.Warn("WAL recovery: failed to remove WAL file", "file", fname, "error", err)
+		}
 	}
 
 	slog.Info("WAL recovery: complete", "recovered_blocks", len(sortedBlocks))
