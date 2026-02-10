@@ -1751,6 +1751,197 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 	})
 }
 
+func TestRecoverLocalWALs(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals", func(t *testing.T, vb *VB) {
+		t.Run("Recover blocks from orphaned WAL", func(t *testing.T) {
+			// Write 3 blocks and flush to WAL (simulates normal writes)
+			testData := make([][]byte, 3)
+			for i := range 3 {
+				testData[i] = make([]byte, DefaultBlockSize)
+				msg := fmt.Sprintf("recover_block_%d", i)
+				copy(testData[i][:len(msg)], msg)
+				err := vb.WriteAt(uint64(i)*uint64(vb.BlockSize), testData[i])
+				assert.NoError(t, err)
+			}
+
+			err := vb.Flush()
+			assert.NoError(t, err)
+
+			// At this point blocks are in WAL file on disk but NOT in chunks/S3.
+			// Simulate a crash: reset in-memory state without calling Close/WriteWALToChunk.
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			// Run recovery — should find WAL file and replay blocks into chunks
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// Verify blocks are now in BlocksToObject (persisted to backend)
+			for i := range 3 {
+				_, _, err := vb.LookupBlockToObject(uint64(i))
+				assert.NoError(t, err, "Block %d should be in BlocksToObject after recovery", i)
+			}
+
+			// Verify data is readable from backend
+			for i := range 3 {
+				data, err := vb.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+				assert.NoError(t, err)
+				assert.Equal(t, testData[i], data, "Block %d data mismatch after recovery", i)
+			}
+		})
+	})
+}
+
+func TestRecoverLocalWALsEmpty(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_empty", func(t *testing.T, vb *VB) {
+		t.Run("No WAL files is no-op", func(t *testing.T) {
+			// Remove any WAL files that setup may have created
+			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+			entries, err := os.ReadDir(walDir)
+			if err == nil {
+				for _, entry := range entries {
+					os.Remove(filepath.Join(walDir, entry.Name()))
+				}
+			}
+
+			// Recovery should succeed as a no-op
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// BlocksToObject should be empty
+			vb.BlocksToObject.mu.RLock()
+			count := len(vb.BlocksToObject.BlockLookup)
+			vb.BlocksToObject.mu.RUnlock()
+			assert.Equal(t, 0, count, "BlocksToObject should remain empty")
+		})
+	})
+}
+
+func TestRecoverLocalWALsPartialRecord(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_partial", func(t *testing.T, vb *VB) {
+		t.Run("Partial/corrupt record still recovers valid blocks", func(t *testing.T) {
+			// Write 2 valid blocks and flush to WAL
+			testData := make([][]byte, 2)
+			for i := range 2 {
+				testData[i] = make([]byte, DefaultBlockSize)
+				msg := fmt.Sprintf("partial_block_%d", i)
+				copy(testData[i][:len(msg)], msg)
+				err := vb.WriteAt(uint64(i)*uint64(vb.BlockSize), testData[i])
+				assert.NoError(t, err)
+			}
+
+			err := vb.Flush()
+			assert.NoError(t, err)
+
+			// Find the WAL file and append garbage bytes to simulate a partial write
+			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+			entries, err := os.ReadDir(walDir)
+			require.NoError(t, err)
+			require.NotEmpty(t, entries)
+
+			// Append garbage to the last WAL file
+			lastWAL := filepath.Join(walDir, entries[len(entries)-1].Name())
+			f, err := os.OpenFile(lastWAL, os.O_APPEND|os.O_WRONLY, 0640)
+			require.NoError(t, err)
+			_, err = f.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03})
+			require.NoError(t, err)
+			f.Close()
+
+			// Reset in-memory state (simulate crash)
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			// Recovery should still succeed and recover the 2 valid blocks
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// Verify both blocks are recovered
+			for i := range 2 {
+				_, _, err := vb.LookupBlockToObject(uint64(i))
+				assert.NoError(t, err, "Block %d should be recovered despite trailing corruption", i)
+			}
+
+			// Verify data is correct
+			for i := range 2 {
+				data, err := vb.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+				assert.NoError(t, err)
+				assert.Equal(t, testData[i], data, "Block %d data mismatch after partial recovery", i)
+			}
+		})
+	})
+}
+
+func TestRecoverLocalWALsDedup(t *testing.T) {
+
+	runWithBackends(t, "recover_local_wals_dedup", func(t *testing.T, vb *VB) {
+		t.Run("Deduplication uses latest SeqNum", func(t *testing.T) {
+			// Write block 0 with initial data
+			initialData := make([]byte, DefaultBlockSize)
+			copy(initialData, "initial_data")
+			err := vb.WriteAt(0, initialData)
+			assert.NoError(t, err)
+
+			err = vb.Flush()
+			assert.NoError(t, err)
+
+			// Write block 0 again with updated data (higher SeqNum)
+			updatedData := make([]byte, DefaultBlockSize)
+			copy(updatedData, "updated_data")
+			err = vb.WriteAt(0, updatedData)
+			assert.NoError(t, err)
+
+			err = vb.Flush()
+			assert.NoError(t, err)
+
+			// Reset in-memory state (simulate crash)
+			vb.BlocksToObject.mu.Lock()
+			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.mu.Unlock()
+
+			vb.PendingBackendWrites.mu.Lock()
+			vb.PendingBackendWrites.Blocks = nil
+			vb.PendingBackendWrites.mu.Unlock()
+
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+			}
+
+			// Recovery should replay and deduplicate — latest write wins
+			err = vb.RecoverLocalWALs()
+			assert.NoError(t, err)
+
+			// Verify block 0 contains the updated data (not the initial data)
+			data, err := vb.ReadAt(0, uint64(vb.BlockSize))
+			assert.NoError(t, err)
+
+			expected := make([]byte, DefaultBlockSize)
+			copy(expected, "updated_data")
+			assert.Equal(t, expected, data, "Block 0 should contain the latest write after dedup recovery")
+		})
+	})
+}
+
 // waitForServer polls the URL until it responds or times out
 func waitForServer(url string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)

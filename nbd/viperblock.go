@@ -178,6 +178,11 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
 	}
 
+	err = vb.RecoverLocalWALs()
+	if err != nil {
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not recover local WALs: %v", err)}
+	}
+
 	walNum = vb.WAL.WallNum.Add(1)
 	slog.Info("Loaded WAL number", "walNum", walNum)
 

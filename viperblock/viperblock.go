@@ -1596,6 +1596,221 @@ func (vb *VB) LoadBlockState() (err error) {
 	return err
 }
 
+// readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.
+// Unlike WriteWALToChunk which discards everything on checksum mismatch, this is
+// checksum-tolerant: on mismatch or unexpected EOF it stops reading but returns
+// all valid blocks read before the corrupt entry.
+func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open WAL file for recovery: %w", err)
+	}
+	defer f.Close()
+
+	// Validate header (magic + version + blocksize + timestamp = 18 bytes)
+	headerSize := vb.WALHeaderSize()
+	header := make([]byte, headerSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return nil, 0, fmt.Errorf("failed to read WAL header: %w", err)
+	}
+
+	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
+		return nil, 0, fmt.Errorf("WAL magic mismatch in %s", filename)
+	}
+	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
+		return nil, 0, fmt.Errorf("WAL version mismatch in %s", filename)
+	}
+
+	var blocks []Block
+	var maxSeqNum uint64
+	recordSize := 28 + int(vb.BlockSize)
+
+	for {
+		record := make([]byte, recordSize)
+		_, err := io.ReadFull(f, record)
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			break
+		}
+
+		// Validate CRC32 checksum
+		checksum := binary.BigEndian.Uint32(record[24:28])
+		checksumValidated := crc32.ChecksumIEEE(record[:24])
+		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, record[28:])
+
+		if checksumValidated != checksum {
+			slog.Info("WAL recovery: checksum mismatch, stopping read", "file", filename)
+			break
+		}
+
+		seqNum := binary.BigEndian.Uint64(record[:8])
+		blockNum := binary.BigEndian.Uint64(record[8:16])
+		blockLen := binary.BigEndian.Uint64(record[16:24])
+
+		data := make([]byte, len(record[28:]))
+		copy(data, record[28:])
+
+		blocks = append(blocks, Block{
+			SeqNum: seqNum,
+			Block:  blockNum,
+			Len:    blockLen,
+			Data:   data,
+		})
+
+		if seqNum > maxSeqNum {
+			maxSeqNum = seqNum
+		}
+	}
+
+	return blocks, maxSeqNum, nil
+}
+
+// RecoverLocalWALs scans for orphaned WAL files left behind by a crash and replays
+// valid blocks into S3 chunks via createChunkFile. This must be called between
+// LoadBlockState() and OpenWAL() during boot to prevent data loss.
+func (vb *VB) RecoverLocalWALs() error {
+	walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read WAL directory: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Collect WAL filenames and sort ascending
+	var walFiles []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		walFiles = append(walFiles, entry.Name())
+	}
+
+	if len(walFiles) == 0 {
+		return nil
+	}
+
+	sort.Strings(walFiles)
+
+	slog.Info("WAL recovery: found orphaned WAL files", "count", len(walFiles))
+
+	// Read all valid blocks from all WAL files
+	var allBlocks []Block
+	var maxSeqNum uint64
+
+	for _, fname := range walFiles {
+		fullPath := filepath.Join(walDir, fname)
+		blocks, fileMaxSeq, err := vb.readWALFileForRecovery(fullPath)
+		if err != nil {
+			slog.Error("WAL recovery: failed to read WAL file, skipping", "file", fname, "error", err)
+			continue
+		}
+		allBlocks = append(allBlocks, blocks...)
+		if fileMaxSeq > maxSeqNum {
+			maxSeqNum = fileMaxSeq
+		}
+	}
+
+	if len(allBlocks) == 0 {
+		slog.Info("WAL recovery: no valid blocks found in orphaned WAL files, cleaning up")
+		for _, fname := range walFiles {
+			os.Remove(filepath.Join(walDir, fname))
+		}
+		return nil
+	}
+
+	// Deduplicate: highest SeqNum wins per block number
+	blocksMap := make(BlocksMapOptimised, len(allBlocks))
+	for index, block := range allBlocks {
+		if existing, ok := blocksMap[block.Block]; !ok || existing.SeqNum < block.SeqNum {
+			blocksMap[block.Block] = BlockOptimised{
+				SeqNum: block.SeqNum,
+				Index:  index,
+			}
+		}
+	}
+
+	// Sort by block number and buffer into 4MB chunks
+	sortedBlocks := make([]*Block, 0, len(blocksMap))
+	for _, opt := range blocksMap {
+		sortedBlocks = append(sortedBlocks, &allBlocks[opt.Index])
+	}
+	sort.Slice(sortedBlocks, func(i, j int) bool { return sortedBlocks[i].Block < sortedBlocks[j].Block })
+
+	slog.Info("WAL recovery: replaying blocks", "unique_blocks", len(sortedBlocks))
+
+	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
+	matchedBlocks := make([]Block, 0)
+
+	for _, block := range sortedBlocks {
+		chunkBuffer = append(chunkBuffer, block.Data...)
+		matchedBlocks = append(matchedBlocks, Block{
+			SeqNum: block.SeqNum,
+			Block:  block.Block,
+		})
+
+		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
+			if err := vb.createChunkFile(0, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks); err != nil {
+				return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
+			}
+			chunkBuffer = chunkBuffer[:0]
+			matchedBlocks = make([]Block, 0)
+		}
+	}
+
+	if len(chunkBuffer) > 0 {
+		if err := vb.createChunkFile(0, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks); err != nil {
+			return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
+		}
+	}
+
+	// Sync BlockStore from BlocksToObject since createChunkFile's MarkPersisted
+	// won't work during recovery (blocks aren't in Pending state in BlockStore)
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		vb.BlocksToObject.mu.RLock()
+		for blockNum, lookup := range vb.BlocksToObject.BlockLookup {
+			vb.BlockStore.SetPersisted(blockNum, lookup.ObjectID, lookup.ObjectOffset, 0)
+		}
+		vb.BlocksToObject.mu.RUnlock()
+	}
+
+	// Advance SeqNum if recovered blocks have higher values
+	for {
+		current := vb.SeqNum.Load()
+		if maxSeqNum <= current {
+			break
+		}
+		if vb.SeqNum.CompareAndSwap(current, maxSeqNum) {
+			break
+		}
+	}
+
+	// Persist recovered state
+	if err := vb.SaveState(); err != nil {
+		return fmt.Errorf("WAL recovery: failed to save state: %w", err)
+	}
+	if err := vb.SaveBlockState(); err != nil {
+		return fmt.Errorf("WAL recovery: failed to save block state: %w", err)
+	}
+
+	// Remove replayed WAL files
+	for _, fname := range walFiles {
+		os.Remove(filepath.Join(walDir, fname))
+	}
+
+	slog.Info("WAL recovery: complete", "recovered_blocks", len(sortedBlocks))
+
+	return nil
+}
+
 // Lookup Block to Object
 func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, err error) {
 
