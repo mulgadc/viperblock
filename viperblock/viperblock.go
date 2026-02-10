@@ -54,6 +54,9 @@ type VBState struct {
 	Version uint16
 
 	VolumeConfig VolumeConfig
+
+	SnapshotID       string `json:"SnapshotID,omitempty"`
+	SourceVolumeName string `json:"SourceVolumeName,omitempty"`
 }
 
 type VB struct {
@@ -117,6 +120,18 @@ type VB struct {
 	BaseDir string
 
 	VolumeConfig VolumeConfig
+
+	// BaseBlockMap is the frozen block-to-object map from a parent snapshot.
+	// Used for copy-on-write clones: if a block isn't in our own BlocksToObject,
+	// fall back to this map. Nil for non-cloned volumes.
+	BaseBlockMap *BlocksToObject
+
+	// SourceVolumeName is the volume whose chunk files the BaseBlockMap references.
+	// Reads that hit BaseBlockMap fetch from this volume's chunks, not our own.
+	SourceVolumeName string
+
+	// SnapshotID is set when this volume was created from a snapshot.
+	SnapshotID string
 }
 
 // CacheConfig holds configuration for the LRU cache
@@ -1616,6 +1631,8 @@ func (vb *VB) SaveState() error {
 		BlockToObjectWALNum: vb.BlockToObjectWAL.WallNum.Load(),
 		Version:             vb.Version,
 		VolumeConfig:        vb.VolumeConfig,
+		SnapshotID:          vb.SnapshotID,
+		SourceVolumeName:    vb.SourceVolumeName,
 	}
 
 	// Save as JSON
@@ -1698,6 +1715,16 @@ func (vb *VB) LoadState() error {
 
 	vb.Version = state.Version
 	vb.VolumeConfig = state.VolumeConfig
+	vb.SnapshotID = state.SnapshotID
+	vb.SourceVolumeName = state.SourceVolumeName
+
+	// If this volume was created from a snapshot, load the base block map
+	if vb.SnapshotID != "" {
+		if err := vb.OpenFromSnapshot(vb.SnapshotID); err != nil {
+			slog.Error("Failed to load snapshot base map", "snapshotID", vb.SnapshotID, "error", err)
+			return fmt.Errorf("failed to load snapshot %s: %w", vb.SnapshotID, err)
+		}
+	}
 
 	slog.Debug("Loaded state", "state", state)
 
@@ -1775,6 +1802,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	var consecutiveBlocks ConsecutiveBlocks
+	var baseConsecutiveBlocks ConsecutiveBlocks
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -1810,6 +1838,22 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Next, fetch which object and offset the block is within
 		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
+			// Block not in our own map -- check snapshot base map
+			if err == ErrZeroBlock && vb.BaseBlockMap != nil {
+				baseObjectID, baseObjectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				if baseErr == nil {
+					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      baseObjectID,
+						ObjectOffset:  baseObjectOffset,
+					})
+					continue
+				}
+			}
 			zeroBlockErr = ErrZeroBlock
 			slog.Debug("[READ] ZERO BLOCK:", "block", currentBlock)
 
@@ -1902,6 +1946,14 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 		}
 
+	}
+
+	// Fetch blocks from the source volume's backend (snapshot fallback)
+	if len(baseConsecutiveBlocks) > 0 {
+		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return data, zeroBlockErr
@@ -2157,6 +2209,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	var consecutiveBlocks ConsecutiveBlocks
+	var baseConsecutiveBlocks ConsecutiveBlocks
 
 	for i := uint64(0); i < blockRequests; i++ {
 		currentBlock := block + i
@@ -2191,16 +2244,39 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 			})
 
 		case BlockStateEmpty:
-			// Zero block - already zeroed in data slice
+			// Block not in our own map -- check snapshot base map
+			if err == ErrZeroBlock && vb.BaseBlockMap != nil {
+				objectID, objectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				if baseErr == nil {
+					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      objectID,
+						ObjectOffset:  objectOffset,
+					})
+					continue
+				}
+			}
 			if err == ErrZeroBlock {
 				zeroBlockErr = ErrZeroBlock
 			}
 		}
 	}
 
-	// Fetch consecutive blocks from backend (same logic as legacy read)
+	// Fetch consecutive blocks from our own backend
 	if len(consecutiveBlocks) > 0 {
 		err = vb.fetchConsecutiveBlocksFromBackend(consecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch blocks from the source volume's backend (snapshot fallback)
+	if len(baseConsecutiveBlocks) > 0 {
+		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -2267,6 +2343,74 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 		}
 
 		// Also update legacy LRU cache if enabled
+		if vb.Cache.Config.Size > 0 {
+			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
+				currentBlock := cb.StartBlock + i
+				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
+			}
+		}
+	}
+
+	return nil
+}
+
+// fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
+// Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
+func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+	var consecutiveBlocksToRead ConsecutiveBlocks
+	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
+
+	for i := 0; i < len(consecutiveBlocks); i++ {
+		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
+			continue
+		}
+
+		numBlocks := 1
+		for j := i + 1; j < len(consecutiveBlocks); j++ {
+			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) &&
+				consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+				numBlocks++
+				consecutiveBlocksRead[consecutiveBlocks[j].StartBlock] = true
+			} else {
+				break
+			}
+		}
+
+		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
+			BlockPosition: consecutiveBlocks[i].BlockPosition,
+			StartBlock:    consecutiveBlocks[i].StartBlock,
+			NumBlocks:     utils.SafeIntToUint16(numBlocks),
+			OffsetStart:   consecutiveBlocks[i].OffsetStart,
+			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
+			ObjectID:      consecutiveBlocks[i].ObjectID,
+			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
+		})
+	}
+
+	for _, cb := range consecutiveBlocksToRead {
+		slog.Debug("[READ] READING BASE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "sourceVolume", sourceVolume)
+
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * uint32(vb.BlockSize)
+		start := cb.BlockPosition * uint64(vb.BlockSize)
+		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
+
+		blockData, err := vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		if err != nil {
+			return err
+		}
+
+		copy(data[start:end], blockData)
+
+		// Cache blocks in BlockStore
+		if vb.UseBlockStore {
+			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
+				currentBlock := cb.StartBlock + i
+				blockStart := i * uint64(vb.BlockSize)
+				blockEnd := blockStart + uint64(vb.BlockSize)
+				vb.BlockStore.Cache(currentBlock, blockData[blockStart:blockEnd])
+			}
+		}
+
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i

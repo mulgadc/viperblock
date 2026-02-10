@@ -4,16 +4,29 @@
 
 package memory
 
+import "github.com/mulgadc/viperblock/types"
+
 type Backend struct{}
 
-func (backend *Backend) Open() {
+func (backend *Backend) Init() error                { return nil }
+func (backend *Backend) Open(fname string) error    { return nil }
+func (backend *Backend) Sync()                      {}
+func (backend *Backend) GetBackendType() string     { return "memory" }
+func (backend *Backend) GetHost() string            { return "" }
+func (backend *Backend) SetConfig(config any)       {}
 
+func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
+	return nil, nil
 }
 
-func (backend *Backend) Read() {
-
+func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	return nil
 }
 
-func (backend *Backend) Write() {
+func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
+	return nil, nil
+}
 
+func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	return nil
 }

@@ -214,6 +214,69 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	return nil
 }
 
+func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+	slog.Info("[S3 READFROM] Reading object", "volumeName", volumeName, "objectId", objectId, "offset", offset, "length", length)
+
+	if backend.config.S3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+
+	filename := types.GetFilePath(fileType, objectId, volumeName)
+
+	requestObject := &s3.GetObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(filename),
+	}
+
+	if length > 0 {
+		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	}
+
+	textResult, err := backend.config.S3Client.GetObject(requestObject)
+	if err != nil {
+		return nil, err
+	}
+	defer textResult.Body.Close()
+
+	res, err := io.ReadAll(textResult.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	if backend.config.S3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+
+	filename := types.GetFilePath(fileType, objectId, volumeName)
+
+	var body []byte
+	if headers != nil && len(*headers) > 0 {
+		body = make([]byte, len(*headers)+len(*data))
+		copy(body[:len(*headers)], *headers)
+		copy(body[len(*headers):], *data)
+	} else {
+		body = *data
+	}
+
+	object := &s3.PutObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(filename),
+		Body:   bytes.NewReader(body),
+	}
+
+	_, err = backend.config.S3Client.PutObject(object)
+	if err != nil {
+		slog.Error("Error writing object", "error", err)
+		return err
+	}
+
+	return nil
+}
+
 func (backend *Backend) Sync() {
 }
 
