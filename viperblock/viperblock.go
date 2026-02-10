@@ -263,6 +263,7 @@ type AMIMetadata struct {
 	Virtualization  string            // "hvm"
 	ImageOwnerAlias string            // e.g. "hive"
 	VolumeSizeGiB   uint64            // Size of the root image
+	SnapshotID      string            // Snapshot ID for zero-copy cloning
 	Tags            map[string]string // Metadata tags
 }
 

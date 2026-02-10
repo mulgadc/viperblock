@@ -182,11 +182,21 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 	}
 
+	// Create a snapshot for AMI imports so that instance launches can use
+	// zero-copy cloning (OpenFromSnapshot) instead of block-by-block copy.
+	if vbConfig.VolumeConfig.AMIMetadata.Name != "" {
+		snapshotID := fmt.Sprintf("snap-%s", vb.VolumeName)
+		_, err := vb.CreateSnapshot(snapshotID)
+		if err != nil {
+			return fmt.Errorf("failed to create AMI snapshot: %v", err)
+		}
+		vb.VolumeConfig.AMIMetadata.SnapshotID = snapshotID
+	}
+
 	err = vb.Close()
 	if err != nil {
 		return fmt.Errorf("failed to close Viperblock store: %v", err)
 	}
 
-	// Implementation would go here
 	return nil
 }
