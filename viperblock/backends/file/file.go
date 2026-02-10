@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
@@ -182,6 +183,62 @@ func (backend *Backend) GetBackendType() string {
 
 func (backend *Backend) SetConfig(config any) {
 	backend.config = config.(FileConfig)
+}
+
+func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, volumeName))
+
+	f, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	if length == 0 {
+		stat, err := os.Stat(filename)
+		if err != nil {
+			return nil, err
+		}
+		length = utils.SafeInt64ToUint32(stat.Size())
+	}
+
+	data = make([]byte, length)
+	_, err = f.ReadAt(data, int64(offset))
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, volumeName))
+
+	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return fmt.Errorf("failed to create directory for %s: %w", filename, err)
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		slog.Error("Failed to create file", "error", err)
+		return err
+	}
+
+	if headers != nil && len(*headers) > 0 {
+		if _, err = file.Write(*headers); err != nil {
+			file.Close()
+			return err
+		}
+	}
+
+	if data != nil {
+		if _, err = file.Write(*data); err != nil {
+			file.Close()
+			return err
+		}
+	}
+
+	return file.Close()
 }
 
 func (backend *Backend) GetHost() string {

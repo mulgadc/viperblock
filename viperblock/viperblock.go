@@ -1,4 +1,4 @@
-// Copyright 2025 Mulga Defense Corporation (MDC). All rights reserved.
+// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
@@ -54,6 +54,9 @@ type VBState struct {
 	Version uint16
 
 	VolumeConfig VolumeConfig
+
+	SnapshotID       string `json:"SnapshotID,omitempty"`
+	SourceVolumeName string `json:"SourceVolumeName,omitempty"`
 }
 
 type VB struct {
@@ -117,6 +120,18 @@ type VB struct {
 	BaseDir string
 
 	VolumeConfig VolumeConfig
+
+	// BaseBlockMap is the frozen block-to-object map from a parent snapshot.
+	// Used for copy-on-write clones: if a block isn't in our own BlocksToObject,
+	// fall back to this map. Nil for non-cloned volumes.
+	BaseBlockMap *BlocksToObject
+
+	// SourceVolumeName is the volume whose chunk files the BaseBlockMap references.
+	// Reads that hit BaseBlockMap fetch from this volume's chunks, not our own.
+	SourceVolumeName string
+
+	// SnapshotID is set when this volume was created from a snapshot.
+	SnapshotID string
 }
 
 // CacheConfig holds configuration for the LRU cache
@@ -219,19 +234,19 @@ type VolumeConfig struct {
 
 // Meta-data
 type VolumeMetadata struct {
-	VolumeID         string // e.g. "vol-0abcd1234ef567890"
-	VolumeName       string // Optional name for UI or tagging
-	TenantID         string // For multi-tenant support
-	SizeGiB          uint64 // Volume size in GiB
-	State            string // "creating", "available", "in-use", "deleted"
-	CreatedAt        time.Time
-	AttachedAt       time.Time         // When volume was attached to instance
-	AvailabilityZone string            // Optional: "us-west-1a"
-	AttachedInstance string            // Instance ID (if any)
-	DeviceName       string            // e.g. "/dev/nbd1"
-	VolumeType       string            // e.g. "gp3", "io1"
-	IOPS             int               // For provisioned volumes
-	Tags             map[string]string // User-defined metadata
+	VolumeID            string // e.g. "vol-0abcd1234ef567890"
+	VolumeName          string // Optional name for UI or tagging
+	TenantID            string // For multi-tenant support
+	SizeGiB             uint64 // Volume size in GiB
+	State               string // "creating", "available", "in-use", "deleted"
+	CreatedAt           time.Time
+	AttachedAt          time.Time         // When volume was attached to instance
+	AvailabilityZone    string            // Optional: "us-west-1a"
+	AttachedInstance    string            // Instance ID (if any)
+	DeviceName          string            // e.g. "/dev/nbd1"
+	VolumeType          string            // e.g. "gp3", "io1"
+	IOPS                int               // For provisioned volumes
+	Tags                map[string]string // User-defined metadata
 	SnapshotID          string            // If created from a snapshot
 	IsEncrypted         bool              // Encryption flag
 	DeleteOnTermination bool              // Whether to delete volume when instance terminates
@@ -663,7 +678,7 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 
 			existing, err := vb.ReadAt(b*blockSize, blockSize)
 
-			if err != nil && err != ErrZeroBlock {
+			if err != nil && !errors.Is(err, ErrZeroBlock) {
 				return fmt.Errorf("failed to read block %d for RMW: %w", b, err)
 			}
 			blockData = make([]byte, blockSize)
@@ -762,9 +777,14 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 // Flush the main memory (writes) to the WAL
 func (vb *VB) Flush() error {
 	vb.Writes.mu.Lock()
+	defer vb.Writes.mu.Unlock()
+	return vb.flushLocked()
+}
+
+// flushLocked flushes hot writes to WAL. Caller must hold vb.Writes.mu.Lock().
+func (vb *VB) flushLocked() error {
 	flushBlocks := make([]Block, len(vb.Writes.Blocks))
 	copy(flushBlocks, vb.Writes.Blocks)
-	vb.Writes.mu.Unlock()
 
 	// Map to track successfully flushed blocks
 	flushed := make(map[uint64]uint64) // block -> seqnum
@@ -787,8 +807,6 @@ func (vb *VB) Flush() error {
 
 	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
 	if len(flushed) > 0 {
-		vb.Writes.mu.Lock()
-
 		remaining := make([]Block, 0)
 		for _, b := range vb.Writes.Blocks {
 			if _, ok := flushed[b.Block]; !ok {
@@ -799,22 +817,15 @@ func (vb *VB) Flush() error {
 		}
 
 		vb.Writes.Blocks = remaining
-		vb.Writes.mu.Unlock()
 	}
 
-	// Append successful flushed blocks to the PendingBackendWrites
+	// Append only successfully flushed blocks to PendingBackendWrites
 	vb.PendingBackendWrites.mu.Lock()
-	vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, flushBlocks...)
-
-	//slog.Info("PENDING BACKEND WRITES:", "len", len(vb.PendingBackendWrites.Blocks))
-	//spew.Dump(vb.PendingBackendWrites.Blocks)
-
-	/*
-		for _, block := range flushBlocks {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+	for _, b := range flushBlocks {
+		if _, ok := flushed[b.Block]; ok {
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
 		}
-	*/
-
+	}
 	vb.PendingBackendWrites.mu.Unlock()
 
 	if len(flushed) < len(flushBlocks) {
@@ -1086,23 +1097,22 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		}
 	}
 
-	// Increment the WAL number and unlock
-	nextWalNum := vb.WAL.WallNum.Add(1)
-	vb.WAL.mu.Unlock()
-
-	// Create the next WAL file
-	err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
-	//err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), nextWalNum))
-	if err != nil {
-		return err
-	}
-
-	// Sync and close the pending WAL, then reopen for reading
-	// Sync ensures all buffered writes are flushed to disk before we read
+	// Sync and close the pending WAL under the lock so no concurrent
+	// WriteWAL() can write after sync but before close.
 	if err := pendingWAL.Sync(); err != nil {
+		vb.WAL.mu.Unlock()
 		return fmt.Errorf("failed to sync WAL before chunking: %w", err)
 	}
 	pendingWAL.Close()
+
+	nextWalNum := vb.WAL.WallNum.Add(1)
+	vb.WAL.mu.Unlock()
+
+	// Create the next WAL file (OpenWAL takes vb.WAL.mu internally)
+	err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
+	if err != nil {
+		return err
+	}
 
 	filename := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, currentWALNum, vb.GetVolume()))
 	//filename := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), currentWALNum)
@@ -1579,6 +1589,221 @@ func (vb *VB) LoadBlockState() (err error) {
 	return err
 }
 
+// readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.
+// Unlike WriteWALToChunk which discards everything on checksum mismatch, this is
+// checksum-tolerant: on mismatch or unexpected EOF it stops reading but returns
+// all valid blocks read before the corrupt entry.
+func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open WAL file for recovery: %w", err)
+	}
+	defer f.Close()
+
+	// Validate header (magic + version + blocksize + timestamp = 18 bytes)
+	headerSize := vb.WALHeaderSize()
+	header := make([]byte, headerSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return nil, 0, fmt.Errorf("failed to read WAL header: %w", err)
+	}
+
+	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
+		return nil, 0, fmt.Errorf("WAL magic mismatch in %s", filename)
+	}
+	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
+		return nil, 0, fmt.Errorf("WAL version mismatch in %s", filename)
+	}
+	walBlockSize := binary.BigEndian.Uint32(header[6:10])
+	if walBlockSize != vb.BlockSize {
+		return nil, 0, fmt.Errorf("WAL blocksize mismatch in %s: WAL has %d, expected %d", filename, walBlockSize, vb.BlockSize)
+	}
+
+	var blocks []Block
+	var maxSeqNum uint64
+	recordSize := 28 + int(vb.BlockSize)
+
+	for {
+		record := make([]byte, recordSize)
+		if _, err := io.ReadFull(f, record); err != nil {
+			if err != io.EOF && err != io.ErrUnexpectedEOF {
+				slog.Warn("WAL recovery: I/O error reading record, stopping", "file", filename, "error", err, "valid_records_so_far", len(blocks))
+			}
+			break
+		}
+
+		// Validate CRC32 checksum
+		checksum := binary.BigEndian.Uint32(record[24:28])
+		checksumValidated := crc32.ChecksumIEEE(record[:24])
+		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, record[28:])
+
+		if checksumValidated != checksum {
+			slog.Warn("WAL recovery: checksum mismatch, stopping read", "file", filename, "valid_records_so_far", len(blocks))
+			break
+		}
+
+		seqNum := binary.BigEndian.Uint64(record[:8])
+
+		blocks = append(blocks, Block{
+			SeqNum: seqNum,
+			Block:  binary.BigEndian.Uint64(record[8:16]),
+			Len:    binary.BigEndian.Uint64(record[16:24]),
+			Data:   append([]byte{}, record[28:]...),
+		})
+
+		maxSeqNum = max(maxSeqNum, seqNum)
+	}
+
+	return blocks, maxSeqNum, nil
+}
+
+// RecoverLocalWALs scans for orphaned WAL files left behind by a crash and replays
+// valid blocks into S3 chunks via createChunkFile. This must be called between
+// LoadBlockState() and OpenWAL() during boot to prevent data loss.
+func (vb *VB) RecoverLocalWALs() error {
+	walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read WAL directory: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Collect WAL filenames and sort ascending
+	var walFiles []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		walFiles = append(walFiles, entry.Name())
+	}
+
+	if len(walFiles) == 0 {
+		return nil
+	}
+
+	sort.Strings(walFiles)
+
+	slog.Info("WAL recovery: found orphaned WAL files", "count", len(walFiles))
+
+	// Read all valid blocks from all WAL files
+	var allBlocks []Block
+	var maxSeqNum uint64
+	var successFiles []string // only delete files we successfully read
+
+	for _, fname := range walFiles {
+		fullPath := filepath.Join(walDir, fname)
+		blocks, fileMaxSeq, err := vb.readWALFileForRecovery(fullPath)
+		if err != nil {
+			slog.Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
+			continue
+		}
+		successFiles = append(successFiles, fname)
+		allBlocks = append(allBlocks, blocks...)
+		maxSeqNum = max(maxSeqNum, fileMaxSeq)
+	}
+
+	if len(allBlocks) == 0 {
+		slog.Info("WAL recovery: no valid blocks found in orphaned WAL files, cleaning up")
+		for _, fname := range successFiles {
+			os.Remove(filepath.Join(walDir, fname))
+		}
+		return nil
+	}
+
+	// Deduplicate: highest SeqNum wins per block number
+	blocksMap := make(BlocksMapOptimised, len(allBlocks))
+	for index, block := range allBlocks {
+		if existing, ok := blocksMap[block.Block]; !ok || existing.SeqNum < block.SeqNum {
+			blocksMap[block.Block] = BlockOptimised{
+				SeqNum: block.SeqNum,
+				Index:  index,
+			}
+		}
+	}
+
+	// Sort by block number and buffer into 4MB chunks
+	sortedBlocks := make([]*Block, 0, len(blocksMap))
+	for _, opt := range blocksMap {
+		sortedBlocks = append(sortedBlocks, &allBlocks[opt.Index])
+	}
+	sort.Slice(sortedBlocks, func(i, j int) bool { return sortedBlocks[i].Block < sortedBlocks[j].Block })
+
+	slog.Info("WAL recovery: replaying blocks", "unique_blocks", len(sortedBlocks))
+
+	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
+	matchedBlocks := make([]Block, 0)
+
+	for _, block := range sortedBlocks {
+		chunkBuffer = append(chunkBuffer, block.Data...)
+		matchedBlocks = append(matchedBlocks, Block{
+			SeqNum: block.SeqNum,
+			Block:  block.Block,
+		})
+
+		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
+			if err := vb.createChunkFile(0, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks); err != nil {
+				return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
+			}
+			chunkBuffer = chunkBuffer[:0]
+			matchedBlocks = make([]Block, 0)
+		}
+	}
+
+	if len(chunkBuffer) > 0 {
+		if err := vb.createChunkFile(0, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks); err != nil {
+			return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
+		}
+	}
+
+	// Sync BlockStore from BlocksToObject since createChunkFile's MarkPersisted
+	// won't work during recovery (blocks aren't in Pending state in BlockStore)
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		vb.BlocksToObject.mu.RLock()
+		for _, block := range sortedBlocks {
+			if lookup, ok := vb.BlocksToObject.BlockLookup[block.Block]; ok {
+				vb.BlockStore.SetPersisted(block.Block, lookup.ObjectID, lookup.ObjectOffset, block.SeqNum)
+			}
+		}
+		vb.BlocksToObject.mu.RUnlock()
+	}
+
+	// Advance SeqNum if recovered blocks have higher values
+	for {
+		current := vb.SeqNum.Load()
+		if maxSeqNum <= current {
+			break
+		}
+		if vb.SeqNum.CompareAndSwap(current, maxSeqNum) {
+			break
+		}
+	}
+
+	// Persist recovered state
+	if err := vb.SaveState(); err != nil {
+		return fmt.Errorf("WAL recovery: failed to save state: %w", err)
+	}
+	if err := vb.SaveBlockState(); err != nil {
+		return fmt.Errorf("WAL recovery: failed to save block state: %w", err)
+	}
+
+	// Remove only successfully-read WAL files (keep failed ones for retry)
+	for _, fname := range successFiles {
+		if err := os.Remove(filepath.Join(walDir, fname)); err != nil {
+			slog.Warn("WAL recovery: failed to remove WAL file", "file", fname, "error", err)
+		}
+	}
+
+	slog.Info("WAL recovery: complete", "recovered_blocks", len(sortedBlocks))
+
+	return nil
+}
+
 // Lookup Block to Object
 func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, err error) {
 
@@ -1616,6 +1841,8 @@ func (vb *VB) SaveState() error {
 		BlockToObjectWALNum: vb.BlockToObjectWAL.WallNum.Load(),
 		Version:             vb.Version,
 		VolumeConfig:        vb.VolumeConfig,
+		SnapshotID:          vb.SnapshotID,
+		SourceVolumeName:    vb.SourceVolumeName,
 	}
 
 	// Save as JSON
@@ -1699,6 +1926,16 @@ func (vb *VB) LoadState() error {
 	vb.Version = state.Version
 	vb.VolumeConfig = state.VolumeConfig
 
+	// If this volume was created from a snapshot, load the base block map.
+	// OpenFromSnapshot sets SnapshotID and SourceVolumeName from the snapshot
+	// config, so we don't set them separately to avoid two sources of truth.
+	if state.SnapshotID != "" {
+		if err := vb.OpenFromSnapshot(state.SnapshotID); err != nil {
+			slog.Error("Failed to load snapshot base map", "snapshotID", state.SnapshotID, "error", err)
+			return fmt.Errorf("failed to load snapshot %s: %w", state.SnapshotID, err)
+		}
+	}
+
 	slog.Debug("Loaded state", "state", state)
 
 	return nil
@@ -1775,6 +2012,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	var consecutiveBlocks ConsecutiveBlocks
+	var baseConsecutiveBlocks ConsecutiveBlocks
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -1810,6 +2048,25 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Next, fetch which object and offset the block is within
 		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
+			if !errors.Is(err, ErrZeroBlock) {
+				return nil, fmt.Errorf("LookupBlockToObject block %d: %w", currentBlock, err)
+			}
+			// Block not in our own map -- check snapshot base map
+			if vb.BaseBlockMap != nil {
+				baseObjectID, baseObjectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				if baseErr == nil {
+					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      baseObjectID,
+						ObjectOffset:  baseObjectOffset,
+					})
+					continue
+				}
+			}
 			zeroBlockErr = ErrZeroBlock
 			slog.Debug("[READ] ZERO BLOCK:", "block", currentBlock)
 
@@ -1902,6 +2159,14 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 		}
 
+	}
+
+	// Fetch blocks from the source volume's backend (snapshot fallback)
+	if len(baseConsecutiveBlocks) > 0 {
+		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return data, zeroBlockErr
@@ -2157,6 +2422,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	var consecutiveBlocks ConsecutiveBlocks
+	var baseConsecutiveBlocks ConsecutiveBlocks
 
 	for i := uint64(0); i < blockRequests; i++ {
 		currentBlock := block + i
@@ -2191,16 +2457,39 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 			})
 
 		case BlockStateEmpty:
-			// Zero block - already zeroed in data slice
-			if err == ErrZeroBlock {
+			// Block not in our own map -- check snapshot base map
+			if vb.BaseBlockMap != nil {
+				objectID, objectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				if baseErr == nil {
+					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      objectID,
+						ObjectOffset:  objectOffset,
+					})
+					continue
+				}
+			}
+			if errors.Is(err, ErrZeroBlock) {
 				zeroBlockErr = ErrZeroBlock
 			}
 		}
 	}
 
-	// Fetch consecutive blocks from backend (same logic as legacy read)
+	// Fetch consecutive blocks from our own backend
 	if len(consecutiveBlocks) > 0 {
 		err = vb.fetchConsecutiveBlocksFromBackend(consecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch blocks from the source volume's backend (snapshot fallback)
+	if len(baseConsecutiveBlocks) > 0 {
+		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -2267,6 +2556,82 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 		}
 
 		// Also update legacy LRU cache if enabled
+		if vb.Cache.Config.Size > 0 {
+			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
+				currentBlock := cb.StartBlock + i
+				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
+			}
+		}
+	}
+
+	return nil
+}
+
+// fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
+// Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
+func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+	if sourceVolume == "" {
+		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
+	}
+	var consecutiveBlocksToRead ConsecutiveBlocks
+	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
+
+	for i := 0; i < len(consecutiveBlocks); i++ {
+		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
+			continue
+		}
+
+		numBlocks := 1
+		for j := i + 1; j < len(consecutiveBlocks); j++ {
+			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) &&
+				consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+				numBlocks++
+				consecutiveBlocksRead[consecutiveBlocks[j].StartBlock] = true
+			} else {
+				break
+			}
+		}
+
+		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
+			BlockPosition: consecutiveBlocks[i].BlockPosition,
+			StartBlock:    consecutiveBlocks[i].StartBlock,
+			NumBlocks:     utils.SafeIntToUint16(numBlocks),
+			OffsetStart:   consecutiveBlocks[i].OffsetStart,
+			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
+			ObjectID:      consecutiveBlocks[i].ObjectID,
+			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
+		})
+	}
+
+	for _, cb := range consecutiveBlocksToRead {
+		slog.Debug("[READ] READING BASE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "sourceVolume", sourceVolume)
+
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * uint32(vb.BlockSize)
+		start := cb.BlockPosition * uint64(vb.BlockSize)
+		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
+
+		blockData, err := vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		if err != nil {
+			return fmt.Errorf("ReadFrom source %s object %d: %w", sourceVolume, cb.ObjectID, err)
+		}
+
+		expectedLen := int(consecutiveBlockOffset)
+		if len(blockData) != expectedLen {
+			return fmt.Errorf("ReadFrom source %s object %d: short read: got %d bytes, expected %d", sourceVolume, cb.ObjectID, len(blockData), expectedLen)
+		}
+
+		copy(data[start:end], blockData)
+
+		// Cache blocks in BlockStore
+		if vb.UseBlockStore {
+			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
+				currentBlock := cb.StartBlock + i
+				blockStart := i * uint64(vb.BlockSize)
+				blockEnd := blockStart + uint64(vb.BlockSize)
+				vb.BlockStore.Cache(currentBlock, blockData[blockStart:blockEnd])
+			}
+		}
+
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i

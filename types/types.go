@@ -11,6 +11,8 @@ type Backend interface {
 	Open(fname string) error
 	Read(fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
 	Write(fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
+	ReadFrom(volumeName string, fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
+	WriteTo(volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	Sync()
 	GetBackendType() string
 	GetHost() string
