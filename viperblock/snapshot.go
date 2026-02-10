@@ -34,15 +34,16 @@ type SnapshotState struct {
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	slog.Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
 
-	// Hold the write lock for the entire snapshot operation to prevent new
-	// writes from arriving between flush and block map serialization.
+	// 1. Flush hot writes to WAL (hold write lock only for the fast WAL write)
 	vb.Writes.mu.Lock()
-	defer vb.Writes.mu.Unlock()
-
-	// 1. Flush hot writes to WAL, then persist WAL to chunk files on backend
 	if err := vb.flushLocked(); err != nil {
+		vb.Writes.mu.Unlock()
 		return nil, fmt.Errorf("snapshot flush failed: %w", err)
 	}
+	vb.Writes.mu.Unlock()
+
+	// Persist WAL to chunk files on backend (potentially slow S3 upload,
+	// no need to hold the write lock — new writes go to the next WAL file)
 	if err := vb.WriteWALToChunk(true); err != nil {
 		return nil, fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
 	}

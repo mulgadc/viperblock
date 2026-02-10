@@ -819,19 +819,13 @@ func (vb *VB) flushLocked() error {
 		vb.Writes.Blocks = remaining
 	}
 
-	// Append successful flushed blocks to the PendingBackendWrites
+	// Append only successfully flushed blocks to PendingBackendWrites
 	vb.PendingBackendWrites.mu.Lock()
-	vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, flushBlocks...)
-
-	//slog.Info("PENDING BACKEND WRITES:", "len", len(vb.PendingBackendWrites.Blocks))
-	//spew.Dump(vb.PendingBackendWrites.Blocks)
-
-	/*
-		for _, block := range flushBlocks {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, block)
+	for _, b := range flushBlocks {
+		if _, ok := flushed[b.Block]; ok {
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
 		}
-	*/
-
+	}
 	vb.PendingBackendWrites.mu.Unlock()
 
 	if len(flushed) < len(flushBlocks) {
@@ -1103,23 +1097,22 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		}
 	}
 
-	// Increment the WAL number and unlock
-	nextWalNum := vb.WAL.WallNum.Add(1)
-	vb.WAL.mu.Unlock()
-
-	// Create the next WAL file
-	err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
-	//err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), nextWalNum))
-	if err != nil {
-		return err
-	}
-
-	// Sync and close the pending WAL, then reopen for reading
-	// Sync ensures all buffered writes are flushed to disk before we read
+	// Sync and close the pending WAL under the lock so no concurrent
+	// WriteWAL() can write after sync but before close.
 	if err := pendingWAL.Sync(); err != nil {
+		vb.WAL.mu.Unlock()
 		return fmt.Errorf("failed to sync WAL before chunking: %w", err)
 	}
 	pendingWAL.Close()
+
+	nextWalNum := vb.WAL.WallNum.Add(1)
+	vb.WAL.mu.Unlock()
+
+	// Create the next WAL file (OpenWAL takes vb.WAL.mu internally)
+	err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
+	if err != nil {
+		return err
+	}
 
 	filename := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, currentWALNum, vb.GetVolume()))
 	//filename := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), currentWALNum)
