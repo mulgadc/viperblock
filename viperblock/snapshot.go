@@ -1,4 +1,4 @@
-// Copyright 2025 Mulga Defense Corporation (MDC). All rights reserved.
+// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
@@ -150,7 +150,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, string, 
 		return nil, "", fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, len(baseMap.BlockLookup))
 	}
 
-	slog.Info("LoadSnapshotBlockMap: loaded",
+	slog.Debug("LoadSnapshotBlockMap: loaded",
 		"snapshotID", snapshotID,
 		"sourceVolume", snap.SourceVolumeName,
 		"blocks", len(baseMap.BlockLookup))
@@ -176,7 +176,7 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 	vb.SourceVolumeName = sourceVolume
 	vb.SnapshotID = snapshotID
 
-	slog.Info("OpenFromSnapshot: clone ready",
+	slog.Debug("OpenFromSnapshot: clone ready",
 		"volume", vb.VolumeName,
 		"snapshotID", snapshotID,
 		"sourceVolume", sourceVolume,

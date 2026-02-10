@@ -1,4 +1,4 @@
-// Copyright 2025 Mulga Defense Corporation (MDC). All rights reserved.
+// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
@@ -234,19 +234,19 @@ type VolumeConfig struct {
 
 // Meta-data
 type VolumeMetadata struct {
-	VolumeID         string // e.g. "vol-0abcd1234ef567890"
-	VolumeName       string // Optional name for UI or tagging
-	TenantID         string // For multi-tenant support
-	SizeGiB          uint64 // Volume size in GiB
-	State            string // "creating", "available", "in-use", "deleted"
-	CreatedAt        time.Time
-	AttachedAt       time.Time         // When volume was attached to instance
-	AvailabilityZone string            // Optional: "us-west-1a"
-	AttachedInstance string            // Instance ID (if any)
-	DeviceName       string            // e.g. "/dev/nbd1"
-	VolumeType       string            // e.g. "gp3", "io1"
-	IOPS             int               // For provisioned volumes
-	Tags             map[string]string // User-defined metadata
+	VolumeID            string // e.g. "vol-0abcd1234ef567890"
+	VolumeName          string // Optional name for UI or tagging
+	TenantID            string // For multi-tenant support
+	SizeGiB             uint64 // Volume size in GiB
+	State               string // "creating", "available", "in-use", "deleted"
+	CreatedAt           time.Time
+	AttachedAt          time.Time         // When volume was attached to instance
+	AvailabilityZone    string            // Optional: "us-west-1a"
+	AttachedInstance    string            // Instance ID (if any)
+	DeviceName          string            // e.g. "/dev/nbd1"
+	VolumeType          string            // e.g. "gp3", "io1"
+	IOPS                int               // For provisioned volumes
+	Tags                map[string]string // User-defined metadata
 	SnapshotID          string            // If created from a snapshot
 	IsEncrypted         bool              // Encryption flag
 	DeleteOnTermination bool              // Whether to delete volume when instance terminates
