@@ -581,6 +581,12 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
+	return vb.openWALLocked(wal, filename)
+}
+
+// openWALLocked creates and opens a new WAL file. Caller must hold wal.mu.
+func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
+
 	// Create the directory if it doesn't exist
 	os.MkdirAll(filepath.Dir(filename), 0750)
 
@@ -1105,11 +1111,11 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 	}
 	pendingWAL.Close()
 
+	// Open the next WAL file while still holding the lock so there is no
+	// window where syncWALIfDirty or WriteWAL can see a closed DB entry.
 	nextWalNum := vb.WAL.WallNum.Add(1)
+	err := vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
 	vb.WAL.mu.Unlock()
-
-	// Create the next WAL file (OpenWAL takes vb.WAL.mu internally)
-	err := vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
 	if err != nil {
 		return err
 	}
