@@ -4,13 +4,7 @@
 
 package memory
 
-import (
-	"errors"
-
-	"github.com/mulgadc/viperblock/types"
-)
-
-var ErrMemoryBackendStub = errors.New("memory backend is a stub and does not store data")
+import "github.com/mulgadc/viperblock/types"
 
 type Backend struct{}
 
@@ -22,17 +16,17 @@ func (backend *Backend) GetHost() string            { return "" }
 func (backend *Backend) SetConfig(config any)       {}
 
 func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
-	return nil, ErrMemoryBackendStub
+	return nil, nil
 }
 
 func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
-	return ErrMemoryBackendStub
+	return nil
 }
 
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
-	return nil, ErrMemoryBackendStub
+	return nil, nil
 }
 
 func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
-	return ErrMemoryBackendStub
+	return nil
 }
