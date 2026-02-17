@@ -475,6 +475,9 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		// Initialize UnifiedBlockStore for O(1) lookups (enabled by default)
 		BlockStore:    NewUnifiedBlockStore(config.BlockSize),
 		UseBlockStore: true,
+
+		UseShardedWAL: true,
+		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
 	}
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
@@ -1560,6 +1563,11 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 }
 
 func (vb *VB) WriteWALToChunk(force bool) error {
+	// Dispatch to sharded implementation when enabled
+	if vb.UseShardedWAL {
+		return vb.WriteShardedWALToChunk(force)
+	}
+
 	// First, lock, and close the current WAL file
 	vb.WAL.mu.Lock()
 	if len(vb.WAL.DB) == 0 {

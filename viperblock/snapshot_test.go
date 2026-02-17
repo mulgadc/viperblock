@@ -356,7 +356,11 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 	require.NoError(t, err)
 
 	// Open WAL files for the clone
-	err = clone.OpenWAL(&clone.WAL, fmt.Sprintf("%s/%s", clone.WAL.BaseDir, fmt.Sprintf("%s/wal/chunks/wal.%08d.bin", cloneName, 0)))
+	if clone.UseShardedWAL {
+		err = clone.OpenShardedWAL()
+	} else {
+		err = clone.OpenWAL(&clone.WAL, fmt.Sprintf("%s/%s", clone.WAL.BaseDir, fmt.Sprintf("%s/wal/chunks/wal.%08d.bin", cloneName, 0)))
+	}
 	require.NoError(t, err)
 
 	err = clone.OpenWAL(&clone.BlockToObjectWAL, fmt.Sprintf("%s/%s", clone.BlockToObjectWAL.BaseDir, fmt.Sprintf("%s/wal/blocks/blocks.%08d.bin", cloneName, 0)))

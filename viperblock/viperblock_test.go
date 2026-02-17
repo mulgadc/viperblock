@@ -32,10 +32,11 @@ type TestVB struct {
 
 // BackendType represents the type of backend to use in tests
 type BackendTest struct {
-	Name        string
-	BackendType string
-	Config      any
-	CacheConfig CacheConfig
+	Name          string
+	BackendType   string
+	Config        any
+	CacheConfig   CacheConfig
+	UseShardedWAL bool
 }
 
 const (
@@ -236,16 +237,21 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	assert.NoError(t, err)
 	assert.NotNil(t, vb)
 
-	//err = vb.SetCacheSize(backendType.CacheConfig.Size, backendType.CacheConfig.SystemMemoryPercent)
-	//assert.NoError(t, err)
+	// Override sharded WAL setting from test config
+	vb.UseShardedWAL = backendType.UseShardedWAL
+	if !backendType.UseShardedWAL {
+		vb.ShardedWAL = nil
+	}
 
 	err = vb.Backend.Init()
 	assert.NoError(t, err)
 
-	//vb.WAL.BaseDir = tmpDir
-	// TODO: Simplify, setup in Init?
-	//err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
+	// Open the chunk WAL (sharded or legacy)
+	if vb.UseShardedWAL {
+		err = vb.OpenShardedWAL()
+	} else {
+		err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
+	}
 	assert.NoError(t, err)
 
 	//vb.BlockToObjectWAL.BaseDir = tmpDir
@@ -255,51 +261,82 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 	return vb, baseURL, shutdown, nil
 }
 
-// runWithBackends runs a test function with both file and S3 backends
+// runWithBackends runs a test function with both file and S3 backends,
+// and both legacy WAL and sharded WAL modes.
 func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, vb *VB)) {
+	s3Config := s3.S3Config{
+		VolumeName: "test_s3",
+		VolumeSize: volumeSize,
+		Region:     "ap-southeast-2",
+		Bucket:     "predastore",
+		AccessKey:  AccessKey,
+		SecretKey:  SecretKey,
+		Host:       "https://127.0.0.1:8443/",
+	}
+
 	backends := []BackendTest{
 		{
-			Name:        "file",
-			BackendType: FileBackend,
-			Config:      file.FileConfig{BaseDir: "test_data"},
-			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+			Name:          "file",
+			BackendType:   FileBackend,
+			Config:        file.FileConfig{BaseDir: "test_data"},
+			CacheConfig:   CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+			UseShardedWAL: true,
 		},
 
 		{
-			Name:        "file_nocache",
-			BackendType: FileBackend,
-			Config:      file.FileConfig{BaseDir: "test_data"},
-			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
+			Name:          "file_nocache",
+			BackendType:   FileBackend,
+			Config:        file.FileConfig{BaseDir: "test_data"},
+			CacheConfig:   CacheConfig{Size: 0, SystemMemoryPercent: 0},
+			UseShardedWAL: true,
 		},
 
 		{
-			Name:        "s3",
-			BackendType: S3Backend,
-			Config: s3.S3Config{
-				VolumeName: "test_s3",
-				VolumeSize: volumeSize,
-				Region:     "ap-southeast-2",
-				Bucket:     "predastore",
-				AccessKey:  AccessKey,
-				SecretKey:  SecretKey,
-				Host:       "https://127.0.0.1:8443/",
-			},
-			CacheConfig: CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+			Name:          "file_legacywal",
+			BackendType:   FileBackend,
+			Config:        file.FileConfig{BaseDir: "test_data"},
+			CacheConfig:   CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+			UseShardedWAL: false,
 		},
 
 		{
-			Name:        "s3_nocache",
-			BackendType: S3Backend,
-			Config: s3.S3Config{
-				VolumeName: "test_s3",
-				VolumeSize: volumeSize,
-				Region:     "ap-southeast-2",
-				Bucket:     "predastore",
-				AccessKey:  AccessKey,
-				SecretKey:  SecretKey,
-				Host:       "https://127.0.0.1:8443/",
-			},
-			CacheConfig: CacheConfig{Size: 0, SystemMemoryPercent: 0},
+			Name:          "file_legacywal_nocache",
+			BackendType:   FileBackend,
+			Config:        file.FileConfig{BaseDir: "test_data"},
+			CacheConfig:   CacheConfig{Size: 0, SystemMemoryPercent: 0},
+			UseShardedWAL: false,
+		},
+
+		{
+			Name:          "s3",
+			BackendType:   S3Backend,
+			Config:        s3Config,
+			CacheConfig:   CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+			UseShardedWAL: true,
+		},
+
+		{
+			Name:          "s3_nocache",
+			BackendType:   S3Backend,
+			Config:        s3Config,
+			CacheConfig:   CacheConfig{Size: 0, SystemMemoryPercent: 0},
+			UseShardedWAL: true,
+		},
+
+		{
+			Name:          "s3_legacywal",
+			BackendType:   S3Backend,
+			Config:        s3Config,
+			CacheConfig:   CacheConfig{Size: 1024 * 1024 * 1024, SystemMemoryPercent: 0},
+			UseShardedWAL: false,
+		},
+
+		{
+			Name:          "s3_legacywal_nocache",
+			BackendType:   S3Backend,
+			Config:        s3Config,
+			CacheConfig:   CacheConfig{Size: 0, SystemMemoryPercent: 0},
+			UseShardedWAL: false,
 		},
 	}
 
@@ -664,6 +701,9 @@ func TestWriteAndRead(t *testing.T) {
 		prevSeqNum := vb.SeqNum.Load()
 		prevObjectNum := vb.ObjectNum.Load()
 		prevWALNum := vb.WAL.WallNum.Load()
+		if vb.UseShardedWAL && vb.ShardedWAL != nil {
+			prevWALNum = vb.ShardedWAL.WallNum.Load()
+		}
 		compareState := vb.BlocksToObject.BlockLookup
 
 		// Gracefully close VB and save state to disk (only once after all subtests)
@@ -799,8 +839,12 @@ func TestWALPeriodicSync(t *testing.T) {
 			err = vb.Backend.Init()
 			require.NoError(t, err)
 
-			err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
-				vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+			if vb.UseShardedWAL {
+				err = vb.OpenShardedWAL()
+			} else {
+				err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
+					vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+			}
 			require.NoError(t, err)
 
 			// Write some data
@@ -824,7 +868,18 @@ func TestWALPeriodicSync(t *testing.T) {
 
 				// Check dirty flag is set (syncer hasn't run yet if interval > test duration)
 				if tc.syncInterval >= 50*time.Millisecond {
-					assert.True(t, vb.WAL.dirty.Load(), "dirty flag should be set after write")
+					if vb.UseShardedWAL {
+						anyDirty := false
+						for i := 0; i < NumShards; i++ {
+							if vb.ShardedWAL.Shards[i].dirty.Load() {
+								anyDirty = true
+								break
+							}
+						}
+						assert.True(t, anyDirty, "at least one shard dirty flag should be set after write")
+					} else {
+						assert.True(t, vb.WAL.dirty.Load(), "dirty flag should be set after write")
+					}
 				}
 
 				// Wait for syncer to run (interval + small buffer)
@@ -835,7 +890,13 @@ func TestWALPeriodicSync(t *testing.T) {
 				time.Sleep(waitTime + 20*time.Millisecond)
 
 				// Dirty flag should be cleared by syncer
-				assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after sync")
+				if vb.UseShardedWAL {
+					for i := 0; i < NumShards; i++ {
+						assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d dirty flag should be cleared after sync", i)
+					}
+				} else {
+					assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after sync")
+				}
 			}
 
 			// Test graceful shutdown
@@ -878,8 +939,12 @@ func TestWALSyncerConcurrency(t *testing.T) {
 	err = vb.Backend.Init()
 	require.NoError(t, err)
 
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
-		vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+	if vb.UseShardedWAL {
+		err = vb.OpenShardedWAL()
+	} else {
+		err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
+			vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load()))
+	}
 	require.NoError(t, err)
 
 	// Concurrent writes while syncer is running
@@ -915,7 +980,13 @@ func TestWALSyncerConcurrency(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Verify no data corruption - dirty flag should be clear
-	assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after all syncs")
+	if vb.UseShardedWAL {
+		for i := 0; i < NumShards; i++ {
+			assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d dirty flag should be cleared after all syncs", i)
+		}
+	} else {
+		assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after all syncs")
+	}
 
 	// Verify writes are readable
 	for i := 0; i < numWriters; i++ {
@@ -1992,6 +2063,12 @@ func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
 
 	runWithBackends(t, "recover_local_wals_checksum", func(t *testing.T, vb *VB) {
 		t.Run("Mid-record checksum corruption recovers blocks before corrupt record", func(t *testing.T) {
+			// This test manipulates WAL file bytes at specific offsets assuming legacy
+			// single-file format. Sharded WAL distributes records across 16 shard files
+			// and has its own recovery test (TestShardedWAL_Recovery).
+			if vb.UseShardedWAL {
+				t.Skip("Legacy WAL byte layout test — not applicable to sharded WAL")
+			}
 			// Write 3 blocks and flush to WAL
 			testData := make([][]byte, 3)
 			for i := range 3 {

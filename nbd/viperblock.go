@@ -37,6 +37,7 @@ var secret_key string
 var host string
 var base_dir string
 var cache_size int = 20
+var use_shardwal bool = true
 
 var disk []byte
 
@@ -87,6 +88,9 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		if err != nil {
 			return err
 		}
+		return nil
+	} else if key == "shardwal" {
+		use_shardwal = value == "true" || value == "1"
 		return nil
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
@@ -148,6 +152,9 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
+
+	// Apply nbdkit config override for sharded WAL
+	vb.UseShardedWAL = use_shardwal
 
 	//vb.SetDebug(true)
 

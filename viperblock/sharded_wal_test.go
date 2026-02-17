@@ -249,9 +249,13 @@ func TestShardedWAL_BackwardCompat(t *testing.T) {
 	err = vb.Backend.Init()
 	require.NoError(t, err)
 
-	// Legacy WAL (UseShardedWAL is false by default)
-	assert.False(t, vb.UseShardedWAL)
-	assert.Nil(t, vb.ShardedWAL)
+	// Sharded WAL is now enabled by default for new volumes
+	assert.True(t, vb.UseShardedWAL)
+	assert.NotNil(t, vb.ShardedWAL)
+
+	// Simulate an existing volume that saved ShardedWAL=false (legacy opt-out)
+	vb.UseShardedWAL = false
+	vb.ShardedWAL = nil
 
 	walPath := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, 0, vb.GetVolume()))
 	err = vb.OpenWAL(&vb.WAL, walPath)
