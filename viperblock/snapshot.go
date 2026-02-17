@@ -36,11 +36,16 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 
 	// 1. Flush hot writes to WAL (hold write lock only for the fast WAL write)
 	vb.Writes.mu.Lock()
-	if err := vb.flushLocked(); err != nil {
-		vb.Writes.mu.Unlock()
-		return nil, fmt.Errorf("snapshot flush failed: %w", err)
+	var flushErr error
+	if vb.UseShardedWAL {
+		flushErr = vb.flushLockedSharded()
+	} else {
+		flushErr = vb.flushLocked()
 	}
 	vb.Writes.mu.Unlock()
+	if flushErr != nil {
+		return nil, fmt.Errorf("snapshot flush failed: %w", flushErr)
+	}
 
 	// Persist WAL to chunk files on backend (potentially slow S3 upload,
 	// no need to hold the write lock — new writes go to the next WAL file)

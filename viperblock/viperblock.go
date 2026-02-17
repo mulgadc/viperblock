@@ -1355,6 +1355,22 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		return fmt.Errorf("ShardedWAL not initialized")
 	}
 
+	// If no shard files are open, this VB instance doesn't own the WAL.
+	// Skip consolidation (matches legacy WriteWALToChunk empty-DB guard).
+	hasOpenShards := false
+	for i := 0; i < NumShards; i++ {
+		sw.Shards[i].mu.RLock()
+		open := sw.Shards[i].DB != nil
+		sw.Shards[i].mu.RUnlock()
+		if open {
+			hasOpenShards = true
+			break
+		}
+	}
+	if !hasOpenShards {
+		return nil
+	}
+
 	currentWALNum := sw.WallNum.Load()
 
 	// Check total size across all shards
@@ -1459,15 +1475,19 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 			}
 
 			var blocks []Block
+			recordSize := 28 + int(vb.BlockSize)
 			for {
-				data := make([]byte, 28+vb.BlockSize)
-				_, err := file.Read(data)
+				data := make([]byte, recordSize)
+				n, err := file.Read(data)
 				if err != nil {
 					if err == io.EOF {
 						break
 					}
 					results[shardID].err = fmt.Errorf("error reading shard %d: %w", shardID, err)
 					return
+				}
+				if n < recordSize {
+					break // Incomplete record at EOF, discard
 				}
 
 				// Validate checksum
