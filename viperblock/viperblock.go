@@ -2818,6 +2818,24 @@ func (vb *VB) GetVolume() string {
 	return vb.VolumeName
 }
 
+// ownsWAL returns true if this VB instance has open WAL files.
+// A VB that never called OpenWAL/OpenShardedWAL (e.g. viperblockd's snapshot
+// VB) does not own the WAL and must not flush or consolidate.
+func (vb *VB) ownsWAL() bool {
+	if vb.UseShardedWAL && vb.ShardedWAL != nil {
+		for i := 0; i < NumShards; i++ {
+			vb.ShardedWAL.Shards[i].mu.RLock()
+			open := vb.ShardedWAL.Shards[i].DB != nil
+			vb.ShardedWAL.Shards[i].mu.RUnlock()
+			if open {
+				return true
+			}
+		}
+		return false
+	}
+	return len(vb.WAL.DB) > 0
+}
+
 func (vb *VB) Reset() error {
 
 	vb.BlocksToObject.mu.Lock()
