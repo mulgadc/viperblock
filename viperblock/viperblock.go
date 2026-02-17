@@ -476,7 +476,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		BlockStore:    NewUnifiedBlockStore(config.BlockSize),
 		UseBlockStore: true,
 
-		UseShardedWAL: true,
+		UseShardedWAL: false,
 		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
 	}
 
