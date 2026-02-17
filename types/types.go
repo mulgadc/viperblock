@@ -29,6 +29,7 @@ const (
 	FileTypeWALChunk
 	FileTypeWALBlock
 	FileTypeSSHAuthKey
+	FileTypeWALChunkShard
 )
 
 // getFilePath returns the appropriate S3 path based on file type and objectId
@@ -44,9 +45,22 @@ func GetFilePath(fileType FileType, objectId uint64, volumeName string) string {
 		return fmt.Sprintf("%s/wal/chunks/wal.%08d.bin", volumeName, objectId)
 	case FileTypeWALBlock:
 		return fmt.Sprintf("%s/wal/blocks/blocks.%08d.bin", volumeName, objectId)
+	case FileTypeWALChunkShard:
+		// Shard ID is encoded in the low 8 bits of objectId, WAL number in the upper bits.
+		// Use GetShardedWALPath for the explicit interface.
+		shardID := objectId & 0xFF
+		walNum := objectId >> 8
+		return fmt.Sprintf("%s/wal/chunks/wal.%08d.shard_%02d.bin", volumeName, walNum, shardID)
 	default:
 		return fmt.Sprintf("%s/unknown.%08d.bin", volumeName, objectId)
 	}
+}
+
+// GetShardedWALPath returns the file path for a sharded WAL file.
+// Files live in the same wal/chunks/ directory as legacy WAL files
+// so recovery can discover them alongside legacy files.
+func GetShardedWALPath(volumeName string, walNum uint64, shardID int) string {
+	return fmt.Sprintf("%s/wal/chunks/wal.%08d.shard_%02d.bin", volumeName, walNum, shardID)
 }
 
 // Example directory layout

@@ -55,6 +55,8 @@ type VBState struct {
 
 	VolumeConfig VolumeConfig
 
+	ShardedWAL bool `json:"ShardedWAL,omitempty"`
+
 	SnapshotID       string `json:"SnapshotID,omitempty"`
 	SourceVolumeName string `json:"SourceVolumeName,omitempty"`
 }
@@ -95,6 +97,14 @@ type VB struct {
 
 	// Periodically writes (Blocks) are flushed to the WAL log (default 5s, or when 64MB written, or OS flushes)
 	WAL WAL
+
+	// ShardedWAL splits the WAL into NumShards parallel files for reduced lock contention.
+	// When UseShardedWAL is true, writes route through ShardedWAL instead of WAL.
+	ShardedWAL *ShardedWAL
+
+	// UseShardedWAL enables the sharded WAL for write operations.
+	// When false, uses the legacy single-file WAL for backward compatibility.
+	UseShardedWAL bool
 
 	// BlockToObject WAL, stored on persistent storage for redundancy and periodic checkpointing
 	BlockToObjectWAL WAL
@@ -218,6 +228,26 @@ type WAL struct {
 	dirty atomic.Bool
 
 	mu sync.RWMutex
+}
+
+// WALShard represents a single shard of a sharded WAL.
+// Each shard has its own file and mutex, so writes to different shards
+// have zero lock contention.
+type WALShard struct {
+	DB      *os.File
+	dirty   atomic.Bool
+	mu      sync.RWMutex
+	shardID int
+}
+
+// ShardedWAL splits the WAL into NumShards parallel files.
+// Blocks are routed to shards via blockNum & ShardMask.
+// During consolidation, all shards are merged into unified 4MB chunks.
+type ShardedWAL struct {
+	Shards   [NumShards]*WALShard
+	WallNum  atomic.Uint64
+	BaseDir  string
+	WALMagic [4]byte
 }
 
 // ChunkWork represents a unit of work for the worker pool
@@ -514,10 +544,18 @@ func (vb *VB) StartWALSyncer() {
 		for {
 			select {
 			case <-vb.walSyncTicker.C:
-				vb.syncWALIfDirty()
+				if vb.UseShardedWAL {
+					vb.syncShardedWALIfDirty()
+				} else {
+					vb.syncWALIfDirty()
+				}
 			case <-vb.walSyncStop:
 				// Final sync before shutdown
-				vb.syncWALIfDirty()
+				if vb.UseShardedWAL {
+					vb.syncShardedWALIfDirty()
+				} else {
+					vb.syncWALIfDirty()
+				}
 				return
 			}
 		}
@@ -575,6 +613,34 @@ func (vb *VB) syncWALIfDirty() {
 	}
 }
 
+// syncShardedWALIfDirty fsyncs only the shards that have been written to since the last sync.
+func (vb *VB) syncShardedWALIfDirty() {
+	sw := vb.ShardedWAL
+	if sw == nil {
+		return
+	}
+
+	for i := 0; i < NumShards; i++ {
+		shard := sw.Shards[i]
+
+		// Fast path: skip clean shards
+		if !shard.dirty.Load() {
+			continue
+		}
+
+		shard.dirty.Store(false)
+
+		shard.mu.RLock()
+		if shard.DB != nil {
+			if err := shard.DB.Sync(); err != nil {
+				slog.Error("Sharded WAL sync failed", "shard", i, "error", err)
+				shard.dirty.Store(true)
+			}
+		}
+		shard.mu.RUnlock()
+	}
+}
+
 // WAL functions
 func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 
@@ -622,6 +688,67 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 
 	return err
 
+}
+
+// NewShardedWAL creates a ShardedWAL with initialized (but unopened) shards.
+func NewShardedWAL(baseDir string, magic [4]byte) *ShardedWAL {
+	sw := &ShardedWAL{
+		BaseDir:  baseDir,
+		WALMagic: magic,
+	}
+	for i := 0; i < NumShards; i++ {
+		sw.Shards[i] = &WALShard{shardID: i}
+	}
+	return sw
+}
+
+// OpenShardedWAL opens all shard files for the current WAL generation.
+// Each shard gets its own file with a standard WAL header.
+func (vb *VB) OpenShardedWAL() error {
+	sw := vb.ShardedWAL
+	if sw == nil {
+		return fmt.Errorf("ShardedWAL not initialized")
+	}
+
+	walNum := sw.WallNum.Load()
+	header := vb.WALHeader()
+
+	for i := 0; i < NumShards; i++ {
+		shard := sw.Shards[i]
+		shard.mu.Lock()
+
+		filename := filepath.Join(sw.BaseDir,
+			types.GetShardedWALPath(vb.GetVolume(), walNum, i))
+
+		os.MkdirAll(filepath.Dir(filename), 0750)
+
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+		if err != nil {
+			shard.mu.Unlock()
+			// Close any shards we already opened
+			for j := 0; j < i; j++ {
+				sw.Shards[j].mu.Lock()
+				if sw.Shards[j].DB != nil {
+					sw.Shards[j].DB.Close()
+					sw.Shards[j].DB = nil
+				}
+				sw.Shards[j].mu.Unlock()
+			}
+			return fmt.Errorf("failed to open shard %d: %w", i, err)
+		}
+
+		if _, err := file.Write(header); err != nil {
+			file.Close()
+			shard.mu.Unlock()
+			return fmt.Errorf("failed to write header for shard %d: %w", i, err)
+		}
+
+		shard.DB = file
+		shard.mu.Unlock()
+	}
+
+	slog.Debug("OpenShardedWAL complete", "walNum", walNum, "shards", NumShards)
+	return nil
 }
 
 func (vb *VB) WriteAt(offset uint64, data []byte) error {
@@ -785,6 +912,9 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 func (vb *VB) Flush() error {
 	vb.Writes.mu.Lock()
 	defer vb.Writes.mu.Unlock()
+	if vb.UseShardedWAL {
+		return vb.flushLockedSharded()
+	}
 	return vb.flushLocked()
 }
 
@@ -837,6 +967,99 @@ func (vb *VB) flushLocked() error {
 
 	if len(flushed) < len(flushBlocks) {
 		return fmt.Errorf("partial flush: %d of %d blocks flushed", len(flushed), len(flushBlocks))
+	}
+
+	return nil
+}
+
+// flushLockedSharded flushes hot writes to the sharded WAL in parallel.
+// Blocks are grouped by shard and written concurrently — one goroutine per shard.
+// Caller must hold vb.Writes.mu.Lock().
+func (vb *VB) flushLockedSharded() error {
+	flushBlocks := make([]Block, len(vb.Writes.Blocks))
+	copy(flushBlocks, vb.Writes.Blocks)
+
+	if len(flushBlocks) == 0 {
+		return nil
+	}
+
+	// Group blocks by shard
+	var shardGroups [NumShards][]Block
+	for _, block := range flushBlocks {
+		idx := block.Block & ShardMask
+		shardGroups[idx] = append(shardGroups[idx], block)
+	}
+
+	// Write to each shard in parallel
+	type shardError struct {
+		shardID int
+		err     error
+		flushed map[uint64]uint64
+	}
+	results := make([]shardError, NumShards)
+	var wg sync.WaitGroup
+
+	for i := 0; i < NumShards; i++ {
+		if len(shardGroups[i]) == 0 {
+			results[i].flushed = make(map[uint64]uint64)
+			continue
+		}
+		wg.Add(1)
+		go func(shardID int) {
+			defer wg.Done()
+			flushed := make(map[uint64]uint64)
+			for _, block := range shardGroups[shardID] {
+				if err := vb.WriteShardedWAL(block); err != nil {
+					slog.Error("ERROR FLUSHING SHARD:", "shard", shardID, "block", block.Block, "error", err)
+					results[shardID].err = err
+					results[shardID].flushed = flushed
+					return
+				}
+				flushed[block.Block] = block.SeqNum
+
+				if vb.UseBlockStore && vb.BlockStore != nil {
+					vb.BlockStore.MarkPending(block.Block)
+				}
+			}
+			results[shardID].flushed = flushed
+		}(i)
+	}
+	wg.Wait()
+
+	// Merge flushed maps from all shards
+	allFlushed := make(map[uint64]uint64)
+	var firstErr error
+	for i := 0; i < NumShards; i++ {
+		for k, v := range results[i].flushed {
+			allFlushed[k] = v
+		}
+		if results[i].err != nil && firstErr == nil {
+			firstErr = results[i].err
+		}
+	}
+
+	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
+	if len(allFlushed) > 0 {
+		remaining := make([]Block, 0)
+		for _, b := range vb.Writes.Blocks {
+			if _, ok := allFlushed[b.Block]; !ok {
+				remaining = append(remaining, b)
+			}
+		}
+		vb.Writes.Blocks = remaining
+	}
+
+	// Append successfully flushed blocks to PendingBackendWrites
+	vb.PendingBackendWrites.mu.Lock()
+	for _, b := range flushBlocks {
+		if _, ok := allFlushed[b.Block]; ok {
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
+		}
+	}
+	vb.PendingBackendWrites.mu.Unlock()
+
+	if firstErr != nil {
+		return fmt.Errorf("partial sharded flush: %d of %d blocks flushed: %w", len(allFlushed), len(flushBlocks), firstErr)
 	}
 
 	return nil
@@ -931,6 +1154,42 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	if n != recordSize {
 		slog.Error("ERROR WRITING BLOCK TO WAL: incomplete write", "n", n, "expected", recordSize)
 		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes", n, recordSize)
+	}
+
+	return err
+}
+
+// WriteShardedWAL writes a block to the appropriate shard based on block number.
+// Only the target shard's mutex is acquired, so writes to different shards
+// have zero lock contention.
+func (vb *VB) WriteShardedWAL(block Block) error {
+	sw := vb.ShardedWAL
+	shardIdx := block.Block & ShardMask
+	shard := sw.Shards[shardIdx]
+
+	// Pre-allocate record buffer (28 byte header + data)
+	recordSize := 28 + len(block.Data)
+	record := make([]byte, recordSize)
+
+	// Format: [seq_number, uint64][block_number, uint64][block_length, uint64][checksum, uint32][block_data, []byte]
+	binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
+	binary.BigEndian.PutUint64(record[8:16], block.Block)
+	binary.BigEndian.PutUint64(record[16:24], block.Len)
+
+	checksum := crc32.ChecksumIEEE(record[0:24])
+	checksum = crc32.Update(checksum, crc32.IEEETable, block.Data)
+	binary.BigEndian.PutUint32(record[24:28], checksum)
+
+	copy(record[28:], block.Data)
+
+	shard.mu.Lock()
+	n, err := shard.DB.Write(record)
+	shard.dirty.Store(true)
+	shard.mu.Unlock()
+
+	if n != recordSize {
+		slog.Error("ERROR WRITING BLOCK TO SHARDED WAL: incomplete write", "shard", shardIdx, "n", n, "expected", recordSize)
+		return fmt.Errorf("incomplete write to sharded WAL shard %d: wrote %d of %d bytes", shardIdx, n, recordSize)
 	}
 
 	return err
@@ -1082,6 +1341,222 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 	}
 
 	return block, nil
+}
+
+// WriteShardedWALToChunk consolidates all shard files into unified 4MB chunks.
+// It briefly locks all shards to rotate to the next generation, then reads
+// the closed shard files in parallel, deduplicates, sorts, and creates chunks.
+func (vb *VB) WriteShardedWALToChunk(force bool) error {
+	sw := vb.ShardedWAL
+	if sw == nil {
+		return fmt.Errorf("ShardedWAL not initialized")
+	}
+
+	currentWALNum := sw.WallNum.Load()
+
+	// Check total size across all shards
+	if !force {
+		var totalSize int64
+		for i := 0; i < NumShards; i++ {
+			shard := sw.Shards[i]
+			shard.mu.RLock()
+			if shard.DB != nil {
+				if fstat, err := shard.DB.Stat(); err == nil {
+					totalSize += fstat.Size()
+				}
+			}
+			shard.mu.RUnlock()
+		}
+		if totalSize < int64(vb.ObjBlockSize) {
+			slog.Info("Sharded WAL total size less than chunk size, skipping", "totalSize", totalSize)
+			return nil
+		}
+	}
+
+	// Lock all shards, sync, close, and open next generation
+	for i := 0; i < NumShards; i++ {
+		sw.Shards[i].mu.Lock()
+	}
+
+	// Sync and close all current shard files
+	for i := 0; i < NumShards; i++ {
+		shard := sw.Shards[i]
+		if shard.DB != nil {
+			shard.DB.Sync()
+			shard.DB.Close()
+			shard.DB = nil
+		}
+	}
+
+	// Open next generation of shard files
+	nextWalNum := sw.WallNum.Add(1)
+	header := vb.WALHeader()
+
+	for i := 0; i < NumShards; i++ {
+		shard := sw.Shards[i]
+		filename := filepath.Join(sw.BaseDir,
+			types.GetShardedWALPath(vb.GetVolume(), nextWalNum, i))
+
+		os.MkdirAll(filepath.Dir(filename), 0750)
+
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+		if err != nil {
+			// Unlock all shards before returning
+			for j := 0; j < NumShards; j++ {
+				sw.Shards[j].mu.Unlock()
+			}
+			return fmt.Errorf("failed to open next shard %d: %w", i, err)
+		}
+		if _, err := file.Write(header); err != nil {
+			file.Close()
+			for j := 0; j < NumShards; j++ {
+				sw.Shards[j].mu.Unlock()
+			}
+			return fmt.Errorf("failed to write header for next shard %d: %w", i, err)
+		}
+		shard.DB = file
+	}
+
+	// Unlock all shards — new writes proceed to next generation
+	for i := 0; i < NumShards; i++ {
+		sw.Shards[i].mu.Unlock()
+	}
+
+	// Read closed shard files in parallel
+	type shardResult struct {
+		blocks []Block
+		err    error
+	}
+	results := make([]shardResult, NumShards)
+	var wg sync.WaitGroup
+	headerSize := vb.WALHeaderSize()
+
+	for i := 0; i < NumShards; i++ {
+		wg.Add(1)
+		go func(shardID int) {
+			defer wg.Done()
+
+			filename := filepath.Join(sw.BaseDir,
+				types.GetShardedWALPath(vb.GetVolume(), currentWALNum, shardID))
+
+			file, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return // Empty shard, no file
+				}
+				results[shardID].err = fmt.Errorf("failed to open shard %d for reading: %w", shardID, err)
+				return
+			}
+			defer file.Close()
+
+			// Skip WAL header
+			if _, err := file.Seek(int64(headerSize), io.SeekStart); err != nil {
+				results[shardID].err = fmt.Errorf("failed to seek past header in shard %d: %w", shardID, err)
+				return
+			}
+
+			var blocks []Block
+			for {
+				data := make([]byte, 28+vb.BlockSize)
+				_, err := file.Read(data)
+				if err != nil {
+					if err == io.EOF {
+						break
+					}
+					results[shardID].err = fmt.Errorf("error reading shard %d: %w", shardID, err)
+					return
+				}
+
+				// Validate checksum
+				checksum := binary.BigEndian.Uint32(data[24:28])
+				computed := crc32.ChecksumIEEE(data[:24])
+				computed = crc32.Update(computed, crc32.IEEETable, data[28:])
+				if computed != checksum {
+					slog.Error("checksum mismatch in sharded WAL", "shard", shardID)
+					results[shardID].err = fmt.Errorf("checksum mismatch in shard %d", shardID)
+					return
+				}
+
+				blocks = append(blocks, Block{
+					SeqNum: binary.BigEndian.Uint64(data[:8]),
+					Block:  binary.BigEndian.Uint64(data[8:16]),
+					Len:    binary.BigEndian.Uint64(data[16:24]),
+					Data:   data[28:],
+				})
+			}
+			results[shardID].blocks = blocks
+		}(i)
+	}
+	wg.Wait()
+
+	// Check for errors and merge all blocks
+	var allBlocks []Block
+	for i := 0; i < NumShards; i++ {
+		if results[i].err != nil {
+			return results[i].err
+		}
+		allBlocks = append(allBlocks, results[i].blocks...)
+	}
+
+	if len(allBlocks) == 0 {
+		return nil
+	}
+
+	// Deduplicate: highest SeqNum wins
+	blocksMap := make(BlocksMapOptimised, len(allBlocks))
+	for index, block := range allBlocks {
+		if existing, ok := blocksMap[block.Block]; !ok || existing.SeqNum < block.SeqNum {
+			blocksMap[block.Block] = BlockOptimised{
+				SeqNum: block.SeqNum,
+				Index:  index,
+			}
+		}
+	}
+
+	// Sort by block number
+	sortedBlocks := make([]*Block, 0, len(blocksMap))
+	for _, block := range blocksMap {
+		sortedBlocks = append(sortedBlocks, &allBlocks[block.Index])
+	}
+	sort.Slice(sortedBlocks, func(i, j int) bool { return sortedBlocks[i].Block < sortedBlocks[j].Block })
+
+	// Create 4MB chunks
+	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
+	matchedBlocks := make([]Block, 0)
+
+	for _, block := range sortedBlocks {
+		chunkBuffer = append(chunkBuffer, block.Data...)
+		matchedBlocks = append(matchedBlocks, Block{
+			SeqNum: block.SeqNum,
+			Block:  block.Block,
+		})
+
+		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
+			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+			if err != nil {
+				return fmt.Errorf("failed to create chunk file: %w", err)
+			}
+			chunkBuffer = chunkBuffer[:0]
+			matchedBlocks = make([]Block, 0)
+		}
+	}
+
+	// Write remaining data
+	if len(chunkBuffer) > 0 {
+		err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+		if err != nil {
+			return fmt.Errorf("failed to create final chunk file: %w", err)
+		}
+	}
+
+	// Update block store state for all consolidated blocks
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		for _, block := range sortedBlocks {
+			vb.BlockStore.MarkPersisted(block.Block, vb.ObjectNum.Load(), 0)
+		}
+	}
+
+	return nil
 }
 
 func (vb *VB) WriteWALToChunk(force bool) error {
@@ -1841,6 +2316,11 @@ func (vb *VB) SaveState() error {
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
 
+	walNum := vb.WAL.WallNum.Load()
+	if vb.UseShardedWAL && vb.ShardedWAL != nil {
+		walNum = vb.ShardedWAL.WallNum.Load()
+	}
+
 	state := VBState{
 		VolumeName:          vb.VolumeName,
 		VolumeSize:          vb.VolumeSize,
@@ -1848,10 +2328,11 @@ func (vb *VB) SaveState() error {
 		ObjBlockSize:        vb.ObjBlockSize,
 		SeqNum:              vb.SeqNum.Load(),
 		ObjectNum:           vb.ObjectNum.Load(),
-		WALNum:              vb.WAL.WallNum.Load(),
+		WALNum:              walNum,
 		BlockToObjectWALNum: vb.BlockToObjectWAL.WallNum.Load(),
 		Version:             vb.Version,
 		VolumeConfig:        vb.VolumeConfig,
+		ShardedWAL:          vb.UseShardedWAL,
 		SnapshotID:          vb.SnapshotID,
 		SourceVolumeName:    vb.SourceVolumeName,
 	}
@@ -1933,6 +2414,15 @@ func (vb *VB) LoadState() error {
 	vb.ObjectNum.Store(state.ObjectNum)
 	vb.WAL.WallNum.Store(state.WALNum)
 	vb.BlockToObjectWAL.WallNum.Store(state.BlockToObjectWALNum)
+
+	// Restore sharded WAL state
+	if state.ShardedWAL {
+		vb.UseShardedWAL = true
+		if vb.ShardedWAL == nil {
+			vb.ShardedWAL = NewShardedWAL(vb.BaseDir, vb.WAL.WALMagic)
+		}
+		vb.ShardedWAL.WallNum.Store(state.WALNum)
+	}
 
 	vb.Version = state.Version
 	vb.VolumeConfig = state.VolumeConfig
@@ -2222,7 +2712,13 @@ func (vb *VB) Close() error {
 	vb.StopWALSyncer()
 
 	vb.Flush()
-	err := vb.WriteWALToChunk(true)
+
+	var err error
+	if vb.UseShardedWAL {
+		err = vb.WriteShardedWALToChunk(true)
+	} else {
+		err = vb.WriteWALToChunk(true)
+	}
 
 	if err != nil {
 		slog.Error("Could not Write WAL to Chunk", "err", err)
@@ -2326,6 +2822,21 @@ func (vb *VB) Reset() error {
 	vb.WAL.mu.Lock()
 	vb.WAL.WallNum.Store(0)
 	vb.WAL.mu.Unlock()
+
+	// Reset ShardedWAL if enabled
+	if vb.ShardedWAL != nil {
+		for i := 0; i < NumShards; i++ {
+			shard := vb.ShardedWAL.Shards[i]
+			shard.mu.Lock()
+			if shard.DB != nil {
+				shard.DB.Close()
+				shard.DB = nil
+			}
+			shard.dirty.Store(false)
+			shard.mu.Unlock()
+		}
+		vb.ShardedWAL.WallNum.Store(0)
+	}
 
 	// Reset BlockWAL
 	vb.BlockToObjectWAL.mu.Lock()

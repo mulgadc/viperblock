@@ -186,8 +186,14 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	walNum = vb.WAL.WallNum.Add(1)
 	slog.Info("Loaded WAL number", "walNum", walNum)
 
-	// Open the chunk WAL
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
+	// Open the chunk WAL (sharded or legacy)
+	if vb.UseShardedWAL {
+		vb.ShardedWAL = viperblock.NewShardedWAL(vb.WAL.BaseDir, vb.WAL.WALMagic)
+		vb.ShardedWAL.WallNum.Store(vb.WAL.WallNum.Load())
+		err = vb.OpenShardedWAL()
+	} else {
+		err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
+	}
 
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open WAL: %v", err)}
@@ -289,7 +295,12 @@ func (c *ViperBlockConnection) Flush(flags uint32) error {
 
 	c.vb.Flush()
 
-	err := c.vb.WriteWALToChunk(false)
+	var err error
+	if c.vb.UseShardedWAL {
+		err = c.vb.WriteShardedWALToChunk(false)
+	} else {
+		err = c.vb.WriteWALToChunk(false)
+	}
 
 	if err != nil {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not Write WAL to Chunk: %v", err)}

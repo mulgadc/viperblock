@@ -272,7 +272,11 @@ func main() {
 
 	fmt.Println("Main memory after flush: ", len(vb.Writes.Blocks))
 
-	vb.WriteWALToChunk(false)
+	if vb.UseShardedWAL {
+		vb.WriteShardedWALToChunk(false)
+	} else {
+		vb.WriteWALToChunk(false)
+	}
 
 	// Serialize the BlocksToObject
 	err = vb.SaveBlockState()
