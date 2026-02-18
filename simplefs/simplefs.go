@@ -181,7 +181,7 @@ func (sfs *SimpleFS) SaveState(filename string) error {
 	}
 
 	// Write to file
-	err = os.WriteFile(filename, jsonData, 0644)
+	err = os.WriteFile(filename, jsonData, 0600)
 	if err != nil {
 		return err
 	}

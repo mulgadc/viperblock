@@ -49,7 +49,7 @@ func (backend *Backend) Init() error {
 	dirPath := fmt.Sprintf("%s/%s", backend.config.BaseDir, backend.config.VolumeName)
 
 	// Create the directory structure
-	err := os.MkdirAll(dirPath, 0755)
+	err := os.MkdirAll(dirPath, 0750)
 
 	if err != nil {
 		slog.Error("Failed to create directory", "error", err)
@@ -69,7 +69,7 @@ func (backend *Backend) Init() error {
 	for _, dir := range dirs {
 		dirPath := fmt.Sprintf("%s/%s/%s", backend.config.BaseDir, backend.config.VolumeName, dir)
 		// Create all parent dirs
-		err := os.MkdirAll(dirPath, 0755)
+		err := os.MkdirAll(dirPath, 0750)
 		if err != nil {
 			slog.Error("Failed to create directory", "error", err)
 			return err
@@ -101,7 +101,7 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
 
-	f, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+	f, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 
 	if err != nil {
 		return nil, err
@@ -188,7 +188,7 @@ func (backend *Backend) SetConfig(config any) {
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, volumeName))
 
-	f, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+	f, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +214,7 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, volumeName))
 
-	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
 		return fmt.Errorf("failed to create directory for %s: %w", filename, err)
 	}
 

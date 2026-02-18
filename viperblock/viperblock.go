@@ -662,7 +662,7 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 
 	// Create the file if it doesn't exist, make sure writes and committed immediately
 	// Removed syscall.O_SYNC, TODO implement buffer, sync every 250ms / 1MB data
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 
 	// Append the WAL header, format
 	// Check our type
@@ -725,7 +725,7 @@ func (vb *VB) OpenShardedWAL() error {
 
 		os.MkdirAll(filepath.Dir(filename), 0750)
 
-		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 		if err != nil {
 			shard.mu.Unlock()
 			// Close any shards we already opened
@@ -1402,7 +1402,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 
 		os.MkdirAll(filepath.Dir(filename), 0750)
 
-		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 		if err != nil {
 			// Unlock all shards before returning
 			for j := 0; j < NumShards; j++ {
@@ -1442,7 +1442,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 			filename := filepath.Join(sw.BaseDir,
 				types.GetShardedWALPath(vb.GetVolume(), currentWALNum, shardID))
 
-			file, err := os.OpenFile(filename, os.O_RDONLY, 0640)
+			file, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 			if err != nil {
 				if os.IsNotExist(err) {
 					return // Empty shard, no file
@@ -1610,7 +1610,7 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 	filename := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, currentWALNum, vb.GetVolume()))
 	//filename := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), currentWALNum)
-	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0640)
+	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -2353,7 +2353,7 @@ func (vb *VB) SaveState() error {
 
 	// First, write to the local persistant disk
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
-	err = os.WriteFile(filename, jsonData, 0640)
+	err = os.WriteFile(filename, jsonData, 0600)
 
 	if err != nil {
 		return err
