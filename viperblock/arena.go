@@ -7,6 +7,8 @@ package viperblock
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/mulgadc/viperblock/utils"
 )
 
 // Arena is a bump-pointer memory allocator for write data.
@@ -93,7 +95,7 @@ func (a *Arena) AllocCopy(data []byte) []byte {
 
 // AllocN allocates n consecutive blocks from the arena
 func (a *Arena) AllocN(n int) []byte {
-	size := uint32(n) * a.blockSize
+	size := utils.SafeIntToUint32(n) * a.blockSize
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
