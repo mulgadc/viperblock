@@ -29,8 +29,8 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v6
 
-      - name: Install nbdkit-dev
-        run: sudo apt-get update && sudo apt-get install -y nbdkit libnbd-dev
+      - name: Install nbdkit dependencies
+        run: sudo apt-get update && sudo apt-get install -y nbdkit nbdkit-plugin-dev pkg-config
 
       - name: Setup Go
         uses: actions/setup-go@v6
