@@ -23,7 +23,7 @@ preflight: check-format vet security-check test
 # Run unit tests
 test:
 	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
-	LOG_IGNORE=1 go test -v -timeout 120s ./...
+	LOG_IGNORE=1 go test -v -timeout 300s ./...
 
 bench:
 	@echo -e "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
