@@ -1,88 +1,75 @@
 GO_PROJECT_NAME := viperblock
+SHELL := /bin/bash
 
 build:
 	$(MAKE) go_build
 	$(MAKE) go_build_nbd
+
 # GO commands
 go_build:
-	@echo "\n....Building $(GO_PROJECT_NAME)"
+	@echo -e "\n....Building $(GO_PROJECT_NAME)"
 	go build -ldflags "-s -w" -o ./bin/sfs cmd/sfs/sfs.go
 	go build -ldflags "-s -w" -o ./bin/vblock cmd/vblock/main.go
 
 go_build_nbd:
-	@echo "\n....Building $(GO_PROJECT_NAME)"
+	@echo -e "\n....Building NBD plugin"
 	go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
 
-# Build multi-arch for docker, TODO add ARM
-#go_build_docker:
-#	@echo "\n....Building $(GO_PROJECT_NAME)"
-#	GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" --ldflags '-extldflags "-static"' -o ./bin/linux/s3d cmd/s3d/main.go
-#
-#	GOOS=darwin GOARCH=$(GOARCH) go build -ldflags "-s -w" -o ./bin/darwin/s3d cmd/s3d/main.go
+# Preflight — runs the same checks as GitHub Actions (format + lint + security + tests).
+# Use this before committing to catch CI failures locally.
+preflight: check-format vet security-check test
+	@echo -e "\n ✅ Preflight passed — safe to commit."
 
-#go_run:
-#	@echo "\n....Running $(GO_PROJECT_NAME)...."
-#	$(GOPATH)/bin/$(GO_PROJECT_NAME)
-
+# Run unit tests
 test:
-	@echo "\n....Running tests for $(GO_PROJECT_NAME)...."
-	LOG_IGNORE=1 go test -v ./...
+	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
+	LOG_IGNORE=1 go test -v -timeout 300s ./...
 
 bench:
-	@echo "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
+	@echo -e "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -benchmem -run=. -bench=. ./...
-
-#dev:
-#	air go run cmd/vbd/main.go
-
-# Docker builds
-#docker_s3d:
-#	@echo "Building docker (vbd)"
-#	docker build -t mulgadc/viperblock:latest -f- . < docker/Dockerfile-vbd
-
-#docker_compose_up:
-#	@echo "Running docker-compose"
-#	docker-compose -f docker/docker-compose.yaml up --build -d
-
-#docker_compose_down:
-#	@echo "Stopping docker-compose"
-#	docker-compose -f docker/docker-compose.yaml down
-
-#docker: go_build_docker docker_s3d
-
-#docker_clean:
-#	@echo "Removing Docker images and volumes"
-#	docker rmi mulgadc/predastore:latest
-#docker volume ls -f dangling=true
-#yes | docker volume prune
-
-#docker_test: docker docker_compose_up test docker_compose_down docker_clean
-
-
-security:
-	@echo "\n....Running security checks for $(GO_PROJECT_NAME)...."
-
-	go tool govulncheck ./... > tests/govulncheck-report.txt || true
-	@echo "Govulncheck report saved to tests/govulncheck-report.txt"
-
-# Note we exclude nbdkit, gosec cgo/issue "[gosec] 2025/11/27 19:34:05 Panic when running SSA analyzer on package: nbdkit. Panic: runtime error: invalid memory address or nil pointer dereference"
-	go tool gosec -exclude-dir nbd/libguestfs.org/nbdkit -exclude-generated ./... > tests/gosec-report.txt || true
-	@echo "Gosec report saved to tests/gosec-report.txt"
-
-	# default config + disable dep warning since we are using aws sdk v1
-	go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-U1000,-SA4006,-SA6002" ./...  > tests/staticcheck-report.txt || true
-	@echo "Staticcheck report saved to tests/staticcheck-report.txt"
-
-	go vet ./... 2>&1 | tee tests/govet-report.txt || true
-	@echo "Go vet report saved to tests/govet-report.txt"
 
 run:
 	$(MAKE) go_build
-	$(MAKE) go_run
 
 clean:
-	rm ./bin/sfs
-	rm ./bin/vblock
-	rm ./lib/nbdkit-viperblock-plugin.so
+	rm -f ./bin/sfs
+	rm -f ./bin/vblock
+	rm -f ./lib/nbdkit-viperblock-plugin.so
 
-.PHONY: go_build go_run build run test security
+# Format all Go files in place
+format:
+	gofmt -w .
+
+# Check that all Go files are formatted (CI-compatible, fails on diff)
+check-format:
+	@echo "Checking gofmt..."
+	@UNFORMATTED=$$(gofmt -l .); \
+	if [ -n "$$UNFORMATTED" ]; then \
+		echo "Files not formatted:"; \
+		echo "$$UNFORMATTED"; \
+		echo "Run 'make format' to fix."; \
+		exit 1; \
+	fi
+	@echo "  gofmt ok"
+
+# Go vet (fails on issues, matches CI)
+vet:
+	@echo "Running go vet..."
+	go vet ./...
+	@echo "  go vet ok"
+
+# Security checks — each tool fails the build on findings (matches CI).
+# Reports are also saved to tests/ for review.
+# Note: gosec excludes nbdkit dir due to cgo panic issue
+security-check:
+	@echo -e "\n....Running security checks for $(GO_PROJECT_NAME)...."
+	set -o pipefail && go tool govulncheck ./... 2>&1 | tee tests/govulncheck-report.txt
+	@echo "  govulncheck ok"
+	set -o pipefail && go tool gosec -exclude=G104,G204,G304,G402 -exclude-dir nbd -exclude-generated ./... 2>&1 | tee tests/gosec-report.txt
+	@echo "  gosec ok"
+	set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-U1000,-SA4006,-SA6002" ./... 2>&1 | tee tests/staticcheck-report.txt
+	@echo "  staticcheck ok"
+
+.PHONY: build go_build go_build_nbd preflight test bench run clean \
+	format check-format vet security-check
