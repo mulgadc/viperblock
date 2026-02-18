@@ -81,12 +81,12 @@ type UnifiedBlockStore struct {
 
 // BlockStoreStats tracks operational statistics
 type BlockStoreStats struct {
-	Reads      atomic.Uint64
-	Writes     atomic.Uint64
-	CacheHits  atomic.Uint64
-	CacheMiss  atomic.Uint64
-	HotReads   atomic.Uint64
-	PendReads  atomic.Uint64
+	Reads        atomic.Uint64
+	Writes       atomic.Uint64
+	CacheHits    atomic.Uint64
+	CacheMiss    atomic.Uint64
+	HotReads     atomic.Uint64
+	PendReads    atomic.Uint64
 	BackendReads atomic.Uint64
 }
 
