@@ -1,13 +1,27 @@
-name: Build and Test Viperblock
+name: Viperblock Build and Test
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - test
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/viperblock.yml
   pull_request:
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/viperblock.yml
   workflow_dispatch:
 
 jobs:
-  viperblock_build_and_test:
+  build_and_test:
     name: Viperblock Build and Test
     runs-on: ubuntu-24.04
 
@@ -21,20 +35,31 @@ jobs:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
+      - name: Build Viperblock
+        run: make build
+
       - name: Run Tests
-        run: LOG_IGNORE=1 go test -v -timeout 120s ./...
+        run: make test
+
+  lint_and_security:
+    name: Viperblock Lint and Security
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      - name: Check Format
+        run: make check-format
 
       - name: Go Vet
-        run: go vet ./...
+        run: make vet
 
-      - name: Static Check
-        run: go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-U1000,-SA4006,-SA6002" ./...
-
-      - name: Go Vulnerability Check
-        run: go tool govulncheck ./...
-
-      # - name: Gosec Security Scanner
-      #   run: go tool gosec -exclude-dir nbd/libguestfs.org/nbdkit -exclude-generated ./...
-
-      - name: Build
-        run: make go_build
+      - name: Security Checks
+        run: make security-check
