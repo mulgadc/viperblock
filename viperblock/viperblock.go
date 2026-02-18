@@ -2919,7 +2919,7 @@ func GenerateVolumeID(voltype, name, bucket string, timestamp int64) string {
 
 // FindFreePort allocates a free TCP port from the OS
 func FindFreePort() (string, error) {
-	l, err := net.Listen("tcp", "0.0.0.0:0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", err
 	}
