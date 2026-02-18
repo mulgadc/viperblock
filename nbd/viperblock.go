@@ -37,7 +37,7 @@ var secret_key string
 var host string
 var base_dir string
 var cache_size int = 20
-var use_shardwal bool = true
+var use_shardwal bool = false
 
 var disk []byte
 

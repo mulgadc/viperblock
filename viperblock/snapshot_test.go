@@ -235,6 +235,88 @@ func TestSnapshotMultiChunk(t *testing.T) {
 	})
 }
 
+// TestSnapshotWithUnopenedShardedWAL simulates the viperblockd scenario where
+// a VB instance has UseShardedWAL=true but never opened the WAL files (because
+// the NBD plugin process owns them). Calling CreateSnapshot on such an instance
+// must not corrupt the WAL directory, and a second snapshot must also succeed.
+// This is a regression test for the shard WAL corruption bug where
+// WriteShardedWALToChunk would rotate into WAL files it didn't own.
+func TestSnapshotWithUnopenedShardedWAL(t *testing.T) {
+	runWithBackends(t, "snapshot_unopened_wal", func(t *testing.T, vb *VB) {
+		if !vb.UseShardedWAL {
+			t.Skip("test only applies to sharded WAL mode")
+		}
+
+		// Write data and consolidate using the "owner" VB (simulates NBD plugin)
+		data := make([]byte, DefaultBlockSize*4)
+		rand.Read(data)
+
+		err := vb.Write(0, data)
+		require.NoError(t, err)
+		err = vb.Flush()
+		require.NoError(t, err)
+		err = vb.WriteWALToChunk(true)
+		require.NoError(t, err)
+
+		// Create a second VB that loads state but does NOT open WAL files
+		// (simulates viperblockd's snapshot VB)
+		snapshotVB := &VB{
+			VolumeName:    vb.VolumeName,
+			VolumeSize:    vb.VolumeSize,
+			BlockSize:     vb.BlockSize,
+			ObjBlockSize:  vb.ObjBlockSize,
+			Version:       vb.Version,
+			BaseDir:       vb.BaseDir,
+			UseShardedWAL: true,
+			ShardedWAL:    NewShardedWAL(vb.BaseDir, vb.WAL.WALMagic),
+			Backend:       vb.Backend,
+			ChunkMagic:    vb.ChunkMagic,
+			BlocksToObject: BlocksToObject{
+				BlockLookup: make(map[uint64]BlockLookup),
+			},
+			BlockStore:    NewUnifiedBlockStore(vb.BlockSize),
+			UseBlockStore: true,
+		}
+		// Copy block-to-object map (simulates LoadState + LoadBlockState)
+		vb.BlocksToObject.mu.RLock()
+		for k, v := range vb.BlocksToObject.BlockLookup {
+			snapshotVB.BlocksToObject.BlockLookup[k] = v
+		}
+		vb.BlocksToObject.mu.RUnlock()
+		snapshotVB.SeqNum.Store(vb.SeqNum.Load())
+		snapshotVB.ObjectNum.Store(vb.ObjectNum.Load())
+		snapshotVB.ShardedWAL.WallNum.Store(vb.ShardedWAL.WallNum.Load())
+
+		// First snapshot on the unopened-WAL VB should succeed
+		snap1, err := snapshotVB.CreateSnapshot("snap-first")
+		require.NoError(t, err)
+		require.NotNil(t, snap1)
+
+		// Write more data through the owner VB (simulates NBD writes continuing)
+		moreData := make([]byte, DefaultBlockSize*4)
+		rand.Read(moreData)
+		err = vb.Write(4, moreData)
+		require.NoError(t, err)
+		err = vb.Flush()
+		require.NoError(t, err)
+		err = vb.WriteWALToChunk(true)
+		require.NoError(t, err)
+
+		// Second snapshot should also succeed (the bug caused checksum mismatch here)
+		snap2, err := snapshotVB.CreateSnapshot("snap-second")
+		require.NoError(t, err)
+		require.NotNil(t, snap2)
+
+		// Verify the owner VB's WAL is not corrupted — it can still write and consolidate
+		err = vb.Write(8, data)
+		require.NoError(t, err)
+		err = vb.Flush()
+		require.NoError(t, err)
+		err = vb.WriteWALToChunk(true)
+		require.NoError(t, err, "owner VB WAL should not be corrupted by snapshot VB")
+	})
+}
+
 // TestLoadFromSnapshot verifies that a clone can be closed and reopened,
 // with the base map restored from the saved state.
 func TestLoadFromSnapshot(t *testing.T) {

@@ -34,18 +34,27 @@ type SnapshotState struct {
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	slog.Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
 
-	// 1. Flush hot writes to WAL (hold write lock only for the fast WAL write)
-	vb.Writes.mu.Lock()
-	if err := vb.flushLocked(); err != nil {
+	// 1. Flush hot writes to WAL and persist to chunks.
+	// Skip if this VB doesn't own the WAL files (e.g. viperblockd snapshot VB
+	// where the NBD plugin process owns the WAL).
+	if vb.ownsWAL() {
+		vb.Writes.mu.Lock()
+		var flushErr error
+		if vb.UseShardedWAL {
+			flushErr = vb.flushLockedSharded()
+		} else {
+			flushErr = vb.flushLocked()
+		}
 		vb.Writes.mu.Unlock()
-		return nil, fmt.Errorf("snapshot flush failed: %w", err)
-	}
-	vb.Writes.mu.Unlock()
+		if flushErr != nil {
+			return nil, fmt.Errorf("snapshot flush failed: %w", flushErr)
+		}
 
-	// Persist WAL to chunk files on backend (potentially slow S3 upload,
-	// no need to hold the write lock — new writes go to the next WAL file)
-	if err := vb.WriteWALToChunk(true); err != nil {
-		return nil, fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
+		// Persist WAL to chunk files on backend (potentially slow S3 upload,
+		// no need to hold the write lock — new writes go to the next WAL file)
+		if err := vb.WriteWALToChunk(true); err != nil {
+			return nil, fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
+		}
 	}
 
 	// 2. Serialize the current block-to-object map as the snapshot checkpoint

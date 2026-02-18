@@ -476,7 +476,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		BlockStore:    NewUnifiedBlockStore(config.BlockSize),
 		UseBlockStore: true,
 
-		UseShardedWAL: true,
+		UseShardedWAL: false,
 		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
 	}
 
@@ -1355,6 +1355,22 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		return fmt.Errorf("ShardedWAL not initialized")
 	}
 
+	// If no shard files are open, this VB instance doesn't own the WAL.
+	// Skip consolidation (matches legacy WriteWALToChunk empty-DB guard).
+	hasOpenShards := false
+	for i := 0; i < NumShards; i++ {
+		sw.Shards[i].mu.RLock()
+		open := sw.Shards[i].DB != nil
+		sw.Shards[i].mu.RUnlock()
+		if open {
+			hasOpenShards = true
+			break
+		}
+	}
+	if !hasOpenShards {
+		return nil
+	}
+
 	currentWALNum := sw.WallNum.Load()
 
 	// Check total size across all shards
@@ -1459,15 +1475,19 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 			}
 
 			var blocks []Block
+			recordSize := 28 + int(vb.BlockSize)
 			for {
-				data := make([]byte, 28+vb.BlockSize)
-				_, err := file.Read(data)
+				data := make([]byte, recordSize)
+				n, err := file.Read(data)
 				if err != nil {
 					if err == io.EOF {
 						break
 					}
 					results[shardID].err = fmt.Errorf("error reading shard %d: %w", shardID, err)
 					return
+				}
+				if n < recordSize {
+					break // Incomplete record at EOF, discard
 				}
 
 				// Validate checksum
@@ -2796,6 +2816,24 @@ func (vb *VB) GetVolumeSize() uint64 {
 
 func (vb *VB) GetVolume() string {
 	return vb.VolumeName
+}
+
+// ownsWAL returns true if this VB instance has open WAL files.
+// A VB that never called OpenWAL/OpenShardedWAL (e.g. viperblockd's snapshot
+// VB) does not own the WAL and must not flush or consolidate.
+func (vb *VB) ownsWAL() bool {
+	if vb.UseShardedWAL && vb.ShardedWAL != nil {
+		for i := 0; i < NumShards; i++ {
+			vb.ShardedWAL.Shards[i].mu.RLock()
+			open := vb.ShardedWAL.Shards[i].DB != nil
+			vb.ShardedWAL.Shards[i].mu.RUnlock()
+			if open {
+				return true
+			}
+		}
+		return false
+	}
+	return len(vb.WAL.DB) > 0
 }
 
 func (vb *VB) Reset() error {
