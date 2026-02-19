@@ -17,13 +17,31 @@ go_build_nbd:
 
 # Preflight — runs the same checks as GitHub Actions (format + lint + security + tests).
 # Use this before committing to catch CI failures locally.
-preflight: check-format check-modernize vet security-check test
+preflight: check-format check-modernize vet security-check test-cover diff-coverage test-race
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
 test:
 	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -v -timeout 300s ./...
+
+# Run unit tests with coverage profile
+COVERPROFILE ?= coverage.out
+test-cover:
+	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
+	LOG_IGNORE=1 go test -v -timeout 300s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/...
+	@echo ""
+	@echo "=== Total Coverage ==="
+	@go tool cover -func=$(COVERPROFILE) | tail -1
+
+# Run unit tests with race detector
+test-race:
+	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
+	LOG_IGNORE=1 go test -race -timeout 600s ./viperblock/...
+
+# Check that new/changed code meets coverage threshold (runs tests first)
+diff-coverage: test-cover
+	@scripts/diff-coverage.sh $(COVERPROFILE)
 
 bench:
 	@echo -e "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
@@ -90,5 +108,5 @@ check-modernize:
 	fi
 	@echo "  go fix ok"
 
-.PHONY: build go_build go_build_nbd preflight test bench run clean \
+.PHONY: build go_build go_build_nbd preflight test test-cover test-race diff-coverage bench run clean \
 	format check-format check-modernize modernize vet security-check

@@ -1,8 +1,22 @@
+lib/nbdkit-viperblock-plugin.so
+
+# Go workspace
 go.work
 go.work.sum
-viperblock/tests/data/
-.DS_Store
-lib/nbdkit-viperblock-plugin.so
-tmp/
-tests/*-report.txt
+
+# Build outputs
 bin/
+tmp/
+*.test
+*.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Test reports
+*-report.txt
+viperblock/tests/data/
