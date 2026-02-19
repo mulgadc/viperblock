@@ -141,7 +141,7 @@ func BenchmarkFlush_LegacyWAL(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		for j := 0; j < 64; j++ {
+		for j := range 64 {
 			vb.WriteAt(uint64(j)*4096, data)
 		}
 		vb.Flush()
@@ -156,7 +156,7 @@ func BenchmarkFlush_ShardedParallel(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		for j := 0; j < 64; j++ {
+		for j := range 64 {
 			vb.WriteAt(uint64(j)*4096, data)
 		}
 		vb.Flush()
@@ -173,11 +173,11 @@ func BenchmarkWriteWALToChunk_Sharded(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		var wg sync.WaitGroup
-		for t := 0; t < 8; t++ {
+		for t := range 8 {
 			wg.Add(1)
 			go func(threadID int) {
 				defer wg.Done()
-				for j := 0; j < 128; j++ {
+				for j := range 128 {
 					blockNum := uint64(threadID*128 + j)
 					vb.WriteShardedWAL(Block{
 						SeqNum: blockNum,

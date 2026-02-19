@@ -100,7 +100,7 @@ func NewUnifiedBlockStore(blockSize uint32) *UnifiedBlockStore {
 	}
 
 	// Initialize all shards
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		ubs.shards[i] = &IndexShard{
 			entries: make(map[uint64]*BlockEntry),
 		}
@@ -331,7 +331,7 @@ func (ubs *UnifiedBlockStore) EvictCache(blockNum uint64) bool {
 func (ubs *UnifiedBlockStore) GetBlocksByState(state BlockState) []uint64 {
 	var blocks []uint64
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.RLock()
 		for blockNum, entry := range shard.entries {
@@ -350,7 +350,7 @@ func (ubs *UnifiedBlockStore) GetBlocksByState(state BlockState) []uint64 {
 func (ubs *UnifiedBlockStore) GetHotBlocks() []Block {
 	var blocks []Block
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.RLock()
 		for blockNum, entry := range shard.entries {
@@ -373,7 +373,7 @@ func (ubs *UnifiedBlockStore) GetHotBlocks() []Block {
 func (ubs *UnifiedBlockStore) GetPendingBlocks() []Block {
 	var blocks []Block
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.RLock()
 		for blockNum, entry := range shard.entries {
@@ -412,7 +412,7 @@ func (ubs *UnifiedBlockStore) GetPersistedInfo(blockNum uint64) (objectID uint64
 // Count returns the total number of blocks across all shards
 func (ubs *UnifiedBlockStore) Count() int {
 	total := 0
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.RLock()
 		total += len(shard.entries)
@@ -425,7 +425,7 @@ func (ubs *UnifiedBlockStore) Count() int {
 func (ubs *UnifiedBlockStore) CountByState() map[BlockState]int {
 	counts := make(map[BlockState]int)
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.RLock()
 		for _, entry := range shard.entries {
@@ -439,7 +439,7 @@ func (ubs *UnifiedBlockStore) CountByState() map[BlockState]int {
 
 // Clear removes all entries from the store
 func (ubs *UnifiedBlockStore) Clear() {
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.Lock()
 		shard.entries = make(map[uint64]*BlockEntry)

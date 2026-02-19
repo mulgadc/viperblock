@@ -23,7 +23,7 @@ func TestBlockStore_NewUnifiedBlockStore(t *testing.T) {
 	}
 
 	// Verify all shards are initialized
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		if bs.shards[i] == nil {
 			t.Errorf("shard %d is nil", i)
 		}
@@ -166,11 +166,11 @@ func TestBlockStore_ConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
-	for g := 0; g < numGoroutines; g++ {
+	for g := range numGoroutines {
 		go func(goroutineID int) {
 			defer wg.Done()
 
-			for i := 0; i < numOpsPerGoroutine; i++ {
+			for i := range numOpsPerGoroutine {
 				blockNum := uint64(goroutineID*numOpsPerGoroutine + i)
 
 				// Write
@@ -205,13 +205,13 @@ func TestBlockStore_ShardDistribution(t *testing.T) {
 	const numBlocks = 1600
 	data := make([]byte, 4096)
 
-	for i := uint64(0); i < numBlocks; i++ {
+	for i := range uint64(numBlocks) {
 		bs.Write(i, data)
 	}
 
 	// Count blocks per shard
 	shardCounts := make([]int, NumShards)
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := bs.shards[i]
 		shard.mu.RLock()
 		shardCounts[i] = len(shard.entries)
@@ -233,12 +233,12 @@ func TestBlockStore_GetBlocksByState(t *testing.T) {
 	data := make([]byte, 4096)
 
 	// Create 10 Hot blocks
-	for i := uint64(0); i < 10; i++ {
+	for i := range uint64(10) {
 		bs.Write(i, data)
 	}
 
 	// Move 5 to Pending
-	for i := uint64(0); i < 5; i++ {
+	for i := range uint64(5) {
 		bs.MarkPending(i)
 	}
 
@@ -257,14 +257,14 @@ func TestBlockStore_GetHotBlocks(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 
 	// Write some blocks
-	for i := uint64(0); i < 10; i++ {
+	for i := range uint64(10) {
 		data := make([]byte, 4096)
 		data[0] = byte(i)
 		bs.Write(i, data)
 	}
 
 	// Mark some as pending
-	for i := uint64(0); i < 5; i++ {
+	for i := range uint64(5) {
 		bs.MarkPending(i)
 	}
 
@@ -330,7 +330,7 @@ func TestBlockStore_ClearAndDelete(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 
 	data := make([]byte, 4096)
-	for i := uint64(0); i < 100; i++ {
+	for i := range uint64(100) {
 		bs.Write(i, data)
 	}
 
@@ -359,7 +359,7 @@ func TestBlockStore_CountByState(t *testing.T) {
 	data := make([]byte, 4096)
 
 	// Create mixed states
-	for i := uint64(0); i < 30; i++ {
+	for i := range uint64(30) {
 		bs.Write(i, data)
 	}
 
@@ -482,7 +482,7 @@ func BenchmarkBlockStore_SingleRead(b *testing.B) {
 	data := make([]byte, 4096)
 
 	// Pre-populate with blocks
-	for i := uint64(0); i < 10000; i++ {
+	for i := range uint64(10000) {
 		bs.Write(i, data)
 	}
 
@@ -512,7 +512,7 @@ func BenchmarkBlockStore_ConcurrentReadWrite(b *testing.B) {
 	data := make([]byte, 4096)
 
 	// Pre-populate
-	for i := uint64(0); i < 10000; i++ {
+	for i := range uint64(10000) {
 		bs.Write(i, data)
 	}
 
@@ -539,7 +539,7 @@ func BenchmarkBlockStore_ConcurrentRead(b *testing.B) {
 	data := make([]byte, 4096)
 
 	// Pre-populate
-	for i := uint64(0); i < 10000; i++ {
+	for i := range uint64(10000) {
 		bs.Write(i, data)
 	}
 
@@ -561,7 +561,7 @@ func BenchmarkBlockStore_RandomReadWrite(b *testing.B) {
 	data := make([]byte, 4096)
 
 	// Pre-populate
-	for i := uint64(0); i < 10000; i++ {
+	for i := range uint64(10000) {
 		bs.Write(i, data)
 	}
 
@@ -667,7 +667,7 @@ func BenchmarkOldVsNew_UnifiedStore(b *testing.B) {
 	// The new approach: O(1) lookup
 	bs := NewUnifiedBlockStore(4096)
 	data := make([]byte, 4096)
-	for i := uint64(0); i < 1000; i++ {
+	for i := range uint64(1000) {
 		bs.Write(i, data)
 	}
 

@@ -15,6 +15,7 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -623,7 +624,7 @@ func (vb *VB) syncShardedWALIfDirty() {
 		return
 	}
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := sw.Shards[i]
 
 		// Fast path: skip clean shards
@@ -699,7 +700,7 @@ func NewShardedWAL(baseDir string, magic [4]byte) *ShardedWAL {
 		BaseDir:  baseDir,
 		WALMagic: magic,
 	}
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		sw.Shards[i] = &WALShard{shardID: i}
 	}
 	return sw
@@ -716,7 +717,7 @@ func (vb *VB) OpenShardedWAL() error {
 	walNum := sw.WallNum.Load()
 	header := vb.WALHeader()
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := sw.Shards[i]
 		shard.mu.Lock()
 
@@ -729,7 +730,7 @@ func (vb *VB) OpenShardedWAL() error {
 		if err != nil {
 			shard.mu.Unlock()
 			// Close any shards we already opened
-			for j := 0; j < i; j++ {
+			for j := range i {
 				sw.Shards[j].mu.Lock()
 				if sw.Shards[j].DB != nil {
 					sw.Shards[j].DB.Close()
@@ -1002,7 +1003,7 @@ func (vb *VB) flushLockedSharded() error {
 	results := make([]shardError, NumShards)
 	var wg sync.WaitGroup
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		if len(shardGroups[i]) == 0 {
 			results[i].flushed = make(map[uint64]uint64)
 			continue
@@ -1032,10 +1033,8 @@ func (vb *VB) flushLockedSharded() error {
 	// Merge flushed maps from all shards
 	allFlushed := make(map[uint64]uint64)
 	var firstErr error
-	for i := 0; i < NumShards; i++ {
-		for k, v := range results[i].flushed {
-			allFlushed[k] = v
-		}
+	for i := range NumShards {
+		maps.Copy(allFlushed, results[i].flushed)
 		if results[i].err != nil && firstErr == nil {
 			firstErr = results[i].err
 		}
@@ -1358,7 +1357,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	// If no shard files are open, this VB instance doesn't own the WAL.
 	// Skip consolidation (matches legacy WriteWALToChunk empty-DB guard).
 	hasOpenShards := false
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		sw.Shards[i].mu.RLock()
 		open := sw.Shards[i].DB != nil
 		sw.Shards[i].mu.RUnlock()
@@ -1376,7 +1375,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	// Check total size across all shards
 	if !force {
 		var totalSize int64
-		for i := 0; i < NumShards; i++ {
+		for i := range NumShards {
 			shard := sw.Shards[i]
 			shard.mu.RLock()
 			if shard.DB != nil {
@@ -1393,12 +1392,12 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	}
 
 	// Lock all shards, sync, close, and open next generation
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		sw.Shards[i].mu.Lock()
 	}
 
 	// Sync and close all current shard files
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := sw.Shards[i]
 		if shard.DB != nil {
 			shard.DB.Sync()
@@ -1411,7 +1410,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	nextWalNum := sw.WallNum.Add(1)
 	header := vb.WALHeader()
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := sw.Shards[i]
 		filename := filepath.Join(sw.BaseDir,
 			types.GetShardedWALPath(vb.GetVolume(), nextWalNum, i))
@@ -1421,14 +1420,14 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 		if err != nil {
 			// Unlock all shards before returning
-			for j := 0; j < NumShards; j++ {
+			for j := range NumShards {
 				sw.Shards[j].mu.Unlock()
 			}
 			return fmt.Errorf("failed to open next shard %d: %w", i, err)
 		}
 		if _, err := file.Write(header); err != nil {
 			file.Close()
-			for j := 0; j < NumShards; j++ {
+			for j := range NumShards {
 				sw.Shards[j].mu.Unlock()
 			}
 			return fmt.Errorf("failed to write header for next shard %d: %w", i, err)
@@ -1437,7 +1436,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	}
 
 	// Unlock all shards — new writes proceed to next generation
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		sw.Shards[i].mu.Unlock()
 	}
 
@@ -1450,7 +1449,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	var wg sync.WaitGroup
 	headerSize := vb.WALHeaderSize()
 
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		wg.Add(1)
 		go func(shardID int) {
 			defer wg.Done()
@@ -1514,7 +1513,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 
 	// Check for errors and merge all blocks
 	var allBlocks []Block
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		if results[i].err != nil {
 			return results[i].err
 		}
@@ -2823,7 +2822,7 @@ func (vb *VB) GetVolume() string {
 // VB) does not own the WAL and must not flush or consolidate.
 func (vb *VB) ownsWAL() bool {
 	if vb.UseShardedWAL && vb.ShardedWAL != nil {
-		for i := 0; i < NumShards; i++ {
+		for i := range NumShards {
 			vb.ShardedWAL.Shards[i].mu.RLock()
 			open := vb.ShardedWAL.Shards[i].DB != nil
 			vb.ShardedWAL.Shards[i].mu.RUnlock()
@@ -2871,7 +2870,7 @@ func (vb *VB) Reset() error {
 
 	// Reset ShardedWAL if enabled
 	if vb.ShardedWAL != nil {
-		for i := 0; i < NumShards; i++ {
+		for i := range NumShards {
 			shard := vb.ShardedWAL.Shards[i]
 			shard.mu.Lock()
 			if shard.DB != nil {
@@ -2992,7 +2991,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
 
-	for i := uint64(0); i < blockRequests; i++ {
+	for i := range blockRequests {
 		currentBlock := block + i
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)
@@ -3072,7 +3071,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
 
-	for i := 0; i < len(consecutiveBlocks); i++ {
+	for i := range consecutiveBlocks {
 		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
 			continue
 		}
@@ -3144,7 +3143,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
 
-	for i := 0; i < len(consecutiveBlocks); i++ {
+	for i := range consecutiveBlocks {
 		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
 			continue
 		}
@@ -3229,7 +3228,7 @@ func (vb *VB) WriteBlockStore(block uint64, data []byte) (err error) {
 
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
-	for i := uint64(0); i < blockRequests; i++ {
+	for i := range blockRequests {
 		currentBlock := block + i
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)

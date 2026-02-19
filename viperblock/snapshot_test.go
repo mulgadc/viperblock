@@ -3,6 +3,7 @@ package viperblock
 import (
 	"crypto/rand"
 	"fmt"
+	"maps"
 	"os"
 	"testing"
 
@@ -84,7 +85,7 @@ func TestSnapshotReadFallback(t *testing.T) {
 		clone := createCloneVB(t, vb, snapshotID)
 
 		// Read all blocks from the clone -- should return snapshot data
-		for i := uint64(0); i < blockCount; i++ {
+		for i := range blockCount {
 			readData, err := clone.ReadAt(i*uint64(clone.BlockSize), uint64(clone.BlockSize))
 			require.NoError(t, err)
 
@@ -279,9 +280,7 @@ func TestSnapshotWithUnopenedShardedWAL(t *testing.T) {
 		}
 		// Copy block-to-object map (simulates LoadState + LoadBlockState)
 		vb.BlocksToObject.mu.RLock()
-		for k, v := range vb.BlocksToObject.BlockLookup {
-			snapshotVB.BlocksToObject.BlockLookup[k] = v
-		}
+		maps.Copy(snapshotVB.BlocksToObject.BlockLookup, vb.BlocksToObject.BlockLookup)
 		vb.BlocksToObject.mu.RUnlock()
 		snapshotVB.SeqNum.Store(vb.SeqNum.Load())
 		snapshotVB.ObjectNum.Store(vb.ObjectNum.Load())

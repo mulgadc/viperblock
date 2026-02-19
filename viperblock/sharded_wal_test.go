@@ -65,7 +65,7 @@ func TestShardedWAL_WriteReadRoundTrip(t *testing.T) {
 	data := make([]byte, 4096)
 	rand.Read(data)
 
-	for i := uint64(0); i < 32; i++ {
+	for i := range uint64(32) {
 		err := vb.WriteShardedWAL(Block{
 			SeqNum: i + 1,
 			Block:  i,
@@ -77,7 +77,7 @@ func TestShardedWAL_WriteReadRoundTrip(t *testing.T) {
 
 	// Verify shard files exist
 	walNum := vb.ShardedWAL.WallNum.Load()
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		path := filepath.Join(vb.ShardedWAL.BaseDir,
 			types.GetShardedWALPath(vb.GetVolume(), walNum, i))
 		_, err := os.Stat(path)
@@ -87,7 +87,7 @@ func TestShardedWAL_WriteReadRoundTrip(t *testing.T) {
 
 func TestShardedWAL_ShardRouting(t *testing.T) {
 	// Verify block N goes to shard N & ShardMask
-	for blockNum := uint64(0); blockNum < 256; blockNum++ {
+	for blockNum := range uint64(256) {
 		expectedShard := blockNum & ShardMask
 		assert.Equal(t, expectedShard, blockNum&ShardMask,
 			"block %d should route to shard %d", blockNum, expectedShard)
@@ -114,11 +114,11 @@ func TestShardedWAL_ConcurrentWriters(t *testing.T) {
 	var wg sync.WaitGroup
 	errors := make([]error, numWriters)
 
-	for w := 0; w < numWriters; w++ {
+	for w := range numWriters {
 		wg.Add(1)
 		go func(writerID int) {
 			defer wg.Done()
-			for j := 0; j < blocksPerWriter; j++ {
+			for j := range blocksPerWriter {
 				blockNum := uint64(writerID*blocksPerWriter + j)
 				err := vb.WriteShardedWAL(Block{
 					SeqNum: blockNum + 1,
@@ -150,7 +150,7 @@ func TestShardedWAL_ConsolidationMerge(t *testing.T) {
 
 	// Write blocks spread across all shards
 	blocks := make(map[uint64][]byte)
-	for i := uint64(0); i < 64; i++ {
+	for i := range uint64(64) {
 		data := make([]byte, 4096)
 		rand.Read(data)
 		blocks[i] = data
@@ -200,7 +200,7 @@ func TestShardedWAL_Recovery(t *testing.T) {
 	rand.Read(data)
 
 	// Write some blocks
-	for i := uint64(0); i < 16; i++ {
+	for i := range uint64(16) {
 		err := vb.WriteShardedWAL(Block{
 			SeqNum: i + 1,
 			Block:  i,
@@ -211,7 +211,7 @@ func TestShardedWAL_Recovery(t *testing.T) {
 	}
 
 	// Sync all shards
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		shard := vb.ShardedWAL.Shards[i]
 		shard.mu.RLock()
 		if shard.DB != nil {
@@ -285,7 +285,7 @@ func TestShardedWAL_FlushDispatch(t *testing.T) {
 	rand.Read(data)
 
 	// Write blocks via WriteAt (goes to vb.Writes)
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		err := vb.WriteAt(uint64(i)*4096, data)
 		require.NoError(t, err)
 	}
@@ -304,7 +304,7 @@ func TestShardedWAL_SyncDirtyOnly(t *testing.T) {
 	defer cleanup()
 
 	// Initially all shards should be clean
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d should be clean initially", i)
 	}
 
@@ -326,7 +326,7 @@ func TestShardedWAL_SyncDirtyOnly(t *testing.T) {
 
 	// Sync should clear dirty flags
 	vb.syncShardedWALIfDirty()
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d should be clean after sync", i)
 	}
 }
@@ -346,7 +346,7 @@ func TestShardedWAL_Reset(t *testing.T) {
 	assert.NoError(t, err)
 
 	assert.Equal(t, uint64(0), vb.ShardedWAL.WallNum.Load())
-	for i := 0; i < NumShards; i++ {
+	for i := range NumShards {
 		assert.Nil(t, vb.ShardedWAL.Shards[i].DB, "shard %d DB should be nil after reset", i)
 		assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d should be clean after reset", i)
 	}

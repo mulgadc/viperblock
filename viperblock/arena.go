@@ -211,7 +211,7 @@ func NewPooledArena(blockSize uint32) *PooledArena {
 		arena:     NewArena(blockSize),
 		blockSize: blockSize,
 	}
-	pa.pool.New = func() interface{} {
+	pa.pool.New = func() any {
 		return make([]byte, blockSize)
 	}
 	return pa

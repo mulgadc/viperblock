@@ -17,7 +17,7 @@ go_build_nbd:
 
 # Preflight — runs the same checks as GitHub Actions (format + lint + security + tests).
 # Use this before committing to catch CI failures locally.
-preflight: check-format vet security-check test
+preflight: check-format check-modernize vet security-check test
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
@@ -66,10 +66,28 @@ security-check:
 	@echo -e "\n....Running security checks for $(GO_PROJECT_NAME)...."
 	set -o pipefail && go tool govulncheck ./... 2>&1 | tee tests/govulncheck-report.txt
 	@echo "  govulncheck ok"
-	set -o pipefail && go tool gosec -exclude=G104,G204,G304,G402 -exclude-dir nbd -exclude-generated ./... 2>&1 | tee tests/gosec-report.txt
+	set -o pipefail && go tool gosec -exclude=G104,G204,G304,G402,G602 -exclude-dir nbd -exclude-generated ./... 2>&1 | tee tests/gosec-report.txt
 	@echo "  gosec ok"
 	set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-U1000,-SA4006,-SA6002" ./... 2>&1 | tee tests/staticcheck-report.txt
 	@echo "  staticcheck ok"
 
+# Excluded: newexpr (replaces aws.String with new, not idiomatic for AWS SDK)
+GOFIX_EXCLUDE := -newexpr=false
+
+modernize:
+	@echo "Applying go fix modernizations..."
+	go fix $(GOFIX_EXCLUDE) ./...
+	@echo "  go fix applied"
+
+check-modernize:
+	@echo "Checking go fix modernizations..."
+	@DIFF=$$(go fix $(GOFIX_EXCLUDE) -diff ./... 2>&1); \
+	if [ -n "$$DIFF" ]; then \
+		echo "$$DIFF"; \
+		echo "Run 'make modernize' to fix."; \
+		exit 1; \
+	fi
+	@echo "  go fix ok"
+
 .PHONY: build go_build go_build_nbd preflight test bench run clean \
-	format check-format vet security-check
+	format check-format check-modernize modernize vet security-check

@@ -870,7 +870,7 @@ func TestWALPeriodicSync(t *testing.T) {
 				if tc.syncInterval >= 50*time.Millisecond {
 					if vb.UseShardedWAL {
 						anyDirty := false
-						for i := 0; i < NumShards; i++ {
+						for i := range NumShards {
 							if vb.ShardedWAL.Shards[i].dirty.Load() {
 								anyDirty = true
 								break
@@ -891,7 +891,7 @@ func TestWALPeriodicSync(t *testing.T) {
 
 				// Dirty flag should be cleared by syncer
 				if vb.UseShardedWAL {
-					for i := 0; i < NumShards; i++ {
+					for i := range NumShards {
 						assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d dirty flag should be cleared after sync", i)
 					}
 				} else {
@@ -952,11 +952,11 @@ func TestWALSyncerConcurrency(t *testing.T) {
 	numWriters := 4
 	writesPerWriter := 10
 
-	for i := 0; i < numWriters; i++ {
+	for i := range numWriters {
 		wg.Add(1)
 		go func(writerID int) {
 			defer wg.Done()
-			for j := 0; j < writesPerWriter; j++ {
+			for j := range writesPerWriter {
 				data := make([]byte, DefaultBlockSize)
 				copy(data, fmt.Sprintf("writer_%d_write_%d", writerID, j))
 
@@ -981,7 +981,7 @@ func TestWALSyncerConcurrency(t *testing.T) {
 
 	// Verify no data corruption - dirty flag should be clear
 	if vb.UseShardedWAL {
-		for i := 0; i < NumShards; i++ {
+		for i := range NumShards {
 			assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d dirty flag should be cleared after all syncs", i)
 		}
 	} else {
@@ -989,8 +989,8 @@ func TestWALSyncerConcurrency(t *testing.T) {
 	}
 
 	// Verify writes are readable
-	for i := 0; i < numWriters; i++ {
-		for j := 0; j < writesPerWriter; j++ {
+	for i := range numWriters {
+		for j := range writesPerWriter {
 			blockID := uint64(i*writesPerWriter+j) * uint64(vb.BlockSize)
 			readData, err := vb.ReadAt(blockID, uint64(vb.BlockSize))
 			assert.NoError(t, err)
@@ -1587,9 +1587,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 			// Start a goroutine that continuously writes new blocks
 			// while we trigger WriteWALToChunk
 			stopChan := make(chan struct{})
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				blockNum := uint64(1000) // Start from a high block number to avoid conflicts
 				for {
 					select {
@@ -1611,7 +1609,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 						time.Sleep(time.Microsecond * 100)
 					}
 				}
-			}()
+			})
 
 			// Give the concurrent writer a moment to start
 			time.Sleep(time.Millisecond * 10)
