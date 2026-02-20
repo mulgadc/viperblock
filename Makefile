@@ -23,13 +23,13 @@ preflight: check-format check-modernize vet security-check test-cover diff-cover
 # Run unit tests
 test:
 	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
-	LOG_IGNORE=1 go test -v -timeout 300s ./...
+	LOG_IGNORE=1 go test -v -timeout 120s ./...
 
 # Run unit tests with coverage profile
 COVERPROFILE ?= coverage.out
 test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
-	LOG_IGNORE=1 go test -v -timeout 300s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/...
+	LOG_IGNORE=1 go test -v -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/...
 	@echo ""
 	@echo "=== Total Coverage ==="
 	@go tool cover -func=$(COVERPROFILE) | tail -1
@@ -37,7 +37,7 @@ test-cover:
 # Run unit tests with race detector
 test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
-	LOG_IGNORE=1 go test -race -timeout 600s ./viperblock/...
+	LOG_IGNORE=1 go test -race -timeout 300s ./viperblock/...
 
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover

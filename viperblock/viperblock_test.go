@@ -56,8 +56,66 @@ var (
 	SecretKey string
 )
 
-func init() {
+// sharedServerHost holds the host:port of the shared predastore test server started in TestMain.
+var sharedServerHost string
+
+// sharedBucketPath is the filesystem path of the first predastore bucket, used for test volume cleanup.
+var sharedBucketPath string
+
+// sharedServerShutdown is the cleanup function for the shared predastore server.
+var sharedServerShutdown func()
+
+func TestMain(m *testing.M) {
 	AccessKey, SecretKey = loadTestCredentials()
+
+	host, err := FindFreePort()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to find free port for shared test server: %v\n", err)
+		os.Exit(1)
+	}
+
+	dir, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get working directory: %v\n", err)
+		os.Exit(1)
+	}
+	dir = filepath.Join(dir, "..")
+
+	s3server := predastore.New(&predastore.Config{
+		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
+	})
+	if err := s3server.ReadConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read predastore config: %v\n", err)
+		os.Exit(1)
+	}
+
+	server := predastore.NewHTTP2Server(s3server)
+	go func() {
+		if err := server.ListenAndServe(host, "../config/server.pem", "../config/server.key"); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "shared test server error: %v\n", err)
+		}
+	}()
+
+	serverURL := fmt.Sprintf("https://%s", host)
+	if !waitForServer(serverURL, 5*time.Second) {
+		fmt.Fprintf(os.Stderr, "shared test server did not respond in time at %s\n", serverURL)
+		os.Exit(1)
+	}
+
+	sharedServerHost = host
+	if len(s3server.Buckets) > 0 {
+		sharedBucketPath = s3server.Buckets[0].Pathname
+	}
+	sharedServerShutdown = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
+	}
+
+	code := m.Run()
+
+	sharedServerShutdown()
+	os.Exit(code)
 }
 
 // loadTestCredentials loads AWS credentials.
@@ -84,66 +142,6 @@ func loadTestCredentials() (accessKey, secretKey string) {
 	}
 
 	return accessKey, secretKey
-}
-
-//var s3server predastore.Config
-
-// startTestServer starts the HTTP/2 server and returns:
-// - a shutdown function to cleanly stop the server
-// - an error if startup failed
-func startTestServer(t *testing.T, host string) (shutdown func(volName string), err error) {
-
-	// Get the current directory
-	dir, err := os.Getwd()
-	require.NoError(t, err, "Failed to get current directory")
-
-	// Go down one directory from the current directory
-	dir = filepath.Join(dir, "..")
-
-	// Create and configure the S3 server
-	s3server := predastore.New(&predastore.Config{
-		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
-	})
-
-	err = s3server.ReadConfig()
-	require.NoError(t, err, "Failed to read config file")
-
-	// Create HTTP/2 server
-	server := predastore.NewHTTP2Server(s3server)
-
-	// Channel to signal server startup error
-	serverErr := make(chan error, 1)
-
-	go func() {
-		// Start the HTTP/2 server
-		if err := server.ListenAndServe(host, "../config/server.pem", "../config/server.key"); err != nil {
-			// http.ErrServerClosed is expected when Shutdown() is called
-			if err != http.ErrServerClosed {
-				serverErr <- err
-			}
-		}
-	}()
-
-	// Give the server a moment to start, then check for immediate errors
-	select {
-	case err := <-serverErr:
-		return nil, fmt.Errorf("server failed to start: %w", err)
-	case <-time.After(50 * time.Millisecond):
-		// Server started successfully (or is starting)
-	}
-
-	shutdown = func(volName string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
-
-		// Remove the test volume
-		tmpVolume := fmt.Sprintf("%s/%s", s3server.Buckets[0].Pathname, volName)
-
-		os.RemoveAll(tmpVolume)
-	}
-
-	return shutdown, nil
 }
 
 // setupTestVB creates a new VB instance for testing with the specified backend
@@ -183,11 +181,6 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 		}
 
 	case S3Backend:
-		//t.Log("S3 backend not found, setting up S3 server")
-
-		host, err := FindFreePort()
-		assert.NoError(t, err)
-
 		backendConfig = s3.S3Config{
 			VolumeName: testVol,
 			VolumeSize: volumeSize,
@@ -196,21 +189,14 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 			Bucket:    "predastore",
 			AccessKey: AccessKey,
 			SecretKey: SecretKey,
-			Host:      fmt.Sprintf("https://%s", host),
+			Host:      fmt.Sprintf("https://%s", sharedServerHost),
 		}
 
-		shutdown, err = startTestServer(t, host)
-		if err != nil {
-			t.Fatalf("failed to start server: %v", err)
+		shutdown = func(volName string) {
+			if sharedBucketPath != "" {
+				os.RemoveAll(fmt.Sprintf("%s/%s", sharedBucketPath, volName))
+			}
 		}
-
-		// Wait until server is responsive
-		ok := waitForServer(backendConfig.(s3.S3Config).Host, 2*time.Second)
-		if !ok {
-			t.Fatalf("server did not respond in time")
-		}
-
-		assert.NoError(t, err)
 
 	default:
 		t.Fatalf("unsupported backend type: %s", backendType.BackendType)
