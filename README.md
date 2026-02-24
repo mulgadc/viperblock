@@ -1,189 +1,168 @@
-# Viperblock - Block Storage for Edge, On-Premise, and Cloud Deployments
+# Viperblock
 
-Viperblock is a block storage service which is compatible with object-storage (S3) for highly durable, consistent, and high-performance volumes. It is suitable for edge deployments, on-premise networks, and private cloud environments.
+Viperblock developed by [Mulga Defense Corporation](https://mulgadc.com/) is a High-performance, WAL-backed block storage engine. Viperblock is the **EBS backend for [Hive](https://github.com/mulgadc/hive)**, providing durable block volumes for QEMU/KVM virtual machines over the NBD protocol.
 
-The system provides a network block device (NBD) with intelligent caching for read/write access, a log-structured database for writes, and batched operations. Viperblock enables the setup of highly available storage that can power virtual machines and containers with durable storage and persistence for critical edge and on-premise deployments.
+Viperblock combines an in-memory write buffer for fast acknowledgment, a write-ahead log on local NVMe for crash durability, and batched 4 MB chunk uploads to pluggable storage backends including S3-compatible object stores. Volumes are exposed as network block devices via an [nbdkit](https://gitlab.com/nbdkit/nbdkit) plugin, giving guest VMs a standard block device backed by durable, distributed storage.
 
-# Design
+For full architectural details, binary formats, and data flow diagrams, see **[DESIGN.md](DESIGN.md)**.
 
-Viperblock is a sophisticated block storage platform designed for durability, consistency, and high performance. Below is a detailed breakdown of the architecture.
+## Key Features
 
-## Core Architecture
+- **WAL-backed durability** — writes are acknowledged from memory, flushed to a write-ahead log on fast local storage, then consolidated into 4 MB chunks on the backend
+- **Sharded WAL** — 16 independent WAL shards eliminate write lock contention across concurrent block writes
+- **Extent-based block mapping** — inspired by ext4 extents, consecutive blocks are merged into single index entries for efficient lookups
+- **O(1) block lookups** — 16-way sharded `UnifiedBlockStore` tracks every block's lifecycle state with per-shard locking
+- **Snapshots and clones** — point-in-time snapshots with copy-on-write clone support (no data duplication)
+- **Pluggable backends** — local filesystem, in-memory (testing), or S3-compatible storage ([Predastore](https://github.com/mulgadc/predastore), AWS S3)
+- **NBD integration** — nbdkit plugin exposes volumes as network block devices for QEMU/KVM
+- **LRU caching** — configurable cache sized by block count or system memory percentage
+- **Arena allocator** — bump-pointer allocator with 4 MB slabs reduces GC pressure on the write path
 
-Viperblock implements a layered approach to block storage:
+## Architecture Overview
 
-1. **In-memory Writes Buffer**: New write operations are first stored in memory
-2. **Write-Ahead Log (WAL)**: Data is periodically flushed to WAL files for durability, recommended to use high-speed NVMe devices as the WAL storage.
-3. **Chunk Files**: WAL entries are consolidated into optimized chunk files which are stored on a specified backend (s3, or direct filesystem)
-4. **Block Mapping**: A mapping system tracks where each logical block is stored in relation to the chunk file and offset position of the block.
-5. **Storage Backends**: Multiple backend options (file, memory, S3) for flexible deployment
-
-## Block Management
-
-- **Default Block Size**: 4KB (standard size for physical disks and filesystems)
-- **Default Chunk Size**: 4MB (`ObjBlockSize`)
-- **Block Identification**: Each block has a unique ID (uint64) that represents its logical position
-
-## Write Path
-
-1. **In-memory Buffer**:
-
-   - When `Write(block, data)` is called, a unique sequence number is assigned
-   - The block is added to `Writes.Blocks` in memory
-   - This provides fast acknowledgment to clients
-
-2. **WAL (Write-Ahead Log)**:
-
-   - The `Flush()` method moves blocks from memory to WAL files
-   - WAL entries include: sequence number, block number, length, checksum, and data
-   - This occurs every 5 seconds or when 64MB is written (`FlushInterval` and `FlushSize`)
-   - WAL files provide durability in case of system crashes, which can be replayed to rebuild the filesystem or as a checkpoint to a specific time.
-
-3. **Chunk File Creation**:
-   - `WriteWALToChunk()` converts WAL entries to optimized chunk files
-   - Blocks are deduplicated (newer versions with higher sequence numbers win)
-   - Blocks are sorted by block number for speeding up sequential access
-   - Multiple blocks are packed into a single chunk file with a 10-byte header to describe the chunk options.
-
-## Block Mapping
-
-The `BlocksToObject` structure is critical to Viperblock's operation:
-
-```go
-type BlocksToObject struct {
-    mu sync.RWMutex
-    BlockLookup map[uint64]BlockLookup
-}
-
-type BlockLookup struct {
-    StartBlock   uint64
-    NumBlocks    uint16
-    ObjectID     uint64
-    ObjectOffset uint32
-}
+```
+QEMU/KVM VM ──── NBD Protocol ────▶ nbdkit + viperblock plugin
+                                              │
+                                    ┌─────────▼──────────┐
+                                    │  Viperblock Engine  │
+                                    │                     │
+                                    │  Write Buffer       │
+                                    │       │             │
+                                    │       ▼             │
+                                    │  WAL (NVMe)         │
+                                    │       │             │
+                                    │       ▼             │
+                                    │  4 MB Chunks        │
+                                    │       │             │
+                                    │       ▼             │
+                                    │  Storage Backend    │
+                                    │  (File/S3/Memory)   │
+                                    └─────────────────────┘
 ```
 
-- When a chunk file is created, entries are added to this mapping
-- For each block or sequence of consecutive blocks, the system records:
-  - The starting block number (`StartBlock`)
-  - How many consecutive blocks are stored together (`NumBlocks`), inspired by `ext4` extents
-  - Which chunk file contains the data (`ObjectID`)
-  - Where in the chunk file the block data begins (`ObjectOffset`)
+See [DESIGN.md](DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
 
-The `LookupBlockToObject()` function uses this mapping to quickly locate any block:
+## Part of the Hive Stack
 
-```go
-func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, err error)
-```
+Viperblock is one of three components in the [Hive](https://github.com/mulgadc/hive) AWS-compatible infrastructure platform:
 
-## Storage Backends
+| Component | Role | Repository |
+|-----------|------|------------|
+| **[Hive](https://github.com/mulgadc/hive)** | VM orchestration (EC2-compatible) | [mulgadc/hive](https://github.com/mulgadc/hive) |
+| **Viperblock** | Block storage (EBS-compatible) | [mulgadc/viperblock](https://github.com/mulgadc/viperblock) |
+| **[Predastore](https://github.com/mulgadc/predastore)** | Object storage (S3-compatible) | [mulgadc/predastore](https://github.com/mulgadc/predastore) |
 
-Viperblock supports multiple storage backends:
+When deployed with Hive, Viperblock subscribes to NATS topics (`ebs.createvolume`, `ebs.mount`, `ebs.attachvolume`, etc.) for EBS-compatible volume lifecycle management. The Hive daemon sends a mount request; Viperblock starts nbdkit and returns an NBD URI that QEMU uses to back a virtual disk.
 
-1. **File Backend**: Stores chunks as files on the local filesystem
-2. **Memory Backend**: Keeps data in memory (for testing or caching)
-3. **S3 Backend**: Stores data in Amazon S3 or S3-compatible storage
-
-This backend flexibility allows Viperblock to operate in various environments, from edge deployments to on-premise installations.
-
-## Durability and Consistency
-
-Several features ensure data durability and consistency:
-
-- **Checksums**: All blocks have CRC32 checksums to detect corruption
-- **Sequence Numbers**: Ensure the latest version of a block is used
-- **WAL**: Provides durability before data is committed to chunk files
-- **State Persistence**: System state can be saved and loaded (`SaveState`/`LoadState`)
-
-## Performance Considerations
-
-- **In-memory Cache**: Recently used blocks are cached for performance
-- **Sequential Block Storage**: Blocks are sorted and stored sequentially when possible
-- **Batched Operations**: Multiple blocks are combined into chunk files
-- **Concurrent Access**: Thread-safe operations with fine-grained locking
-
-This architecture makes Viperblock suitable for high-performance, durable block storage platform designed for edge, private cloud and secure on-premise deployments.
+Viperblock can also be used standalone for any application that needs durable block storage with S3 as a backend tier.
 
 ## Getting Started
 
 ### Dependencies
 
-Install required `nbdkit`
-
-```
+```bash
 sudo apt install nbdkit nbdkit-plugin-dev
 ```
 
-### Installation
-
-Clone the repository and navigate to the project directory:
+### Build
 
 ```bash
-git clone https://github.com/yourusername/viperblock.git
+git clone https://github.com/mulgadc/viperblock.git
 cd viperblock
+make build
 ```
 
-Build from source:
+This produces:
+- `./bin/sfs` — Simple File System demo
+- `./bin/vblock` — Volume management CLI
+- `./lib/nbdkit-viperblock-plugin.so` — NBD plugin for nbdkit
+
+### Run Tests
 
 ```bash
-make
+make test        # Unit tests
+make preflight   # Full CI checks (format, vet, security, tests, race detector)
 ```
 
-### Usage (NBD)
+## Usage
 
-Work in progress for using Viperblock via NBD with KVM/QEMU to provide the block-storage for VM's.
+### NBD (Production)
 
-### Usage (SFS)
-
-To run a simulated filesystem, Simple File System (SFS) is included with Viperblock to simulate a real-world filesystem that interacts with the service.
-
-To run Viperblock with different backend types, use the following commands:
-
-#### Using S3 Backend
-
-Viperblock is designed to be used in conjunction with [Predastore](https://github.com/mulgadc/predastore/) (designed by Mulga) as part of the Hive platform. Ensure Predastore is running on your local network as the S3 service, or alternatively Viperblock is compatible with Amazon S3 or other S3 implementations.
+Viperblock volumes are served to QEMU/KVM via nbdkit. When used with Hive, this is managed automatically via NATS. For standalone use:
 
 ```bash
-AWS_BUCKET="predastore" AWS_PROFILE=predastore AWS_REGION=ap-southeast-2 AWS_HOST="https://localhost:8443/" AWS_ACCESS_KEY="EXAMPLEKEY" AWS_SECRET_KEY="EXAMPLEKEY" ./bin/sfs -btype s3 -dir /dir/to/upload -sfsstate /tmp/state_s3.json -vbstate /tmp/vb_s3.json -voldata tmp -vol test1_s3
+nbdkit --filter=blocksize ./lib/nbdkit-viperblock-plugin.so \
+    volume=my-volume \
+    size=$((10*1024*1024*1024)) \
+    base_dir=/data/viperblock \
+    cache_size=20
 ```
 
-#### Using File Backend (for Development)
+Plugin parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `size` | Volume size in bytes |
+| `volume` | Volume name |
+| `base_dir` | Local storage directory (file backend) |
+| `bucket` | S3 bucket (S3 backend) |
+| `host` | S3 endpoint URL (S3 backend) |
+| `region` | AWS region (S3 backend) |
+| `access_key` / `secret_key` | S3 credentials (S3 backend) |
+| `cache_size` | LRU cache as percentage of system memory |
+| `shardwal` | Enable sharded WAL (`true`/`false`) |
+
+### SFS Demo
+
+The Simple File System (SFS) demo demonstrates Viperblock with a simulated filesystem:
 
 ```bash
-./bin/sfs -btype file -dir /dir/to/upload -sfsstate /tmp/state_file.json -vbstate /tmp/vb_file.json -voldata tmp -vol test1_file
+# File backend (development)
+./bin/sfs -btype file -dir /path/to/data -vol my-volume -voldata /tmp/vb
+
+# S3 backend (with Predastore or AWS S3)
+AWS_HOST="https://localhost:8443/" \
+AWS_BUCKET="viperblock" \
+AWS_ACCESS_KEY="EXAMPLEKEY" \
+AWS_SECRET_KEY="EXAMPLEKEY" \
+./bin/sfs -btype s3 -dir /path/to/data -vol my-volume -voldata /tmp/vb
 ```
 
-### Command-Line Options
+### SFS Options
 
-- `-btype string`: Backend type (file, memory, s3) (default "file")
-- `-createvol`: Initialize a new volume with the specified `-vol` argument
-- `-dir string`: Sample directory to read
-- `-sfsstate string`: SFS (filesystem) state file to load
-- `-size uint`: Volume size in bytes (default 524288)
-- `-vbstate string`: Viperblock state file to load
-- `-vol string`: Volume to read
-- `-voldata string`: Volume data directory to store blocks
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-btype` | Backend type: `file`, `memory`, `s3` | `file` |
+| `-vol` | Volume name | |
+| `-size` | Volume size in bytes | 524288 |
+| `-dir` | Directory to read into volume | |
+| `-voldata` | Local directory for volume data | |
+| `-createvol` | Initialize a new volume | |
+| `-vbstate` | Viperblock state file path | |
+| `-sfsstate` | SFS state file path | |
 
-### Help
+## Design Decisions
 
-For more information on command-line options, run:
+A summary of the key design choices. See [DESIGN.md](DESIGN.md) for the full treatment.
 
-```bash
-./bin/sfs -h
-```
+**WAL on fast local storage, chunks on S3.** Writes are acknowledged from memory and durably flushed to a local WAL (NVMe recommended). WAL entries are then consolidated into 4 MB chunks and uploaded to the backend. This separates write latency (local NVMe speed) from storage durability (S3 replication).
 
-## Contributing
+**Extent-based block mapping.** Rather than one index entry per 4 KB block, consecutive blocks are merged into extents (inspired by ext4). A 10-block sequential write produces one extent entry instead of ten, reducing memory usage and speeding up lookups.
 
-Contributions are welcome! Please fork the repository and submit a pull request.
+**16-way sharded locking.** Both the `UnifiedBlockStore` and the sharded WAL use 16 shards keyed by `blockNum & 0xF`. Concurrent writes to different blocks never contend on the same lock.
+
+**Copy-on-write snapshots.** `CreateSnapshot` freezes the block-to-object mapping without copying any data. Clones created from a snapshot read unmodified blocks from the source volume's chunks and only allocate new storage for blocks that are overwritten. This makes snapshot creation instant and clone creation near-instant regardless of volume size.
+
+**CRC32 checksums everywhere.** Every WAL record includes a CRC32 checksum validated during replay and consolidation. Corrupt records are detected before they reach chunk storage.
 
 ## Research
 
-The following research papers aided the design and implementation of Viperblock, a huge thank you to the authors for their contributions.
+The following papers informed the design of Viperblock:
 
-- Hajkazemi, Mohammad Hossein, et al. "Beating the i/o bottleneck: a case for log-structured virtual disks." Proceedings of the Seventeenth European Conference on Computer Systems. 2022. https://doi.org/10.1145/3492321.3524271
-- Zhou, Diyu, et al. "Enabling high-performance and secure userspace nvm file systems with the trio architecture." Proceedings of the 29th Symposium on Operating Systems Principles. 2023. https://doi.org/10.1145/3600006.3613171
-- Li, Huiba, et al. "Ursa: Hybrid block storage for cloud-scale virtual disks." Proceedings of the Fourteenth EuroSys Conference 2019. 2019. https://doi.org/10.1145/3302424.3303967
+- Hajkazemi, M. H. et al. "Beating the I/O bottleneck: a case for log-structured virtual disks." *EuroSys 2022.* https://doi.org/10.1145/3492321.3524271
+- Zhou, D. et al. "Enabling high-performance and secure userspace NVM file systems with the trio architecture." *SOSP 2023.* https://doi.org/10.1145/3600006.3613171
+- Li, H. et al. "Ursa: Hybrid block storage for cloud-scale virtual disks." *EuroSys 2019.* https://doi.org/10.1145/3302424.3303967
 
 ## License
 
-This project is licensed under the Apache 2.0 License.
+Apache 2.0
