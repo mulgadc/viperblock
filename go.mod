@@ -1,6 +1,6 @@
 module github.com/mulgadc/viperblock
 
-go 1.26.0
+go 1.26.1
 
 replace libguestfs.org/nbdkit => ./nbd/libguestfs.org/nbdkit
 
