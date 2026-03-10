@@ -131,7 +131,9 @@ func (sfs *SimpleFS) CreateFile(pathname string, dataLen uint64) (blocks []uint6
 
 	// Check if the filename already exists, if so delete the previous blocks allocated
 	if _, ok := sfs.Blocks[pathname]; ok {
-		sfs.FreeBlocks(sfs.Blocks[pathname].Blocks)
+		if err := sfs.FreeBlocks(sfs.Blocks[pathname].Blocks); err != nil {
+			return nil, fmt.Errorf("failed to free existing blocks for %s: %w", pathname, err)
+		}
 		delete(sfs.Blocks, pathname)
 	}
 
@@ -160,7 +162,9 @@ func (sfs *SimpleFS) DeleteFile(pathname string) error {
 		return fmt.Errorf("file not found")
 	}
 
-	sfs.FreeBlocks(sfs.Blocks[pathname].Blocks)
+	if err := sfs.FreeBlocks(sfs.Blocks[pathname].Blocks); err != nil {
+		return fmt.Errorf("failed to free blocks for %s: %w", pathname, err)
+	}
 
 	sfs.mu.Lock()
 	defer sfs.mu.Unlock()

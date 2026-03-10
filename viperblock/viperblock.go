@@ -491,10 +491,14 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	}
 
 	// Create the base directory if it doesn't exist
-	os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume()), 0750)
+	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume()), 0750); err != nil {
+		return nil, fmt.Errorf("failed to create base directory: %w", err)
+	}
 
 	// Create the checkpoint directory if it doesn't exist
-	os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750)
+	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750); err != nil {
+		return nil, fmt.Errorf("failed to create checkpoint directory: %w", err)
+	}
 
 	// Start background WAL syncer for periodic fsync (if interval > 0)
 	vb.StartWALSyncer()
@@ -659,7 +663,9 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 
 	// Create the directory if it doesn't exist
-	os.MkdirAll(filepath.Dir(filename), 0750)
+	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
+		return fmt.Errorf("failed to create WAL directory: %w", err)
+	}
 
 	// Create the file if it doesn't exist, make sure writes and committed immediately
 	// Removed syscall.O_SYNC, TODO implement buffer, sync every 250ms / 1MB data
@@ -724,7 +730,10 @@ func (vb *VB) OpenShardedWAL() error {
 		filename := filepath.Join(sw.BaseDir,
 			types.GetShardedWALPath(vb.GetVolume(), walNum, i))
 
-		os.MkdirAll(filepath.Dir(filename), 0750)
+		if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
+			shard.mu.Unlock()
+			return fmt.Errorf("failed to create shard directory %d: %w", i, err)
+		}
 
 		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 		if err != nil {
@@ -733,7 +742,9 @@ func (vb *VB) OpenShardedWAL() error {
 			for j := range i {
 				sw.Shards[j].mu.Lock()
 				if sw.Shards[j].DB != nil {
-					sw.Shards[j].DB.Close()
+					if cerr := sw.Shards[j].DB.Close(); cerr != nil {
+						slog.Warn("failed to close shard during cleanup", "shard", j, "error", cerr)
+					}
 					sw.Shards[j].DB = nil
 				}
 				sw.Shards[j].mu.Unlock()
@@ -742,7 +753,9 @@ func (vb *VB) OpenShardedWAL() error {
 		}
 
 		if _, err := file.Write(header); err != nil {
-			file.Close()
+			if cerr := file.Close(); cerr != nil {
+				slog.Warn("failed to close shard file during cleanup", "shard", i, "error", cerr)
+			}
 			shard.mu.Unlock()
 			return fmt.Errorf("failed to write header for shard %d: %w", i, err)
 		}
@@ -1400,8 +1413,12 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 	for i := range NumShards {
 		shard := sw.Shards[i]
 		if shard.DB != nil {
-			shard.DB.Sync()
-			shard.DB.Close()
+			if err := shard.DB.Sync(); err != nil {
+				slog.Warn("failed to sync shard WAL", "shard", i, "error", err)
+			}
+			if err := shard.DB.Close(); err != nil {
+				slog.Warn("failed to close shard WAL", "shard", i, "error", err)
+			}
 			shard.DB = nil
 		}
 	}
@@ -1415,7 +1432,12 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		filename := filepath.Join(sw.BaseDir,
 			types.GetShardedWALPath(vb.GetVolume(), nextWalNum, i))
 
-		os.MkdirAll(filepath.Dir(filename), 0750)
+		if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
+			for j := range NumShards {
+				sw.Shards[j].mu.Unlock()
+			}
+			return fmt.Errorf("failed to create next shard directory %d: %w", i, err)
+		}
 
 		file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 		if err != nil {
@@ -1426,7 +1448,9 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 			return fmt.Errorf("failed to open next shard %d: %w", i, err)
 		}
 		if _, err := file.Write(header); err != nil {
-			file.Close()
+			if cerr := file.Close(); cerr != nil {
+				slog.Warn("failed to close shard file during cleanup", "shard", i, "error", cerr)
+			}
 			for j := range NumShards {
 				sw.Shards[j].mu.Unlock()
 			}
@@ -1616,7 +1640,9 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		vb.WAL.mu.Unlock()
 		return fmt.Errorf("failed to sync WAL before chunking: %w", err)
 	}
-	pendingWAL.Close()
+	if err := pendingWAL.Close(); err != nil {
+		slog.Warn("failed to close pending WAL", "error", err)
+	}
 
 	// Open the next WAL file while still holding the lock so there is no
 	// window where syncWALIfDirty or WriteWAL can see a closed DB entry.
@@ -1942,11 +1968,14 @@ func (vb *VB) SaveHotState(filename string) (err error) {
 	defer file.Close()
 
 	// Write the BlocksToObject to the file as JSON
-	json.NewEncoder(file).Encode(vb.Writes.Blocks)
+	if err := json.NewEncoder(file).Encode(vb.Writes.Blocks); err != nil {
+		vb.Writes.mu.RUnlock()
+		return fmt.Errorf("failed to encode blocks to JSON: %w", err)
+	}
 
 	defer vb.Writes.mu.RUnlock()
 
-	return err
+	return nil
 
 }
 
@@ -1994,7 +2023,9 @@ func (vb *VB) SaveBlockState() (err error) {
 	defer file.Close()
 
 	// Write the file locally
-	file.Write(checkpoint)
+	if _, err = file.Write(checkpoint); err != nil {
+		return fmt.Errorf("failed to write block checkpoint: %w", err)
+	}
 
 	headers := []byte{}
 
@@ -2224,7 +2255,9 @@ func (vb *VB) RecoverLocalWALs() error {
 	if len(allBlocks) == 0 {
 		slog.Info("WAL recovery: no valid blocks found in orphaned WAL files, cleaning up")
 		for _, fname := range successFiles {
-			os.Remove(filepath.Join(walDir, fname))
+			if err := os.Remove(filepath.Join(walDir, fname)); err != nil {
+				slog.Warn("failed to remove orphaned WAL file", "file", fname, "error", err)
+			}
 		}
 		return nil
 	}
@@ -2738,7 +2771,9 @@ func (vb *VB) Close() error {
 	// Stop the WAL syncer goroutine (performs final sync before stopping)
 	vb.StopWALSyncer()
 
-	vb.Flush()
+	if err := vb.Flush(); err != nil {
+		slog.Error("failed to flush during Close", "error", err)
+	}
 
 	var err error
 	if vb.UseShardedWAL {
@@ -2874,7 +2909,9 @@ func (vb *VB) Reset() error {
 			shard := vb.ShardedWAL.Shards[i]
 			shard.mu.Lock()
 			if shard.DB != nil {
-				shard.DB.Close()
+				if err := shard.DB.Close(); err != nil {
+					slog.Warn("failed to close shard during reset", "shard", i, "error", err)
+				}
 				shard.DB = nil
 			}
 			shard.dirty.Store(false)

@@ -74,7 +74,10 @@ func main() {
 		// Check if the directory exists
 		if _, err := os.Stat(*voldata); os.IsNotExist(err) {
 			fmt.Println("Volume data directory does not exist, creating it")
-			os.MkdirAll(*voldata, 0750)
+			if err := os.MkdirAll(*voldata, 0750); err != nil {
+				slog.Error("Failed to create volume data directory", "error", err)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -189,7 +192,7 @@ func main() {
 	//blockSHA256 = make(map[string]string)
 
 	// Next, iterate over the directory and traverse the directory tree
-	filepath.Walk(*fname, func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(*fname, func(path string, info os.FileInfo, err error) error {
 
 		// Skip directories
 		if info.IsDir() {
@@ -245,7 +248,10 @@ func main() {
 			}
 
 			// Append the currentBlock and raw data to main memory
-			vb.Write(blocks[currentBlock], buffer)
+			if werr := vb.Write(blocks[currentBlock], buffer); werr != nil {
+				slog.Error("Failed to write block", "block", currentBlock, "error", werr)
+				return werr
+			}
 
 			currentBlock++
 
@@ -260,6 +266,10 @@ func main() {
 
 		return nil
 	})
+	if err != nil {
+		slog.Error("Failed to walk directory", "error", err)
+		os.Exit(1)
+	}
 
 	//spew.Dump(localSHA256)
 
@@ -268,14 +278,23 @@ func main() {
 	// Next, flush the main memory to the WAL
 	fmt.Println("Flushing main memory to WAL")
 
-	vb.Flush()
+	if err = vb.Flush(); err != nil {
+		slog.Error("Failed to flush", "error", err)
+		os.Exit(1)
+	}
 
 	fmt.Println("Main memory after flush: ", len(vb.Writes.Blocks))
 
 	if vb.UseShardedWAL {
-		vb.WriteShardedWALToChunk(false)
+		if err = vb.WriteShardedWALToChunk(false); err != nil {
+			slog.Error("Failed to write sharded WAL to chunk", "error", err)
+			os.Exit(1)
+		}
 	} else {
-		vb.WriteWALToChunk(false)
+		if err = vb.WriteWALToChunk(false); err != nil {
+			slog.Error("Failed to write WAL to chunk", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	// Serialize the BlocksToObject
@@ -361,7 +380,9 @@ func main() {
 	}
 
 	// Save the state
-	vb.SaveState()
+	if err = vb.SaveState(); err != nil {
+		slog.Error("Failed to save viperblock state", "error", err)
+	}
 
 	// Export the WAL number and chunk number
 	fmt.Println("WAL number", vb.WAL.WallNum.Load())

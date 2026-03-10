@@ -226,14 +226,18 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 
 	if headers != nil && len(*headers) > 0 {
 		if _, err = file.Write(*headers); err != nil {
-			file.Close()
+			if cerr := file.Close(); cerr != nil {
+				slog.Warn("failed to close file during cleanup", "error", cerr)
+			}
 			return err
 		}
 	}
 
 	if data != nil {
 		if _, err = file.Write(*data); err != nil {
-			file.Close()
+			if cerr := file.Close(); cerr != nil {
+				slog.Warn("failed to close file during cleanup", "error", cerr)
+			}
 			return err
 		}
 	}

@@ -167,7 +167,9 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 			return fmt.Errorf("failed to read disk file: %v", err)
 		}
 
-		vb.WriteAt(block*uint64(vb.BlockSize), buf[:n])
+		if err := vb.WriteAt(block*uint64(vb.BlockSize), buf[:n]); err != nil {
+			return fmt.Errorf("failed to write block %d: %w", block, err)
+		}
 
 		//fmt.Println("Write", "block", hex.EncodeToString(buf[:n]))
 
@@ -176,8 +178,12 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		// Flush every 4MB
 		if block%uint64(vb.BlockSize) == 0 {
 			fmt.Println("Flush", "block", block)
-			vb.Flush()
-			vb.WriteWALToChunk(true)
+			if err := vb.Flush(); err != nil {
+				return fmt.Errorf("failed to flush at block %d: %w", block, err)
+			}
+			if err := vb.WriteWALToChunk(true); err != nil {
+				return fmt.Errorf("failed to write WAL to chunk at block %d: %w", block, err)
+			}
 		}
 
 	}
