@@ -162,8 +162,6 @@ type Cache struct {
 }
 
 type ObjectMap struct {
-	mu sync.RWMutex
-
 	Objects map[uint64]Block
 }
 
@@ -249,13 +247,6 @@ type ShardedWAL struct {
 	WallNum  atomic.Uint64
 	BaseDir  string
 	WALMagic [4]byte
-}
-
-// ChunkWork represents a unit of work for the worker pool
-type ChunkWork struct {
-	currentWALNum uint64
-	chunkBuffer   []byte
-	matchedBlocks []Block
 }
 
 type VolumeConfig struct {
@@ -670,6 +661,9 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 	// Create the file if it doesn't exist, make sure writes and committed immediately
 	// Removed syscall.O_SYNC, TODO implement buffer, sync every 250ms / 1MB data
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to open WAL file: %w", err)
+	}
 
 	// Append the WAL header, format
 	// Check our type
@@ -1009,7 +1003,6 @@ func (vb *VB) flushLockedSharded() error {
 
 	// Write to each shard in parallel
 	type shardError struct {
-		shardID int
 		err     error
 		flushed map[uint64]uint64
 	}
@@ -1224,7 +1217,7 @@ func (vb *VB) ReadWAL() (err error) {
 
 		// Read the block number
 		headers := make([]byte, 28)
-		n, err := currentWAL.Read(headers)
+		_, err := currentWAL.Read(headers)
 
 		if err != nil {
 			if err == io.EOF {
@@ -1242,6 +1235,7 @@ func (vb *VB) ReadWAL() (err error) {
 		block.Data = make([]byte, block.Len)
 
 		// TODO: Optimise, read entire block at once, from the header magic that tells us the length
+		var n int
 		n, err = currentWAL.Read(block.Data)
 
 		if n != utils.SafeUint64ToInt(block.Len) {
