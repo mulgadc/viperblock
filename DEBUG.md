@@ -31,14 +31,14 @@ export AWS_AMI=ami-10bc1adb8bfa29b57
 Confirm a fresh state
 
 ```
-rm -r-f /home/ben/hive/viperblock/$AWS_AMI
+rm -r-f /home/ben/spinifex/viperblock/$AWS_AMI
 ```
 
 ## Mount the viperblock
 
 Note, add -r for read-only
 
-nbdkit -r -f -p 42909 --pidfile /run/user/1000/nbdkit-vol-vol-b83fc4b28d6e6f693.pid /home/ben/Development/mulga/viperblock/lib/nbdkit-viperblock-plugin.so -v size=3758096384 volume=$AWS_AMI bucket=predastore region=ap-southeast-2 access_key=AKIA8DD3DGGZTO4EOWR0 secret_key=EGHkBFO9JH6NapedR6kJIKcFkrbCQLshk9VbGEEf base_dir=/home/ben/hive/viperblock/ host=0.0.0.0:8443 cache_size=0
+nbdkit -r -f -p 42909 --pidfile /run/user/1000/nbdkit-vol-vol-b83fc4b28d6e6f693.pid /home/ben/Development/mulga/viperblock/lib/nbdkit-viperblock-plugin.so -v size=3758096384 volume=$AWS_AMI bucket=predastore region=ap-southeast-2 access_key=AKIA8DD3DGGZTO4EOWR0 secret_key=EGHkBFO9JH6NapedR6kJIKcFkrbCQLshk9VbGEEf base_dir=/home/ben/spinifex/viperblock/ host=0.0.0.0:8443 cache_size=0
 export AWS_AMI=ami-10bc1adb8bfa29b57
 
 Once nbdkit running, mount the specified disk.
@@ -357,7 +357,7 @@ cd ~/Development/mulga/viperblock && make
 aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 rm --recursive s3://predastore/ami-10bc1adb8bfa29b57/
 
 # 3. Clean local state
-rm -rf ~/hive/viperblock/ami-10bc1adb8bfa29b57
+rm -rf ~/spinifex/viperblock/ami-10bc1adb8bfa29b57
 
 # 4. Re-import AMI via vblock
 ./bin/vblock -metadata path/to/ami.json -file ~/isos/noble-server-cloudimg-amd64.raw ...

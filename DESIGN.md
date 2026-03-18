@@ -1,6 +1,6 @@
 # Viperblock Architecture
 
-Viperblock is a high-performance, WAL-backed block storage engine that provides EBS-compatible volumes for [Hive](https://github.com/mulgadc/hive). It combines an in-memory write buffer, a write-ahead log on fast local storage, and batched chunk uploads to a pluggable backend (local filesystem, S3, or [Predastore](https://github.com/mulgadc/predastore)). Volumes are exposed to QEMU/KVM virtual machines via an nbdkit plugin over the NBD protocol.
+Viperblock is a high-performance, WAL-backed block storage engine that provides EBS-compatible volumes for [Spinifex](https://github.com/mulgadc/spinifex). It combines an in-memory write buffer, a write-ahead log on fast local storage, and batched chunk uploads to a pluggable backend (local filesystem, S3, or [Predastore](https://github.com/mulgadc/predastore)). Volumes are exposed to QEMU/KVM virtual machines via an nbdkit plugin over the NBD protocol.
 
 ---
 
@@ -525,7 +525,7 @@ In-memory storage for unit tests and benchmarks. All data is lost on process exi
 
 ## S3 Backend
 
-Stores chunks in any S3-compatible object storage. Designed to work with [Predastore](https://github.com/mulgadc/predastore) as part of the Hive stack, but compatible with AWS S3 or other implementations.
+Stores chunks in any S3-compatible object storage. Designed to work with [Predastore](https://github.com/mulgadc/predastore) as part of the Spinifex stack, but compatible with AWS S3 or other implementations.
 
 Key optimizations:
 - **HTTP/2**: Connection multiplexing reduces TLS handshake overhead
@@ -584,7 +584,7 @@ The plugin implements the full nbdkit interface:
 
 # 13. NATS Integration
 
-When deployed with [Hive](https://github.com/mulgadc/hive), Viperblock subscribes to NATS topics for EBS-compatible volume lifecycle management:
+When deployed with [Spinifex](https://github.com/mulgadc/spinifex), Viperblock subscribes to NATS topics for EBS-compatible volume lifecycle management:
 
 | Topic | Purpose |
 |-------|---------|
@@ -595,7 +595,7 @@ When deployed with [Hive](https://github.com/mulgadc/hive), Viperblock subscribe
 | `ebs.mount` | Mount volume via NBD — returns NBD URI for QEMU |
 | `ebs.unmount` | Unmount volume, flush, and close |
 
-The Hive daemon sends a mount request over NATS; Viperblock starts an nbdkit process with the plugin and returns the NBD URI. QEMU uses this URI to back a virtual disk.
+The Spinifex daemon sends a mount request over NATS; Viperblock starts an nbdkit process with the plugin and returns the NBD URI. QEMU uses this URI to back a virtual disk.
 
 ---
 

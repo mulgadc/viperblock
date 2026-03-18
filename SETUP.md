@@ -6,7 +6,7 @@ To import a qcow2 image into Viperblock, such as an OS cloud image that can be b
 
 ### Prerequisites
 
-* Predastore (Hive object storage) is pre-installed and running.
+* Predastore (Spinifex object storage) is pre-installed and running.
 
 ### Step 1
 
@@ -68,7 +68,7 @@ manage_etc_hosts: true
 
 ```
 # meta-data
-instance-id: hive-vm-yourhost
+instance-id: spinifex-vm-yourhost
 local-hostname: yourhost
 ```
 
@@ -142,7 +142,7 @@ SSH into the host using the port forwarding from port 2222 to the local instance
 ```
 ssh --p 2222 ec2-user@localhost    
 
-ec2-user@hive4:~$ id
+ec2-user@spinifex4:~$ id
 uid=1000(ec2-user) gid=1000(ec2-user) groups=1000(ec2-user),27(sudo)
 ```
 
