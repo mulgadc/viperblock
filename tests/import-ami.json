@@ -17,12 +17,12 @@
     "AMIMetadata": {
         "ImageID": "",
         "Name": "debian-12.10.0",
-        "Description": "Debian 12.10.0 minimal cloud image prepared for Hive",
+        "Description": "Debian 12.10.0 minimal cloud image prepared for Spinifex",
         "Architecture": "arm64",
         "PlatformDetails": "Linux/UNIX",
         "RootDeviceType": "ebs",
         "Virtualization": "hvm",
-        "ImageOwnerAlias": "hive",
+        "ImageOwnerAlias": "spinifex",
         "VolumeSizeGiB": 0,
         "Tags": null
     }

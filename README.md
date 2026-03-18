@@ -1,6 +1,6 @@
 # Viperblock
 
-Viperblock developed by [Mulga Defense Corporation](https://mulgadc.com/) is a High-performance, WAL-backed block storage engine. Viperblock is the **EBS backend for [Hive](https://github.com/mulgadc/hive)**, providing durable block volumes for QEMU/KVM virtual machines over the NBD protocol.
+Viperblock developed by [Mulga Defense Corporation](https://mulgadc.com/) is a High-performance, WAL-backed block storage engine. Viperblock is the **EBS backend for [Spinifex](https://github.com/mulgadc/spinifex)**, providing durable block volumes for QEMU/KVM virtual machines over the NBD protocol.
 
 Viperblock combines an in-memory write buffer for fast acknowledgment, a write-ahead log on local NVMe for crash durability, and batched 4 MB chunk uploads to pluggable storage backends including S3-compatible object stores. Volumes are exposed as network block devices via an [nbdkit](https://gitlab.com/nbdkit/nbdkit) plugin, giving guest VMs a standard block device backed by durable, distributed storage.
 
@@ -42,17 +42,17 @@ QEMU/KVM VM ──── NBD Protocol ────▶ nbdkit + viperblock plugin
 
 See [DESIGN.md](DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
 
-## Part of the Hive Stack
+## Part of the Spinifex Stack
 
-Viperblock is one of three components in the [Hive](https://github.com/mulgadc/hive) AWS-compatible infrastructure platform:
+Viperblock is one of three components in the [Spinifex](https://github.com/mulgadc/spinifex) AWS-compatible infrastructure platform:
 
 | Component | Role | Repository |
 |-----------|------|------------|
-| **[Hive](https://github.com/mulgadc/hive)** | VM orchestration (EC2-compatible) | [mulgadc/hive](https://github.com/mulgadc/hive) |
+| **[Spinifex](https://github.com/mulgadc/spinifex)** | VM orchestration (EC2-compatible) | [mulgadc/spinifex](https://github.com/mulgadc/spinifex) |
 | **Viperblock** | Block storage (EBS-compatible) | [mulgadc/viperblock](https://github.com/mulgadc/viperblock) |
 | **[Predastore](https://github.com/mulgadc/predastore)** | Object storage (S3-compatible) | [mulgadc/predastore](https://github.com/mulgadc/predastore) |
 
-When deployed with Hive, Viperblock subscribes to NATS topics (`ebs.createvolume`, `ebs.mount`, `ebs.attachvolume`, etc.) for EBS-compatible volume lifecycle management. The Hive daemon sends a mount request; Viperblock starts nbdkit and returns an NBD URI that QEMU uses to back a virtual disk.
+When deployed with Spinifex, Viperblock subscribes to NATS topics (`ebs.createvolume`, `ebs.mount`, `ebs.attachvolume`, etc.) for EBS-compatible volume lifecycle management. The Spinifex daemon sends a mount request; Viperblock starts nbdkit and returns an NBD URI that QEMU uses to back a virtual disk.
 
 Viperblock can also be used standalone for any application that needs durable block storage with S3 as a backend tier.
 
@@ -88,7 +88,7 @@ make preflight   # Full CI checks (format, vet, security, tests, race detector)
 
 ### NBD (Production)
 
-Viperblock volumes are served to QEMU/KVM via nbdkit. When used with Hive, this is managed automatically via NATS. For standalone use:
+Viperblock volumes are served to QEMU/KVM via nbdkit. When used with Spinifex, this is managed automatically via NATS. For standalone use:
 
 ```bash
 nbdkit --filter=blocksize ./lib/nbdkit-viperblock-plugin.so \

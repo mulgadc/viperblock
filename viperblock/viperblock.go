@@ -283,7 +283,7 @@ type AMIMetadata struct {
 	CreationDate    time.Time
 	RootDeviceType  string            // "ebs"
 	Virtualization  string            // "hvm"
-	ImageOwnerAlias string            // e.g. "hive"
+	ImageOwnerAlias string            // e.g. "spinifex"
 	VolumeSizeGiB   uint64            // Size of the root image
 	SnapshotID      string            // Snapshot ID for zero-copy cloning
 	Tags            map[string]string // Metadata tags

@@ -87,7 +87,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		}
 
 		if vbConfig.VolumeConfig.AMIMetadata.ImageOwnerAlias == "" {
-			vbConfig.VolumeConfig.AMIMetadata.ImageOwnerAlias = "hive"
+			vbConfig.VolumeConfig.AMIMetadata.ImageOwnerAlias = "spinifex"
 		}
 
 		if vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB == 0 {
