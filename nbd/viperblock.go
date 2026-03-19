@@ -76,6 +76,7 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "secret_key" {
 		secret_key = value
+		return nil
 	} else if key == "host" {
 		host = value
 		return nil
@@ -300,7 +301,9 @@ func (c *ViperBlockConnection) CanFlush() (bool, error) {
 
 func (c *ViperBlockConnection) Flush(flags uint32) error {
 
-	c.vb.Flush()
+	if err := c.vb.Flush(); err != nil {
+		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not flush: %v", err)}
+	}
 
 	var err error
 	if c.vb.UseShardedWAL {

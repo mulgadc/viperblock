@@ -296,6 +296,7 @@ var ErrRequestTooLarge = errors.New("request too large")
 var ErrRequestOutOfRange = errors.New("request out of range")
 var ErrRequestBlockSize = errors.New("request must be a multiple of block size")
 var ErrRequestBufferEmpty = errors.New("request requires a buffer > 0")
+var ErrInvalidState = errors.New("invalid state: block size or object block size is 0")
 
 // getSystemMemory returns the total system memory in bytes
 func getSystemMemory() uint64 {
@@ -1953,21 +1954,23 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 func (vb *VB) SaveHotState(filename string) (err error) {
 
 	vb.Writes.mu.RLock()
+	defer vb.Writes.mu.RUnlock()
 
 	// Write the BlocksToObject to a file as a binary file
 	file, err := os.Create(filename)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() {
+		if cerr := file.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("failed to close hot state file: %w", cerr)
+		}
+	}()
 
 	// Write the BlocksToObject to the file as JSON
 	if err := json.NewEncoder(file).Encode(vb.Writes.Blocks); err != nil {
-		vb.Writes.mu.RUnlock()
 		return fmt.Errorf("failed to encode blocks to JSON: %w", err)
 	}
-
-	defer vb.Writes.mu.RUnlock()
 
 	return nil
 
@@ -2014,7 +2017,11 @@ func (vb *VB) SaveBlockState() (err error) {
 		return err
 	}
 
-	defer file.Close()
+	defer func() {
+		if cerr := file.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("failed to close block checkpoint file: %w", cerr)
+		}
+	}()
 
 	// Write the file locally
 	if _, err = file.Write(checkpoint); err != nil {
@@ -2432,9 +2439,8 @@ func (vb *VB) LoadState() error {
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
-		errMsg := "invalid state, block size or object block size is 0. Not syncing config"
-		slog.Error(errMsg)
-		return errors.New(errMsg)
+		slog.Error("invalid state, block size or object block size is 0. Not syncing config")
+		return ErrInvalidState
 	}
 
 	// Step 3. Compare the two states, the state with the highest SeqNum is the correct state.
