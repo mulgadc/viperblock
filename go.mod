@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/stretchr/testify v1.11.1
+	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000
 )
 
 require (
