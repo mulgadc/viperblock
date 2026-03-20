@@ -31,13 +31,10 @@ type Backend struct {
 
 // 3. Implement WithConfig for each backend
 func New(config any) (backend *Backend) {
-
 	return &Backend{FileBackend: FileBackend{config: config.(FileConfig)}}
-
 }
 
 func (backend *Backend) Init() error {
-
 	slog.Info("Init for file backend", "volumeName", backend.config.VolumeName)
 
 	// Check if the directory exists
@@ -77,11 +74,9 @@ func (backend *Backend) Init() error {
 	}
 
 	return nil
-
 }
 
 func (backend *Backend) Open(fname string) (err error) {
-
 	/*
 		backend.filename, err = os.Open(fname)
 
@@ -91,12 +86,10 @@ func (backend *Backend) Open(fname string) (err error) {
 
 		fmt.Println("Open specified file")
 	*/
-	return
-
+	return err
 }
 
 func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
-
 	// Open the specified file
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
@@ -127,11 +120,9 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 	}
 
 	return data, nil
-
 }
 
 func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
-
 	// TODO Improve
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
@@ -168,7 +159,6 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	}
 
 	return nil
-
 }
 
 func (backend *Backend) Sync() {

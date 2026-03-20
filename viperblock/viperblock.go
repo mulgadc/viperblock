@@ -319,7 +319,6 @@ func calculateCacheSize(blockSize uint32, percent int) int {
 
 // SetCacheSize sets the size of the LRU cache in number of blocks
 func (vb *VB) SetCacheSize(size int, percentage int) error {
-
 	if size < 0 {
 		return fmt.Errorf("cache size must be greater than 0")
 	}
@@ -423,15 +422,12 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		//config.Cache.Config.SystemMemoryPercent = 30
 		config.Cache.Config.UseSystemMemory = false
 		config.Cache.Config.SystemMemoryPercent = 0
-
 	} else {
-
 		// Create LRU cache with calculated size
 		lruCache, err = lru.New[uint64, []byte](config.Cache.Config.Size)
 		if err != nil {
 			panic(fmt.Sprintf("failed to create LRU cache: %v", err))
 		}
-
 	}
 
 	// Calculate initial cache size based on 30% of system memory
@@ -478,7 +474,6 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		vb.SetDebug(true)
 	} else {
 		vb.SetDebug(false)
-
 	}
 
 	// Create the base directory if it doesn't exist
@@ -498,7 +493,6 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 }
 
 func (vb *VB) SetDebug(debug bool) {
-
 	var level slog.Level
 	if debug {
 		level = slog.LevelDebug
@@ -642,7 +636,6 @@ func (vb *VB) syncShardedWALIfDirty() {
 
 // WAL functions
 func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
-
 	// Lock operations on the WAL
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
@@ -652,7 +645,6 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 
 // openWALLocked creates and opens a new WAL file. Caller must hold wal.mu.
 func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
-
 	// Create the directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
 		return fmt.Errorf("failed to create WAL directory: %w", err)
@@ -669,13 +661,14 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 	// Check our type
 	var headers []byte
 
-	if wal.WALMagic == vb.WAL.WALMagic {
+	switch wal.WALMagic {
+	case vb.WAL.WALMagic:
 		// Write the WAL header
 		headers = vb.WALHeader()
-	} else if wal.WALMagic == vb.BlockToObjectWAL.WALMagic {
+	case vb.BlockToObjectWAL.WALMagic:
 		// Write the BlockToObjectWAL header
 		headers = vb.BlockToObjectWALHeader()
-	} else {
+	default:
 		return fmt.Errorf("invalid WAL magic")
 	}
 
@@ -691,7 +684,6 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 	slog.Debug("OpenWAL complete, new WAL", "file", *file)
 
 	return err
-
 }
 
 // NewShardedWAL creates a ShardedWAL with initialized (but unopened) shards.
@@ -763,7 +755,6 @@ func (vb *VB) OpenShardedWAL() error {
 }
 
 func (vb *VB) WriteAt(offset uint64, data []byte) error {
-
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
 		return ErrRequestTooLarge
@@ -796,7 +787,6 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 	var writes []Block
 
 	for b := startBlock; b <= endBlock; b++ {
-
 		blockStart := b * blockSize
 		blockEnd := blockStart + blockSize
 
@@ -820,7 +810,6 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 		// Read existing block if partial write, else skip
 		var blockData []byte
 		if writeStart > 0 || writeEnd < blockSize {
-
 			existing, err := vb.ReadAt(b*blockSize, blockSize)
 
 			if err != nil && !errors.Is(err, ErrZeroBlock) {
@@ -859,7 +848,6 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 }
 
 func (vb *VB) Write(block uint64, data []byte) (err error) {
-
 	blockLen := uint64(len(data))
 
 	// First check the block exists in our volume size
@@ -885,7 +873,6 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 
 	// Loop through each block request
 	for i := range blockRequests {
-
 		currentBlock := block + i
 
 		start := i * uint64(vb.BlockSize)
@@ -911,7 +898,6 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 		}
 
 		//slog.Info("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
-
 	}
 
 	vb.Writes.mu.Unlock()
@@ -938,7 +924,6 @@ func (vb *VB) flushLocked() error {
 	flushed := make(map[uint64]uint64) // block -> seqnum
 
 	for _, block := range flushBlocks {
-
 		if err := vb.WriteWAL(block); err != nil {
 			slog.Error("ERROR FLUSHING:", "block", block.Block, "error", err)
 			break
@@ -1074,7 +1059,6 @@ func (vb *VB) flushLockedSharded() error {
 }
 
 func (vb *VB) Flush2() (err error) {
-
 	vb.Writes.mu.Lock()
 	flushBlocks := make([]Block, len(vb.Writes.Blocks))
 	copy(flushBlocks, vb.Writes.Blocks)
@@ -1090,15 +1074,12 @@ func (vb *VB) Flush2() (err error) {
 			slog.Error("ERROR FLUSHING:", "error", err)
 			return err
 		}
-
 	}
 
 	return nil
-
 }
 
 func (vb *VB) WriteWAL(block Block) (err error) {
-
 	// Pre-allocate record buffer (28 byte header + data)
 	recordSize := 28 + len(block.Data)
 	record := make([]byte, recordSize)
@@ -1204,7 +1185,6 @@ func (vb *VB) WriteShardedWAL(block Block) error {
 }
 
 func (vb *VB) ReadWAL() (err error) {
-
 	block := Block{}
 	vb.WAL.mu.RLock()
 
@@ -1214,7 +1194,6 @@ func (vb *VB) ReadWAL() (err error) {
 	defer vb.WAL.mu.RUnlock()
 
 	for {
-
 		// Read the block number
 		headers := make([]byte, 28)
 		_, err := currentWAL.Read(headers)
@@ -1260,16 +1239,13 @@ func (vb *VB) ReadWAL() (err error) {
 			}
 			return err
 		}
-
 	}
 
 	return nil
-
 }
 
 func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
-
-	return
+	return err
 
 	// vb.BlockToObjectWAL.mu.Lock()
 
@@ -1330,7 +1306,6 @@ func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
 }
 
 func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
-
 	block.StartBlock = binary.BigEndian.Uint64(data[:8])
 	block.NumBlocks = binary.BigEndian.Uint16(data[8:10])
 	block.ObjectID = binary.BigEndian.Uint64(data[10:18])
@@ -1690,7 +1665,6 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[28:])
 
 		if checksumValidated != checksum {
-
 			pos, err := pendingWAL2.Seek(0, io.SeekCurrent)
 			if err != nil {
 				return fmt.Errorf("error seeking in WriteWALToChunk: %v", err)
@@ -1748,7 +1722,6 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 			chunkBuffer = chunkBuffer[:0] // Reset bufferAdd commentMore actions
 			matchedBlocks = make([]Block, 0)
 		}
-
 	}
 
 	// Write any remaining data as the last chunkAdd commentMore actions
@@ -1759,7 +1732,6 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 			return err
 		}
-
 	}
 
 	return nil
@@ -1849,7 +1821,6 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 */
 
 func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
-
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
 
@@ -1900,17 +1871,14 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	vb.BlocksToObject.mu.Lock()
 	for k, block := range *matchedBlocks {
-
 		// Find out how many consecutive blocks there are
 		numBlocks := 1
 		for j := k + 1; j < len(*matchedBlocks); j++ {
-
 			if (*matchedBlocks)[j].Block == (*matchedBlocks)[j-1].Block+1 {
 				numBlocks++
 			} else {
 				break
 			}
-
 		}
 
 		newBlock := BlockLookup{
@@ -1933,7 +1901,6 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 		}
 
 		i++
-
 	}
 
 	vb.BlocksToObject.mu.Unlock()
@@ -1951,7 +1918,6 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 }
 
 func (vb *VB) SaveHotState(filename string) (err error) {
-
 	vb.Writes.mu.RLock()
 
 	// Write the BlocksToObject to a file as a binary file
@@ -1970,11 +1936,9 @@ func (vb *VB) SaveHotState(filename string) (err error) {
 	defer vb.Writes.mu.RUnlock()
 
 	return nil
-
 }
 
 func (vb *VB) SaveBlockState() (err error) {
-
 	vb.BlocksToObject.mu.RLock()
 	defer vb.BlocksToObject.mu.RUnlock()
 
@@ -1997,14 +1961,12 @@ func (vb *VB) SaveBlockState() (err error) {
 	//file.Write(header)
 
 	for _, block := range vb.BlocksToObject.BlockLookup {
-
 		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
 
 		if err != nil {
 			slog.Error("ERROR WRITING BLOCK TO BLOCK WAL:", "error", err)
 			return err
 		}
-
 	}
 
 	filepath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))
@@ -2033,12 +1995,10 @@ func (vb *VB) SaveBlockState() (err error) {
 	vb.BlockToObjectWAL.WallNum.Add(1)
 
 	return err
-
 }
 
 // Load the previous blockstate from disk
 func (vb *VB) LoadBlockState() (err error) {
-
 	var checkpoint []byte
 
 	// Step 1. Validate the local persistant disk contains the state
@@ -2055,7 +2015,6 @@ func (vb *VB) LoadBlockState() (err error) {
 			// If no file found, volume is empty, return nil
 			return nil
 		}
-
 	} else {
 		checkpoint, err = os.ReadFile(filename)
 		if err != nil {
@@ -2104,7 +2063,6 @@ func (vb *VB) LoadBlockState() (err error) {
 	offset := vb.BlockToObjectWALHeaderSize()
 
 	for offset < len(checkpoint) {
-
 		// TODO: Improve offset calculation, not specific to 26 bytes
 		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+26])
 
@@ -2121,7 +2079,6 @@ func (vb *VB) LoadBlockState() (err error) {
 		}
 
 		offset += 26
-
 	}
 
 	return err
@@ -2346,7 +2303,6 @@ func (vb *VB) RecoverLocalWALs() error {
 
 // Lookup Block to Object
 func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, err error) {
-
 	slog.Debug("LookupBlockToObject", "block", block)
 
 	vb.BlocksToObject.mu.RLock()
@@ -2362,7 +2318,6 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	} else {
 		return 0, 0, ErrZeroBlock
 	}
-
 }
 
 // Save the block tracking state to disk
@@ -2417,7 +2372,6 @@ func (vb *VB) SaveState() error {
 
 // Load the block tracking state from disk
 func (vb *VB) LoadState() error {
-
 	// Step 1. Query the state locally
 	state, localErr := vb.LoadStateRequest(fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume())))
 	if localErr != nil {
@@ -2498,7 +2452,6 @@ func (vb *VB) LoadState() error {
 
 // Query the local state from file or the backend
 func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
-
 	var jsonData []byte
 
 	// Read from file
@@ -2508,19 +2461,16 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 			return state, err
 		}
 	} else {
-
 		jsonData, err = vb.Backend.Read(types.FileTypeConfig, 0, 0, 0)
 		if err != nil {
 			return state, err
 		}
-
 	}
 
 	// Parse JSON
 	err = json.Unmarshal(jsonData, &state)
 
 	return state, err
-
 }
 
 // Private function to read a block from the storage backend, use ReadAt for public access
@@ -2640,7 +2590,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			ObjectID:      objectID,
 			ObjectOffset:  uint32(objectOffset),
 		})
-
 	}
 
 	// Loop through all consecutive blocks that are required to fetch from the backend
@@ -2661,7 +2610,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Find out how many consecutive blocks there are
 		numBlocks := 1
 		for j := i + 1; j < len(consecutiveBlocks); j++ {
-
 			// If our StartBlock is consecutive, and the ObjectID is the same, then we have a consecutive block to read from our backend
 			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) && (consecutiveBlocks)[j].ObjectID == (consecutiveBlocks)[j-1].ObjectID {
 				numBlocks++
@@ -2669,7 +2617,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			} else {
 				break
 			}
-
 		}
 
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
@@ -2711,9 +2658,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 				currentBlock := cb.StartBlock + uint64(i)
 				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
 			}
-
 		}
-
 	}
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
@@ -2725,11 +2670,9 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 	}
 
 	return data, zeroBlockErr
-
 }
 
 func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
-
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
 		return nil, ErrRequestTooLarge
@@ -2759,7 +2702,6 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 }
 
 func (vb *VB) Close() error {
-
 	slog.Info("VB Close, flushing block state to disk")
 
 	// Stop the WAL syncer goroutine (performs final sync before stopping)
@@ -2820,12 +2762,10 @@ func (vb *VB) Close() error {
 	}
 
 	return nil
-
 }
 
 // Remove local WAL and block state files, connection must be closed first.
 func (vb *VB) RemoveLocalFiles() (err error) {
-
 	localPath := filepath.Join(vb.BaseDir, vb.GetVolume())
 
 	slog.Info("Removing local files", "path", localPath)
@@ -2835,7 +2775,6 @@ func (vb *VB) RemoveLocalFiles() (err error) {
 	vb.WAL.mu.Unlock()
 
 	return err
-
 }
 
 func (vb *VB) GetVolumeSize() uint64 {
@@ -2865,7 +2804,6 @@ func (vb *VB) ownsWAL() bool {
 }
 
 func (vb *VB) Reset() error {
-
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
 	vb.BlocksToObject.mu.Unlock()

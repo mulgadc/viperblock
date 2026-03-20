@@ -84,7 +84,6 @@ func (sfs *SimpleFS) FormatVolume() error {
 }
 
 func (sfs *SimpleFS) AllocateBlocks(size uint64) (blocks []uint64, err error) {
-
 	sfs.mu.Lock()
 	defer sfs.mu.Unlock()
 
@@ -125,7 +124,6 @@ func (sfs *SimpleFS) FreeBlocks(blocks []uint64) error {
 }
 
 func (sfs *SimpleFS) CreateFile(pathname string, dataLen uint64) (blocks []uint64, err error) {
-
 	// Allocate the number of blocks that fit the block size
 	numBlocks := (dataLen + sfs.Blocksize - 1) / sfs.Blocksize
 
@@ -157,7 +155,6 @@ func (sfs *SimpleFS) CreateFile(pathname string, dataLen uint64) (blocks []uint6
 
 // Delete a file
 func (sfs *SimpleFS) DeleteFile(pathname string) error {
-
 	if _, ok := sfs.Blocks[pathname]; !ok {
 		return fmt.Errorf("file not found")
 	}

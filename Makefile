@@ -6,12 +6,10 @@ ifdef QUIET
   _Q     = @
   _COVQ  = 2>&1 | grep -Ev '^\s*(ok|PASS|\?|=== RUN|--- PASS:)\s' | grep -v 'coverage: 0\.0%' || true
   _RACEQ = 2>&1 | { grep -Ev '^\s*(ok|PASS|\?|=== RUN|--- PASS:)\s' || true; }; exit $${PIPESTATUS[0]}
-  _SECQ  = >
 else
   _Q     =
   _COVQ  = || true
   _RACEQ =
-  _SECQ  = 2>&1 | tee
 endif
 
 build:
@@ -28,10 +26,10 @@ go_build_nbd:
 	@echo -e "\n....Building NBD plugin"
 	go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
 
-# Preflight — runs the same checks as GitHub Actions (format + lint + security + tests).
+# Preflight — runs the same checks as GitHub Actions (lint + vuln + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 check-format check-modernize vet security-check test-cover diff-coverage test-race
+	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
@@ -69,58 +67,21 @@ clean:
 	rm -f ./bin/vblock
 	rm -f ./lib/nbdkit-viperblock-plugin.so
 
-# Format all Go files in place
-format:
-	gofmt -w .
+# Lint all Go code via golangci-lint (replaces check-format, vet, gosec, staticcheck)
+lint:
+	@echo "Running golangci-lint..."
+	$(_Q)golangci-lint run ./...
+	@echo "  golangci-lint ok"
 
-# Check that all Go files are formatted (CI-compatible, fails on diff)
-check-format:
-	@echo "Checking gofmt..."
-	@UNFORMATTED=$$(gofmt -l .); \
-	if [ -n "$$UNFORMATTED" ]; then \
-		echo "Files not formatted:"; \
-		echo "$$UNFORMATTED"; \
-		echo "Run 'make format' to fix."; \
-		exit 1; \
-	fi
-	@echo "  gofmt ok"
+# Auto-fix all linter issues that have fixers
+fix:
+	golangci-lint run --fix ./...
 
-# Go vet (fails on issues, matches CI)
-vet:
-	@echo "Running go vet..."
-	$(_Q)go vet ./...
-	@echo "  go vet ok"
-
-# Security checks — each tool fails the build on findings (matches CI).
-# Reports are also saved to tests/ for review.
-# Note: gosec excludes nbdkit dir due to cgo panic issue
-security-check:
-	@echo -e "\n....Running security checks for $(GO_PROJECT_NAME)...."
-	$(_Q)set -o pipefail && go tool govulncheck ./... $(_SECQ) tests/govulncheck-report.txt $(if $(QUIET),|| { cat tests/govulncheck-report.txt; exit 1; })
+# Govulncheck — dependency vulnerability scanning (not covered by golangci-lint)
+govulncheck:
+	@echo "Running govulncheck..."
+	$(_Q)go tool govulncheck ./...
 	@echo "  govulncheck ok"
-	$(_Q)set -o pipefail && go tool gosec -exclude=G204,G304,G402,G117,G703,G705,G706 -exclude-dir nbd -exclude-generated ./... $(_SECQ) tests/gosec-report.txt $(if $(QUIET),|| { cat tests/gosec-report.txt; exit 1; })
-	@echo "  gosec ok"
-	$(_Q)set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005,-SA6002" ./... $(_SECQ) tests/staticcheck-report.txt $(if $(QUIET),|| { cat tests/staticcheck-report.txt; exit 1; })
-	@echo "  staticcheck ok"
-
-# Excluded: newexpr (replaces aws.String with new, not idiomatic for AWS SDK)
-# Excluded: stringsbuilder (replaces string += in loops with strings.Builder, not worth the complexity for small loops)
-GOFIX_EXCLUDE := -newexpr=false -stringsbuilder=false
-
-modernize:
-	@echo "Applying go fix modernizations..."
-	go fix $(GOFIX_EXCLUDE) ./...
-	@echo "  go fix applied"
-
-check-modernize:
-	@echo "Checking go fix modernizations..."
-	@DIFF=$$(go fix $(GOFIX_EXCLUDE) -diff ./...); \
-	if [ -n "$$DIFF" ]; then \
-		echo "$$DIFF"; \
-		echo "Run 'make modernize' to fix."; \
-		exit 1; \
-	fi
-	@echo "  go fix ok"
 
 .PHONY: build go_build go_build_nbd preflight test test-cover test-race diff-coverage bench run clean \
-	format check-format check-modernize modernize vet security-check
+	lint fix govulncheck

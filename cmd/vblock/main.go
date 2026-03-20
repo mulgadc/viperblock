@@ -14,7 +14,6 @@ import (
 )
 
 func main() {
-
 	// Read the RAW disk file in 4096 byte chunks, starting from offset 0, to the Viperblock store
 
 	file := flag.String("file", "", "The path to the RAW disk file")
@@ -71,7 +70,6 @@ func main() {
 	var volumeConfig viperblock.VolumeConfig
 
 	if *metadata != "" {
-
 		fmt.Println("Reading metadata from file", *metadata)
 		// Check file exists
 		if _, err := os.Stat(*metadata); os.IsNotExist(err) {
@@ -90,7 +88,6 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to parse metadata: %v", err)
 		}
-
 	}
 
 	var volID string

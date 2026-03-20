@@ -23,7 +23,6 @@ import (
 )
 
 func main() {
-
 	fmt.Println("Welcome to SimpleFS simulation for the Viper Block Storage")
 
 	btype := flag.String("btype", "file", "Backend type (file, memory, s3)")
@@ -70,7 +69,6 @@ func main() {
 
 	// Create the volume data directory if it doesn't exist
 	if *voldata != "" {
-
 		// Check if the directory exists
 		if _, err := os.Stat(*voldata); os.IsNotExist(err) {
 			fmt.Println("Volume data directory does not exist, creating it")
@@ -97,7 +95,6 @@ func main() {
 				os.Exit(-1)
 			}
 		}
-
 	}
 
 	if *createvol {
@@ -193,7 +190,6 @@ func main() {
 
 	// Next, iterate over the directory and traverse the directory tree
 	err = filepath.Walk(*fname, func(path string, info os.FileInfo, err error) error {
-
 		// Skip directories
 		if info.IsDir() {
 			return nil
@@ -228,7 +224,6 @@ func main() {
 		totalLen := 0
 
 		for {
-
 			// Read 4kb chunks
 			buffer := make([]byte, vb.BlockSize)
 
@@ -254,7 +249,6 @@ func main() {
 			}
 
 			currentBlock++
-
 		}
 
 		entry := SHA256{}
@@ -319,7 +313,6 @@ func main() {
 		fmt.Println("fileBuffer", len(fileBuffer))
 
 		for i, block := range blocks {
-
 			objectID, objectOffset, err := vb.LookupBlockToObject(block)
 
 			if err != nil {
@@ -368,7 +361,6 @@ func main() {
 		} else {
 			fmt.Println("SHA256 match")
 		}
-
 	}
 
 	if *sfsstate != "" {
@@ -387,5 +379,4 @@ func main() {
 	// Export the WAL number and chunk number
 	fmt.Println("WAL number", vb.WAL.WallNum.Load())
 	fmt.Println("Chunk number", vb.ObjectNum.Load())
-
 }
