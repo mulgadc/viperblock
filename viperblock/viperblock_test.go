@@ -146,7 +146,6 @@ func loadTestCredentials() (accessKey, secretKey string) {
 
 // setupTestVB creates a new VB instance for testing with the specified backend
 func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
-
 	// Create a temporary directory for test data
 	//tmpDir, err := os.MkdirTemp("", "viperblock_test_*")
 	tmpDir := os.TempDir()
@@ -162,12 +161,10 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 			//os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
 		}
-
 	})
 
 	var backendConfig any
 	switch backendType.BackendType {
-
 	case FileBackend:
 		backendConfig = file.FileConfig{
 			VolumeName: testVol,
@@ -328,7 +325,6 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 
 	for _, backendType := range backends {
 		t.Run(fmt.Sprintf("%s_%s", testName, backendType.Name), func(t *testing.T) {
-
 			//t.Log("Running test ", backendType.Name, " with backend:", backendType.BackendType)
 
 			vb, baseURL, shutdown, err := setupTestVB(t, TestVB{name: testName}, backendType)
@@ -339,7 +335,6 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 			testFunc(t, vb)
 
 			defer shutdown(vb.GetVolume())
-
 		})
 	}
 }
@@ -377,7 +372,7 @@ func TestNew(t *testing.T) {
 			assert.NoError(t, err)
 			assert.NotNil(t, vb)
 			assert.Equal(t, tc.blockSize, vb.BlockSize)
-			assert.Equal(t, uint32(DefaultObjBlockSize), vb.ObjBlockSize)
+			assert.Equal(t, DefaultObjBlockSize, vb.ObjBlockSize)
 			assert.Equal(t, DefaultFlushInterval, vb.FlushInterval)
 			assert.Equal(t, DefaultFlushSize, vb.FlushSize)
 
@@ -389,13 +384,11 @@ func TestNew(t *testing.T) {
 
 			err = vb.RemoveLocalFiles()
 			assert.NoError(t, err)
-
 		})
 	}
 }
 
 func TestWriteAndRead(t *testing.T) {
-
 	// Test data block
 	dataSingleBlock := make([]byte, DefaultBlockSize)
 	msg := "test data"
@@ -499,7 +492,6 @@ func TestWriteAndRead(t *testing.T) {
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-
 				if tc.endOfVolume {
 					// Change the block size to write at the end of the volume
 					volumeEndBlock := vb.GetVolumeSize()/uint64(vb.BlockSize) - 1
@@ -578,8 +570,7 @@ func TestWriteAndRead(t *testing.T) {
 				msg := "inflight HOT write"
 				copy(inflightWrite[:len(msg)], msg)
 
-				var inflightBlock uint64 = 0
-
+				var inflightBlock uint64
 				if tc.endOfVolume {
 					inflightBlock = tc.blockID - 200
 				} else {
@@ -616,25 +607,20 @@ func TestWriteAndRead(t *testing.T) {
 
 				// If cache enabled, check the LRU cache
 				if vb.Cache.Config.Size > 0 {
-
 					var blockCount uint64 = 0
 
 					// Loop through each 4096 (default) block, confirm in the cache
 					for i := uint64(0); i < uint64(len(tc.data))/uint64(DefaultBlockSize); i++ {
-
 						//t.Log("Checking cache for block", tc.blockID+i)
 
 						if cachedData, ok := vb.Cache.lru.Get(tc.blockID + i); ok {
 							//slog.Info("CACHE HIT:", "block", tc.blockID+i)
 
 							assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], cachedData)
-
 						}
 
 						blockCount += uint64(vb.BlockSize)
-
 					}
-
 				}
 
 				err = vb.SetCacheSize(1, 0)
@@ -646,7 +632,6 @@ func TestWriteAndRead(t *testing.T) {
 				// Loop through each 4096 block, confirm in the cache
 
 				for i := uint64(0); i < uint64(len(tc.data))/uint64(vb.BlockSize); i++ {
-
 					//readData, err = vb.Read(tc.blockID+i, uint64(vb.BlockSize))
 
 					readData, err = vb.ReadAt((tc.blockID+i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
@@ -656,7 +641,6 @@ func TestWriteAndRead(t *testing.T) {
 					assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], readData)
 
 					blockCount += uint64(vb.BlockSize)
-
 				}
 
 				// Test smaller blocksize write, e.g simulate GRUB writing 512 blocks for bootloader
@@ -676,9 +660,7 @@ func TestWriteAndRead(t *testing.T) {
 				// Next, upload chunk to the backend
 				err = vb.WriteWALToChunk(true)
 				assert.NoError(t, err)
-
 			})
-
 		}
 
 		// Capture state BEFORE Close() for comparison after reload
@@ -720,12 +702,9 @@ func TestWriteAndRead(t *testing.T) {
 }
 
 func TestWALOperations(t *testing.T) {
-
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
-
 		// Test WAL file operations
 		t.Run("WAL file operations", func(t *testing.T) {
-
 			// Create a new WAL file with current timestamp
 			walFile := filepath.Join(vb.WAL.BaseDir, fmt.Sprintf("test.%s.wal", time.Now().Format("20060102150405")))
 
@@ -753,7 +732,6 @@ func TestWALOperations(t *testing.T) {
 			// Delete the temp WAL file
 			os.Remove(walFile)
 		})
-
 	})
 }
 
@@ -988,10 +966,8 @@ func TestWALSyncerConcurrency(t *testing.T) {
 }
 
 func TestStateOperations(t *testing.T) {
-
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
 		t.Run("Save and Load State", func(t *testing.T) {
-
 			// Create with unique timestamp
 			//stateFile := filepath.Join(vb.WAL.BaseDir, fmt.Sprintf("state.%s.json", time.Now().Format("20060102150405")))
 
@@ -1006,15 +982,12 @@ func TestStateOperations(t *testing.T) {
 			// Remove the state file
 			// os.Remove(stateFile)
 		})
-
 	})
 }
 
 func TestBlockLookup(t *testing.T) {
-
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
 		t.Run("Block Lookup Operations", func(t *testing.T) {
-
 			// Write a test block
 			blockID := uint64(0)
 			data := make([]byte, DefaultBlockSize)
@@ -1065,7 +1038,7 @@ func TestBlockLookup(t *testing.T) {
 				objectID, objectOffset, err := vb.LookupBlockToObject(block)
 				assert.NoError(t, err)
 				assert.Equal(t, objectID, uint64(0))
-				offset := uint32(vb.BlockSize)*uint32(block) + uint32(headersLen)
+				offset := vb.BlockSize*uint32(block) + uint32(headersLen)
 				assert.Equal(t, offset, objectOffset)
 				//t.Log("offset", offset, "objectOffset", objectOffset)
 
@@ -1098,18 +1071,14 @@ func TestBlockLookup(t *testing.T) {
 			objectID, objectOffset, err = vb.LookupBlockToObject(3)
 			assert.NoError(t, err)
 			assert.Equal(t, uint64(1), objectID)
-			offset := uint32(vb.BlockSize)*uint32(0) + uint32(headersLen)
+			offset := vb.BlockSize*uint32(0) + uint32(headersLen)
 			assert.Equal(t, int(offset), int(objectOffset))
-
 		})
-
 	})
 }
 
 func TestFlushOperations(t *testing.T) {
-
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
-
 		t.Run("Flush Operations", func(t *testing.T) {
 			// Write multiple blocks
 			for i := uint64(1); i <= 5; i++ {
@@ -1128,16 +1097,12 @@ func TestFlushOperations(t *testing.T) {
 			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 		})
-
 	})
 }
 
 func TestConsecutiveBlockRead(t *testing.T) {
-
 	runWithBackends(t, "consecutive_block_read", func(t *testing.T, vb *VB) {
-
 		t.Run("Consecutive Block Read", func(t *testing.T) {
-
 			err := vb.SetCacheSize(0, 0)
 			assert.NoError(t, err)
 
@@ -1165,23 +1130,18 @@ func TestConsecutiveBlockRead(t *testing.T) {
 			readData, err := vb.ReadAt(0, uint64(len(data)))
 			assert.NoError(t, err)
 			assert.Equal(t, buffer[0:len(data)], readData)
-
 		})
-
 	})
 }
 
 func TestInvalidS3Host(t *testing.T) {
-
 	runWithBackends(t, "invalid_s3_write_and_read", func(t *testing.T, vb *VB) {
-
 		// Skip if file backend
 		if vb.Backend.GetBackendType() == "file" {
 			t.Skip("Skipping test for file backend")
 		}
 
 		t.Run("Use Invalid S3 Bucket", func(t *testing.T) {
-
 			// Get a temp free port
 			tempPort, err := FindFreePort()
 			assert.NoError(t, err)
@@ -1226,23 +1186,18 @@ func TestInvalidS3Host(t *testing.T) {
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
-
 		})
-
 	})
 }
 
 func TestInvalidS3Bucket(t *testing.T) {
-
 	runWithBackends(t, "invalid_s3_write_and_read", func(t *testing.T, vb *VB) {
-
 		// Skip if file backend
 		if vb.Backend.GetBackendType() == "file" {
 			t.Skip("Skipping test for file backend")
 		}
 
 		t.Run("Use Invalid S3 Bucket", func(t *testing.T) {
-
 			vb.Backend.SetConfig(s3.S3Config{
 				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
@@ -1283,23 +1238,18 @@ func TestInvalidS3Bucket(t *testing.T) {
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
-
 		})
-
 	})
 }
 
 func TestInvalidS3Auth(t *testing.T) {
-
 	runWithBackends(t, "invalid_s3_write_and_read", func(t *testing.T, vb *VB) {
-
 		// Skip if file backend
 		if vb.Backend.GetBackendType() == "file" {
 			t.Skip("Skipping test for file backend")
 		}
 
 		t.Run("Use Invalid S3 Auth", func(t *testing.T) {
-
 			vb.Backend.SetConfig(s3.S3Config{
 				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
@@ -1337,25 +1287,19 @@ func TestInvalidS3Auth(t *testing.T) {
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
-
 		})
-
 	})
-
 }
 
 // Test image import from local disk file
 func TestImportDiskImage(t *testing.T) {
-
 	runWithBackends(t, "s3_import_disk_image", func(t *testing.T, vb *VB) {
-
 		// Skip if file backend
 		if vb.Backend.GetBackendType() == "file" {
 			t.Skip("Skipping test for file backend")
 		}
 
 		t.Run("Valid Import Disk Image", func(t *testing.T) {
-
 			s3Config := &s3.S3Config{
 				VolumeName: vb.VolumeName,
 				VolumeSize: vb.VolumeSize,
@@ -1377,14 +1321,11 @@ func TestImportDiskImage(t *testing.T) {
 			//v_utils.ImportDiskImage(s3Config, vbConfig, "../tests/unit-test-disk-image.raw")
 			err := vb.Backend.Init()
 			assert.NoError(t, err)
-
 		})
-
 	})
 }
 
 func TestCacheConfiguration(t *testing.T) {
-
 	runWithBackends(t, "write_and_read", func(t *testing.T, vb *VB) {
 		t.Run("Set Cache Size", func(t *testing.T) {
 			// Test setting cache size
@@ -1421,7 +1362,6 @@ func TestCacheConfiguration(t *testing.T) {
 		})
 
 		t.Run("Cache Operations", func(t *testing.T) {
-
 			t.Skip("Skipping cache operations test")
 			// Set a small cache size for testing
 			err := vb.SetCacheSize(5, 0)
@@ -1454,7 +1394,6 @@ func TestCacheConfiguration(t *testing.T) {
 				}
 			}
 		})
-
 	})
 }
 
@@ -1463,9 +1402,7 @@ func TestCacheConfiguration(t *testing.T) {
 // This test verifies correctness under concurrent conditions where new blocks are
 // being added to PendingBackendWrites while createChunkFile is processing.
 func TestPendingBackendWritesDeduplication(t *testing.T) {
-
 	runWithBackends(t, "pending_writes_dedup", func(t *testing.T, vb *VB) {
-
 		t.Run("Basic Deduplication", func(t *testing.T) {
 			// Write some blocks and flush to populate PendingBackendWrites
 			for i := range uint64(10) {
@@ -1807,7 +1744,6 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 }
 
 func TestRecoverLocalWALs(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals", func(t *testing.T, vb *VB) {
 		t.Run("Recover blocks from orphaned WAL", func(t *testing.T) {
 			// Write 3 blocks and flush to WAL (simulates normal writes)
@@ -1858,7 +1794,6 @@ func TestRecoverLocalWALs(t *testing.T) {
 }
 
 func TestRecoverLocalWALsEmpty(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_empty", func(t *testing.T, vb *VB) {
 		t.Run("No WAL files is no-op", func(t *testing.T) {
 			// Remove any WAL files that setup may have created
@@ -1884,7 +1819,6 @@ func TestRecoverLocalWALsEmpty(t *testing.T) {
 }
 
 func TestRecoverLocalWALsPartialRecord(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_partial", func(t *testing.T, vb *VB) {
 		t.Run("Partial/corrupt record still recovers valid blocks", func(t *testing.T) {
 			// Write 2 valid blocks and flush to WAL
@@ -1948,7 +1882,6 @@ func TestRecoverLocalWALsPartialRecord(t *testing.T) {
 }
 
 func TestRecoverLocalWALsDedup(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_dedup", func(t *testing.T, vb *VB) {
 		t.Run("Deduplication uses latest SeqNum", func(t *testing.T) {
 			// Write block 0 with initial data
@@ -1998,7 +1931,6 @@ func TestRecoverLocalWALsDedup(t *testing.T) {
 }
 
 func TestRecoverLocalWALsSeqNumAdvancement(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_seqnum", func(t *testing.T, vb *VB) {
 		t.Run("SeqNum advances to recovered maximum", func(t *testing.T) {
 			// Write several blocks to create WAL entries with known SeqNums
@@ -2044,7 +1976,6 @@ func TestRecoverLocalWALsSeqNumAdvancement(t *testing.T) {
 }
 
 func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_checksum", func(t *testing.T, vb *VB) {
 		t.Run("Mid-record checksum corruption recovers blocks before corrupt record", func(t *testing.T) {
 			// This test manipulates WAL file bytes at specific offsets assuming legacy
@@ -2120,7 +2051,6 @@ func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
 }
 
 func TestRecoverLocalWALsFileCleanup(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_cleanup", func(t *testing.T, vb *VB) {
 		t.Run("WAL files are removed after successful recovery", func(t *testing.T) {
 			// Write blocks and flush to WAL
@@ -2162,7 +2092,6 @@ func TestRecoverLocalWALsFileCleanup(t *testing.T) {
 }
 
 func TestRecoverLocalWALsBlockStoreSync(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_blockstore", func(t *testing.T, vb *VB) {
 		t.Run("BlockStore is synced with correct SeqNums after recovery", func(t *testing.T) {
 			if !vb.UseBlockStore || vb.BlockStore == nil {
@@ -2212,7 +2141,6 @@ func TestRecoverLocalWALsBlockStoreSync(t *testing.T) {
 }
 
 func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_corrupt_header", func(t *testing.T, vb *VB) {
 		t.Run("Corrupt header file is skipped, valid file is recovered", func(t *testing.T) {
 			// Write blocks and flush to create a valid WAL file
@@ -2260,7 +2188,6 @@ func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
 }
 
 func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
-
 	runWithBackends(t, "recover_local_wals_all_corrupt", func(t *testing.T, vb *VB) {
 		t.Run("All files with corrupt headers results in no-op recovery", func(t *testing.T) {
 			// Remove any existing WAL files

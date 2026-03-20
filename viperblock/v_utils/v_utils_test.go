@@ -9,7 +9,6 @@ import (
 )
 
 func TestImportDiskImage(t *testing.T) {
-
 	s3Config := &s3.S3Config{}
 	vbConfig := &viperblock.VB{
 		VolumeConfig: viperblock.VolumeConfig{},
@@ -55,5 +54,4 @@ func TestImportDiskImage(t *testing.T) {
 	assert.NotEmpty(t, vbConfig.VolumeConfig.AMIMetadata.RootDeviceType)
 	assert.NotEmpty(t, vbConfig.VolumeConfig.AMIMetadata.Virtualization)
 	assert.NotEmpty(t, vbConfig.VolumeConfig.AMIMetadata.ImageOwnerAlias)
-
 }

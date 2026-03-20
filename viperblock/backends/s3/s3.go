@@ -42,6 +42,7 @@ type S3Backend struct {
 
 type Backend struct {
 	S3Backend
+
 	Config S3Config
 }
 
@@ -50,7 +51,6 @@ func New(config any) (backend *Backend) {
 }
 
 func (backend *Backend) Init() error {
-
 	slog.Info("Initializing S3 backend", "config", backend.config)
 
 	// Create HTTP client with HTTP/2 support for connection multiplexing.
@@ -132,7 +132,6 @@ func (backend *Backend) Open(fname string) error {
 }
 
 func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
-
 	slog.Debug("[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
 
 	if backend.config.S3Client == nil {
@@ -177,7 +176,6 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 }
 
 func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
-
 	if backend.config.S3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}

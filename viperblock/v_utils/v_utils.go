@@ -15,7 +15,6 @@ import (
 
 // Helper function to import disk image to S3 backend
 func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename string) error {
-
 	// Confirm filename can be opened
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
@@ -60,7 +59,6 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 	// First, check if `AMIMetadata` is defined, otherwise skip
 	if vbConfig.VolumeConfig.AMIMetadata.Name != "" {
-
 		// Check AMI config and set defaults
 		if vbConfig.VolumeConfig.AMIMetadata.ImageID == "" {
 			vbConfig.VolumeConfig.AMIMetadata.ImageID = viperblock.GenerateVolumeID("ami", volumeName, s3Config.Bucket, time.Now().Unix())
@@ -94,7 +92,6 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 			// Convert from bytes to GiB
 			vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB = utils.SafeInt64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
 		}
-
 	}
 
 	vb, err := viperblock.New(vbConfig, "s3", *s3Config)
@@ -148,7 +145,6 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	nullBlock := make([]byte, vb.BlockSize)
 
 	for {
-
 		n, err := f.Read(buf)
 
 		// Check if the input is a Zero block
@@ -185,7 +181,6 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 				return fmt.Errorf("failed to write WAL to chunk at block %d: %w", block, err)
 			}
 		}
-
 	}
 
 	// Create a snapshot for AMI imports so that instance launches can use
