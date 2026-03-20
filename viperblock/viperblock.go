@@ -791,8 +791,8 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 		blockEnd := blockStart + blockSize
 
 		// Slice the range of data to write into this block
-		writeStart := uint64(0)
-		writeEnd := uint64(0)
+		var writeStart uint64
+		var writeEnd uint64
 
 		if offset > blockStart {
 			// Support different blocksizes that do not match
@@ -2401,7 +2401,7 @@ func (vb *VB) LoadState() error {
 	// Reconcile VolumeSize with VolumeConfig.SizeGiB (safety net for resize).
 	// After ModifyVolume updates SizeGiB, VBState.VolumeSize may be stale.
 	// The VolumeConfig's SizeGiB (set by ModifyVolume) takes precedence.
-	configSizeBytes := uint64(state.VolumeConfig.VolumeMetadata.SizeGiB) * 1024 * 1024 * 1024
+	configSizeBytes := state.VolumeConfig.VolumeMetadata.SizeGiB * 1024 * 1024 * 1024
 	if configSizeBytes > 0 && configSizeBytes > state.VolumeSize {
 		slog.Info("LoadState: reconciling VolumeSize from VolumeConfig.SizeGiB",
 			"oldSize", state.VolumeSize, "newSize", configSizeBytes,
@@ -2588,7 +2588,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			OffsetStart:   start,
 			OffsetEnd:     end,
 			ObjectID:      objectID,
-			ObjectOffset:  uint32(objectOffset),
+			ObjectOffset:  objectOffset,
 		})
 	}
 
@@ -2636,7 +2636,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 		// Account for our extra 10 bytes of metadata per block
 		//consecutiveBlockStart := cb.BlockPosition * uint64(vb.BlockSize)
-		consecutiveBlockOffset := (uint32(cb.NumBlocks) * uint32(vb.BlockSize))
+		consecutiveBlockOffset := (uint32(cb.NumBlocks) * vb.BlockSize)
 
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
@@ -2655,7 +2655,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		// Update the cache with the read data
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
-				currentBlock := cb.StartBlock + uint64(i)
+				currentBlock := cb.StartBlock + i
 				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
 			}
 		}
@@ -3070,7 +3070,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 	for _, cb := range consecutiveBlocksToRead {
 		slog.Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
 
-		consecutiveBlockOffset := uint32(cb.NumBlocks) * uint32(vb.BlockSize)
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * vb.BlockSize
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
@@ -3142,7 +3142,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 	for _, cb := range consecutiveBlocksToRead {
 		slog.Debug("[READ] READING BASE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "sourceVolume", sourceVolume)
 
-		consecutiveBlockOffset := uint32(cb.NumBlocks) * uint32(vb.BlockSize)
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * vb.BlockSize
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 

@@ -1,7 +1,6 @@
 package simplefs
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -18,11 +17,7 @@ type TestSimpleFS struct {
 // setupTestSimpleFS creates a new SimpleFS instance for testing
 func setupTestSimpleFS(t *testing.T, testCase TestSimpleFS) *SimpleFS {
 	// Create a temporary directory for test data
-	tmpDir, err := os.MkdirTemp("", "simplefs_test_*")
-	assert.NoError(t, err)
-	t.Cleanup(func() {
-		os.RemoveAll(tmpDir)
-	})
+	_ = t.TempDir()
 
 	sfs := New()
 	assert.NotNil(t, sfs)
@@ -175,9 +170,7 @@ func TestStateOperations(t *testing.T) {
 
 	t.Run("Save and Load State", func(t *testing.T) {
 		// Create temporary state file
-		tmpDir, err := os.MkdirTemp("", "simplefs_state_*")
-		assert.NoError(t, err)
-		defer os.RemoveAll(tmpDir)
+		tmpDir := t.TempDir()
 
 		stateFile := filepath.Join(tmpDir, "state.json")
 

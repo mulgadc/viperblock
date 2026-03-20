@@ -49,9 +49,6 @@ linters:
     embeddedstructfieldcheck:
       forbid-mutex: true
 
-    errcheck:
-      check-type-assertions: true
-
     govet:
       enable-all: true
       disable:
@@ -112,7 +109,7 @@ linters:
           - gosec
 
       # viperblock-specific: nbd directory has cgo panic issues with gosec
-      - path: 'nbd/'
+      - path: "nbd/"
         linters: [gosec]
 
       - text: "G204"

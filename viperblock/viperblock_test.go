@@ -372,7 +372,7 @@ func TestNew(t *testing.T) {
 			assert.NoError(t, err)
 			assert.NotNil(t, vb)
 			assert.Equal(t, tc.blockSize, vb.BlockSize)
-			assert.Equal(t, uint32(DefaultObjBlockSize), vb.ObjBlockSize)
+			assert.Equal(t, DefaultObjBlockSize, vb.ObjBlockSize)
 			assert.Equal(t, DefaultFlushInterval, vb.FlushInterval)
 			assert.Equal(t, DefaultFlushSize, vb.FlushSize)
 
@@ -570,8 +570,7 @@ func TestWriteAndRead(t *testing.T) {
 				msg := "inflight HOT write"
 				copy(inflightWrite[:len(msg)], msg)
 
-				var inflightBlock uint64 = 0
-
+				var inflightBlock uint64
 				if tc.endOfVolume {
 					inflightBlock = tc.blockID - 200
 				} else {
@@ -1039,7 +1038,7 @@ func TestBlockLookup(t *testing.T) {
 				objectID, objectOffset, err := vb.LookupBlockToObject(block)
 				assert.NoError(t, err)
 				assert.Equal(t, objectID, uint64(0))
-				offset := uint32(vb.BlockSize)*uint32(block) + uint32(headersLen)
+				offset := vb.BlockSize*uint32(block) + uint32(headersLen)
 				assert.Equal(t, offset, objectOffset)
 				//t.Log("offset", offset, "objectOffset", objectOffset)
 
@@ -1072,7 +1071,7 @@ func TestBlockLookup(t *testing.T) {
 			objectID, objectOffset, err = vb.LookupBlockToObject(3)
 			assert.NoError(t, err)
 			assert.Equal(t, uint64(1), objectID)
-			offset := uint32(vb.BlockSize)*uint32(0) + uint32(headersLen)
+			offset := vb.BlockSize*uint32(0) + uint32(headersLen)
 			assert.Equal(t, int(offset), int(objectOffset))
 		})
 	})
