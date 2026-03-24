@@ -2386,8 +2386,8 @@ func (vb *VB) LoadState() error {
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
-		errMsg := "invalid state, block size or object block size is 0. Not syncing config"
-		slog.Error(errMsg)
+		errMsg := "block size is 0 in both local and backend state, skipping config sync (expected for new volumes)"
+		slog.Debug(errMsg)
 		return errors.New(errMsg)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
+	"github.com/pterm/pterm"
 )
 
 // Helper function to import disk image to S3 backend
@@ -140,6 +142,22 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 	var block uint64 = 0
 
+	totalBytes := fileInfo.Size()
+	if totalBytes < 0 {
+		return fmt.Errorf("invalid file size: %d", totalBytes)
+	}
+	totalBlocks := uint64(totalBytes) / uint64(vb.BlockSize)
+
+	progressTotal := math.MaxInt
+	if totalBlocks <= uint64(math.MaxInt) {
+		progressTotal = int(totalBlocks)
+	}
+
+	bar, _ := pterm.DefaultProgressbar.
+		WithTitle("Flushing image to storage").
+		WithTotal(progressTotal).
+		Start()
+
 	buf := make([]byte, vb.BlockSize)
 
 	nullBlock := make([]byte, vb.BlockSize)
@@ -151,6 +169,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		if bytes.Equal(buf[:n], nullBlock) {
 			//fmt.Printf("Null block found at %d, skipping\n", block)
 			block++
+			bar.Increment()
 			continue
 		}
 
@@ -160,28 +179,34 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 			if err == io.EOF {
 				break
 			}
+			_, _ = bar.Stop()
 			return fmt.Errorf("failed to read disk file: %v", err)
 		}
 
 		if err := vb.WriteAt(block*uint64(vb.BlockSize), buf[:n]); err != nil {
+			_, _ = bar.Stop()
 			return fmt.Errorf("failed to write block %d: %w", block, err)
 		}
 
 		//fmt.Println("Write", "block", hex.EncodeToString(buf[:n]))
 
 		block++
+		bar.Increment()
 
 		// Flush every 4MB
 		if block%uint64(vb.BlockSize) == 0 {
-			fmt.Println("Flush", "block", block)
 			if err := vb.Flush(); err != nil {
+				_, _ = bar.Stop()
 				return fmt.Errorf("failed to flush at block %d: %w", block, err)
 			}
 			if err := vb.WriteWALToChunk(true); err != nil {
+				_, _ = bar.Stop()
 				return fmt.Errorf("failed to write WAL to chunk at block %d: %w", block, err)
 			}
 		}
 	}
+
+	_, _ = bar.Stop()
 
 	// Create a snapshot for AMI imports so that instance launches can use
 	// zero-copy cloning (OpenFromSnapshot) instead of block-by-block copy.
