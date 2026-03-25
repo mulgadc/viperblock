@@ -7,8 +7,10 @@ replace libguestfs.org/nbdkit => ./nbd/libguestfs.org/nbdkit
 require (
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/mulgadc/predastore v1.0.0
 	github.com/pterm/pterm v0.12.83
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/net v0.52.0
 	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000
 )
 
@@ -50,7 +52,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.21 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
-	github.com/mulgadc/predastore v1.0.0
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/quic-go v0.57.1 // indirect
@@ -63,7 +64,6 @@ require (
 	go.uber.org/automaxprocs v1.6.0 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/mod v0.33.0 // indirect
-	golang.org/x/net v0.52.0
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260304144227-18da59047661 // indirect
