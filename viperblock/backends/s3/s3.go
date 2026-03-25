@@ -61,7 +61,6 @@ func (backend *Backend) Init() error {
 	// http2.ConfigureTransport() to properly enable HTTP/2.
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
 			// Enable TLS session resumption for faster reconnects if HTTP/2 fails
 			ClientSessionCache: tls.NewLRUClientSessionCache(256),
 			// Ensure HTTP/2 ALPN is advertised
