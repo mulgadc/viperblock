@@ -169,7 +169,9 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		if bytes.Equal(buf[:n], nullBlock) {
 			//fmt.Printf("Null block found at %d, skipping\n", block)
 			block++
-			bar.Increment()
+			if block%1024 == 0 {
+				bar.Add(1024)
+			}
 			continue
 		}
 
@@ -191,7 +193,9 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		//fmt.Println("Write", "block", hex.EncodeToString(buf[:n]))
 
 		block++
-		bar.Increment()
+		if block%1024 == 0 {
+			bar.Add(1024)
+		}
 
 		// Flush every 4MB
 		if block%uint64(vb.BlockSize) == 0 {
