@@ -209,7 +209,7 @@ func main() {
 
 		fmt.Println(blocks)
 
-		finput, err := os.Open(path) // #nosec G122 -- CLI tool processes user-specified local paths
+		finput, err := os.Open(path)
 
 		if err != nil {
 			fmt.Println(err)

@@ -119,7 +119,7 @@ linters:
       - text: "G602"
         linters: [gosec] # slice bounds — false positives
       - text: "G122"
-        linters: [gosec] # net/http serve without timeout
+        linters: [gosec] # symlink TOCTOU in Walk callbacks — false positives on CLI tools
 
       # staticcheck: non-pointer sync.Pool — intentional in viperblock
       - text: "SA6002"
