@@ -59,6 +59,21 @@ var (
 // sharedServerHost holds the host:port of the shared predastore test server started in TestMain.
 var sharedServerHost string
 
+// testHTTPClient is an HTTP client that skips TLS verification for the test predastore server.
+var testHTTPClient = &http.Client{
+	Timeout: 120 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // only for test
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   200,
+		IdleConnTimeout:       120 * time.Second,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
 // sharedBucketPath is the filesystem path of the first predastore bucket, used for test volume cleanup.
 var sharedBucketPath string
 
@@ -182,11 +197,12 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 			VolumeName: testVol,
 			VolumeSize: volumeSize,
 
-			Region:    "ap-southeast-2",
-			Bucket:    "predastore",
-			AccessKey: AccessKey,
-			SecretKey: SecretKey,
-			Host:      fmt.Sprintf("https://%s", sharedServerHost),
+			Region:     "ap-southeast-2",
+			Bucket:     "predastore",
+			AccessKey:  AccessKey,
+			SecretKey:  SecretKey,
+			Host:       fmt.Sprintf("https://%s", sharedServerHost),
+			HTTPClient: testHTTPClient,
 		}
 
 		shutdown = func(volName string) {
@@ -255,6 +271,7 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 		AccessKey:  AccessKey,
 		SecretKey:  SecretKey,
 		Host:       "https://127.0.0.1:8443/",
+		HTTPClient: testHTTPClient,
 	}
 
 	backends := []BackendTest{
@@ -361,6 +378,7 @@ func TestNew(t *testing.T) {
 				AccessKey:  AccessKey,
 				SecretKey:  SecretKey,
 				Host:       "https://127.0.0.1:8443/",
+				HTTPClient: testHTTPClient,
 			},
 			blockSize: DefaultBlockSize,
 		},
@@ -1154,6 +1172,7 @@ func TestInvalidS3Host(t *testing.T) {
 				AccessKey:  AccessKey,
 				SecretKey:  SecretKey,
 				Host:       fmt.Sprintf("https://%s", tempPort),
+				HTTPClient: testHTTPClient,
 			})
 
 			err = vb.Backend.Init()
@@ -1206,6 +1225,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 				AccessKey:  AccessKey,
 				SecretKey:  SecretKey,
 				Host:       vb.Backend.GetHost(),
+				HTTPClient: testHTTPClient,
 			})
 
 			err := vb.Backend.Init()
@@ -1258,6 +1278,7 @@ func TestInvalidS3Auth(t *testing.T) {
 				AccessKey:  "INVALIDACCESSKEY",
 				SecretKey:  "BADSECRET/K7MDENG/bPxRfiCYEXAMPLEKEY",
 				Host:       vb.Backend.GetHost(),
+				HTTPClient: testHTTPClient,
 			})
 
 			// Write a block
@@ -1304,11 +1325,12 @@ func TestImportDiskImage(t *testing.T) {
 				VolumeName: vb.VolumeName,
 				VolumeSize: vb.VolumeSize,
 
-				Region:    "ap-southeast-2",
-				Bucket:    "predastore",
-				AccessKey: AccessKey,
-				SecretKey: SecretKey,
-				Host:      fmt.Sprintf("https://%s", vb.Backend.GetHost()),
+				Region:     "ap-southeast-2",
+				Bucket:     "predastore",
+				AccessKey:  AccessKey,
+				SecretKey:  SecretKey,
+				Host:       fmt.Sprintf("https://%s", vb.Backend.GetHost()),
+				HTTPClient: testHTTPClient,
 			}
 
 			fmt.Println(s3Config)

@@ -417,6 +417,7 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 			AccessKey:  AccessKey,
 			SecretKey:  SecretKey,
 			Host:       source.Backend.GetHost(),
+			HTTPClient: testHTTPClient,
 		}
 	}
 

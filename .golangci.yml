@@ -116,12 +116,10 @@ linters:
         linters: [gosec] # subprocess execution
       - text: "G304"
         linters: [gosec] # file path from variable — necessary for config loading
-      - text: "G402"
-        linters: [gosec] # TLS config
       - text: "G602"
         linters: [gosec] # slice bounds — false positives
       - text: "G122"
-        linters: [gosec] # net/http serve without timeout
+        linters: [gosec] # symlink TOCTOU in Walk callbacks — false positives on CLI tools
 
       # staticcheck: non-pointer sync.Pool — intentional in viperblock
       - text: "SA6002"
