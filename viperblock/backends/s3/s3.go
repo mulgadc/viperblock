@@ -33,7 +33,8 @@ type S3Config struct {
 
 	Host string
 
-	S3Client *s3.S3
+	S3Client   *s3.S3
+	HTTPClient *http.Client // Optional: override the default HTTP client (e.g. for tests)
 }
 
 type S3Backend struct {
@@ -53,48 +54,51 @@ func New(config any) (backend *Backend) {
 func (backend *Backend) Init() error {
 	slog.Info("Initializing S3 backend", "config", backend.config)
 
-	// Create HTTP client with HTTP/2 support for connection multiplexing.
-	// HTTP/2 allows multiple requests over a single TCP connection, eliminating
-	// TLS handshake overhead for each request.
-	//
-	// IMPORTANT: When using a custom TLSClientConfig, you MUST call
-	// http2.ConfigureTransport() to properly enable HTTP/2.
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			// Enable TLS session resumption for faster reconnects if HTTP/2 fails
-			ClientSessionCache: tls.NewLRUClientSessionCache(256),
-			// Ensure HTTP/2 ALPN is advertised
-			NextProtos: []string{"h2", "http/1.1"},
-		},
+	client := backend.config.HTTPClient
+	if client == nil {
+		// Create HTTP client with HTTP/2 support for connection multiplexing.
+		// HTTP/2 allows multiple requests over a single TCP connection, eliminating
+		// TLS handshake overhead for each request.
+		//
+		// IMPORTANT: When using a custom TLSClientConfig, you MUST call
+		// http2.ConfigureTransport() to properly enable HTTP/2.
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				// Enable TLS session resumption for faster reconnects if HTTP/2 fails
+				ClientSessionCache: tls.NewLRUClientSessionCache(256),
+				// Ensure HTTP/2 ALPN is advertised
+				NextProtos: []string{"h2", "http/1.1"},
+			},
 
-		// Connection pool settings - still useful as HTTP/2 fallback
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 200,
-		MaxConnsPerHost:     0,
-		IdleConnTimeout:     120 * time.Second,
+			// Connection pool settings - still useful as HTTP/2 fallback
+			MaxIdleConns:        200,
+			MaxIdleConnsPerHost: 200,
+			MaxConnsPerHost:     0,
+			IdleConnTimeout:     120 * time.Second,
 
-		// Keep-alive settings
-		DisableKeepAlives: false,
+			// Keep-alive settings
+			DisableKeepAlives: false,
 
-		// ForceAttemptHTTP2 alone is NOT enough with custom TLSClientConfig!
-		// We must also call http2.ConfigureTransport() below.
-		ForceAttemptHTTP2: true,
+			// ForceAttemptHTTP2 alone is NOT enough with custom TLSClientConfig!
+			// We must also call http2.ConfigureTransport() below.
+			ForceAttemptHTTP2: true,
 
-		// Timeouts
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
+			// Timeouts
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
 
-	// CRITICAL: Configure HTTP/2 support with custom TLS config
-	// Without this, the transport falls back to HTTP/1.1
-	if err := http2.ConfigureTransport(tr); err != nil {
-		slog.Warn("Failed to configure HTTP/2, falling back to HTTP/1.1", "error", err)
-	}
+		// CRITICAL: Configure HTTP/2 support with custom TLS config
+		// Without this, the transport falls back to HTTP/1.1
+		if err := http2.ConfigureTransport(tr); err != nil {
+			slog.Warn("Failed to configure HTTP/2, falling back to HTTP/1.1", "error", err)
+		}
 
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   120 * time.Second,
+		client = &http.Client{
+			Transport: tr,
+			Timeout:   120 * time.Second,
+		}
 	}
 
 	// Use the AWS SDK to initialize the S3 backend
