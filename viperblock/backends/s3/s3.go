@@ -48,7 +48,11 @@ type Backend struct {
 }
 
 func New(config any) (backend *Backend) {
-	return &Backend{S3Backend: S3Backend{config: config.(S3Config)}}
+	cfg, ok := config.(S3Config)
+	if !ok {
+		panic("s3 backend: expected S3Config")
+	}
+	return &Backend{S3Backend: S3Backend{config: cfg}}
 }
 
 func (backend *Backend) Init() error {
@@ -298,7 +302,11 @@ func (backend *Backend) GetBackendType() string {
 }
 
 func (backend *Backend) SetConfig(config any) {
-	backend.config = config.(S3Config)
+	cfg, ok := config.(S3Config)
+	if !ok {
+		panic("s3 backend: expected S3Config")
+	}
+	backend.config = cfg
 }
 
 func (backend *Backend) GetHost() string {

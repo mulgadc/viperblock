@@ -15,24 +15,24 @@ import (
 )
 
 type SimpleVolume struct {
-	Used map[uint64]bool
-	Free []uint64
-	Size uint64
-	Name string
+	Used map[uint64]bool `json:"Used"`
+	Free []uint64        `json:"Free"`
+	Size uint64          `json:"Size"`
+	Name string          `json:"Name"`
 }
 
 type SimpleFS struct {
-	Volume SimpleVolume
+	Volume SimpleVolume `json:"Volume"`
 	mu     sync.RWMutex
 
-	Blocks    map[string]SimpleBlock
-	Blocksize uint64
+	Blocks    map[string]SimpleBlock `json:"Blocks"`
+	Blocksize uint64                 `json:"Blocksize"`
 }
 
 type SimpleBlock struct {
-	Filename string
-	Size     uint64
-	Blocks   []uint64
+	Filename string   `json:"Filename"`
+	Size     uint64   `json:"Size"`
+	Blocks   []uint64 `json:"Blocks"`
 }
 
 func New() *SimpleFS {

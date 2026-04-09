@@ -219,7 +219,11 @@ func NewPooledArena(blockSize uint32) *PooledArena {
 
 // Get returns a block from the pool
 func (pa *PooledArena) Get() []byte {
-	return pa.pool.Get().([]byte)
+	b, ok := pa.pool.Get().([]byte)
+	if !ok {
+		return make([]byte, pa.blockSize)
+	}
+	return b
 }
 
 // Put returns a block to the pool

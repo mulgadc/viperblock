@@ -40,21 +40,21 @@ const DefaultFlushSize uint32 = 64 * 1024 * 1024
 const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
 
 type VBState struct {
-	VolumeName string
-	VolumeSize uint64
+	VolumeName string `json:"VolumeName"`
+	VolumeSize uint64 `json:"VolumeSize"`
 
-	BlockSize    uint32
-	ObjBlockSize uint32
+	BlockSize    uint32 `json:"BlockSize"`
+	ObjBlockSize uint32 `json:"ObjBlockSize"`
 
-	SeqNum    uint64
-	ObjectNum uint64
-	WALNum    uint64
+	SeqNum    uint64 `json:"SeqNum"`
+	ObjectNum uint64 `json:"ObjectNum"`
+	WALNum    uint64 `json:"WALNum"`
 
-	BlockToObjectWALNum uint64
+	BlockToObjectWALNum uint64 `json:"BlockToObjectWALNum"`
 
-	Version uint16
+	Version uint16 `json:"Version"`
 
-	VolumeConfig VolumeConfig
+	VolumeConfig VolumeConfig `json:"VolumeConfig"`
 
 	ShardedWAL bool `json:"ShardedWAL,omitempty"`
 
@@ -170,20 +170,20 @@ type BlockCache struct {
 }
 
 type Block struct {
-	SeqNum uint64
-	Block  uint64
-	Offset uint64
-	Len    uint64
-	Data   []byte
+	SeqNum uint64 `json:"SeqNum"`
+	Block  uint64 `json:"Block"`
+	Offset uint64 `json:"Offset"`
+	Len    uint64 `json:"Len"`
+	Data   []byte `json:"Data"`
 }
 
 type BlockOptimised struct {
-	SeqNum uint64
-	Index  int
+	SeqNum uint64 `json:"SeqNum"`
+	Index  int    `json:"Index"`
 }
 
 type Blocks struct {
-	Blocks []Block
+	Blocks []Block `json:"Blocks"`
 	mu     sync.RWMutex
 }
 
@@ -256,37 +256,37 @@ type VolumeConfig struct {
 
 // Meta-data
 type VolumeMetadata struct {
-	VolumeID            string // e.g. "vol-0abcd1234ef567890"
-	VolumeName          string // Optional name for UI or tagging
-	TenantID            string // For multi-tenant support
-	SizeGiB             uint64 // Volume size in GiB
-	State               string // "creating", "available", "in-use", "deleted"
-	CreatedAt           time.Time
-	AttachedAt          time.Time         // When volume was attached to instance
-	AvailabilityZone    string            // Optional: "us-west-1a"
-	AttachedInstance    string            // Instance ID (if any)
-	DeviceName          string            // e.g. "/dev/nbd1"
-	VolumeType          string            // e.g. "gp3", "io1"
-	IOPS                int               // For provisioned volumes
-	Tags                map[string]string // User-defined metadata
-	SnapshotID          string            // If created from a snapshot
-	IsEncrypted         bool              // Encryption flag
-	DeleteOnTermination bool              // Whether to delete volume when instance terminates
+	VolumeID            string            `json:"VolumeID"`   // e.g. "vol-0abcd1234ef567890"
+	VolumeName          string            `json:"VolumeName"` // Optional name for UI or tagging
+	TenantID            string            `json:"TenantID"`   // For multi-tenant support
+	SizeGiB             uint64            `json:"SizeGiB"`    // Volume size in GiB
+	State               string            `json:"State"`      // "creating", "available", "in-use", "deleted"
+	CreatedAt           time.Time         `json:"CreatedAt"`
+	AttachedAt          time.Time         `json:"AttachedAt"`          // When volume was attached to instance
+	AvailabilityZone    string            `json:"AvailabilityZone"`    // Optional: "us-west-1a"
+	AttachedInstance    string            `json:"AttachedInstance"`    // Instance ID (if any)
+	DeviceName          string            `json:"DeviceName"`          // e.g. "/dev/nbd1"
+	VolumeType          string            `json:"VolumeType"`          // e.g. "gp3", "io1"
+	IOPS                int               `json:"IOPS"`                // For provisioned volumes
+	Tags                map[string]string `json:"Tags"`                // User-defined metadata
+	SnapshotID          string            `json:"SnapshotID"`          // If created from a snapshot
+	IsEncrypted         bool              `json:"IsEncrypted"`         // Encryption flag
+	DeleteOnTermination bool              `json:"DeleteOnTermination"` // Whether to delete volume when instance terminates
 }
 
 type AMIMetadata struct {
-	ImageID         string // e.g. "ami-0fbce8adcf7e5166f"
-	Name            string // e.g. "debian-12-cloud"
-	Description     string
-	Architecture    string // "x86_64", "arm64"
-	PlatformDetails string // "Linux/UNIX"
-	CreationDate    time.Time
-	RootDeviceType  string            // "ebs"
-	Virtualization  string            // "hvm"
-	ImageOwnerAlias string            // e.g. "spinifex"
-	VolumeSizeGiB   uint64            // Size of the root image
-	SnapshotID      string            // Snapshot ID for zero-copy cloning
-	Tags            map[string]string // Metadata tags
+	ImageID         string            `json:"ImageID"` // e.g. "ami-0fbce8adcf7e5166f"
+	Name            string            `json:"Name"`    // e.g. "debian-12-cloud"
+	Description     string            `json:"Description"`
+	Architecture    string            `json:"Architecture"`    // "x86_64", "arm64"
+	PlatformDetails string            `json:"PlatformDetails"` // "Linux/UNIX"
+	CreationDate    time.Time         `json:"CreationDate"`
+	RootDeviceType  string            `json:"RootDeviceType"`  // "ebs"
+	Virtualization  string            `json:"Virtualization"`  // "hvm"
+	ImageOwnerAlias string            `json:"ImageOwnerAlias"` // e.g. "spinifex"
+	VolumeSizeGiB   uint64            `json:"VolumeSizeGiB"`   // Size of the root image
+	SnapshotID      string            `json:"SnapshotID"`      // Snapshot ID for zero-copy cloning
+	Tags            map[string]string `json:"Tags"`            // Metadata tags
 }
 
 // Error messages

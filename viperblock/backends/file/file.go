@@ -31,7 +31,11 @@ type Backend struct {
 
 // 3. Implement WithConfig for each backend
 func New(config any) (backend *Backend) {
-	return &Backend{FileBackend: FileBackend{config: config.(FileConfig)}}
+	cfg, ok := config.(FileConfig)
+	if !ok {
+		panic("file backend: expected FileConfig")
+	}
+	return &Backend{FileBackend: FileBackend{config: cfg}}
 }
 
 func (backend *Backend) Init() error {
@@ -172,7 +176,11 @@ func (backend *Backend) GetBackendType() string {
 }
 
 func (backend *Backend) SetConfig(config any) {
-	backend.config = config.(FileConfig)
+	cfg, ok := config.(FileConfig)
+	if !ok {
+		panic("file backend: expected FileConfig")
+	}
+	backend.config = cfg
 }
 
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
