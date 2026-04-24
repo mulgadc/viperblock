@@ -270,9 +270,13 @@ func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) e
 
 	slog.Info("ZERO:", "len", count, "offset", offset)
 
+	if count == 0 {
+		return nil
+	}
+
 	data := make([]byte, count)
 
-	err := c.vb.Write(offset/uint64(c.vb.BlockSize), data)
+	err := c.vb.WriteAt(offset, data)
 
 	if err != nil {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write zero data: %v", err)}
