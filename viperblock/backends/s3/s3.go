@@ -105,14 +105,26 @@ func (backend *Backend) Init() error {
 		}
 	}
 
-	// Use the AWS SDK to initialize the S3 backend
+	// Use the AWS SDK to initialize the S3 backend.
+	//
+	// S3Disable100Continue: aws-sdk-go v1 auto-adds "Expect: 100-continue" for
+	// PUTs >= 2 MiB (service/s3/platform_handlers_go1.6.go). Chunk writes are
+	// 4 MiB so every chunk PUT qualifies. Under HTTP/2, Go's server strips the
+	// Expect header before handlers see it (x/net/http2 server behavior). On
+	// the first send the signer runs before add100Continue so "expect" is NOT
+	// in SignedHeaders and sigs match. On retry, copyHTTPRequest preserves the
+	// Expect header, the signer now sees it and includes "expect" in
+	// SignedHeaders signed with value "100-continue" — but the server still
+	// strips it and canonicalizes "expect:" as empty, producing a signature
+	// mismatch (AccessDenied, 403, not retried). Disabling 100-continue skips
+	// the header entirely; it's a no-op under HTTP/2 anyway.
 	sess, err := session.NewSession(&aws.Config{
-		// Specify the endpoint
-		Endpoint:         aws.String(backend.config.Host),
-		S3ForcePathStyle: aws.Bool(true),
-		Region:           aws.String(backend.config.Region),
-		HTTPClient:       client,
-		Credentials:      credentials.NewStaticCredentials(backend.config.AccessKey, backend.config.SecretKey, ""),
+		Endpoint:             aws.String(backend.config.Host),
+		S3ForcePathStyle:     aws.Bool(true),
+		S3Disable100Continue: aws.Bool(true),
+		Region:               aws.String(backend.config.Region),
+		HTTPClient:           client,
+		Credentials:          credentials.NewStaticCredentials(backend.config.AccessKey, backend.config.SecretKey, ""),
 	})
 
 	if err != nil {
