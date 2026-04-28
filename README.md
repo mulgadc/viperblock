@@ -23,7 +23,7 @@ For full architectural details, binary formats, and data flow diagrams, see **[D
 ```
 QEMU/KVM VM ──── NBD Protocol ────▶ nbdkit + viperblock plugin
                                               │
-                                    ┌─────────▼──────────┐
+                                    ┌─────────▼───────────┐
                                     │  Viperblock Engine  │
                                     │                     │
                                     │  Write Buffer       │
