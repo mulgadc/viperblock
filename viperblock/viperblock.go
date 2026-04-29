@@ -250,8 +250,28 @@ type ShardedWAL struct {
 }
 
 type VolumeConfig struct {
-	VolumeMetadata VolumeMetadata `json:"VolumeMetadata"`
-	AMIMetadata    AMIMetadata    `json:"AMIMetadata"`
+	VolumeMetadata VolumeMetadata      `json:"VolumeMetadata"`
+	AMIMetadata    AMIMetadata         `json:"AMIMetadata"`
+	Modification   *VolumeModification `json:"Modification,omitempty"`
+}
+
+// VolumeModification records the most recent ModifyVolume request against a
+// volume. It mirrors the AWS EC2 VolumeModification shape so the spinifex API
+// edge can convert with no field gymnastics. A single record is kept per
+// volume; a subsequent ModifyVolume overwrites it.
+type VolumeModification struct {
+	VolumeID           string    `json:"VolumeID"`
+	ModificationState  string    `json:"ModificationState"` // "modifying"|"optimizing"|"completed"|"failed"
+	Progress           int64     `json:"Progress"`
+	StatusMessage      string    `json:"StatusMessage,omitempty"`
+	OriginalSize       int64     `json:"OriginalSize"`
+	OriginalIops       int64     `json:"OriginalIops"`
+	OriginalVolumeType string    `json:"OriginalVolumeType"`
+	TargetSize         int64     `json:"TargetSize"`
+	TargetIops         int64     `json:"TargetIops"`
+	TargetVolumeType   string    `json:"TargetVolumeType"`
+	StartTime          time.Time `json:"StartTime"`
+	EndTime            time.Time `json:"EndTime,omitempty"`
 }
 
 // Meta-data
