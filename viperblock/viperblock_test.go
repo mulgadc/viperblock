@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -2332,3 +2333,50 @@ func Benchmark_SeqWrite(b *testing.B) {
 
 }
 */
+
+func TestVolumeConfig_ModificationJSONRoundTrip(t *testing.T) {
+	start := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Second)
+
+	original := VolumeConfig{
+		VolumeMetadata: VolumeMetadata{
+			VolumeID: "vol-roundtrip",
+			SizeGiB:  20,
+			State:    "available",
+		},
+		Modification: &VolumeModification{
+			VolumeID:           "vol-roundtrip",
+			ModificationState:  "completed",
+			Progress:           100,
+			OriginalSize:       10,
+			OriginalIops:       3000,
+			OriginalVolumeType: "gp3",
+			TargetSize:         20,
+			TargetIops:         3000,
+			TargetVolumeType:   "gp3",
+			StartTime:          start,
+			EndTime:            end,
+		},
+	}
+
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+
+	var decoded VolumeConfig
+	require.NoError(t, json.Unmarshal(data, &decoded))
+
+	require.NotNil(t, decoded.Modification)
+	assert.Equal(t, original.Modification.VolumeID, decoded.Modification.VolumeID)
+	assert.Equal(t, original.Modification.ModificationState, decoded.Modification.ModificationState)
+	assert.Equal(t, original.Modification.Progress, decoded.Modification.Progress)
+	assert.Equal(t, original.Modification.OriginalSize, decoded.Modification.OriginalSize)
+	assert.Equal(t, original.Modification.TargetSize, decoded.Modification.TargetSize)
+	assert.True(t, original.Modification.StartTime.Equal(decoded.Modification.StartTime))
+	assert.True(t, original.Modification.EndTime.Equal(decoded.Modification.EndTime))
+
+	// Absent Modification omits the field entirely (omitempty).
+	bare := VolumeConfig{VolumeMetadata: VolumeMetadata{VolumeID: "vol-bare"}}
+	bareData, err := json.Marshal(bare)
+	require.NoError(t, err)
+	assert.NotContains(t, string(bareData), "Modification")
+}
