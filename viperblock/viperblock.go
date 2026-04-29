@@ -271,7 +271,7 @@ type VolumeModification struct {
 	TargetIops         int64     `json:"TargetIops"`
 	TargetVolumeType   string    `json:"TargetVolumeType"`
 	StartTime          time.Time `json:"StartTime"`
-	EndTime            time.Time `json:"EndTime,omitempty"`
+	EndTime            time.Time `json:"EndTime,omitzero"`
 }
 
 // Meta-data
