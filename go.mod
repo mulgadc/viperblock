@@ -11,6 +11,7 @@ require (
 	github.com/pterm/pterm v0.12.83
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.53.0
+	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000
 )
 
 require (
