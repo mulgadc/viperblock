@@ -1,6 +1,6 @@
 module main
 
-go 1.26.2
+go 1.26.3
 
 replace libguestfs.org/nbdkit => ./libguestfs.org/nbdkit
 

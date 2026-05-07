@@ -1,13 +1,13 @@
 module github.com/mulgadc/viperblock
 
-go 1.26.2
+go 1.26.3
 
 replace libguestfs.org/nbdkit => ./nbd/libguestfs.org/nbdkit
 
 require (
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/predastore v1.1.6
+	github.com/mulgadc/predastore v1.2.1
 	github.com/pterm/pterm v0.12.83
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.53.0
@@ -45,16 +45,16 @@ require (
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/klauspost/compress v1.18.5 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/klauspost/reedsolomon v1.13.3 // indirect
+	github.com/klauspost/reedsolomon v1.14.0 // indirect
 	github.com/lithammer/fuzzysearch v1.1.8 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.21 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
-	github.com/nats-io/nats.go v1.49.0 // indirect
+	github.com/nats-io/nats.go v1.51.0 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/pelletier/go-toml/v2 v2.3.0 // indirect
+	github.com/pelletier/go-toml/v2 v2.3.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
@@ -64,6 +64,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.42.0 // indirect
 	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
+	golang.org/x/exp v0.0.0-20231110203233-9a3e6036ecaa // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
