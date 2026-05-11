@@ -7,19 +7,40 @@ package s3
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/viperblock/types"
 	"golang.org/x/net/http2"
 )
+
+// wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error code
+// indicates the requested object is genuinely absent (NoSuchKey, 404 NotFound,
+// NoSuchBucket). Callers can detect "missing" vs "transient" via
+// errors.Is(err, os.ErrNotExist) without taking an AWS SDK dependency.
+func wrapNotFound(err error) error {
+	if err == nil {
+		return nil
+	}
+	var aerr awserr.Error
+	if errors.As(err, &aerr) {
+		switch aerr.Code() {
+		case s3.ErrCodeNoSuchKey, s3.ErrCodeNoSuchBucket, "NotFound", "NoSuchVersion":
+			return fmt.Errorf("%w: %w", os.ErrNotExist, err)
+		}
+	}
+	return err
+}
 
 // 2. Define config structs
 type S3Config struct {
@@ -179,7 +200,7 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 	textResult, err := backend.config.S3Client.GetObject(requestObject)
 
 	if err != nil {
-		return nil, err
+		return nil, wrapNotFound(err)
 	}
 	defer textResult.Body.Close()
 
@@ -257,7 +278,7 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 
 	textResult, err := backend.config.S3Client.GetObject(requestObject)
 	if err != nil {
-		return nil, err
+		return nil, wrapNotFound(err)
 	}
 	defer textResult.Body.Close()
 
