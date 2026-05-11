@@ -317,6 +317,40 @@ var ErrRequestOutOfRange = errors.New("request out of range")
 var ErrRequestBlockSize = errors.New("request must be a multiple of block size")
 var ErrRequestBufferEmpty = errors.New("request requires a buffer > 0")
 
+// ErrStateNotFound is returned by LoadState when both the local file and the
+// backend object are genuinely absent (NoSuchKey/os.ErrNotExist). The volume
+// has no persisted state — caller decides whether that is expected (newly
+// created volume pre-SaveState) or a hard error (recovery of an existing
+// volume).
+var ErrStateNotFound = errors.New("viperblock: state not found")
+
+// ErrStateBackendUnavailable is returned by LoadState when the backend Read
+// failed with a non-not-found error (timeout, network, 5xx). Callers should
+// retry with backoff; the state may become available shortly.
+var ErrStateBackendUnavailable = errors.New("viperblock: state backend unavailable")
+
+// classifyStateLoad maps the local and backend LoadStateRequest errors into a
+// sentinel suitable for callers. The local read is informational — its
+// absence is normal on multi-node deployments and post-restart recovery. The
+// backend error drives the classification: a not-found there means the
+// volume has no persisted state (genuine "new volume"), anything else means
+// the backend is transiently unreachable.
+//
+// Backends signal "object missing" by wrapping os.ErrNotExist (file backend
+// returns os.PathError directly; s3 backend's wrapNotFound translates
+// NoSuchKey/NoSuchBucket/etc.). Any other error is treated as transient.
+func classifyStateLoad(localErr, backendErr error) error {
+	if backendErr != nil && !errors.Is(backendErr, os.ErrNotExist) {
+		return fmt.Errorf("%w: %w", ErrStateBackendUnavailable, backendErr)
+	}
+	localMissing := localErr == nil || errors.Is(localErr, os.ErrNotExist)
+	backendMissing := backendErr == nil || errors.Is(backendErr, os.ErrNotExist)
+	if localMissing && backendMissing {
+		return ErrStateNotFound
+	}
+	return fmt.Errorf("%w: state present but BlockSize=0", ErrStateNotFound)
+}
+
 // getSystemMemory returns the total system memory in bytes
 func getSystemMemory() uint64 {
 	var m runtime.MemStats
@@ -2393,7 +2427,8 @@ func (vb *VB) SaveState() error {
 // Load the block tracking state from disk
 func (vb *VB) LoadState() error {
 	// Step 1. Query the state locally
-	state, localErr := vb.LoadStateRequest(fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume())))
+	localPath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
+	state, localErr := vb.LoadStateRequest(localPath)
 	if localErr != nil {
 		slog.Info("No state found in local file, using backend state", "error", localErr)
 	}
@@ -2402,13 +2437,19 @@ func (vb *VB) LoadState() error {
 	stateBackend, backendErr := vb.LoadStateRequest("")
 
 	if backendErr != nil {
-		slog.Warn("No state found in backend, using local state", "error", backendErr)
+		slog.Warn("Failed to load state from backend", "error", backendErr)
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
-		errMsg := "block size is 0 in both local and backend state, skipping config sync (expected for new volumes)"
-		slog.Debug(errMsg)
-		return errors.New(errMsg)
+		classified := classifyStateLoad(localErr, backendErr)
+		if errors.Is(classified, ErrStateBackendUnavailable) {
+			slog.Warn("LoadState: backend unavailable, retry recommended",
+				"volume", vb.GetVolume(), "err", backendErr)
+		} else {
+			slog.Debug("LoadState: no state in local or backend",
+				"volume", vb.GetVolume())
+		}
+		return classified
 	}
 
 	// Step 3. Compare the two states, the state with the highest SeqNum is the correct state.

@@ -2380,3 +2380,58 @@ func TestVolumeConfig_ModificationJSONRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(bareData), "Modification")
 }
+
+// TestClassifyStateLoad pins the local/backend error → sentinel mapping for
+// recovery callers (mulga-siv-25). The classification decides whether the
+// caller should retry (transient backend) or fail (genuine missing state).
+func TestClassifyStateLoad(t *testing.T) {
+	transient := fmt.Errorf("connection refused: tls handshake timeout")
+	notFound := fmt.Errorf("get config.json: %w", os.ErrNotExist)
+
+	cases := []struct {
+		name       string
+		localErr   error
+		backendErr error
+		wantIs     error
+	}{
+		{
+			name:       "both_missing_is_not_found",
+			localErr:   notFound,
+			backendErr: notFound,
+			wantIs:     ErrStateNotFound,
+		},
+		{
+			name:       "backend_transient_is_unavailable",
+			localErr:   notFound,
+			backendErr: transient,
+			wantIs:     ErrStateBackendUnavailable,
+		},
+		{
+			name:       "local_present_backend_missing_is_not_found",
+			localErr:   nil,
+			backendErr: notFound,
+			wantIs:     ErrStateNotFound,
+		},
+		{
+			name:       "local_missing_backend_present_is_not_found",
+			localErr:   notFound,
+			backendErr: nil,
+			wantIs:     ErrStateNotFound,
+		},
+		{
+			name:       "backend_transient_dominates_local_missing",
+			localErr:   nil,
+			backendErr: transient,
+			wantIs:     ErrStateBackendUnavailable,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyStateLoad(tc.localErr, tc.backendErr)
+			require.Error(t, got)
+			assert.ErrorIs(t, got, tc.wantIs,
+				"classifyStateLoad(local=%v, backend=%v) = %v", tc.localErr, tc.backendErr, got)
+		})
+	}
+}
