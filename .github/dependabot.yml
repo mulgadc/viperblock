@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    target-branch: dev
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Australia/Sydney
+    cooldown:
+      default-days: 3
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    target-branch: dev
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Australia/Sydney
+    cooldown:
+      default-days: 3
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
