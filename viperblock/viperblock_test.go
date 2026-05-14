@@ -15,13 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/viperblock/internal/predastoretest"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	predastore "github.com/mulgadc/predastore/s3"
 )
 
 // TestVB is a helper struct to hold test cases
@@ -60,6 +59,9 @@ var (
 // sharedServerHost holds the host:port of the shared predastore test server started in TestMain.
 var sharedServerHost string
 
+// sharedBucket holds the name of the pre-created bucket on the shared server.
+var sharedBucket string
+
 // testHTTPClient is an HTTP client that skips TLS verification for the test predastore server.
 var testHTTPClient = &http.Client{
 	Timeout: 120 * time.Second,
@@ -75,63 +77,51 @@ var testHTTPClient = &http.Client{
 	},
 }
 
-// sharedBucketPath is the filesystem path of the first predastore bucket, used for test volume cleanup.
-var sharedBucketPath string
-
-// sharedServerShutdown is the cleanup function for the shared predastore server.
-var sharedServerShutdown func()
-
 func TestMain(m *testing.M) {
-	AccessKey, SecretKey = loadTestCredentials()
+	os.Exit(func() int {
+		AccessKey, SecretKey = loadTestCredentials()
 
-	host, err := FindFreePort()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to find free port for shared test server: %v\n", err)
-		os.Exit(1)
-	}
-
-	dir, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get working directory: %v\n", err)
-		os.Exit(1)
-	}
-	dir = filepath.Join(dir, "..")
-
-	s3server := predastore.New(&predastore.Config{
-		ConfigPath: filepath.Join(dir, "tests/config/server.toml"),
-	})
-	if err := s3server.ReadConfig(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read predastore config: %v\n", err)
-		os.Exit(1)
-	}
-
-	server := predastore.NewHTTP2Server(s3server)
-	go func() {
-		if err := server.ListenAndServe(host, "../config/server.pem", "../config/server.key"); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "shared test server error: %v\n", err)
+		dir, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to get working directory: %v\n", err)
+			return 1
 		}
-	}()
+		repoRoot := filepath.Join(dir, "..")
 
-	serverURL := fmt.Sprintf("https://%s", host)
-	if !waitForServer(serverURL, 5*time.Second) {
-		fmt.Fprintf(os.Stderr, "shared test server did not respond in time at %s\n", serverURL)
-		os.Exit(1)
-	}
+		dataDir, err := os.MkdirTemp("", "viperblock-predastore-*")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
+			return 1
+		}
+		defer os.RemoveAll(dataDir)
 
-	sharedServerHost = host
-	if len(s3server.Buckets) > 0 {
-		sharedBucketPath = s3server.Buckets[0].Pathname
-	}
-	sharedServerShutdown = func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
-	}
+		srv, err := predastoretest.Start(predastoretest.Options{
+			DataDir:    dataDir,
+			CertPath:   filepath.Join(repoRoot, "config", "server.pem"),
+			KeyPath:    filepath.Join(repoRoot, "config", "server.key"),
+			BucketName: "predastore",
+			AccessKey:  AccessKey,
+			SecretKey:  SecretKey,
+			AccountID:  "123456789012",
+			Region:     "ap-southeast-2",
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start predastore test cluster: %v\n", err)
+			return 1
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
+				fmt.Fprintf(os.Stderr, "predastore shutdown error: %v\n", shutdownErr)
+			}
+		}()
 
-	code := m.Run()
+		sharedServerHost = srv.Endpoint
+		sharedBucket = srv.Bucket
 
-	sharedServerShutdown()
-	os.Exit(code)
+		return m.Run()
+	}())
 }
 
 // loadTestCredentials loads AWS credentials.
@@ -199,18 +189,17 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 			VolumeSize: volumeSize,
 
 			Region:     "ap-southeast-2",
-			Bucket:     "predastore",
+			Bucket:     sharedBucket,
 			AccessKey:  AccessKey,
 			SecretKey:  SecretKey,
 			Host:       fmt.Sprintf("https://%s", sharedServerHost),
 			HTTPClient: testHTTPClient,
 		}
 
-		shutdown = func(volName string) {
-			if sharedBucketPath != "" {
-				os.RemoveAll(fmt.Sprintf("%s/%s", sharedBucketPath, volName))
-			}
-		}
+		// Distributed predastore stores objects in Raft global state across
+		// shards; there's no per-volume directory to nuke. Test tmpdir is
+		// recycled at TestMain teardown.
+		shutdown = func(volName string) {}
 
 	default:
 		t.Fatalf("unsupported backend type: %s", backendType.BackendType)
@@ -268,10 +257,10 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 		VolumeName: "test_s3",
 		VolumeSize: volumeSize,
 		Region:     "ap-southeast-2",
-		Bucket:     "predastore",
+		Bucket:     sharedBucket,
 		AccessKey:  AccessKey,
 		SecretKey:  SecretKey,
-		Host:       "https://127.0.0.1:8443/",
+		Host:       fmt.Sprintf("https://%s", sharedServerHost),
 		HTTPClient: testHTTPClient,
 	}
 
@@ -375,10 +364,10 @@ func TestNew(t *testing.T) {
 				VolumeName: "test_s3",
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
-				Bucket:     "test_bucket",
+				Bucket:     sharedBucket,
 				AccessKey:  AccessKey,
 				SecretKey:  SecretKey,
-				Host:       "https://127.0.0.1:8443/",
+				Host:       fmt.Sprintf("https://%s", sharedServerHost),
 				HTTPClient: testHTTPClient,
 			},
 			blockSize: DefaultBlockSize,
@@ -2246,93 +2235,6 @@ func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
 		})
 	})
 }
-
-// waitForServer polls the URL until it responds or times out
-func waitForServer(url string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	client := http.Client{Timeout: 100 * time.Millisecond, Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // only for test
-		},
-	}}
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			return true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return false
-}
-
-// BENCHMARKS: TODO, use generics for shared test/bench environment setup
-
-/*
-func Benchmark_SeqWrite(b *testing.B) {
-
-	tests := []struct {
-		Name  string
-		Data  []byte
-		Flush bool
-	}{
-		//{Name: "1024", Data: make([]byte, 1024)},
-		//{Name: "2048", Data: make([]byte, 2048)},
-		{Name: "4KB", Data: make([]byte, 4096), Flush: false},
-		{Name: "8KB", Data: make([]byte, 8192), Flush: false},
-		{Name: "16KB", Data: make([]byte, 16384), Flush: false},
-		{Name: "32KB", Data: make([]byte, 32768), Flush: false},
-		{Name: "64KB", Data: make([]byte, 65536), Flush: false},
-		{Name: "128KB", Data: make([]byte, 131072), Flush: false},
-
-		{Name: "4KB_flush", Data: make([]byte, 4096), Flush: true},
-		{Name: "8KB_flush", Data: make([]byte, 8192), Flush: true},
-		{Name: "16KB_flush", Data: make([]byte, 16384), Flush: true},
-		{Name: "32KB_flush", Data: make([]byte, 32768), Flush: true},
-		{Name: "64KB_flush", Data: make([]byte, 65536), Flush: true},
-		{Name: "128KB_flush", Data: make([]byte, 131072), Flush: true},
-	}
-
-	// Read a sample dataset
-	for _, test := range tests {
-
-		_, err := rand.Read(test.Data)
-		assert.NoError(b, err)
-
-		b.Run(test.Name, func(b *testing.B) {
-
-			runWithBackendsBench(b, fmt.Sprintf("flush_%t", test.Flush), func(b *testing.B, vb *VB) {
-
-				for i := 0; i < b.N; i++ {
-					err := vb.WriteAt(0, test.Data)
-					assert.NoError(b, err)
-
-					if test.Flush {
-						err := vb.Flush()
-						assert.NoError(b, err)
-					}
-				}
-
-				// Flush previous writes
-
-				err := vb.Flush()
-				//assert.NoError(b, err)
-
-				err = vb.WriteWALToChunk(true)
-				assert.NoError(b, err)
-
-				// Flush again to ensure no blocks are remaining
-				err = vb.Flush()
-				assert.NoError(b, err)
-
-			})
-
-		})
-
-	}
-
-}
-*/
 
 func TestVolumeConfig_ModificationJSONRoundTrip(t *testing.T) {
 	start := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
