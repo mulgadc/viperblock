@@ -78,49 +78,50 @@ var testHTTPClient = &http.Client{
 }
 
 func TestMain(m *testing.M) {
-	AccessKey, SecretKey = loadTestCredentials()
+	os.Exit(func() int {
+		AccessKey, SecretKey = loadTestCredentials()
 
-	dir, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to get working directory: %v\n", err)
-		os.Exit(1)
-	}
-	repoRoot := filepath.Join(dir, "..")
+		dir, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to get working directory: %v\n", err)
+			return 1
+		}
+		repoRoot := filepath.Join(dir, "..")
 
-	dataDir, err := os.MkdirTemp("", "viperblock-predastore-*")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
-		os.Exit(1)
-	}
+		dataDir, err := os.MkdirTemp("", "viperblock-predastore-*")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
+			return 1
+		}
+		defer os.RemoveAll(dataDir)
 
-	srv, err := predastoretest.Start(predastoretest.Options{
-		DataDir:    dataDir,
-		CertPath:   filepath.Join(repoRoot, "config", "server.pem"),
-		KeyPath:    filepath.Join(repoRoot, "config", "server.key"),
-		BucketName: "predastore",
-		AccessKey:  AccessKey,
-		SecretKey:  SecretKey,
-		AccountID:  "123456789012",
-		Region:     "ap-southeast-2",
-	})
-	if err != nil {
-		os.RemoveAll(dataDir)
-		fmt.Fprintf(os.Stderr, "failed to start predastore test cluster: %v\n", err)
-		os.Exit(1)
-	}
+		srv, err := predastoretest.Start(predastoretest.Options{
+			DataDir:    dataDir,
+			CertPath:   filepath.Join(repoRoot, "config", "server.pem"),
+			KeyPath:    filepath.Join(repoRoot, "config", "server.key"),
+			BucketName: "predastore",
+			AccessKey:  AccessKey,
+			SecretKey:  SecretKey,
+			AccountID:  "123456789012",
+			Region:     "ap-southeast-2",
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start predastore test cluster: %v\n", err)
+			return 1
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
+				fmt.Fprintf(os.Stderr, "predastore shutdown error: %v\n", shutdownErr)
+			}
+		}()
 
-	sharedServerHost = srv.Endpoint
-	sharedBucket = srv.Bucket
+		sharedServerHost = srv.Endpoint
+		sharedBucket = srv.Bucket
 
-	code := m.Run()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
-		fmt.Fprintf(os.Stderr, "predastore shutdown error: %v\n", shutdownErr)
-	}
-	cancel()
-	os.RemoveAll(dataDir)
-	os.Exit(code)
+		return m.Run()
+	}())
 }
 
 // loadTestCredentials loads AWS credentials.
