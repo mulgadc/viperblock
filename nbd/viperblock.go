@@ -14,6 +14,8 @@ import (
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
+
+	_ "github.com/mulgadc/viperblock/internal/fipsboot"
 )
 
 var pluginName = "viperblock"

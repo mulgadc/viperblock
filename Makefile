@@ -22,12 +22,12 @@ build:
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	go build -ldflags "-s -w" -o ./bin/sfs cmd/sfs/sfs.go
-	go build -ldflags "-s -w" -o ./bin/vblock cmd/vblock/main.go
+	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/sfs cmd/sfs/sfs.go
+	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/vblock cmd/vblock/main.go
 
 go_build_nbd:
 	@echo -e "\n....Building NBD plugin"
-	go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
+	GOFIPS140=v1.0.0 go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
 
 # Preflight — runs the same checks as GitHub Actions (lint + vuln + tests).
 # Use this before committing to catch CI failures locally.
