@@ -11,6 +11,8 @@ import (
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/mulgadc/viperblock/viperblock/v_utils"
+
+	_ "github.com/mulgadc/viperblock/internal/fipsboot"
 )
 
 func main() {
