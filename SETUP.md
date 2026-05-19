@@ -13,13 +13,13 @@ To import a qcow2 image into Viperblock, such as an OS cloud image that can be b
 Download the selected image
 
 ```
-wget https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2
+wget https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2
 ```
 
 Mount the qcow2 image
 
 ```
-qemu-nbd -r --connect=/dev/nbd0 debian-12-genericcloud-arm64.qcow2
+qemu-nbd -r --connect=/dev/nbd0 debian-13-genericcloud-arm64.qcow2
 ```
 
 ### Step 2
