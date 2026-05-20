@@ -301,13 +301,15 @@ type AMIMetadata struct {
 	Architecture    string            `json:"Architecture"`    // "x86_64", "arm64"
 	PlatformDetails string            `json:"PlatformDetails"` // "Linux/UNIX"
 	CreationDate    time.Time         `json:"CreationDate"`
-	RootDeviceType  string            `json:"RootDeviceType"`     // "ebs"
-	Virtualization  string            `json:"Virtualization"`     // "hvm"
-	ImageOwnerAlias string            `json:"ImageOwnerAlias"`    // e.g. "spinifex"
-	VolumeSizeGiB   uint64            `json:"VolumeSizeGiB"`      // Size of the root image
-	SnapshotID      string            `json:"SnapshotID"`         // Snapshot ID for zero-copy cloning
-	BootMode        string            `json:"BootMode,omitempty"` // "bios" | "uefi" | "uefi-preferred"; empty for legacy AMIs registered before this field existed
-	Tags            map[string]string `json:"Tags"`               // Metadata tags
+	RootDeviceType  string            `json:"RootDeviceType"`         // "ebs"
+	Virtualization  string            `json:"Virtualization"`         // "hvm"
+	ImageOwnerAlias string            `json:"ImageOwnerAlias"`        // e.g. "spinifex"
+	VolumeSizeGiB   uint64            `json:"VolumeSizeGiB"`          // Size of the root image
+	SnapshotID      string            `json:"SnapshotID"`             // Snapshot ID for zero-copy cloning
+	BootMode        string            `json:"BootMode,omitempty"`     // "bios" | "uefi" | "uefi-preferred"; empty for legacy AMIs registered before this field existed
+	Distro          string            `json:"Distro,omitempty"`       // e.g. "debian", "ubuntu", "rocky", "alpine"; empty for AMIs registered before this field existed
+	DistroFamily    string            `json:"DistroFamily,omitempty"` // "debian" | "rhel" | "alpine"; drives cloud-init template branching. Empty defaults to debian-family rendering at launch time.
+	Tags            map[string]string `json:"Tags"`                   // Metadata tags
 }
 
 // Error messages
