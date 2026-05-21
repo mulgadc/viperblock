@@ -88,6 +88,16 @@ func TestMain(m *testing.M) {
 		}
 		repoRoot := filepath.Join(dir, "..")
 
+		// predastore's internal s3db + QUIC clients verify TLS strictly against
+		// the OS trust store. Point SystemCertPool at our self-signed test cert
+		// so verify succeeds without installing the cert system-wide. Must be
+		// set before any TLS handshake in this process (Go caches the pool).
+		certPath := filepath.Join(repoRoot, "config", "server.pem")
+		if err := os.Setenv("SSL_CERT_FILE", certPath); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to set SSL_CERT_FILE: %v\n", err)
+			return 1
+		}
+
 		dataDir, err := os.MkdirTemp("", "viperblock-predastore-*")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
