@@ -211,7 +211,7 @@ func main() {
 
 		fmt.Println(blocks)
 
-		finput, err := os.Open(path)
+		finput, err := os.Open(path) //nolint:gosec // G122: dev CLI walks a user-supplied tree; symlink TOCTOU isn't a concern here
 
 		if err != nil {
 			fmt.Println(err)
