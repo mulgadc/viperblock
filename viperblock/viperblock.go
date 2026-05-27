@@ -260,6 +260,13 @@ type BlockLookup struct {
 	NumBlocks    uint16
 	ObjectID     uint64
 	ObjectOffset uint32
+	// SeqNum is the chunk-write generation that produced this block's
+	// ciphertext on the backend. Drives nonce + AAD reconstruction on the
+	// decrypt path: the on-disk chunk carries no nonce, so the per-block
+	// SeqNum here is the only source. Always populated from BlockEntry.SeqNum
+	// in createChunkFile (zero for blocks written by pre-encryption code paths
+	// — those volumes are unreadable post-cutover by design).
+	SeqNum uint64
 }
 
 type ConsecutiveBlock struct {
@@ -574,6 +581,18 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	// Calculate initial cache size based on 30% of system memory
 	//initialCacheSize := calculateCacheSize(config.BlockSize, 30)
 
+	// Magic selection: encrypted volumes use VBCE chunks and VBWE single-file
+	// WAL records (AEAD-sealed, no CRC). Unencrypted volumes keep the legacy
+	// VBCH / VBWL formats unchanged. The sharded WAL keeps VBWL because the
+	// sharded path is refused at startup under encryption (see New
+	// validation); pre-existing unencrypted shards remain readable.
+	chunkMagic := [4]byte{'V', 'B', 'C', 'H'}
+	walMagic := [4]byte{'V', 'B', 'W', 'L'}
+	if config.EncryptionEnabled {
+		chunkMagic = [4]byte{'V', 'B', 'C', 'E'}
+		walMagic = [4]byte{'V', 'B', 'W', 'E'}
+	}
+
 	vb = &VB{
 		VolumeName:       config.VolumeName,
 		VolumeSize:       config.VolumeSize,
@@ -583,7 +602,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		FlushSize:        config.FlushSize,
 		WALSyncInterval:  config.WALSyncInterval,
 		Writes:           Blocks{},
-		WAL:              WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'L'}},
+		WAL:              WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
 		BlockToObjectWAL: WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
 		Cache: Cache{
 			lru: lruCache,
@@ -595,7 +614,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		},
 		Version: 1,
 
-		ChunkMagic:     [4]byte{'V', 'B', 'C', 'H'},
+		ChunkMagic:     chunkMagic,
 		BlocksToObject: BlocksToObject{},
 		Backend:        backend,
 		BaseDir:        config.BaseDir,
@@ -1229,69 +1248,47 @@ func (vb *VB) Flush2() (err error) {
 }
 
 func (vb *VB) WriteWAL(block Block) (err error) {
-	// Pre-allocate record buffer (28 byte header + data)
-	recordSize := 28 + len(block.Data)
-	record := make([]byte, recordSize)
+	var record []byte
+
+	if vb.EncryptionEnabled {
+		// Encrypted layout (magic VBWE), per-record:
+		//   [SeqNum(8) | BlockNum(8) | BlockLen(8) | ciphertext(BlockLen) | tag(16)]
+		// CRC32 is dropped — the 16-byte GCM tag subsumes it (NIST SP 800-38D
+		// §5: AEAD provides confidentiality and integrity in one primitive).
+		// Nonce: (SeqNum, VolumeUUID, DomainWAL). AAD: (volumeNameHash,
+		// BlockNum, SeqNum). Bound together they defeat cross-volume swap,
+		// in-place rollback, and positional shuffle on WAL replay.
+		const headerLen = 24
+		record = make([]byte, headerLen, headerLen+len(block.Data)+16)
+		binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
+		binary.BigEndian.PutUint64(record[8:16], block.Block)
+		binary.BigEndian.PutUint64(record[16:24], block.Len)
+		nonce := makeNonce(block.SeqNum, vb.VolumeUUID, DomainWAL)
+		aad := makeAAD(vb.volumeNameHash, block.Block, block.SeqNum)
+		record = vb.aead.Seal(record, nonce[:], block.Data, aad)
+	} else {
+		// Legacy layout (magic VBWL), per-record:
+		//   [SeqNum(8) | BlockNum(8) | BlockLen(8) | CRC32(4) | data(BlockLen)]
+		recordSize := 28 + len(block.Data)
+		record = make([]byte, recordSize)
+		binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
+		binary.BigEndian.PutUint64(record[8:16], block.Block)
+		binary.BigEndian.PutUint64(record[16:24], block.Len)
+		checksum := crc32.ChecksumIEEE(record[0:24])
+		checksum = crc32.Update(checksum, crc32.IEEETable, block.Data)
+		binary.BigEndian.PutUint32(record[24:28], checksum)
+		copy(record[28:], block.Data)
+	}
 
 	vb.WAL.mu.Lock()
-
-	// Get the current WAL file
 	currentWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
-
-	//slog.Info("WRITE WAL:", "currentWAL", currentWAL)
-
-	// Format for each block in the WAL
-	// [seq_number, uint64][block_number, uint64][block_length, uint64][checksum, uint32][block_data, []byte]
-	// big endian
-
-	// Write the block number as big endian
-	binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
-
-	//blockSeq := make([]byte, 8)
-	//binary.BigEndian.PutUint64(blockSeq, block.SeqNum)
-	//currentWAL.Write(blockSeq)
-
-	// Write the block number as big endian
-	binary.BigEndian.PutUint64(record[8:16], block.Block)
-
-	//blockNumber := make([]byte, 8)
-	//binary.BigEndian.PutUint64(blockNumber, block.Block)
-	//slog.Info("WriteWAL > blockNumber", "original", block.Block, "converted", binary.BigEndian.Uint64(blockNumber))
-	//currentWAL.Write(blockNumber)
-
-	// TODO: Optimise
-	// Write the block length as big endian
-	binary.BigEndian.PutUint64(record[16:24], block.Len)
-
-	//blockLength := make([]byte, 8)
-	//binary.BigEndian.PutUint64(blockLength, uint64(len(block.Data)))
-	//currentWAL.Write(blockLength)
-
-	// Calculate a CRC32 checksum of the block data and headers
-	checksum := crc32.ChecksumIEEE(record[0:24])
-	checksum = crc32.Update(checksum, crc32.IEEETable, block.Data)
-
-	// Write the checksum as big endian
-	binary.BigEndian.PutUint32(record[24:28], checksum)
-
-	//checksumBytes := make([]byte, 4)
-	//binary.BigEndian.PutUint32(checksumBytes, checksum)
-	//currentWAL.Write(checksumBytes)
-
-	// Next, write the block data
-	copy(record[28:], block.Data)
-
-	// Optimistation, write a single time to reduce O_SYNC calls (slow) per finished block
 	n, err := currentWAL.Write(record)
-
-	// Mark WAL as dirty for periodic sync goroutine
 	vb.WAL.dirty.Store(true)
-
 	vb.WAL.mu.Unlock()
 
-	if n != recordSize {
-		slog.Error("ERROR WRITING BLOCK TO WAL: incomplete write", "n", n, "expected", recordSize)
-		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes", n, recordSize)
+	if n != len(record) {
+		slog.Error("ERROR WRITING BLOCK TO WAL: incomplete write", "n", n, "expected", len(record))
+		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes", n, len(record))
 	}
 
 	return err
@@ -1437,19 +1434,30 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 	// return nil
 }
 
-func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
-	data = make([]byte, 26)
+// blockWalChunkSize is the on-disk size of a serialized BlockLookup entry in
+// the block-to-object checkpoint. Format (big-endian):
+//
+//	[StartBlock(8) | NumBlocks(2) | ObjectID(8) | ObjectOffset(4) | SeqNum(8) | CRC32(4)]
+//
+// SeqNum was added to drive nonce + AAD reconstruction on the decrypt path
+// (Stage 3); the field is populated unconditionally so encrypted and
+// unencrypted volumes share a single checkpoint format. Pre-encryption
+// checkpoints written under the previous 26-byte layout are unreadable by
+// post-cutover binaries — volumes must be recreated. CRC32 is retained on
+// metadata because the checkpoint stays plaintext (not AEAD-sealed).
+const blockWalChunkSize = 34
 
-	// Write the start block
+func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
+	data = make([]byte, blockWalChunkSize)
+
 	binary.BigEndian.PutUint64(data[0:8], block.StartBlock)
 	binary.BigEndian.PutUint16(data[8:10], block.NumBlocks)
 	binary.BigEndian.PutUint64(data[10:18], block.ObjectID)
 	binary.BigEndian.PutUint32(data[18:22], block.ObjectOffset)
+	binary.BigEndian.PutUint64(data[22:30], block.SeqNum)
 
-	// Calculate a CRC32 checksum of the block data and headers
-	checksum := crc32.ChecksumIEEE(data[0:22])
-
-	binary.BigEndian.PutUint32(data[22:26], checksum)
+	checksum := crc32.ChecksumIEEE(data[0:30])
+	binary.BigEndian.PutUint32(data[30:34], checksum)
 
 	return data
 }
@@ -1459,17 +1467,13 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 	block.NumBlocks = binary.BigEndian.Uint16(data[8:10])
 	block.ObjectID = binary.BigEndian.Uint64(data[10:18])
 	block.ObjectOffset = binary.BigEndian.Uint32(data[18:22])
+	block.SeqNum = binary.BigEndian.Uint64(data[22:30])
 
-	checksum := binary.BigEndian.Uint32(data[22:26])
+	checksum := binary.BigEndian.Uint32(data[30:34])
 
-	// Validate checksum
-	checksum_validated := crc32.ChecksumIEEE(data[:8])
-	checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, data[8:10])
-	checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, data[10:18])
-	checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, data[18:22])
-
-	if checksum_validated != checksum {
-		slog.Error("Checksum mismatch", "checksum", checksum, "checksum_validated", checksum_validated)
+	checksumValidated := crc32.ChecksumIEEE(data[:30])
+	if checksumValidated != checksum {
+		slog.Error("Checksum mismatch", "checksum", checksum, "checksum_validated", checksumValidated)
 		return block, fmt.Errorf("checksum mismatch")
 	}
 
@@ -1977,7 +1981,29 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	headers := vb.ChunkHeader()
 
-	err = vb.Backend.Write(types.FileTypeChunk, chunkIndex, &headers, chunkBuffer)
+	// On encrypted volumes the chunk body is rebuilt as a sequence of sealed
+	// blocks at stride BlockSize+16. Per-block nonce: (block.SeqNum,
+	// VolumeUUID, DomainChunk). AAD: (volumeNameHash, block.Block,
+	// block.SeqNum). The on-disk chunk carries no nonce; decrypt reconstructs
+	// it from BlockLookup.SeqNum (set below) at read time.
+	bodyBuffer := chunkBuffer
+	if vb.EncryptionEnabled {
+		bs := int(vb.BlockSize)
+		sealed := make([]byte, 0, len(*matchedBlocks)*(bs+16))
+		for i, mb := range *matchedBlocks {
+			start := i * bs
+			end := start + bs
+			if end > len(*chunkBuffer) {
+				return fmt.Errorf("createChunkFile: matchedBlocks/chunkBuffer length mismatch (block %d of %d, buffer %d bytes)", i, len(*matchedBlocks), len(*chunkBuffer))
+			}
+			nonce := makeNonce(mb.SeqNum, vb.VolumeUUID, DomainChunk)
+			aad := makeAAD(vb.volumeNameHash, mb.Block, mb.SeqNum)
+			sealed = vb.aead.Seal(sealed, nonce[:], (*chunkBuffer)[start:end], aad)
+		}
+		bodyBuffer = &sealed
+	}
+
+	err = vb.Backend.Write(types.FileTypeChunk, chunkIndex, &headers, bodyBuffer)
 	if err != nil {
 		return err
 	}
@@ -2018,6 +2044,13 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	BlockObjectsToWAL := make([]BlockLookup, 0, len(*matchedBlocks))
 
+	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
+	// each ciphertext block; unencrypted chunks stay at BlockSize.
+	stride := int(vb.BlockSize)
+	if vb.EncryptionEnabled {
+		stride += 16
+	}
+
 	vb.BlocksToObject.mu.Lock()
 	for k, block := range *matchedBlocks {
 		// Find out how many consecutive blocks there are
@@ -2034,7 +2067,8 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 			StartBlock:   block.Block,
 			NumBlocks:    utils.SafeIntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
-			ObjectOffset: utils.SafeIntToUint32(headerLen + (i * int(vb.BlockSize))),
+			ObjectOffset: utils.SafeIntToUint32(headerLen + (i * stride)),
+			SeqNum:       block.SeqNum,
 		}
 
 		// TODO: Optimise for number of consecutive blocks to reduce the memory size
@@ -2208,12 +2242,11 @@ func (vb *VB) LoadBlockState() (err error) {
 
 	// Check the wall number
 
-	// Read each block from the checkpoint buffer (26 bytes each)
+	// Read each block from the checkpoint buffer (blockWalChunkSize bytes each).
 	offset := vb.BlockToObjectWALHeaderSize()
 
 	for offset < len(checkpoint) {
-		// TODO: Improve offset calculation, not specific to 26 bytes
-		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+26])
+		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
 
 		if err != nil {
 			slog.Error("Error reading block", "error", err)
@@ -2224,10 +2257,10 @@ func (vb *VB) LoadBlockState() (err error) {
 
 		// Also update BlockStore if enabled
 		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, 0)
+			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
 		}
 
-		offset += 26
+		offset += blockWalChunkSize
 	}
 
 	return err
