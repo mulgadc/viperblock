@@ -23,7 +23,8 @@ Viperblock is a high-performance, WAL-backed block storage engine that provides 
 15. [Binary Formats](#15-binary-formats)
 16. [Configuration Reference](#16-configuration-reference)
 17. [File Structure](#17-file-structure)
-18. [References](#18-references)
+18. [Encryption at Rest](#18-encryption-at-rest)
+19. [References](#19-references)
 
 ---
 
@@ -645,11 +646,15 @@ An LRU cache (`github.com/hashicorp/golang-lru`) stores clean blocks read from t
 
 ## Magic Bytes
 
-| Format | Magic | ASCII |
-|--------|-------|-------|
-| Chunk data | `0x56 0x42 0x43 0x48` | `VBCH` |
-| WAL data | `0x56 0x42 0x57 0x4C` | `VBWL` |
-| Block mapping WAL | `0x56 0x42 0x57 0x42` | `VBWB` |
+| Format | Magic | ASCII | Notes |
+|--------|-------|-------|-------|
+| Chunk data (plaintext) | `0x56 0x42 0x43 0x48` | `VBCH` | Pre-encryption layout |
+| Chunk data (encrypted) | `0x56 0x42 0x43 0x45` | `VBCE` | AES-256-GCM sealed per block, see §18 |
+| WAL data (plaintext) | `0x56 0x42 0x57 0x4C` | `VBWL` | Pre-encryption layout; sharded WAL retains this |
+| WAL data (encrypted) | `0x56 0x42 0x57 0x45` | `VBWE` | AES-256-GCM sealed per record (single-file WAL only) |
+| Block mapping WAL | `0x56 0x42 0x57 0x42` | `VBWB` | Plaintext + CRC32 in both modes (metadata, not FCI) |
+
+Volumes are mode-locked at creation: an encrypted volume never sees `VBCH`/`VBWL`, and an unencrypted volume never sees `VBCE`/`VBWE`. A magic mismatch on read is a migration error — there is no in-place upgrade path.
 
 ## File Types and Storage Paths
 
@@ -681,6 +686,11 @@ An LRU cache (`github.com/hashicorp/golang-lru`) stores clean blocks read from t
 | `ShardedWAL` | bool | Whether sharded WAL is enabled |
 | `SnapshotID` | string | Source snapshot ID (if cloned) |
 | `SourceVolumeName` | string | Source volume (if cloned) |
+| `EncryptionEnabled` | bool | Volume is sealed under the operator master key (see §18) |
+| `VolumeUUID` | [4]byte | Per-volume nonce subspace, minted via `crypto/rand` on first SaveState |
+| `SeqNumHighWater` | uint64 | Crash-safe nonce-uniqueness reservation; SeqNum resumes here on Open |
+| `StateSeqNum` | uint64 | Monotonic SaveState generation, bound into the VBState metadata HMAC |
+| `KeyFingerprint` | string | 16 hex chars of the master key fingerprint; mismatched key fails Open |
 
 ## Volume Metadata (EBS-compatible)
 
@@ -722,7 +732,101 @@ viperblock/
 
 ---
 
-# 18. References
+# 18. Encryption at Rest
+
+Viperblock seals every byte of FCI to its live code paths under AES-256-GCM using a node-shared master key, and HMACs `VBState` and `SnapshotState` metadata so a backend writer cannot pivot one volume onto another's blocks. This closes the CMMC L1 practices MP.L1-3.8.3 (cryptographic erase at node-decommission granularity), SI.L1-3.14.2 (chunk + WAL integrity via the 16-byte AEAD tag), and SC.L1-3.13.1 (backend payload is opaque ciphertext).
+
+## Scope
+
+In scope: single-file WAL, chunk write/read, `VBState` / `SnapshotState` metadata HMAC. The encryption-enabled `Open` refuses `UseShardedWAL=true`; the sharded path stays plaintext until a follow-up bead lifts the gate. `WriteBlockWAL` (the block-to-object streaming path) is a dead stub and is not encrypted. The block-to-object checkpoint stays plaintext (it is metadata, not FCI).
+
+## Master key
+
+The master key is a 32-byte raw key file, loaded via `predastore/pkg/masterkey.LoadShared` (group-readable 0640 OK, world-accessible refused). The same file serves predastore and viperblock under different unix users via a shared group. Viperblock receives the file path at startup (`-encryption-key-file` / `ENCRYPTION_KEY_FILE`); raw key bytes are never retained — `LoadShared` returns `*Key{AEAD, Fingerprint}` and viperblock caches the AEAD on `VB.aead` for the hot path.
+
+**Crypto-erase granularity is the node, not the volume.** Destroying the master key file renders every viperblock volume and every predastore object on that node unrecoverable. Per-volume `DeleteVolume` is a logical delete; whole-node decommission is the operator path for MP.L1-3.8.3. Per-volume crypto-erase via envelope encryption is a follow-up.
+
+## Nonce construction
+
+GCM nonces are 12 bytes (96 bits). Reuse with the same key is catastrophic (NIST SP 800-38D §8.3), so the construction uses three disjoint subspaces under the shared master key:
+
+```
+nonce[0:7]   = BE(SeqNum)         56 bits of monotonic counter
+nonce[7:11]  = VolumeUUID         4 random bytes per volume, persisted in VBState
+nonce[11]    = domain             0x00 chunk | 0x01 WAL | 0x02 vbstate-meta | 0x03 snapshot-meta
+```
+
+The 56-bit SeqNum gives ~2,283 years at 1M writes/sec per volume; `reserveSeqNum` refuses past `MaxSeqNum = (1<<56)-1`. `VolumeUUID` is minted via `crypto/rand` on first `SaveState` of an encrypted volume and persisted before `Open` returns. The domain byte keeps a WAL record sealed at `(SeqNum=N, VolumeUUID=V)` from colliding with the chunk block built from it at the same SeqNum / UUID after consolidation.
+
+`SeqNumHighWater` is the crash-safe nonce-uniqueness mechanism: `reserveSeqNum` hands out values lock-free until the high-water is crossed, then takes a mutex, advances by `seqNumReservation = 2^20`, and `SaveState`s before releasing. A kill -9 loses up to one reservation window of values, but every SeqNum handed out before the crash sits below the persisted high-water and cannot be re-issued.
+
+## AAD construction
+
+Data-domain AAD is 48 bytes — `SHA256(VolumeName) || BE(blockNum_8) || BE(seqNum_8)`. The volume hash defeats cross-volume swap; the blockNum defeats positional shuffle; the seqNum defeats in-place rollback.
+
+Metadata AAD substitutes a domain tag for the block slot: `SHA256(VolumeName) || domainTag || BE(StateSeqNum_8)`, where `domainTag` is `"vbstate"` for `VBState` and `"snap:"||snapshotID` for `SnapshotState`. The literal separator stops a snapshot blob from being accepted as a `VBState` blob and vice versa.
+
+## Encrypted WAL record (single-file WAL only, magic `VBWE`)
+
+```
+[SeqNum(8) | BlockNum(8) | BlockLen(8) | ciphertext(BlockLen) | tag(16)]
+= 40 + BlockLen bytes per record
+```
+
+CRC32 is deleted; the 16-byte GCM tag subsumes it. Nonce: `(SeqNum, VolumeUUID, 0x01)`. AAD: `(volumeNameHash, BlockNum, SeqNum)`. The WAL file header is `[VBWE(4) | version(2) | BlockSize(4) | timestamp(8)]` — same 18-byte shape as `VBWL`.
+
+## Encrypted chunk block (chunk magic `VBCE`)
+
+```
+[Chunk header(10): VBCE(4) | version(2) | BlockSize(4)]
+[block 0 ciphertext(BlockSize) | tag(16)]
+[block 1 ciphertext(BlockSize) | tag(16)]
+...
+```
+
+Stride = `BlockSize + 16` = 4112 bytes at default 4 KiB. Per-block nonce: `(block.SeqNum, VolumeUUID, 0x00)`. AAD: `(volumeNameHash, block.Block, block.SeqNum)`. No on-disk SeqNum, no on-disk nonce — both reconstructible from `BlockLookup.SeqNum` (which Stage 2 added to the persisted checkpoint) and `vb.VolumeUUID`.
+
+`BlockLookup` grew from 22 + 4 (CRC32) = 26 bytes per entry to 30 + 4 = 34 bytes to carry the SeqNum needed for nonce reconstruction.
+
+## Metadata HMAC — AES-GCM as MAC
+
+`VBState` and `SnapshotState` ship plaintext-readable on disk (operators can `cat config.json`) but gain a 16-byte trailing tag. `sealMeta` calls `aead.Seal(nil, nonce, nil, aad || jsonBytes)` — the JSON content is part of the covered AAD even though it ships in the clear, so any byte modification breaks verification.
+
+```
+saveMeta:
+  jsonBytes := json.Marshal(state)
+  nonce := makeNonce(StateSeqNum, VolumeUUID, 0x02 or 0x03)
+  aad   := makeMetaAAD(volumeNameHash, "vbstate" or "snap:"||snapshotID, StateSeqNum)
+  tag   := aead.Seal(nil, nonce, nil, aad || jsonBytes)
+  write: jsonBytes || tag
+
+loadMeta:
+  blob := read
+  jsonBytes, tag := blob[:len-16], blob[len-16:]
+  peek StateSeqNum + VolumeUUID from jsonBytes (and KeyFingerprint for clear errors)
+  nonce, aad := reconstruct
+  aead.Open(nil, nonce, tag, aad || jsonBytes)  → ErrIntegrity on mismatch
+```
+
+Rollback protection composes with the existing `LoadState` tie-break (highest `SeqNum` between local-fsync and backend wins): HMAC blocks cross-volume substitution and bit-flips, the SeqNum comparison blocks replay of an older authentic backend blob. The local copy is written atomically via tmp + fsync + rename + fsync(parent dir).
+
+## Snapshot identity
+
+`CreateSnapshot` persists the source volume's `VolumeUUID` (hex string, 8 chars) and `volumeNameHash` (hex string, 64 chars) into `SnapshotState`, plus the snapshot's own `StateSeqNum` for the snapshot-meta HMAC nonce. `OpenFromSnapshot` decodes these into `vb.SourceVolumeUUID` and `vb.sourceVolumeNameHash`; `fetchBaseBlocksFromBackend` uses them (not the clone's own identity) when decrypting source chunks. The clone's own writes seal under the clone's identity. This makes snapshots self-describing: a snapshot is readable as long as the source's chunks exist on the backend, independent of whether the source volume's `VBState` is still loadable.
+
+## Threat model
+
+**In scope:** confidentiality of guest block data against an attacker reading raw chunk files on the backend or raw WAL files on local NVMe; integrity/authenticity of WAL records and chunk blocks against an attacker who can modify them in place; cross-volume metadata pivot (a `VBState` or `SnapshotState` blob authentic for volume B spliced into volume A's location); within-volume positional shuffle; in-place rollback.
+
+**Out of scope:** compromise of a running viperblock host with the master key resident in memory; per-volume cryptographic erase (envelope encryption is the follow-up); migration of existing unencrypted volumes (hard cutover); encryption of the block-to-object checkpoint (metadata, not FCI); encryption of `VBState`/`SnapshotState` JSON itself (HMAC only — operators must still be able to `cat config.json`); the sharded WAL path; inbound NBD authentication.
+
+## Migration
+
+There is no in-place upgrade. A post-cutover binary refuses to open a volume with `VBCH` chunk magic or `VBWL` WAL magic under `EncryptionEnabled=true` (magic-mismatch error, then a migration message). Operators convert by creating a new encrypted volume, copying data across via guest-side tooling (`dd`, filesystem clone), and deleting the old volume. The decision is per-volume — an encrypted volume is encrypted end-to-end; an unencrypted volume runs the pre-encryption code path unchanged.
+
+---
+
+# 19. References
 
 The following research aided the design and implementation of Viperblock:
 
