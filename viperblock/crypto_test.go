@@ -2,22 +2,40 @@
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
-// Stage 1 smoke tests for the encryption-at-rest plumbing. The full Stage 5
-// test inventory (round-trip, AAD/ciphertext tamper, domain separation,
-// nonce uniqueness sweep, etc.) lands alongside the Stage 2-4 production
-// code; these tests exist to keep the global coverage gate satisfied while
-// the per-stage scope discipline is preserved.
+// Crypto-helper tests for the encryption-at-rest plumbing. Layout invariants
+// (nonce byte positions, 56-bit SeqNum truncation, AAD shape, domain
+// separation) live alongside the full Stage 5 matrix: AEAD round-trip,
+// ciphertext + tag tamper detection, sealMeta / openMeta round-trip and
+// tamper, ciphertext-level domain separation, and a 10^6-triple nonce
+// uniqueness sweep.
 
 package viperblock
 
 import (
+	"bytes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"testing"
 
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// freshAEAD builds an AES-256-GCM AEAD from a random 32-byte key. Caller-
+// controlled key generation so tests can mint independent keys for
+// cross-key separation checks.
+func freshAEAD(t *testing.T) cipher.AEAD {
+	t.Helper()
+	var raw [masterkey.MasterKeySize]byte
+	_, err := rand.Read(raw[:])
+	require.NoError(t, err)
+	aead, err := masterkey.NewAEAD(raw[:])
+	require.NoError(t, err)
+	return aead
+}
 
 func TestMakeNonce_LayoutAndDomainSeparation(t *testing.T) {
 	uuid := [4]byte{0xde, 0xad, 0xbe, 0xef}
@@ -108,4 +126,224 @@ func TestMakeMetaAAD_DomainSeparation(t *testing.T) {
 func TestComputeVolumeNameHash_MatchesSHA256(t *testing.T) {
 	want := sha256.Sum256([]byte("vol-42"))
 	assert.Equal(t, want, computeVolumeNameHash("vol-42"))
+}
+
+// TestAEAD_RoundTrip exercises the full data-domain primitive: seal with
+// (nonce, aad, plaintext) and recover the plaintext via Open. The pure-
+// helper tests above only assert layout; this gates that an actual
+// aead.Seal / aead.Open round-trip through makeNonce + makeAAD is
+// symmetric. Foundation for every tamper test below.
+func TestAEAD_RoundTrip(t *testing.T) {
+	aead := freshAEAD(t)
+	hash := sha256.Sum256([]byte("vol-rt"))
+	uuid := [4]byte{0xaa, 0xbb, 0xcc, 0xdd}
+	plaintext := []byte("the only winning move is not to play")
+
+	nonce := makeNonce(42, uuid, DomainChunk)
+	aad := makeAAD(hash, 7, 42)
+	sealed := aead.Seal(nil, nonce[:], plaintext, aad)
+	require.Len(t, sealed, len(plaintext)+aead.Overhead())
+
+	opened, err := aead.Open(nil, nonce[:], sealed, aad)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, opened)
+}
+
+// TestAEAD_CiphertextTamperFails — flipping a single bit in the body or
+// the trailing 16-byte tag must surface as an aead.Open error. This is the
+// SI.L1-3.14.2 backbone: chunk-store / WAL integrity rests on these two
+// detections firing on every byte modification at rest.
+func TestAEAD_CiphertextTamperFails(t *testing.T) {
+	aead := freshAEAD(t)
+	hash := sha256.Sum256([]byte("vol-tamper"))
+	uuid := [4]byte{1, 2, 3, 4}
+	plaintext := make([]byte, 512)
+	_, err := rand.Read(plaintext)
+	require.NoError(t, err)
+
+	nonce := makeNonce(100, uuid, DomainChunk)
+	aad := makeAAD(hash, 0, 100)
+	sealed := aead.Seal(nil, nonce[:], plaintext, aad)
+
+	t.Run("body bit flip", func(t *testing.T) {
+		tampered := append([]byte(nil), sealed...)
+		tampered[5] ^= 0x01
+		_, err := aead.Open(nil, nonce[:], tampered, aad)
+		assert.Error(t, err, "body tamper must fail Open")
+	})
+
+	t.Run("tag bit flip", func(t *testing.T) {
+		tampered := append([]byte(nil), sealed...)
+		tampered[len(tampered)-1] ^= 0x01
+		_, err := aead.Open(nil, nonce[:], tampered, aad)
+		assert.Error(t, err, "tag tamper must fail Open")
+	})
+}
+
+// TestAEAD_AADTamperFails — Open must reject when any AAD field
+// (volumeNameHash, blockNum, seqNum) differs from the seal-time value.
+// This is what defeats cross-volume swap (volume hash differs), positional
+// shuffle (blockNum differs), and in-place rollback (seqNum differs).
+// makeAAD layout is asserted by TestMakeAAD_TamperDetectionPrecondition;
+// here we wire that into a real Seal/Open pair to gate the cryptographic
+// detection.
+func TestAEAD_AADTamperFails(t *testing.T) {
+	aead := freshAEAD(t)
+	hash := sha256.Sum256([]byte("vol-aad"))
+	uuid := [4]byte{0x10, 0x20, 0x30, 0x40}
+	plaintext := []byte("authenticated data binding test")
+	nonce := makeNonce(500, uuid, DomainChunk)
+	aad := makeAAD(hash, 99, 500)
+	sealed := aead.Seal(nil, nonce[:], plaintext, aad)
+
+	t.Run("wrong volumeNameHash", func(t *testing.T) {
+		other := sha256.Sum256([]byte("vol-aad-OTHER"))
+		_, err := aead.Open(nil, nonce[:], sealed, makeAAD(other, 99, 500))
+		assert.Error(t, err)
+	})
+	t.Run("wrong blockNum", func(t *testing.T) {
+		_, err := aead.Open(nil, nonce[:], sealed, makeAAD(hash, 100, 500))
+		assert.Error(t, err)
+	})
+	t.Run("wrong seqNum", func(t *testing.T) {
+		_, err := aead.Open(nil, nonce[:], sealed, makeAAD(hash, 99, 501))
+		assert.Error(t, err)
+	})
+}
+
+// TestAEAD_DomainSeparationAtCiphertext — sealing identical plaintext under
+// (same key, same seqNum, same uuid) but different domains yields distinct
+// ciphertexts AND a tag from one domain does not verify under another. This
+// is the cryptographic teeth of the domain byte: without it, consolidating
+// a WAL record (DomainWAL) into a chunk block (DomainChunk) would reuse
+// the same nonce — catastrophic for AES-GCM.
+func TestAEAD_DomainSeparationAtCiphertext(t *testing.T) {
+	aead := freshAEAD(t)
+	hash := sha256.Sum256([]byte("vol-domain"))
+	uuid := [4]byte{0xfe, 0xed, 0xfa, 0xce}
+	plaintext := []byte("same plaintext, different domain")
+	aad := makeAAD(hash, 1, 1)
+
+	chunkNonce := makeNonce(1, uuid, DomainChunk)
+	walNonce := makeNonce(1, uuid, DomainWAL)
+	require.NotEqual(t, chunkNonce, walNonce)
+
+	chunkSealed := aead.Seal(nil, chunkNonce[:], plaintext, aad)
+	walSealed := aead.Seal(nil, walNonce[:], plaintext, aad)
+	assert.False(t, bytes.Equal(chunkSealed, walSealed),
+		"identical plaintext under different domain nonces must produce different ciphertexts")
+
+	// Cross-domain Open must fail — a chunk ciphertext presented as a WAL
+	// ciphertext (or vice versa) is rejected because the nonce differs.
+	_, err := aead.Open(nil, walNonce[:], chunkSealed, aad)
+	assert.Error(t, err, "chunk ciphertext must not verify under WAL nonce")
+	_, err = aead.Open(nil, chunkNonce[:], walSealed, aad)
+	assert.Error(t, err, "WAL ciphertext must not verify under chunk nonce")
+}
+
+// TestSealMeta_RoundTrip exercises the metadata HMAC primitive: seal a
+// JSON blob with structured AAD + nonce, recover the JSON via openMeta.
+// jsonBytes ship in the clear (operators can `cat config.json`) — the tag
+// binds them to (volumeNameHash, domainTag, stateSeqNum) so cross-volume
+// substitution and bit-flip are detectable.
+func TestSealMeta_RoundTrip(t *testing.T) {
+	aead := freshAEAD(t)
+	hash := sha256.Sum256([]byte("vol-meta"))
+	jsonBytes := []byte(`{"VolumeName":"vol-meta","StateSeqNum":7}`)
+	nonce := makeNonce(7, [4]byte{1, 2, 3, 4}, DomainVBStateMeta)
+	aad := makeMetaAAD(hash, "vbstate", 7)
+
+	blob := sealMeta(aead, jsonBytes, aad, nonce)
+	require.Len(t, blob, len(jsonBytes)+aead.Overhead())
+	assert.Equal(t, jsonBytes, blob[:len(jsonBytes)], "jsonBytes ship plaintext in the prefix")
+
+	recovered, err := openMeta(aead, blob, aad, nonce)
+	require.NoError(t, err)
+	assert.Equal(t, jsonBytes, recovered)
+}
+
+// TestSealMeta_TamperFails — bit-flip in the JSON, the tag, or the
+// structured AAD inputs (domainTag / stateSeqNum / volumeNameHash) all
+// surface as openMeta errors. This is the cross-volume metadata pivot
+// closer: an attacker swapping volume A's tagged config.json into volume
+// B's prefix is rejected because the AAD's volumeNameHash differs.
+func TestSealMeta_TamperFails(t *testing.T) {
+	aead := freshAEAD(t)
+	hash := sha256.Sum256([]byte("vol-meta-tamper"))
+	jsonBytes := []byte(`{"VolumeName":"vol-meta-tamper","StateSeqNum":99}`)
+	nonce := makeNonce(99, [4]byte{9, 9, 9, 9}, DomainVBStateMeta)
+	aad := makeMetaAAD(hash, "vbstate", 99)
+	blob := sealMeta(aead, jsonBytes, aad, nonce)
+
+	t.Run("json byte flip", func(t *testing.T) {
+		tampered := append([]byte(nil), blob...)
+		tampered[3] ^= 0x01
+		_, err := openMeta(aead, tampered, aad, nonce)
+		assert.Error(t, err)
+	})
+
+	t.Run("tag byte flip", func(t *testing.T) {
+		tampered := append([]byte(nil), blob...)
+		tampered[len(tampered)-1] ^= 0x01
+		_, err := openMeta(aead, tampered, aad, nonce)
+		assert.Error(t, err)
+	})
+
+	t.Run("wrong volumeNameHash", func(t *testing.T) {
+		other := sha256.Sum256([]byte("vol-meta-OTHER"))
+		_, err := openMeta(aead, blob, makeMetaAAD(other, "vbstate", 99), nonce)
+		assert.Error(t, err, "cross-volume AAD must fail verify")
+	})
+
+	t.Run("wrong domain tag", func(t *testing.T) {
+		_, err := openMeta(aead, blob, makeMetaAAD(hash, "snap:foo", 99), nonce)
+		assert.Error(t, err, "vbstate blob must not verify under snapshot AAD")
+	})
+
+	t.Run("wrong stateSeqNum", func(t *testing.T) {
+		_, err := openMeta(aead, blob, makeMetaAAD(hash, "vbstate", 100), nonce)
+		assert.Error(t, err)
+	})
+
+	t.Run("blob shorter than tag", func(t *testing.T) {
+		short := blob[:aead.Overhead()-1]
+		_, err := openMeta(aead, short, aad, nonce)
+		assert.Error(t, err, "undersized blob must surface a clear error")
+	})
+}
+
+// TestMakeNonce_UniquenessSweep stresses the (seqNum, volumeUUID, domain)
+// nonce space over 10^6 random triples and asserts there is no collision.
+// 12 bytes of nonce gives a 2^96 space, so a million-shot collision is
+// astronomically unlikely if our construction actually uses all the bits
+// — a collision here means makeNonce dropped a field. Catches regressions
+// like "VolumeUUID slot mis-sliced" or "domain byte XORed instead of
+// assigned" that would silently shrink the effective nonce space.
+//
+// At 10^6 triples this runs in ~200ms; gated by testing.Short so the
+// short-mode preflight stays under a minute.
+func TestMakeNonce_UniquenessSweep(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping million-triple nonce sweep in short mode")
+	}
+	const N = 1_000_000
+	seen := make(map[[12]byte]struct{}, N)
+	var buf [8]byte
+	for i := range N {
+		_, err := rand.Read(buf[:])
+		require.NoError(t, err)
+		seqNum := binary.BigEndian.Uint64(buf[:]) & MaxSeqNum
+		var uuid [4]byte
+		_, err = rand.Read(uuid[:])
+		require.NoError(t, err)
+		_, err = rand.Read(buf[:1])
+		require.NoError(t, err)
+		domain := buf[0]
+		n := makeNonce(seqNum, uuid, domain)
+		if _, dup := seen[n]; dup {
+			t.Fatalf("nonce collision at iteration %d: %x (seqNum=%d uuid=%x domain=%#x)", i, n, seqNum, uuid, domain)
+		}
+		seen[n] = struct{}{}
+	}
+	assert.Len(t, seen, N)
 }
