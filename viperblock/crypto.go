@@ -18,8 +18,10 @@
 package viperblock
 
 import (
+	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 )
 
 // Nonce domain bytes — disjoint nonce spaces under the shared master key so a
@@ -86,4 +88,47 @@ func makeMetaAAD(volumeNameHash [32]byte, domainTag string, stateSeqNum uint64) 
 // to avoid recomputing for every seal/open call.
 func computeVolumeNameHash(name string) [32]byte {
 	return sha256.Sum256([]byte(name))
+}
+
+// sealMeta authenticates VBState/SnapshotState JSON with AES-GCM-as-MAC: the
+// JSON bytes stay plaintext-readable so operators can still `cat config.json`,
+// while a 16-byte trailing tag binds the bytes to the structured metadata AAD
+// (volumeNameHash || domain || stateSeqNum) and to the nonce. Returns
+// jsonBytes || tag. The full AAD covered by the tag is aad || jsonBytes — the
+// JSON content is authenticated even though it ships in the clear.
+//
+// Caller is responsible for (key, nonce) uniqueness: callers must allocate a
+// fresh stateSeqNum (via VB.nextStateSeqNum.Add(1)) for every seal, since
+// domain separation only keeps metadata nonces disjoint from data-path nonces
+// — it does not protect back-to-back metadata seals on the same volume.
+func sealMeta(aead cipher.AEAD, jsonBytes, aad []byte, nonce [12]byte) []byte {
+	fullAAD := make([]byte, 0, len(aad)+len(jsonBytes))
+	fullAAD = append(fullAAD, aad...)
+	fullAAD = append(fullAAD, jsonBytes...)
+	tag := aead.Seal(nil, nonce[:], nil, fullAAD)
+	out := make([]byte, 0, len(jsonBytes)+len(tag))
+	out = append(out, jsonBytes...)
+	out = append(out, tag...)
+	return out
+}
+
+// openMeta verifies the trailing AES-GCM tag on a sealMeta blob and returns
+// the leading JSON bytes on success. Any tampering with the JSON, the tag,
+// the structured AAD, or the nonce inputs surfaces as a non-nil error;
+// callers must wrap with ErrIntegrity and fail-closed.
+func openMeta(aead cipher.AEAD, blob, aad []byte, nonce [12]byte) ([]byte, error) {
+	tagLen := aead.Overhead()
+	if len(blob) < tagLen {
+		return nil, fmt.Errorf("metadata blob %d bytes shorter than %d-byte tag", len(blob), tagLen)
+	}
+	split := len(blob) - tagLen
+	jsonBytes := blob[:split]
+	tag := blob[split:]
+	fullAAD := make([]byte, 0, len(aad)+len(jsonBytes))
+	fullAAD = append(fullAAD, aad...)
+	fullAAD = append(fullAAD, jsonBytes...)
+	if _, err := aead.Open(nil, nonce[:], tag, fullAAD); err != nil {
+		return nil, err
+	}
+	return jsonBytes, nil
 }

@@ -2699,14 +2699,27 @@ func (vb *VB) SaveState() error {
 		return err
 	}
 
+	// Encrypted volumes append a 16-byte AES-GCM tag binding the JSON bytes to
+	// (volumeNameHash, "vbstate", StateSeqNum). Closes the cross-volume
+	// metadata pivot: an attacker swapping volume A's config.json into volume
+	// B's prefix is rejected at LoadStateRequest because the AAD
+	// reconstruction uses vb.volumeNameHash (our own identity), which differs
+	// from the seal-time hash for volume A.
+	persisted := jsonData
+	if vb.EncryptionEnabled {
+		nonce := makeNonce(state.StateSeqNum, vb.VolumeUUID, DomainVBStateMeta)
+		aad := makeMetaAAD(vb.volumeNameHash, "vbstate", state.StateSeqNum)
+		persisted = sealMeta(vb.aead, jsonData, aad, nonce)
+	}
+
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
-	if err := writeFileAtomic(filename, jsonData, 0600); err != nil {
+	if err := writeFileAtomic(filename, persisted, 0600); err != nil {
 		return fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
 	}
 
 	// Next, write to the backend.
 	headers := []byte{}
-	if err := vb.Backend.Write(types.FileTypeConfig, 0, &headers, &jsonData); err != nil {
+	if err := vb.Backend.Write(types.FileTypeConfig, 0, &headers, &persisted); err != nil {
 		return err
 	}
 
@@ -2765,6 +2778,9 @@ func (vb *VB) LoadState() error {
 	// Step 1. Query the state locally
 	localPath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	state, localErr := vb.LoadStateRequest(localPath)
+	if errors.Is(localErr, ErrIntegrity) || errors.Is(localErr, ErrEncryptionMismatch) {
+		return fmt.Errorf("LoadState: local %s: %w", localPath, localErr)
+	}
 	if localErr != nil {
 		slog.Info("No state found in local file, using backend state", "error", localErr)
 	}
@@ -2772,6 +2788,9 @@ func (vb *VB) LoadState() error {
 	// Step 2. Query the state from the backend
 	stateBackend, backendErr := vb.LoadStateRequest("")
 
+	if errors.Is(backendErr, ErrIntegrity) || errors.Is(backendErr, ErrEncryptionMismatch) {
+		return fmt.Errorf("LoadState: backend: %w", backendErr)
+	}
 	if backendErr != nil {
 		slog.Warn("Failed to load state from backend", "error", backendErr)
 	}
@@ -2952,8 +2971,51 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 		}
 	}
 
-	// Parse JSON
-	err = json.Unmarshal(jsonData, &state)
+	// Encrypted volumes carry a trailing 16-byte AES-GCM tag binding the JSON
+	// to (volumeNameHash, "vbstate", StateSeqNum). The nonce + structured AAD
+	// reconstruction needs StateSeqNum + VolumeUUID, both of which live in
+	// the JSON — extract them via a minimal peek struct over the pre-tag
+	// bytes, then verify before unmarshalling the full state. The peek's
+	// VolumeUUID is the nonce subspace identifier (binds the seal-time
+	// nonce); vb.volumeNameHash is the trusted volume identity (caller-
+	// supplied at New, untouched by the parsed JSON) — splicing in another
+	// volume's blob is rejected because the AAD's volumeNameHash differs.
+	// KeyFingerprint is checked pre-verify so a wrong-key open surfaces as
+	// ErrEncryptionMismatch (with both fingerprints in the error) rather
+	// than the generic "tag verify failed" that AEAD would otherwise return.
+	if vb.EncryptionEnabled {
+		tagLen := vb.aead.Overhead()
+		if len(jsonData) < tagLen {
+			return state, fmt.Errorf("%w: VBState blob %d bytes shorter than %d-byte tag", ErrIntegrity, len(jsonData), tagLen)
+		}
+		var peek struct {
+			VolumeUUID     [4]byte `json:"VolumeUUID"`
+			StateSeqNum    uint64  `json:"StateSeqNum"`
+			KeyFingerprint string  `json:"KeyFingerprint"`
+		}
+		peekJSON := jsonData[:len(jsonData)-tagLen]
+		if err := json.Unmarshal(peekJSON, &peek); err != nil {
+			return state, fmt.Errorf("%w: VBState peek parse: %w", ErrIntegrity, err)
+		}
+		if peek.KeyFingerprint != "" && peek.KeyFingerprint != vb.MasterKey.Fingerprint {
+			return state, fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
+				ErrEncryptionMismatch, vb.VolumeName, peek.KeyFingerprint, vb.MasterKey.Fingerprint)
+		}
+		nonce := makeNonce(peek.StateSeqNum, peek.VolumeUUID, DomainVBStateMeta)
+		aad := makeMetaAAD(vb.volumeNameHash, "vbstate", peek.StateSeqNum)
+		verified, openErr := openMeta(vb.aead, jsonData, aad, nonce)
+		if openErr != nil {
+			return state, fmt.Errorf("%w: VBState tag verify: %w", ErrIntegrity, openErr)
+		}
+		jsonData = verified
+	}
+
+	// Use a Decoder rather than Unmarshal so a plain-mode runtime reading a
+	// sealed blob does not error on the trailing 16-byte tag. The Decoder
+	// reads one JSON value and stops; LoadState's existing
+	// EncryptionEnabled mismatch check then surfaces the misconfig as
+	// ErrEncryptionMismatch instead of swallowing it as parse failure.
+	err = json.NewDecoder(bytes.NewReader(jsonData)).Decode(&state)
 
 	return state, err
 }
