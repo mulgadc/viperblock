@@ -1037,7 +1037,7 @@ func TestBlockLookup(t *testing.T) {
 			// Test LookupBlockToObject
 
 			for _, block := range []uint64{0, 1, 2} {
-				objectID, objectOffset, err := vb.LookupBlockToObject(block)
+				objectID, objectOffset, _, err := vb.LookupBlockToObject(block)
 				assert.Error(t, err)
 				assert.Equal(t, uint64(0), objectID)
 				assert.Equal(t, uint32(0), objectOffset)
@@ -1053,7 +1053,7 @@ func TestBlockLookup(t *testing.T) {
 
 			// Test LookupBlockToObject
 			for _, block := range []uint64{0, 1, 2} {
-				objectID, objectOffset, err := vb.LookupBlockToObject(block)
+				objectID, objectOffset, _, err := vb.LookupBlockToObject(block)
 				assert.NoError(t, err)
 				assert.Equal(t, objectID, uint64(0))
 				offset := vb.BlockSize*uint32(block) + uint32(headersLen)
@@ -1074,7 +1074,7 @@ func TestBlockLookup(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err := vb.LookupBlockToObject(3)
+			objectID, objectOffset, _, err := vb.LookupBlockToObject(3)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1086,7 +1086,7 @@ func TestBlockLookup(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Lookup the block in the WAL, should be the 2nd chunk
-			objectID, objectOffset, err = vb.LookupBlockToObject(3)
+			objectID, objectOffset, _, err = vb.LookupBlockToObject(3)
 			assert.NoError(t, err)
 			assert.Equal(t, uint64(1), objectID)
 			offset := vb.BlockSize*uint32(0) + uint32(headersLen)
@@ -1189,7 +1189,7 @@ func TestInvalidS3Host(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err := vb.LookupBlockToObject(5)
+			objectID, objectOffset, _, err := vb.LookupBlockToObject(5)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1201,7 +1201,7 @@ func TestInvalidS3Host(t *testing.T) {
 			assert.Error(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err = vb.LookupBlockToObject(4)
+			objectID, objectOffset, _, err = vb.LookupBlockToObject(4)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1242,7 +1242,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err := vb.LookupBlockToObject(5)
+			objectID, objectOffset, _, err := vb.LookupBlockToObject(5)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1254,7 +1254,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 			assert.Error(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err = vb.LookupBlockToObject(4)
+			objectID, objectOffset, _, err = vb.LookupBlockToObject(4)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1292,7 +1292,7 @@ func TestInvalidS3Auth(t *testing.T) {
 			assert.NoError(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err := vb.LookupBlockToObject(4)
+			objectID, objectOffset, _, err := vb.LookupBlockToObject(4)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1304,7 +1304,7 @@ func TestInvalidS3Auth(t *testing.T) {
 			assert.Error(t, err)
 
 			// Confirm the block does not exist in the object/chunk file (since not flushed/Write to WAL)
-			objectID, objectOffset, err = vb.LookupBlockToObject(4)
+			objectID, objectOffset, _, err = vb.LookupBlockToObject(4)
 			assert.Error(t, err)
 			assert.Equal(t, uint64(0), objectID)
 			assert.Equal(t, uint32(0), objectOffset)
@@ -1801,7 +1801,7 @@ func TestRecoverLocalWALs(t *testing.T) {
 
 			// Verify blocks are now in BlocksToObject (persisted to backend)
 			for i := range 3 {
-				_, _, err := vb.LookupBlockToObject(uint64(i))
+				_, _, _, err := vb.LookupBlockToObject(uint64(i))
 				assert.NoError(t, err, "Block %d should be in BlocksToObject after recovery", i)
 			}
 
@@ -1889,7 +1889,7 @@ func TestRecoverLocalWALsPartialRecord(t *testing.T) {
 
 			// Verify both blocks are recovered
 			for i := range 2 {
-				_, _, err := vb.LookupBlockToObject(uint64(i))
+				_, _, _, err := vb.LookupBlockToObject(uint64(i))
 				assert.NoError(t, err, "Block %d should be recovered despite trailing corruption", i)
 			}
 
@@ -2066,7 +2066,7 @@ func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
 			}
 
 			// Block 2 (the 3rd block) should NOT be recovered
-			_, _, err = vb.LookupBlockToObject(2)
+			_, _, _, err = vb.LookupBlockToObject(2)
 			assert.Error(t, err, "Block 2 should not be recovered due to checksum corruption")
 		})
 	})

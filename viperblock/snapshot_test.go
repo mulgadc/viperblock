@@ -42,9 +42,9 @@ func TestCreateSnapshot(t *testing.T) {
 		assert.Equal(t, vb.ObjBlockSize, snap.ObjBlockSize)
 
 		// Verify we can load the snapshot block map back
-		baseMap, sourceVol, err := vb.LoadSnapshotBlockMap(snapshotID)
+		baseMap, ident, err := vb.LoadSnapshotBlockMap(snapshotID)
 		require.NoError(t, err)
-		assert.Equal(t, vb.VolumeName, sourceVol)
+		assert.Equal(t, vb.VolumeName, ident.SourceVolumeName)
 		assert.Equal(t, len(vb.BlocksToObject.BlockLookup), len(baseMap.BlockLookup))
 
 		// Verify each block mapping matches
