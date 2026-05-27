@@ -10,7 +10,9 @@ import (
 import (
 	"fmt"
 	"log/slog"
+	"os"
 
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -40,6 +42,7 @@ var host string
 var base_dir string
 var cache_size int = 20
 var use_shardwal bool = false
+var encryption_key_file string
 
 var disk []byte
 
@@ -94,6 +97,9 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 	} else if key == "shardwal" {
 		use_shardwal = value == "true" || value == "1"
 		return nil
+	} else if key == "encryption_key_file" {
+		encryption_key_file = value
+		return nil
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
 	}
@@ -138,6 +144,27 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		Host:       host,
 	}
 
+	// Resolve the encryption key path: explicit flag takes precedence over
+	// the ENCRYPTION_KEY_FILE env var so an operator running the daemon with
+	// the env set can still override per-instance.
+	keyPath := encryption_key_file
+	if keyPath == "" {
+		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
+	}
+
+	var mkey *masterkey.Key
+	if keyPath != "" {
+		var err error
+		mkey, err = masterkey.LoadShared(keyPath)
+		if err != nil {
+			return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load encryption key: %v", err)}
+		}
+	}
+
+	if use_shardwal && mkey != nil {
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: "shardwal is incompatible with encryption (plan §Scope discipline — sharded WAL is out of scope for encryption-at-rest)"}
+	}
+
 	vbconfig := viperblock.VB{
 		VolumeName: volume,
 		VolumeSize: size,
@@ -147,6 +174,8 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 				Size: cache_size,
 			},
 		},
+		MasterKey:         mkey,
+		EncryptionEnabled: mkey != nil,
 	}
 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)

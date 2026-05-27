@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/simplefs"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
@@ -41,6 +42,7 @@ func main() {
 	voldata := flag.String("voldata", "", "Volume data directory to store blocks")
 
 	volsize := flag.Uint64("size", 2<<18, "Volume size in bytes")
+	encryptionKeyFile := flag.String("encryption-key-file", "", "path to AES-256 master key (32 raw bytes, 0640 or stricter); falls back to ENCRYPTION_KEY_FILE env if unset")
 
 	// S3 configuration (via environment variables)
 	// aws_profile := os.Getenv("AWS_PROFILE")
@@ -124,8 +126,26 @@ func main() {
 		}
 	}
 
+	keyPath := *encryptionKeyFile
+	if keyPath == "" {
+		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
+	}
+	var mkey *masterkey.Key
+	if keyPath != "" {
+		mkey, err = masterkey.LoadShared(keyPath)
+		if err != nil {
+			slog.Error("Could not load encryption key", "path", keyPath, "error", err)
+			os.Exit(1)
+		}
+	}
+
 	fmt.Println("Creating Viperblock backend with btype, config", *btype, cfg)
-	vb, err := viperblock.New(&viperblock.VB{VolumeName: *vol, VolumeSize: *volsize}, *btype, cfg)
+	vb, err := viperblock.New(&viperblock.VB{
+		VolumeName:        *vol,
+		VolumeSize:        *volsize,
+		MasterKey:         mkey,
+		EncryptionEnabled: mkey != nil,
+	}, *btype, cfg)
 	if err != nil {
 		slog.Error("Could not create Viperblock", "error", err)
 		os.Exit(1)

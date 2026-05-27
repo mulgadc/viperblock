@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -28,6 +29,7 @@ func main() {
 	host := flag.String("host", "https://127.0.0.1:8443", "S3 host")
 	base_dir := flag.String("base_dir", "/tmp/vb/", "base directory for viperblock")
 	metadata := flag.String("metadata", "", "metadata (JSON) file to describe volume or AMI")
+	encryptionKeyFile := flag.String("encryption-key-file", "", "path to AES-256 master key (32 raw bytes, 0640 or stricter); falls back to ENCRYPTION_KEY_FILE env if unset")
 
 	flag.Parse()
 
@@ -110,6 +112,19 @@ func main() {
 		Host:       *host,
 	}
 
+	keyPath := *encryptionKeyFile
+	if keyPath == "" {
+		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
+	}
+	var mkey *masterkey.Key
+	if keyPath != "" {
+		var err error
+		mkey, err = masterkey.LoadShared(keyPath)
+		if err != nil {
+			log.Fatalf("Failed to load encryption key %s: %v", keyPath, err)
+		}
+	}
+
 	vbConfig := viperblock.VB{
 		VolumeName: volID,
 		VolumeSize: utils.SafeIntToUint64(*size),
@@ -119,7 +134,9 @@ func main() {
 				Size: 0,
 			},
 		},
-		VolumeConfig: volumeConfig,
+		VolumeConfig:      volumeConfig,
+		MasterKey:         mkey,
+		EncryptionEnabled: mkey != nil,
 	}
 
 	err := v_utils.ImportDiskImage(&s3Config, &vbConfig, *file)

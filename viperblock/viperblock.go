@@ -6,6 +6,8 @@ package viperblock
 
 import (
 	"bytes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
@@ -38,6 +41,16 @@ const DefaultObjBlockSize uint32 = 1024 * 1024 * 4
 const DefaultFlushInterval time.Duration = 5 * time.Second
 const DefaultFlushSize uint32 = 64 * 1024 * 1024
 const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
+
+// seqNumReservation is the size of each SeqNum high-water reservation window.
+// reserveSeqNum hands out values lock-free via atomic.Add until the persisted
+// high-water is crossed; the slow path advances by seqNumReservation and
+// fsyncs VBState before any of the newly reserved values are handed out. A
+// kill -9 between the bump and the next persist can lose up to one window;
+// the loaded SeqNum on restart starts from the persisted high-water, so no
+// value handed out before the crash is reused. 1<<20 keeps the slow path off
+// the per-write critical path (one fsync per million writes).
+const seqNumReservation uint64 = 1 << 20
 
 type VBState struct {
 	VolumeName string `json:"VolumeName"`
@@ -60,6 +73,23 @@ type VBState struct {
 
 	SnapshotID       string `json:"SnapshotID,omitempty"`
 	SourceVolumeName string `json:"SourceVolumeName,omitempty"`
+
+	// Encryption-at-rest fields (populated when EncryptionEnabled is true).
+	// EncryptionEnabled is the authoritative persistent flag; replaces the
+	// dead VolumeMetadata.IsEncrypted (which remains deprecated pending
+	// spinifex caller migration). VolumeUUID seeds the per-volume nonce
+	// subspace and is generated via crypto/rand on first SaveState of an
+	// encrypted volume. SeqNumHighWater is the durable upper bound on the
+	// next SeqNum the volume may hand out post-restart — crash-safe nonce
+	// uniqueness. StateSeqNum is a monotonic SaveState generation counter
+	// used by the metadata HMAC (Stage 4) and to break ties in LoadState.
+	// KeyFingerprint surfaces master-key mismatch at Open with a clear error
+	// instead of silent decrypt failure.
+	EncryptionEnabled bool    `json:"EncryptionEnabled,omitempty"`
+	VolumeUUID        [4]byte `json:"VolumeUUID,omitempty"`
+	SeqNumHighWater   uint64  `json:"SeqNumHighWater,omitempty"`
+	StateSeqNum       uint64  `json:"StateSeqNum,omitempty"`
+	KeyFingerprint    string  `json:"KeyFingerprint,omitempty"`
 }
 
 type VB struct {
@@ -143,6 +173,38 @@ type VB struct {
 
 	// SnapshotID is set when this volume was created from a snapshot.
 	SnapshotID string
+
+	// Encryption-at-rest. MasterKey is supplied by the caller (NBD plugin /
+	// CLI) via masterkey.LoadShared; aead caches MasterKey.AEAD for the hot
+	// path. EncryptionEnabled is the caller-supplied flag for this volume; it
+	// must agree with VBState.EncryptionEnabled on LoadState or LoadState
+	// refuses. volumeNameHash is SHA256(VolumeName) cached at New for AAD
+	// construction. VolumeUUID is the per-volume nonce subspace, persisted in
+	// VBState. SourceVolumeUUID / sourceVolumeNameHash carry the source
+	// volume's identity when this is a snapshot clone (Stage 3 populates
+	// them from SnapshotState; Stage 1 leaves them zero).
+	MasterKey         *masterkey.Key
+	EncryptionEnabled bool
+	aead              cipher.AEAD
+	volumeNameHash    [32]byte
+	VolumeUUID        [4]byte
+	SourceVolumeUUID  [4]byte
+	//nolint:unused // Stage 3 populates this from SnapshotState when reading clone base chunks.
+	sourceVolumeNameHash [32]byte
+
+	// SeqNumHighWater is the in-memory mirror of VBState.SeqNumHighWater —
+	// the largest SeqNum that may be handed out without persisting a new
+	// VBState. reserveSeqNum hands out values lock-free via SeqNum.Add until
+	// the high-water is crossed; the slow path takes seqNumHighWaterMu,
+	// advances by seqNumReservation, and SaveStates before releasing.
+	seqNumHighWater   atomic.Uint64
+	seqNumHighWaterMu sync.Mutex
+
+	// nextStateSeqNum is the monotonic SaveState generation counter mirrored
+	// from VBState.StateSeqNum. Each SaveState increments it before marshal.
+	// Stage 4 binds the value into the VBState metadata HMAC; Stage 1 uses
+	// it only for LoadState tie-breaking.
+	nextStateSeqNum atomic.Uint64
 }
 
 // CacheConfig holds configuration for the LRU cache
@@ -290,7 +352,7 @@ type VolumeMetadata struct {
 	IOPS                int               `json:"IOPS"`                // For provisioned volumes
 	Tags                map[string]string `json:"Tags"`                // User-defined metadata
 	SnapshotID          string            `json:"SnapshotID"`          // If created from a snapshot
-	IsEncrypted         bool              `json:"IsEncrypted"`         // Encryption flag
+	IsEncrypted         bool              `json:"IsEncrypted"`         // Deprecated: superseded by VBState.EncryptionEnabled. Field retained until spinifex callers migrate to the VBState source of truth; do not branch on this for encryption decisions.
 	DeleteOnTermination bool              `json:"DeleteOnTermination"` // Whether to delete volume when instance terminates
 }
 
@@ -331,6 +393,13 @@ var ErrStateNotFound = errors.New("viperblock: state not found")
 // failed with a non-not-found error (timeout, network, 5xx). Callers should
 // retry with backoff; the state may become available shortly.
 var ErrStateBackendUnavailable = errors.New("viperblock: state backend unavailable")
+
+// ErrEncryptionMismatch is returned when the runtime master key and the
+// persisted VBState disagree on whether the volume is encrypted, when the
+// KeyFingerprint on disk does not match the loaded key, or when an encrypted
+// configuration is combined with UseShardedWAL (refused for the duration of
+// the single-file-WAL-only encryption scope).
+var ErrEncryptionMismatch = errors.New("viperblock: encryption configuration mismatch")
 
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
@@ -435,6 +504,21 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		return nil, fmt.Errorf("volume name and size must be set")
 	}
 
+	// Encryption invariants: flag and key must agree, and sharded WAL is
+	// refused for encrypted volumes (plan §Scope discipline — only the
+	// single-file WAL is in scope; refusing here makes the unsupported combo
+	// a startup-time error instead of a silent fall-through to unencrypted
+	// writes via the sharded path).
+	if config.EncryptionEnabled && config.MasterKey == nil {
+		return nil, fmt.Errorf("%w: EncryptionEnabled=true requires MasterKey", ErrEncryptionMismatch)
+	}
+	if !config.EncryptionEnabled && config.MasterKey != nil {
+		return nil, fmt.Errorf("%w: MasterKey provided but EncryptionEnabled=false", ErrEncryptionMismatch)
+	}
+	if config.EncryptionEnabled && config.UseShardedWAL {
+		return nil, fmt.Errorf("%w: EncryptionEnabled is incompatible with UseShardedWAL", ErrEncryptionMismatch)
+	}
+
 	switch btype {
 	case "file":
 		//volumeName = backendConfig.(file.FileConfig).VolumeName
@@ -523,6 +607,14 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 		UseShardedWAL: false,
 		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
+
+		MasterKey:         config.MasterKey,
+		EncryptionEnabled: config.EncryptionEnabled,
+	}
+
+	if config.EncryptionEnabled {
+		vb.aead = config.MasterKey.AEAD
+		vb.volumeNameHash = computeVolumeNameHash(config.VolumeName)
 	}
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
@@ -2377,10 +2469,28 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	}
 }
 
-// Save the block tracking state to disk
+// Save the block tracking state to disk.
+//
+// For encrypted volumes, SaveState bootstraps the per-volume nonce subspace
+// on first call: if VolumeUUID is zero we mint it via crypto/rand and seed
+// SeqNumHighWater = seqNumReservation. Subsequent calls preserve the existing
+// UUID and advance StateSeqNum monotonically (Stage 4 binds the value into
+// the metadata HMAC). The local write is atomic — tmp file + fsync + rename
+// + fsync parent dir — so a crash mid-persist cannot leave a torn config.json
+// that would let reserveSeqNum re-hand-out values on restart.
 func (vb *VB) SaveState() error {
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
+
+	if vb.EncryptionEnabled {
+		var zero [4]byte
+		if vb.VolumeUUID == zero {
+			if _, err := rand.Read(vb.VolumeUUID[:]); err != nil {
+				return fmt.Errorf("SaveState: mint VolumeUUID: %w", err)
+			}
+			vb.seqNumHighWater.Store(seqNumReservation)
+		}
+	}
 
 	walNum := vb.WAL.WallNum.Load()
 	if vb.UseShardedWAL && vb.ShardedWAL != nil {
@@ -2401,30 +2511,81 @@ func (vb *VB) SaveState() error {
 		ShardedWAL:          vb.UseShardedWAL,
 		SnapshotID:          vb.SnapshotID,
 		SourceVolumeName:    vb.SourceVolumeName,
+		EncryptionEnabled:   vb.EncryptionEnabled,
+		VolumeUUID:          vb.VolumeUUID,
+		SeqNumHighWater:     vb.seqNumHighWater.Load(),
 	}
 
-	// Save as JSON
+	if vb.EncryptionEnabled && vb.MasterKey != nil {
+		state.KeyFingerprint = vb.MasterKey.Fingerprint
+	}
+
+	state.StateSeqNum = vb.nextStateSeqNum.Add(1)
+
 	jsonData, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
 
-	// First, write to the local persistant disk
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
-	err = os.WriteFile(filename, jsonData, 0600)
-
-	if err != nil {
-		return err
+	if err := writeFileAtomic(filename, jsonData, 0600); err != nil {
+		return fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
 	}
 
-	// Next, write to the backend
+	// Next, write to the backend.
 	headers := []byte{}
-	err = vb.Backend.Write(types.FileTypeConfig, 0, &headers, &jsonData)
-	if err != nil {
+	if err := vb.Backend.Write(types.FileTypeConfig, 0, &headers, &jsonData); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// writeFileAtomic writes data to path atomically via tmp + fsync + rename +
+// fsync(parent). On return without error, the file exists at path with the
+// new contents fully durable on disk. A crash before return may leave a
+// stale path.tmp behind (caller-tolerable: next SaveState rewrites it).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return fsyncDir(dir)
+}
+
+// fsyncDir fsyncs a directory entry so a preceding rename is durable. POSIX:
+// without this, the rename may be lost on crash even if the file content was
+// fsynced (the directory entry change is buffered separately).
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // Load the block tracking state from disk
@@ -2499,6 +2660,45 @@ func (vb *VB) LoadState() error {
 	vb.Version = state.Version
 	vb.VolumeConfig = state.VolumeConfig
 
+	vb.nextStateSeqNum.Store(state.StateSeqNum)
+
+	// Encryption-at-rest validation and SeqNum bootstrap.
+	//
+	// The runtime must agree with the persisted flag — supplying a key for an
+	// unencrypted volume, or omitting the key for an encrypted one, is a
+	// startup-time error rather than a silent fall-through. Key fingerprint
+	// mismatch surfaces the same way (an operator who points the daemon at
+	// the wrong key file sees a clear error rather than every read failing
+	// integrity later).
+	//
+	// On a successful Open of an existing encrypted volume, restart SeqNum at
+	// the persisted high-water and reserve the next window durably before any
+	// data write can hand out a value. This is what makes nonce uniqueness
+	// crash-safe: a kill -9 before the next SaveState loses up to one
+	// reservation window of values, but every value handed out before the
+	// crash sits below the high-water we just persisted, so none can be
+	// re-issued.
+	if vb.EncryptionEnabled != state.EncryptionEnabled {
+		return fmt.Errorf("%w: runtime EncryptionEnabled=%v, persisted=%v (volume %s)",
+			ErrEncryptionMismatch, vb.EncryptionEnabled, state.EncryptionEnabled, vb.VolumeName)
+	}
+	if vb.EncryptionEnabled {
+		if vb.MasterKey == nil {
+			return fmt.Errorf("%w: volume %s requires master key", ErrEncryptionMismatch, vb.VolumeName)
+		}
+		if state.KeyFingerprint != "" && state.KeyFingerprint != vb.MasterKey.Fingerprint {
+			return fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
+				ErrEncryptionMismatch, vb.VolumeName, state.KeyFingerprint, vb.MasterKey.Fingerprint)
+		}
+		vb.VolumeUUID = state.VolumeUUID
+		vb.volumeNameHash = computeVolumeNameHash(state.VolumeName)
+		vb.SeqNum.Store(state.SeqNumHighWater)
+		vb.seqNumHighWater.Store(state.SeqNumHighWater)
+		if err := vb.bumpSeqNumHighWater(); err != nil {
+			return fmt.Errorf("LoadState: reserve initial SeqNum window: %w", err)
+		}
+	}
+
 	// If this volume was created from a snapshot, load the base block map.
 	// OpenFromSnapshot sets SnapshotID and SourceVolumeName from the snapshot
 	// config, so we don't set them separately to avoid two sources of truth.
@@ -2512,6 +2712,55 @@ func (vb *VB) LoadState() error {
 	slog.Debug("Loaded state", "state", state)
 
 	return nil
+}
+
+// reserveSeqNum hands out n consecutive sequence numbers for the data path.
+// Common path is lock-free atomic.Add; the high-water is checked after the
+// fact and only when crossed do we take seqNumHighWaterMu and SaveState to
+// advance it. Stage 1 wires the helper into LoadState's startup reservation
+// only — Stage 2 plugs it into WriteWAL/createChunkFile in place of the
+// existing vb.SeqNum.Add calls. Refuses past MaxSeqNum (56-bit nonce slot).
+//
+// Unencrypted volumes fall through to plain atomic.Add — the high-water is a
+// nonce-uniqueness mechanism and is irrelevant when no nonce exists.
+func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
+	end := vb.SeqNum.Add(n)
+	start = end - n
+	if !vb.EncryptionEnabled {
+		return start, nil
+	}
+	if end > MaxSeqNum {
+		return 0, fmt.Errorf("viperblock: SeqNum %d exceeds 56-bit nonce limit, volume %s must be recreated", end, vb.VolumeName)
+	}
+	if end <= vb.seqNumHighWater.Load() {
+		return start, nil
+	}
+	vb.seqNumHighWaterMu.Lock()
+	defer vb.seqNumHighWaterMu.Unlock()
+	// Re-check under the mutex: another caller may have advanced past us.
+	hw := vb.seqNumHighWater.Load()
+	if end <= hw {
+		return start, nil
+	}
+	for end > hw {
+		hw += seqNumReservation
+	}
+	vb.seqNumHighWater.Store(hw)
+	if err := vb.SaveState(); err != nil {
+		return 0, fmt.Errorf("reserveSeqNum: SaveState: %w", err)
+	}
+	return start, nil
+}
+
+// bumpSeqNumHighWater advances the persisted SeqNumHighWater by
+// seqNumReservation and durably SaveStates. Called from LoadState's startup
+// path to claim a fresh reservation window before any data write can issue a
+// SeqNum that overlaps the pre-crash range.
+func (vb *VB) bumpSeqNumHighWater() error {
+	vb.seqNumHighWaterMu.Lock()
+	defer vb.seqNumHighWaterMu.Unlock()
+	vb.seqNumHighWater.Add(seqNumReservation)
+	return vb.SaveState()
 }
 
 // Query the local state from file or the backend
