@@ -183,13 +183,12 @@ type VB struct {
 	// VBState. SourceVolumeUUID / sourceVolumeNameHash carry the source
 	// volume's identity when this is a snapshot clone (Stage 3 populates
 	// them from SnapshotState; Stage 1 leaves them zero).
-	MasterKey         *masterkey.Key
-	EncryptionEnabled bool
-	aead              cipher.AEAD
-	volumeNameHash    [32]byte
-	VolumeUUID        [4]byte
-	SourceVolumeUUID  [4]byte
-	//nolint:unused // Stage 3 populates this from SnapshotState when reading clone base chunks.
+	MasterKey            *masterkey.Key
+	EncryptionEnabled    bool
+	aead                 cipher.AEAD
+	volumeNameHash       [32]byte
+	VolumeUUID           [4]byte
+	SourceVolumeUUID     [4]byte
 	sourceVolumeNameHash [32]byte
 
 	// SeqNumHighWater is the in-memory mirror of VBState.SeqNumHighWater —
@@ -277,6 +276,15 @@ type ConsecutiveBlock struct {
 	OffsetEnd     uint64
 	ObjectID      uint64
 	ObjectOffset  uint32
+	// SeqNum is the chunk-write generation that sealed this block's
+	// ciphertext on the backend. On pre-coalesce per-block entries it is
+	// populated from BlockLookup.SeqNum (or BlockEntry.SeqNum on the
+	// BlockStore path). After coalescing, the head block's SeqNum is left
+	// here and per-block SeqNums for the full run land in SeqNums; on the
+	// decrypt path we iterate SeqNums to reconstruct each block's nonce +
+	// AAD. Unused on unencrypted reads.
+	SeqNum  uint64
+	SeqNums []uint64
 }
 
 type ConsecutiveBlocks []ConsecutiveBlock
@@ -407,6 +415,13 @@ var ErrStateBackendUnavailable = errors.New("viperblock: state backend unavailab
 // configuration is combined with UseShardedWAL (refused for the duration of
 // the single-file-WAL-only encryption scope).
 var ErrEncryptionMismatch = errors.New("viperblock: encryption configuration mismatch")
+
+// ErrIntegrity wraps every AEAD-open failure on the read paths (WAL replay,
+// chunk read, snapshot-clone base read). A non-nil unwrap of ErrIntegrity
+// means an attacker either tampered with on-disk ciphertext / tag, swapped
+// one volume's chunk into another's prefix, or replayed an older authentic
+// ciphertext at the same offset. Callers must fail-closed on any wrap.
+var ErrIntegrity = errors.New("viperblock: integrity check failed")
 
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
@@ -1800,39 +1815,78 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 	// Read blocks from WAL, pre-allocate the estimated number of blocks that could be in the chunk
 	blocks := make([]Block, 0, (vb.ObjBlockSize/vb.BlockSize)+1)
 
-	for {
-		data := make([]byte, 28+vb.BlockSize)
-		_, err := pendingWAL2.Read(data)
-		if err != nil {
-			if err == io.EOF {
-				break
+	if vb.EncryptionEnabled {
+		// Encrypted WAL record layout (magic VBWE):
+		//   [SeqNum(8) | BlockNum(8) | BlockLen(8) | ciphertext(BlockLen) | tag(16)]
+		// = 40 + BlockSize bytes. Nonce (SeqNum, VolumeUUID, DomainWAL),
+		// AAD (volumeNameHash, BlockNum, SeqNum). The 16-byte GCM tag
+		// subsumes the dropped CRC32; aead.Open validates confidentiality
+		// and integrity in one pass.
+		recordSize := 40 + int(vb.BlockSize)
+		for {
+			record := make([]byte, recordSize)
+			if _, err := io.ReadFull(pendingWAL2, record); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return fmt.Errorf("error reading encrypted WAL data: %v", err)
 			}
-			return fmt.Errorf("error reading WAL data: %v", err)
-		}
 
-		// Validate checksum
-		checksum := binary.BigEndian.Uint32(data[24:28])
+			seqNum := binary.BigEndian.Uint64(record[0:8])
+			blockNum := binary.BigEndian.Uint64(record[8:16])
+			blockLen := binary.BigEndian.Uint64(record[16:24])
 
-		checksumValidated := crc32.ChecksumIEEE(data[:24])
-		// Skip the checksum (24:28), just the data next
-		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[28:])
-
-		if checksumValidated != checksum {
-			pos, err := pendingWAL2.Seek(0, io.SeekCurrent)
+			nonce := makeNonce(seqNum, vb.VolumeUUID, DomainWAL)
+			aad := makeAAD(vb.volumeNameHash, blockNum, seqNum)
+			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad)
 			if err != nil {
-				return fmt.Errorf("error seeking in WriteWALToChunk: %v", err)
+				pos, _ := pendingWAL2.Seek(0, io.SeekCurrent)
+				slog.Error("WAL aead.Open failed", "filename", filename, "pos", pos, "block", blockNum, "seqNum", seqNum)
+				return fmt.Errorf("%w: WAL record block %d seqNum %d in %s: %w", ErrIntegrity, blockNum, seqNum, filename, err)
 			}
 
-			slog.Error("checksum mismatch in WriteWALToChunk", "filename", filename, "pos", pos, "checksum", checksum, "checksumValidated", checksumValidated)
-			return fmt.Errorf("checksum mismatch in WriteWALToChunk")
+			blocks = append(blocks, Block{
+				SeqNum: seqNum,
+				Block:  blockNum,
+				Len:    blockLen,
+				Data:   plain,
+			})
 		}
+	} else {
+		for {
+			data := make([]byte, 28+vb.BlockSize)
+			_, err := pendingWAL2.Read(data)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return fmt.Errorf("error reading WAL data: %v", err)
+			}
 
-		blocks = append(blocks, Block{
-			SeqNum: binary.BigEndian.Uint64(data[:8]),
-			Block:  binary.BigEndian.Uint64(data[8:16]),
-			Len:    binary.BigEndian.Uint64(data[16:24]),
-			Data:   data[28:],
-		})
+			// Validate checksum
+			checksum := binary.BigEndian.Uint32(data[24:28])
+
+			checksumValidated := crc32.ChecksumIEEE(data[:24])
+			// Skip the checksum (24:28), just the data next
+			checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, data[28:])
+
+			if checksumValidated != checksum {
+				pos, err := pendingWAL2.Seek(0, io.SeekCurrent)
+				if err != nil {
+					return fmt.Errorf("error seeking in WriteWALToChunk: %v", err)
+				}
+
+				slog.Error("checksum mismatch in WriteWALToChunk", "filename", filename, "pos", pos, "checksum", checksum, "checksumValidated", checksumValidated)
+				return fmt.Errorf("checksum mismatch in WriteWALToChunk")
+			}
+
+			blocks = append(blocks, Block{
+				SeqNum: binary.BigEndian.Uint64(data[:8]),
+				Block:  binary.BigEndian.Uint64(data[8:16]),
+				Len:    binary.BigEndian.Uint64(data[16:24]),
+				Data:   data[28:],
+			})
+		}
 	}
 
 	// Deduplicate and sort blocks
@@ -2297,8 +2351,48 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 
 	var blocks []Block
 	var maxSeqNum uint64
-	recordSize := 28 + int(vb.BlockSize)
 
+	// Encrypted WAL records are 40+BlockSize (24-byte header + ciphertext +
+	// 16-byte tag); unencrypted records are 28+BlockSize (24-byte header +
+	// CRC32 + plaintext). Both record sizes are fixed, so a tail tear shows
+	// up as ErrUnexpectedEOF and stops replay at the last fully-written
+	// record (same fail-tolerant posture as the legacy CRC path).
+	if vb.EncryptionEnabled {
+		recordSize := 40 + int(vb.BlockSize)
+		for {
+			record := make([]byte, recordSize)
+			if _, err := io.ReadFull(f, record); err != nil {
+				if err != io.EOF && err != io.ErrUnexpectedEOF {
+					slog.Warn("WAL recovery: I/O error reading record, stopping", "file", filename, "error", err, "valid_records_so_far", len(blocks))
+				}
+				break
+			}
+
+			seqNum := binary.BigEndian.Uint64(record[0:8])
+			blockNum := binary.BigEndian.Uint64(record[8:16])
+			blockLen := binary.BigEndian.Uint64(record[16:24])
+
+			nonce := makeNonce(seqNum, vb.VolumeUUID, DomainWAL)
+			aad := makeAAD(vb.volumeNameHash, blockNum, seqNum)
+			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad)
+			if err != nil {
+				slog.Warn("WAL recovery: aead.Open failed, stopping read", "file", filename, "block", blockNum, "seqNum", seqNum, "valid_records_so_far", len(blocks))
+				break
+			}
+
+			blocks = append(blocks, Block{
+				SeqNum: seqNum,
+				Block:  blockNum,
+				Len:    blockLen,
+				Data:   plain,
+			})
+
+			maxSeqNum = max(maxSeqNum, seqNum)
+		}
+		return blocks, maxSeqNum, nil
+	}
+
+	recordSize := 28 + int(vb.BlockSize)
 	for {
 		record := make([]byte, recordSize)
 		if _, err := io.ReadFull(f, record); err != nil {
@@ -2484,7 +2578,52 @@ func (vb *VB) RecoverLocalWALs() error {
 }
 
 // Lookup Block to Object
-func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, err error) {
+// LookupBlockToObject returns the persisted location of a block plus its
+// chunk-write SeqNum. The SeqNum return drives nonce + AAD reconstruction on
+// the decrypt path; on unencrypted volumes callers ignore it. Returns
+// ErrZeroBlock when the block has never been written.
+// openChunkRun decrypts a coalesced run of N chunk blocks read from the
+// backend at stride BlockSize+16. Each block's nonce is reconstructed from
+// (cb.SeqNums[k], volumeUUID, DomainChunk) and AAD from (volumeNameHash,
+// cb.StartBlock+k, cb.SeqNums[k]). On any AEAD-open failure we wrap
+// ErrIntegrity and refuse to populate dst — fail-closed: a partial decrypt
+// would let an attacker corrupt one block while leaving the rest readable.
+// The dst slice must have length cb.NumBlocks*BlockSize; ciphertext must
+// have length cb.NumBlocks*(BlockSize+16).
+//
+// volumeUUID + volumeNameHash are passed explicitly (not read off vb) so
+// snapshot-clone reads can decrypt source-volume chunks under the source's
+// identity, not the clone's.
+func (vb *VB) openChunkRun(ciphertext []byte, cb ConsecutiveBlock, volumeUUID [4]byte, volumeNameHash [32]byte, dst []byte) error {
+	bs := int(vb.BlockSize)
+	sealedStride := bs + 16
+	expected := int(cb.NumBlocks) * sealedStride
+	if len(ciphertext) != expected {
+		return fmt.Errorf("openChunkRun: short ciphertext for object %d offset %d run %d: got %d bytes, expected %d", cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(ciphertext), expected)
+	}
+	if len(dst) != int(cb.NumBlocks)*bs {
+		return fmt.Errorf("openChunkRun: dst length %d does not match run plaintext size %d", len(dst), int(cb.NumBlocks)*bs)
+	}
+	if len(cb.SeqNums) != int(cb.NumBlocks) {
+		return fmt.Errorf("openChunkRun: SeqNums length %d does not match NumBlocks %d", len(cb.SeqNums), cb.NumBlocks)
+	}
+	for k := 0; k < int(cb.NumBlocks); k++ {
+		seqNum := cb.SeqNums[k]
+		blockNum := cb.StartBlock + uint64(k)
+		nonce := makeNonce(seqNum, volumeUUID, DomainChunk)
+		aad := makeAAD(volumeNameHash, blockNum, seqNum)
+		sealedStart := k * sealedStride
+		sealedEnd := sealedStart + sealedStride
+		dstStart := k * bs
+		dstEnd := dstStart + bs
+		if _, err := vb.aead.Open(dst[dstStart:dstStart:dstEnd], nonce[:], ciphertext[sealedStart:sealedEnd], aad); err != nil {
+			return fmt.Errorf("%w: chunk %d block %d (seqNum %d): %w", ErrIntegrity, cb.ObjectID, blockNum, seqNum, err)
+		}
+	}
+	return nil
+}
+
+func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, seqNum uint64, err error) {
 	slog.Debug("LookupBlockToObject", "block", block)
 
 	vb.BlocksToObject.mu.RLock()
@@ -2496,9 +2635,9 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	slog.Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
 
 	if ok {
-		return blockLookup.ObjectID, blockLookup.ObjectOffset, nil
+		return blockLookup.ObjectID, blockLookup.ObjectOffset, blockLookup.SeqNum, nil
 	} else {
-		return 0, 0, ErrZeroBlock
+		return 0, 0, 0, ErrZeroBlock
 	}
 }
 
@@ -2897,14 +3036,14 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		}
 
 		// Next, fetch which object and offset the block is within
-		objectID, objectOffset, err := vb.LookupBlockToObject(currentBlock)
+		objectID, objectOffset, seqNum, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
 			if !errors.Is(err, ErrZeroBlock) {
 				return nil, fmt.Errorf("LookupBlockToObject block %d: %w", currentBlock, err)
 			}
 			// Block not in our own map -- check snapshot base map
 			if vb.BaseBlockMap != nil {
-				baseObjectID, baseObjectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				baseObjectID, baseObjectOffset, baseSeqNum, baseErr := vb.LookupBaseBlockToObject(currentBlock)
 				if baseErr == nil {
 					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
 						BlockPosition: i,
@@ -2914,6 +3053,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 						OffsetEnd:     end,
 						ObjectID:      baseObjectID,
 						ObjectOffset:  baseObjectOffset,
+						SeqNum:        baseSeqNum,
 					})
 					continue
 				}
@@ -2935,6 +3075,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			OffsetEnd:     end,
 			ObjectID:      objectID,
 			ObjectOffset:  objectOffset,
+			SeqNum:        seqNum,
 		})
 	}
 
@@ -2965,6 +3106,17 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			}
 		}
 
+		// Carry per-block SeqNums for the run so the encrypted decrypt loop
+		// below can reconstruct each block's nonce + AAD. Unused on
+		// unencrypted reads.
+		var seqNums []uint64
+		if vb.EncryptionEnabled {
+			seqNums = make([]uint64, numBlocks)
+			for k := 0; k < numBlocks; k++ {
+				seqNums[k] = consecutiveBlocks[i+k].SeqNum
+			}
+		}
+
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
@@ -2973,16 +3125,23 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
+			SeqNum:        consecutiveBlocks[i].SeqNum,
+			SeqNums:       seqNums,
 		})
+	}
+
+	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
+	// each ciphertext block; unencrypted chunks stay at BlockSize.
+	stride := vb.BlockSize
+	if vb.EncryptionEnabled {
+		stride += 16
 	}
 
 	// Next, read our consecutive blocks from the backend
 	for _, cb := range consecutiveBlocksToRead {
 		slog.Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "offsetStart", cb.OffsetStart, "offsetEnd", cb.OffsetEnd, "objectID", cb.ObjectID, "objectOffset", cb.ObjectOffset)
 
-		// Account for our extra 10 bytes of metadata per block
-		//consecutiveBlockStart := cb.BlockPosition * uint64(vb.BlockSize)
-		consecutiveBlockOffset := (uint32(cb.NumBlocks) * vb.BlockSize)
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
@@ -2993,16 +3152,21 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		}
 
 		slog.Debug("[READ] COPYING BLOCK DATA:", "start", start, "end", end)
-		//slog.Debug("[READ] BLOCK DATA:", "blockData", blockData[:32])
 		slog.Debug("[READ] DATA:", "data len", len(data))
-		copy(data[start:end], blockData)
-		//copy(data[consecutiveBlockStart:consecutiveBlockOffset], blockData)
+
+		if vb.EncryptionEnabled {
+			if err := vb.openChunkRun(blockData, cb, vb.VolumeUUID, vb.volumeNameHash, data[start:end]); err != nil {
+				return nil, err
+			}
+		} else {
+			copy(data[start:end], blockData)
+		}
 
 		// Update the cache with the read data
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
+				vb.Cache.lru.Add(currentBlock, data[start+i*uint64(vb.BlockSize):start+(i+1)*uint64(vb.BlockSize)])
 			}
 		}
 	}
@@ -3336,12 +3500,13 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 				OffsetEnd:     end,
 				ObjectID:      entry.ObjectID,
 				ObjectOffset:  entry.ObjectOffset,
+				SeqNum:        entry.SeqNum,
 			})
 
 		case BlockStateEmpty:
 			// Block not in our own map -- check snapshot base map
 			if vb.BaseBlockMap != nil {
-				objectID, objectOffset, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				objectID, objectOffset, baseSeqNum, baseErr := vb.LookupBaseBlockToObject(currentBlock)
 				if baseErr == nil {
 					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
 						BlockPosition: i,
@@ -3351,6 +3516,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 						OffsetEnd:     end,
 						ObjectID:      objectID,
 						ObjectOffset:  objectOffset,
+						SeqNum:        baseSeqNum,
 					})
 					continue
 				}
@@ -3402,6 +3568,14 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 			}
 		}
 
+		var seqNums []uint64
+		if vb.EncryptionEnabled {
+			seqNums = make([]uint64, numBlocks)
+			for k := 0; k < numBlocks; k++ {
+				seqNums[k] = consecutiveBlocks[i+k].SeqNum
+			}
+		}
+
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
@@ -3410,13 +3584,20 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
+			SeqNum:        consecutiveBlocks[i].SeqNum,
+			SeqNums:       seqNums,
 		})
+	}
+
+	stride := vb.BlockSize
+	if vb.EncryptionEnabled {
+		stride += 16
 	}
 
 	for _, cb := range consecutiveBlocksToRead {
 		slog.Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
 
-		consecutiveBlockOffset := uint32(cb.NumBlocks) * vb.BlockSize
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
@@ -3425,23 +3606,31 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 			return err
 		}
 
-		copy(data[start:end], blockData)
+		if vb.EncryptionEnabled {
+			if err := vb.openChunkRun(blockData, cb, vb.VolumeUUID, vb.volumeNameHash, data[start:end]); err != nil {
+				return err
+			}
+		} else {
+			copy(data[start:end], blockData)
+		}
 
-		// Cache blocks in BlockStore
+		// Cache blocks in BlockStore (post-decrypt plaintext)
 		if vb.UseBlockStore {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				blockStart := i * uint64(vb.BlockSize)
+				blockStart := start + i*uint64(vb.BlockSize)
 				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.BlockStore.Cache(currentBlock, blockData[blockStart:blockEnd])
+				vb.BlockStore.Cache(currentBlock, data[blockStart:blockEnd])
 			}
 		}
 
-		// Also update legacy LRU cache if enabled
+		// Also update legacy LRU cache if enabled (post-decrypt plaintext)
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
+				blockStart := start + i*uint64(vb.BlockSize)
+				blockEnd := blockStart + uint64(vb.BlockSize)
+				vb.Cache.lru.Add(currentBlock, data[blockStart:blockEnd])
 			}
 		}
 	}
@@ -3451,6 +3640,12 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
 // Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
+//
+// Encrypted clones decrypt the fetched ciphertext under the SOURCE volume's
+// identity (vb.SourceVolumeUUID, vb.sourceVolumeNameHash), not the clone's
+// own identity — the chunk was sealed by the source on its original write,
+// so its nonce + AAD bind the source-volume hash and the source-side SeqNum
+// carried forward via SnapshotState.
 func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	if sourceVolume == "" {
 		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
@@ -3474,6 +3669,14 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 			}
 		}
 
+		var seqNums []uint64
+		if vb.EncryptionEnabled {
+			seqNums = make([]uint64, numBlocks)
+			for k := 0; k < numBlocks; k++ {
+				seqNums[k] = consecutiveBlocks[i+k].SeqNum
+			}
+		}
+
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
@@ -3482,13 +3685,20 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
+			SeqNum:        consecutiveBlocks[i].SeqNum,
+			SeqNums:       seqNums,
 		})
+	}
+
+	stride := vb.BlockSize
+	if vb.EncryptionEnabled {
+		stride += 16
 	}
 
 	for _, cb := range consecutiveBlocksToRead {
 		slog.Debug("[READ] READING BASE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "sourceVolume", sourceVolume)
 
-		consecutiveBlockOffset := uint32(cb.NumBlocks) * vb.BlockSize
+		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
@@ -3502,22 +3712,30 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 			return fmt.Errorf("ReadFrom source %s object %d: short read: got %d bytes, expected %d", sourceVolume, cb.ObjectID, len(blockData), expectedLen)
 		}
 
-		copy(data[start:end], blockData)
+		if vb.EncryptionEnabled {
+			if err := vb.openChunkRun(blockData, cb, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, data[start:end]); err != nil {
+				return fmt.Errorf("base chunk decrypt source %s: %w", sourceVolume, err)
+			}
+		} else {
+			copy(data[start:end], blockData)
+		}
 
-		// Cache blocks in BlockStore
+		// Cache blocks in BlockStore (post-decrypt plaintext)
 		if vb.UseBlockStore {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				blockStart := i * uint64(vb.BlockSize)
+				blockStart := start + i*uint64(vb.BlockSize)
 				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.BlockStore.Cache(currentBlock, blockData[blockStart:blockEnd])
+				vb.BlockStore.Cache(currentBlock, data[blockStart:blockEnd])
 			}
 		}
 
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				vb.Cache.lru.Add(currentBlock, blockData[i*uint64(vb.BlockSize):(i+1)*uint64(vb.BlockSize)])
+				blockStart := start + i*uint64(vb.BlockSize)
+				blockEnd := blockStart + uint64(vb.BlockSize)
+				vb.Cache.lru.Add(currentBlock, data[blockStart:blockEnd])
 			}
 		}
 	}

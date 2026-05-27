@@ -335,7 +335,7 @@ func main() {
 		fmt.Println("fileBuffer", len(fileBuffer))
 
 		for i, block := range blocks {
-			objectID, objectOffset, err := vb.LookupBlockToObject(block)
+			objectID, objectOffset, _, err := vb.LookupBlockToObject(block)
 
 			if err != nil {
 				slog.Error("Could not lookup block to object", "error", err)
