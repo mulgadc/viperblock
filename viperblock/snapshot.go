@@ -25,6 +25,11 @@ import (
 // keep SnapshotState plaintext-readable for operator debugging — JSON would
 // base64-encode fixed-size byte arrays. Empty on snapshots of unencrypted
 // volumes (zero-valued, ignored on the read path).
+//
+// StateSeqNum is the source volume's VB.nextStateSeqNum value at the moment
+// CreateSnapshot sealed this state — bound into the snapshot-meta nonce so
+// back-to-back snapshots on the same volume use disjoint nonces (domain
+// separation alone does not protect two seals in the same domain).
 type SnapshotState struct {
 	SnapshotID           string    `json:"SnapshotID"`
 	SourceVolumeName     string    `json:"SourceVolumeName"`
@@ -36,6 +41,7 @@ type SnapshotState struct {
 	CreatedAt            time.Time `json:"CreatedAt"`
 	SourceVolumeUUID     string    `json:"SourceVolumeUUID,omitempty"`
 	SourceVolumeNameHash string    `json:"SourceVolumeNameHash,omitempty"`
+	StateSeqNum          uint64    `json:"StateSeqNum,omitempty"`
 }
 
 // CreateSnapshot flushes all in-flight data and creates a frozen snapshot of
@@ -98,6 +104,18 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	if vb.EncryptionEnabled {
 		snap.SourceVolumeUUID = hex.EncodeToString(vb.VolumeUUID[:])
 		snap.SourceVolumeNameHash = hex.EncodeToString(vb.volumeNameHash[:])
+		snap.StateSeqNum = vb.nextStateSeqNum.Add(1)
+		// Persist the bumped counter before sealing under it: a crash
+		// between this Add and the next SaveState would otherwise reset
+		// nextStateSeqNum to the previously persisted value on restart,
+		// letting a subsequent snapshot re-issue snap.StateSeqNum and
+		// reuse this nonce under the same (key, VolumeUUID, domain=0x03)
+		// triple — catastrophic for AES-GCM. SaveState bumps once more
+		// for its own VBState, so the durable high-water lands at
+		// snap.StateSeqNum + 1 (or higher under concurrent saves).
+		if err := vb.SaveState(); err != nil {
+			return nil, fmt.Errorf("snapshot StateSeqNum persist: %w", err)
+		}
 	}
 
 	snapJSON, err := json.Marshal(snap)
@@ -105,7 +123,19 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		return nil, fmt.Errorf("failed to marshal snapshot state: %w", err)
 	}
 
-	if err := vb.Backend.WriteTo(snapshotID, types.FileTypeConfig, 0, &emptyHeaders, &snapJSON); err != nil {
+	// Encrypted snapshots append a 16-byte AES-GCM tag binding the JSON to
+	// (volumeNameHash, "snap:"||snapshotID, StateSeqNum). The snapshotID
+	// literal in the AAD prevents cross-snapshot splicing under the same key;
+	// tampering with any persisted field (SourceVolumeUUID, BlockCount, etc.)
+	// breaks verification because the JSON bytes are part of the covered AAD.
+	persisted := snapJSON
+	if vb.EncryptionEnabled {
+		nonce := makeNonce(snap.StateSeqNum, vb.VolumeUUID, DomainSnapshotMeta)
+		aad := makeMetaAAD(vb.volumeNameHash, "snap:"+snapshotID, snap.StateSeqNum)
+		persisted = sealMeta(vb.aead, snapJSON, aad, nonce)
+	}
+
+	if err := vb.Backend.WriteTo(snapshotID, types.FileTypeConfig, 0, &emptyHeaders, &persisted); err != nil {
 		return nil, fmt.Errorf("failed to write snapshot config: %w", err)
 	}
 
@@ -134,6 +164,48 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	configData, err := vb.Backend.ReadFrom(snapshotID, types.FileTypeConfig, 0, 0, 0)
 	if err != nil {
 		return nil, ident, fmt.Errorf("failed to read snapshot config %s: %w", snapshotID, err)
+	}
+
+	// Encrypted snapshots carry a trailing 16-byte AES-GCM tag. Two-stage
+	// parse: peek the pre-tag bytes for SourceVolumeUUID +
+	// SourceVolumeNameHash + StateSeqNum (needed to reconstruct nonce + AAD),
+	// verify, then unmarshal the verified bytes into the full struct. The
+	// snapshotID parameter is the trusted external identity bound into the
+	// AAD — splicing in another snapshot's blob fails because the literal
+	// "snap:"||snapshotID differs from the seal-time value.
+	if vb.EncryptionEnabled {
+		tagLen := vb.aead.Overhead()
+		if len(configData) < tagLen {
+			return nil, ident, fmt.Errorf("%w: snapshot %s config %d bytes shorter than %d-byte tag", ErrIntegrity, snapshotID, len(configData), tagLen)
+		}
+		var peek struct {
+			SourceVolumeUUID     string `json:"SourceVolumeUUID"`
+			SourceVolumeNameHash string `json:"SourceVolumeNameHash"`
+			StateSeqNum          uint64 `json:"StateSeqNum"`
+		}
+		peekJSON := configData[:len(configData)-tagLen]
+		if err := json.Unmarshal(peekJSON, &peek); err != nil {
+			return nil, ident, fmt.Errorf("%w: snapshot %s peek parse: %w", ErrIntegrity, snapshotID, err)
+		}
+		uuid, uuidErr := hex.DecodeString(peek.SourceVolumeUUID)
+		if uuidErr != nil || len(uuid) != 4 {
+			return nil, ident, fmt.Errorf("%w: snapshot %s SourceVolumeUUID invalid", ErrIntegrity, snapshotID)
+		}
+		nameHash, nhErr := hex.DecodeString(peek.SourceVolumeNameHash)
+		if nhErr != nil || len(nameHash) != 32 {
+			return nil, ident, fmt.Errorf("%w: snapshot %s SourceVolumeNameHash invalid", ErrIntegrity, snapshotID)
+		}
+		var nonceUUID [4]byte
+		copy(nonceUUID[:], uuid)
+		var aadNameHash [32]byte
+		copy(aadNameHash[:], nameHash)
+		nonce := makeNonce(peek.StateSeqNum, nonceUUID, DomainSnapshotMeta)
+		aad := makeMetaAAD(aadNameHash, "snap:"+snapshotID, peek.StateSeqNum)
+		verified, openErr := openMeta(vb.aead, configData, aad, nonce)
+		if openErr != nil {
+			return nil, ident, fmt.Errorf("%w: snapshot %s tag verify: %w", ErrIntegrity, snapshotID, openErr)
+		}
+		configData = verified
 	}
 
 	var snap SnapshotState
