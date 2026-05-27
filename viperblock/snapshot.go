@@ -133,10 +133,10 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, string, 
 		return nil, "", fmt.Errorf("snapshot checkpoint version mismatch")
 	}
 
-	// 4. Validate checkpoint size: must contain only complete 26-byte entries after header
+	// 4. Validate checkpoint size: must contain only complete entries after header.
 	dataSize := len(checkpoint) - headerSize
-	if dataSize%26 != 0 {
-		return nil, "", fmt.Errorf("snapshot checkpoint has %d trailing bytes (data section %d bytes is not a multiple of 26-byte entries)", dataSize%26, dataSize)
+	if dataSize%blockWalChunkSize != 0 {
+		return nil, "", fmt.Errorf("snapshot checkpoint has %d trailing bytes (data section %d bytes is not a multiple of %d-byte entries)", dataSize%blockWalChunkSize, dataSize, blockWalChunkSize)
 	}
 
 	// 5. Deserialize block lookup entries
@@ -145,13 +145,13 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, string, 
 	}
 
 	offset := headerSize
-	for offset+26 <= len(checkpoint) {
-		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+26])
+	for offset+blockWalChunkSize <= len(checkpoint) {
+		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to read snapshot block entry at offset %d: %w", offset, err)
 		}
 		baseMap.BlockLookup[block.StartBlock] = block
-		offset += 26
+		offset += blockWalChunkSize
 	}
 
 	// 6. Validate block count against metadata if available (BlockCount > 0 means
