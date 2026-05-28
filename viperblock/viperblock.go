@@ -1321,16 +1321,36 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 
 	vb.WAL.mu.Lock()
 	currentWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
+	// O_APPEND makes the file offset unreliable; Stat is the source of truth
+	// for the on-disk boundary we may need to roll back to.
+	preStat, statErr := currentWAL.Stat()
+	if statErr != nil {
+		vb.WAL.mu.Unlock()
+		return fmt.Errorf("error obtaining WAL size before write: %w", statErr)
+	}
+	preSize := preStat.Size()
 	n, err := currentWAL.Write(record)
 	vb.WAL.dirty.Store(true)
-	vb.WAL.mu.Unlock()
 
-	if n != len(record) {
-		slog.Error("ERROR WRITING BLOCK TO WAL: incomplete write", "n", n, "expected", len(record))
-		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes", n, len(record))
+	if err != nil || n != len(record) {
+		// Torn write: roll back to the last record boundary so future appends
+		// and replay stay aligned with the record framing.
+		truncErr := currentWAL.Truncate(preSize)
+		vb.WAL.mu.Unlock()
+
+		if truncErr != nil {
+			return fmt.Errorf("incomplete WAL write (wrote %d of %d bytes) and truncate to %d failed: %w", n, len(record), preSize, truncErr)
+		}
+		if err != nil {
+			slog.Error("WAL write failed, truncated to last boundary", "n", n, "expected", len(record), "preSize", preSize, "error", err)
+			return fmt.Errorf("WAL write failed (truncated to %d): %w", preSize, err)
+		}
+		slog.Error("WAL incomplete write, truncated to last boundary", "n", n, "expected", len(record), "preSize", preSize)
+		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes (truncated to %d)", n, len(record), preSize)
 	}
 
-	return err
+	vb.WAL.mu.Unlock()
+	return nil
 }
 
 // WriteShardedWAL writes a block to the appropriate shard based on block number.

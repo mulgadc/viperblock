@@ -753,6 +753,137 @@ func TestWALOperations(t *testing.T) {
 	})
 }
 
+// TestWriteWALTruncatesOnShortWrite verifies two related properties of the
+// truncate-on-failed-write path in WriteWAL:
+//
+//  1. Boundary preservation under torn-write conditions. If a previous
+//     WriteWAL leaves partial bytes past the last record boundary (the bug's
+//     blast radius), replay misaligns. Truncating back to the boundary
+//     restores a WAL whose replay round-trips. This is the actual invariant
+//     the fix defends.
+//
+//  2. Write-error path. When WriteWAL's underlying Write returns an error,
+//     WriteWAL returns an error and does NOT grow the WAL past the last
+//     record boundary. We induce a deterministic error by closing the
+//     *os.File handle before calling WriteWAL.
+func TestWriteWALTruncatesOnShortWrite(t *testing.T) {
+	t.Run("BoundaryPreservation_TornBytesBreakReplay_TruncateRestoresIt", func(t *testing.T) {
+		vb, walPath := setupWALTruncateTestVB(t, "boundary")
+
+		dataA := make([]byte, DefaultBlockSize)
+		copy(dataA, "record A")
+		require.NoError(t, vb.WriteWAL(Block{SeqNum: 10, Block: 10, Len: uint64(len(dataA)), Data: dataA}))
+
+		dataB := make([]byte, DefaultBlockSize)
+		copy(dataB, "record B")
+		require.NoError(t, vb.WriteWAL(Block{SeqNum: 11, Block: 11, Len: uint64(len(dataB)), Data: dataB}))
+
+		boundary, err := os.Stat(walPath)
+		require.NoError(t, err)
+		boundarySize := boundary.Size()
+		recordSize := int64(28 + vb.BlockSize)
+		require.Equal(t, int64(vb.WALHeaderSize())+2*recordSize, boundarySize, "boundary size sanity")
+
+		// Inject a partial-record tail — exactly what a torn write would
+		// leave on disk without the fix. 7 bytes is partial-but-nonzero.
+		f, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0600)
+		require.NoError(t, err)
+		_, err = f.Write([]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07})
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		// Replay over the misaligned tail must surface as an error.
+		currentWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
+		_, err = currentWAL.Seek(int64(vb.WALHeaderSize()), 0)
+		require.NoError(t, err)
+		replayErr := vb.ReadWAL()
+		require.Error(t, replayErr, "replay must fail when WAL has unaligned trailing bytes")
+
+		// Apply the fix: truncate back to the last good boundary.
+		require.NoError(t, os.Truncate(walPath, boundarySize))
+
+		_, err = currentWAL.Seek(int64(vb.WALHeaderSize()), 0)
+		require.NoError(t, err)
+		require.NoError(t, vb.ReadWAL(), "replay must succeed after truncating back to the record boundary")
+
+		st, err := os.Stat(walPath)
+		require.NoError(t, err)
+		require.Equal(t, boundarySize, st.Size(), "truncate must restore the WAL to exactly the boundary size")
+	})
+
+	t.Run("WriteErrorPath_ClosedHandle_NoGrowthPastBoundary", func(t *testing.T) {
+		vb, walPath := setupWALTruncateTestVB(t, "writeerr")
+
+		data1 := make([]byte, DefaultBlockSize)
+		copy(data1, "first valid record")
+		require.NoError(t, vb.WriteWAL(Block{SeqNum: 1, Block: 1, Len: uint64(len(data1)), Data: data1}))
+
+		st, err := os.Stat(walPath)
+		require.NoError(t, err)
+		boundarySize := st.Size()
+		require.Greater(t, boundarySize, int64(0))
+
+		// Close the active WAL handle to deterministically trigger an error
+		// on the next Write. WriteWAL must surface that error and must NOT
+		// leave the WAL file grown past the boundary.
+		vb.WAL.mu.Lock()
+		require.NoError(t, vb.WAL.DB[len(vb.WAL.DB)-1].Close())
+		vb.WAL.mu.Unlock()
+
+		data2 := make([]byte, DefaultBlockSize)
+		copy(data2, "this write must fail")
+		err = vb.WriteWAL(Block{SeqNum: 2, Block: 2, Len: uint64(len(data2)), Data: data2})
+		require.Error(t, err, "WriteWAL on a closed handle must return an error")
+
+		st2, err := os.Stat(walPath)
+		require.NoError(t, err)
+		require.LessOrEqual(t, st2.Size(), boundarySize,
+			"WAL must not have grown past the boundary after a failed write (pre=%d, post=%d)",
+			boundarySize, st2.Size())
+	})
+}
+
+// setupWALTruncateTestVB spins up a minimal file-backed VB with legacy WAL
+// and an opened WAL file. Returns the VB and the WAL file path. Cleanup is
+// registered with t.Cleanup.
+func setupWALTruncateTestVB(t *testing.T, tag string) (*VB, string) {
+	t.Helper()
+	tmpDir := os.TempDir()
+	testVol := fmt.Sprintf("test_wal_truncate_%s_%d", tag, time.Now().UnixNano())
+
+	backendConfig := file.FileConfig{
+		VolumeName: testVol,
+		VolumeSize: volumeSize,
+		BaseDir:    tmpDir,
+	}
+
+	vbconfig := VB{
+		VolumeName:      testVol,
+		VolumeSize:      volumeSize,
+		BaseDir:         fmt.Sprintf("%s/%s", tmpDir, "viperblock"),
+		WALSyncInterval: -1,
+	}
+
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+	require.NotNil(t, vb)
+	vb.UseShardedWAL = false
+	vb.ShardedWAL = nil
+
+	t.Cleanup(func() {
+		vb.StopWALSyncer()
+		os.RemoveAll(filepath.Join(vb.BaseDir, testVol))
+	})
+
+	require.NoError(t, vb.Backend.Init())
+
+	walPath := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
+		vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load())
+	require.NoError(t, vb.OpenWAL(&vb.WAL, walPath))
+
+	return vb, walPath
+}
+
 // TestWALPeriodicSync tests the periodic WAL fsync functionality
 // following patterns from PostgreSQL (wal_writer_delay), BadgerDB, and MongoDB
 func TestWALPeriodicSync(t *testing.T) {
