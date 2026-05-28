@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
@@ -121,7 +122,8 @@ func main() {
 		var err error
 		mkey, err = masterkey.LoadShared(keyPath)
 		if err != nil {
-			log.Fatalf("Failed to load encryption key %s: %v", keyPath, err)
+			slog.Error("Could not load encryption key", "path", keyPath, "error", err)
+			os.Exit(1)
 		}
 	}
 

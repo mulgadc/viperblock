@@ -59,16 +59,37 @@ func makeNonce(seqNum uint64, volumeUUID [4]byte, domain byte) [12]byte {
 	return n
 }
 
+// AADLen is the fixed size of the data-domain AAD: 32-byte volumeNameHash +
+// 8-byte blockNum + 8-byte seqNum.
+const AADLen = 32 + 8 + 8
+
 // makeAAD builds the 48-byte AAD bound into every data-domain seal/open:
 // volumeNameHash || BE(blockNum) || BE(seqNum). Defeats cross-volume swap
 // (hash differs), in-place rollback (seqnum differs from index-trusted
 // value), and positional shuffle (blockNum differs).
+//
+// For per-block hot loops, prefer initAAD + updateAAD against a stack-
+// allocated [AADLen]byte to avoid an allocation per block.
 func makeAAD(volumeNameHash [32]byte, blockNum, seqNum uint64) []byte {
-	aad := make([]byte, 32+8+8)
+	aad := make([]byte, AADLen)
 	copy(aad[0:32], volumeNameHash[:])
 	binary.BigEndian.PutUint64(aad[32:40], blockNum)
 	binary.BigEndian.PutUint64(aad[40:48], seqNum)
 	return aad
+}
+
+// initAAD populates the fixed volumeNameHash prefix of an AAD buffer once.
+// Per-block hot loops pair this with updateAAD to mutate only the block-
+// varying suffix without reallocating or copying the 32-byte hash each call.
+func initAAD(aad *[AADLen]byte, volumeNameHash [32]byte) {
+	copy(aad[0:32], volumeNameHash[:])
+}
+
+// updateAAD overwrites the blockNum + seqNum suffix of an AAD buffer whose
+// volumeNameHash prefix was previously set by initAAD.
+func updateAAD(aad *[AADLen]byte, blockNum, seqNum uint64) {
+	binary.BigEndian.PutUint64(aad[32:40], blockNum)
+	binary.BigEndian.PutUint64(aad[40:48], seqNum)
 }
 
 // makeMetaAAD builds the AAD for VBState and SnapshotState integrity tags:
