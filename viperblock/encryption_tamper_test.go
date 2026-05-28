@@ -499,10 +499,11 @@ func randUint64(t *testing.T, upper uint64) uint64 {
 
 // TestEncryptedWAL_RecoveryAEADTamperSurfacesErrIntegrity — flipping a
 // single byte in an encrypted WAL record on the recovery path must
-// surface as ErrIntegrity from readWALFileForRecovery and the WAL file
-// must remain on disk so RecoverLocalWALs does NOT silently truncate
-// recovery. The legacy CRC path tolerates bit-rot and breaks the read
-// loop; AEAD failure is tamper, not rot, so we fail closed.
+// surface as ErrIntegrity from both readWALFileForRecovery and
+// RecoverLocalWALs. The tampered file stays on disk for forensics +
+// retry, and the caller refuses to bring the volume up. The legacy CRC
+// path tolerates bit-rot and breaks the read loop; AEAD failure is
+// tamper, not rot, so we fail closed and propagate.
 func TestEncryptedWAL_RecoveryAEADTamperSurfacesErrIntegrity(t *testing.T) {
 	env := newEncryptedTamperEnv(t, "vol-wal-recovery-tamper", testKey(t, 0x42))
 
@@ -543,13 +544,17 @@ func TestEncryptedWAL_RecoveryAEADTamperSurfacesErrIntegrity(t *testing.T) {
 	assert.ErrorIs(t, err, ErrIntegrity)
 	assert.Nil(t, blocks, "no blocks must be returned alongside an integrity error")
 
-	// 2) RecoverLocalWALs must NOT delete the tampered WAL file.
+	// 2) RecoverLocalWALs must propagate ErrIntegrity to the caller AND
+	// leave the tampered WAL file on disk. Silently continuing past a
+	// tampered file and reporting success would drop sealed writes that
+	// have no plaintext fallback.
 	_, statErr := os.Stat(walPath)
 	require.NoError(t, statErr, "WAL must still exist before RecoverLocalWALs")
 
-	require.NoError(t, env.vb.RecoverLocalWALs(),
-		"RecoverLocalWALs keeps tampered files for retry; it must not propagate the per-file error")
+	recoverErr := env.vb.RecoverLocalWALs()
+	require.Error(t, recoverErr, "RecoverLocalWALs must surface ErrIntegrity, not swallow it")
+	assert.ErrorIs(t, recoverErr, ErrIntegrity)
 
 	_, statErr = os.Stat(walPath)
-	assert.NoError(t, statErr, "tampered WAL must NOT be deleted by RecoverLocalWALs — silent truncation of recovery is the bug being fixed")
+	assert.NoError(t, statErr, "tampered WAL must NOT be deleted by RecoverLocalWALs — kept on disk for forensics + retry")
 }

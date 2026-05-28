@@ -214,6 +214,15 @@ type VB struct {
 	// the value is bound into the VBState metadata HMAC and breaks ties when
 	// LoadState picks between local and backend copies.
 	nextStateSeqNum atomic.Uint64
+
+	// saveStateMu serialises persistStateLocal so the StateSeqNum bump,
+	// marshal, and atomic rename are observed in monotonic order on disk.
+	// Without serialisation two concurrent SaveStates could mint StateSeqNum
+	// N and N+1 then rename in either order, leaving the lower StateSeqNum
+	// as the on-disk winner. Held only across the marshal+fsync path; not
+	// shared with the read-path mutex so LookupBlockToObject and friends
+	// stay uncontended.
+	saveStateMu sync.Mutex
 }
 
 // CacheConfig holds configuration for the LRU cache
@@ -437,9 +446,10 @@ var ErrIntegrity = errors.New("viperblock: integrity check failed")
 // the pre-encryption magic — VBCH for chunks, VBWL for the single-file WAL.
 // Without this dedicated signal the chunk read path would try to AEAD-open
 // plaintext bytes and surface a generic ErrIntegrity, leaving operators with
-// no actionable migration cue. Callers must refuse to open the volume and
-// direct the operator to the migration tool before retrying.
-var ErrPreEncryptionFormat = errors.New("viperblock: chunk has pre-encryption format (VBCH) but volume opened with EncryptionEnabled=true; migrate via the viperblock migration tool before re-opening")
+// no actionable migration cue. The supported migration path is a hard cutover:
+// create a new encrypted volume and copy data across via guest-side tooling
+// (dd, filesystem-level copy). Callers must refuse to open the volume.
+var ErrPreEncryptionFormat = errors.New("viperblock: chunk has pre-encryption format (VBCH) but volume opened with EncryptionEnabled=true; create a new encrypted volume and copy data across via guest-side tooling")
 
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
@@ -1321,8 +1331,10 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 		binary.BigEndian.PutUint64(record[8:16], block.Block)
 		binary.BigEndian.PutUint64(record[16:24], block.Len)
 		nonce := makeNonce(block.SeqNum, vb.VolumeUUID, DomainWAL)
-		aad := makeAAD(vb.volumeNameHash, block.Block, block.SeqNum)
-		record = vb.aead.Seal(record, nonce[:], block.Data, aad)
+		var aad [AADLen]byte
+		initAAD(&aad, vb.volumeNameHash)
+		updateAAD(&aad, block.Block, block.SeqNum)
+		record = vb.aead.Seal(record, nonce[:], block.Data, aad[:])
 	} else {
 		// Legacy layout (magic VBWL), per-record:
 		//   [SeqNum(8) | BlockNum(8) | BlockLen(8) | CRC32(4) | data(BlockLen)]
@@ -2558,6 +2570,14 @@ func (vb *VB) RecoverLocalWALs() error {
 		fullPath := filepath.Join(walDir, fname)
 		blocks, fileMaxSeq, err := vb.readWALFileForRecovery(fullPath)
 		if err != nil {
+			// An integrity failure on a recovered WAL is fail-closed: the
+			// tampered or torn file may hold the only durable copy of writes
+			// that never made it to a chunk, and silently skipping it would
+			// surface as data loss. Abort so the caller can refuse to bring
+			// the volume up; the file stays on disk for forensics + retry.
+			if errors.Is(err, ErrIntegrity) {
+				return fmt.Errorf("WAL recovery: integrity failure in %s: %w", fname, err)
+			}
 			slog.Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
 			continue
 		}
@@ -2704,11 +2724,6 @@ func (vb *VB) checkChunkMagic(volumeName string, objectID uint64, read func(offs
 	return nil
 }
 
-// Lookup Block to Object
-// LookupBlockToObject returns the persisted location of a block plus its
-// chunk-write SeqNum. The SeqNum return drives nonce + AAD reconstruction on
-// the decrypt path; on unencrypted volumes callers ignore it. Returns
-// ErrZeroBlock when the block has never been written.
 // openChunkRun decrypts a coalesced run of N chunk blocks read from the
 // backend at stride BlockSize+16. Each block's nonce is reconstructed from
 // (cb.SeqNums[k], volumeUUID, DomainChunk) and AAD from (volumeNameHash,
@@ -2752,6 +2767,10 @@ func (vb *VB) openChunkRun(ciphertext []byte, cb ConsecutiveBlock, volumeUUID [4
 	return nil
 }
 
+// LookupBlockToObject returns the persisted location of a block plus its
+// chunk-write SeqNum. The SeqNum return drives nonce + AAD reconstruction on
+// the decrypt path; on unencrypted volumes callers ignore it. Returns
+// ErrZeroBlock when the block has never been written.
 func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, seqNum uint64, err error) {
 	slog.Debug("LookupBlockToObject", "block", block)
 
@@ -2770,19 +2789,15 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	}
 }
 
-// Save the block tracking state to disk.
+// SaveState persists VBState to disk and to the backend.
 //
-// For encrypted volumes, SaveState bootstraps the per-volume nonce subspace
-// on first call: if VolumeUUID is zero we mint it via crypto/rand and seed
+// For encrypted volumes, the first call bootstraps the per-volume nonce
+// subspace: if VolumeUUID is zero we mint it via crypto/rand and seed
 // SeqNumHighWater = seqNumReservation. Subsequent calls preserve the existing
 // UUID and advance StateSeqNum monotonically (the value is bound into the
-// metadata HMAC). The local write is atomic — tmp file + fsync + rename
-// + fsync parent dir — so a crash mid-persist cannot leave a torn config.json
+// metadata HMAC). The local write is atomic — tmp file + fsync + rename +
+// fsync parent dir — so a crash mid-persist cannot leave a torn config.json
 // that would let reserveSeqNum re-hand-out values on restart.
-// SaveState persists VBState with the currently-committed SeqNumHighWater.
-// Bootstraps VolumeUUID + initial high-water on first call of an encrypted
-// volume — safe because Open serializes its bootstrap SaveState before any
-// data writer can run.
 func (vb *VB) SaveState() error {
 	if vb.EncryptionEnabled {
 		var zero [4]byte
@@ -2817,8 +2832,8 @@ func (vb *VB) saveStateWithHighWater(highWater uint64) error {
 // hand them to pushStateToBackend without re-marshaling. Crash-safety lives
 // in this step: when it returns nil, the new state is durable on local disk.
 func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
-	vb.BlocksToObject.mu.Lock()
-	defer vb.BlocksToObject.mu.Unlock()
+	vb.saveStateMu.Lock()
+	defer vb.saveStateMu.Unlock()
 
 	walNum := vb.WAL.WallNum.Load()
 	if vb.UseShardedWAL && vb.ShardedWAL != nil {
@@ -2966,11 +2981,35 @@ func (vb *VB) LoadState() error {
 		return classified
 	}
 
-	// Step 3. Compare the two states, the state with the highest SeqNum is the correct state.
-	// When local state failed to load (e.g. no local file for a newly created volume),
-	// always prefer the backend state regardless of SeqNum.
-	if localErr != nil || stateBackend.SeqNum > state.SeqNum {
+	// Step 3. Compare the two states and select the authoritative copy.
+	// StateSeqNum is the SaveState generation counter — bumped on every
+	// persist whether or not data writes occurred — so it is the
+	// strictly-monotonic tiebreak the rollback defense rests on (an attacker
+	// who rolls the backend back to v1 loses to local v2 because v2's
+	// StateSeqNum is strictly higher). When local failed to load (e.g. no
+	// local file for a newly created volume), always prefer the backend
+	// state regardless.
+	if localErr != nil || stateBackend.StateSeqNum > state.StateSeqNum {
 		state = stateBackend
+	}
+
+	// Step 4. Validate encryption invariants against the selected state
+	// BEFORE mutating any vb.* field. A wrong-key open, a flag XOR mismatch,
+	// or a key-fingerprint mismatch must leave the VB untouched so callers
+	// that log the error and continue cannot operate on partially-loaded
+	// state derived from the rejected blob.
+	if vb.EncryptionEnabled != state.EncryptionEnabled {
+		return fmt.Errorf("%w: runtime EncryptionEnabled=%v, persisted=%v (volume %s)",
+			ErrEncryptionMismatch, vb.EncryptionEnabled, state.EncryptionEnabled, vb.VolumeName)
+	}
+	if vb.EncryptionEnabled {
+		if vb.MasterKey == nil {
+			return fmt.Errorf("%w: volume %s requires master key", ErrEncryptionMismatch, vb.VolumeName)
+		}
+		if state.KeyFingerprint != vb.MasterKey.Fingerprint {
+			return fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
+				ErrEncryptionMismatch, vb.VolumeName, state.KeyFingerprint, vb.MasterKey.Fingerprint)
+		}
 	}
 
 	// Reconcile VolumeSize with VolumeConfig.SizeGiB (safety net for resize).
@@ -2986,8 +3025,6 @@ func (vb *VB) LoadState() error {
 		slog.Warn("LoadState: VolumeConfig.SizeGiB < VBState.VolumeSize (shrink not supported, keeping current size)",
 			"configSize", configSizeBytes, "stateSize", state.VolumeSize)
 	}
-
-	// TODO: Add improved test cases for state.json corruption and edge cases
 
 	vb.VolumeName = state.VolumeName
 	vb.VolumeSize = state.VolumeSize
@@ -3012,34 +3049,14 @@ func (vb *VB) LoadState() error {
 
 	vb.nextStateSeqNum.Store(state.StateSeqNum)
 
-	// Encryption-at-rest validation and SeqNum bootstrap.
-	//
-	// The runtime must agree with the persisted flag — supplying a key for an
-	// unencrypted volume, or omitting the key for an encrypted one, is a
-	// startup-time error rather than a silent fall-through. Key fingerprint
-	// mismatch surfaces the same way (an operator who points the daemon at
-	// the wrong key file sees a clear error rather than every read failing
-	// integrity later).
-	//
-	// On a successful Open of an existing encrypted volume, restart SeqNum at
-	// the persisted high-water and reserve the next window durably before any
-	// data write can hand out a value. This is what makes nonce uniqueness
-	// crash-safe: a kill -9 before the next SaveState loses up to one
-	// reservation window of values, but every value handed out before the
-	// crash sits below the high-water we just persisted, so none can be
-	// re-issued.
-	if vb.EncryptionEnabled != state.EncryptionEnabled {
-		return fmt.Errorf("%w: runtime EncryptionEnabled=%v, persisted=%v (volume %s)",
-			ErrEncryptionMismatch, vb.EncryptionEnabled, state.EncryptionEnabled, vb.VolumeName)
-	}
+	// Encryption SeqNum bootstrap. On a successful Open of an existing
+	// encrypted volume, restart SeqNum at the persisted high-water and
+	// reserve the next window durably before any data write can hand out a
+	// value. This is what makes nonce uniqueness crash-safe: a kill -9
+	// before the next SaveState loses up to one reservation window of
+	// values, but every value handed out before the crash sits below the
+	// high-water we just persisted, so none can be re-issued.
 	if vb.EncryptionEnabled {
-		if vb.MasterKey == nil {
-			return fmt.Errorf("%w: volume %s requires master key", ErrEncryptionMismatch, vb.VolumeName)
-		}
-		if state.KeyFingerprint != vb.MasterKey.Fingerprint {
-			return fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
-				ErrEncryptionMismatch, vb.VolumeName, state.KeyFingerprint, vb.MasterKey.Fingerprint)
-		}
 		vb.VolumeUUID = state.VolumeUUID
 		vb.SeqNum.Store(state.SeqNumHighWater)
 		vb.seqNumHighWater.Store(state.SeqNumHighWater)
@@ -3068,8 +3085,9 @@ func (vb *VB) LoadState() error {
 // fact and only when crossed do we take seqNumHighWaterMu and SaveState to
 // advance it. Refuses past MaxSeqNum (56-bit nonce slot).
 //
-// Lock order: callers must NOT hold BlocksToObject.mu — the slow path takes
-// seqNumHighWaterMu then calls SaveState, which acquires BlocksToObject.mu.
+// Lock order: the slow path takes seqNumHighWaterMu then calls
+// persistStateLocal, which acquires saveStateMu. saveStateMu must not be
+// held when calling reserveSeqNum.
 //
 // Unencrypted volumes fall through to plain atomic.Add — the high-water is a
 // nonce-uniqueness mechanism and is irrelevant when no nonce exists.

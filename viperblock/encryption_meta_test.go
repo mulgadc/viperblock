@@ -108,21 +108,30 @@ func TestVBStateMeta_CrossVolumeSwapFailsLoad(t *testing.T) {
 }
 
 // TestVBStateMeta_RollbackLosesTieToFsync — write VBState v1, then v2,
-// then substitute the v1 backend copy. LoadState's existing tie-break
-// (highest SeqNum wins between local fsync and backend) must select
-// the local v2 copy; HMAC verify of v2 succeeds. This gates the
-// composition: HMAC alone does not stop replay of an older authentic
-// blob — the SeqNum comparison does. An attacker who rewinds the
-// backend copy is foiled because the local fsync'd copy holds a higher
-// StateSeqNum and wins the tie-break.
+// then v3, then substitute the v1 backend copy. LoadState's tie-break
+// by StateSeqNum (the SaveState generation counter, monotonic even
+// without data writes) must select the local v3 copy; HMAC verify of
+// v3 succeeds. This gates the composition: HMAC alone does not stop
+// replay of an older authentic blob — the StateSeqNum comparison does.
+// An attacker who rewinds the backend copy is foiled because the local
+// fsync'd copy holds a strictly higher StateSeqNum.
+//
+// The file backend writes config.json to {BaseDir}/{volume}/config.json,
+// which is the same path persistStateLocal uses. To genuinely simulate a
+// backend-only rollback we point the file backend at a separate directory
+// from vb.BaseDir, so local fsync'd state and the backend "object" live
+// in independent locations.
 func TestVBStateMeta_RollbackLosesTieToFsync(t *testing.T) {
 	key := testKey(t, 0x42)
-	dir := t.TempDir()
-	cfg := file.FileConfig{BaseDir: dir, VolumeName: "vol-rollback"}
+	localDir := t.TempDir()
+	backendDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(localDir, "vol-rollback"), 0750))
+
+	cfg := file.FileConfig{BaseDir: backendDir, VolumeName: "vol-rollback"}
 	vb, err := New(&VB{
 		VolumeName:        "vol-rollback",
 		VolumeSize:        4 * 1024 * 1024,
-		BaseDir:           dir,
+		BaseDir:           localDir,
 		MasterKey:         key,
 		EncryptionEnabled: true,
 	}, "file", cfg)
@@ -131,34 +140,49 @@ func TestVBStateMeta_RollbackLosesTieToFsync(t *testing.T) {
 	vb.BlockSize = DefaultBlockSize
 
 	// v1: first SaveState. Snapshot the backend blob immediately so
-	// v1Backend captures the true v1 bytes (SeqNum=0), not a later rev.
+	// v1Backend captures the true v1 bytes (StateSeqNum=1), not a later rev.
 	require.NoError(t, vb.SaveState())
 	v1Backend, err := vb.Backend.Read(types.FileTypeConfig, 0, 0, 0)
 	require.NoError(t, err)
-	// v1Backend now holds the sealed v1 blob (SeqNum=0, StateSeqNum=1).
 
-	// v2: bump SeqNum and persist (overwrites backend and local fsync).
-	vb.SeqNum.Store(100)
+	// v2 and v3: two more SaveStates with no data writes between them.
+	// Each bump advances StateSeqNum (1 → 2 → 3) while the data-path
+	// SeqNum stays put. The bumpless interval is the exact case a
+	// data-path-SeqNum tiebreak would degenerate on.
+	require.NoError(t, vb.SaveState())
 	require.NoError(t, vb.SaveState())
 
-	// v3: bump SeqNum again and persist (overwrites backend and local
-	// fsync). After this, both backend and local hold v3 (SeqNum=200).
-	vb.SeqNum.Store(200)
-	require.NoError(t, vb.SaveState())
-
-	// Roll the BACKEND copy back to v1, leave the local fsync'd copy at
-	// v3. LoadState's tie-break by SeqNum (or StateSeqNum) must prefer
-	// the local higher-SeqNum copy; HMAC verify of v3 succeeds.
+	// Roll the BACKEND copy back to v1; local fsync'd copy still holds v3.
 	emptyHeaders := []byte{}
 	require.NoError(t, vb.Backend.Write(types.FileTypeConfig, 0, &emptyHeaders, &v1Backend))
 
-	// Reopen — must succeed and surface the v3 SeqNum, proving the
+	// Sanity: confirm local and backend now hold different bytes — local v3,
+	// backend v1. Without this guard a regression in the test setup (e.g.
+	// the file backend reverting to vb.BaseDir) would silently degenerate
+	// the assertion into a same-bytes comparison that passes trivially.
+	localPath := filepath.Join(vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, "vol-rollback"))
+	localBytes, err := os.ReadFile(localPath)
+	require.NoError(t, err)
+	backendBytes, err := vb.Backend.Read(types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err)
+	require.NotEqual(t, localBytes, backendBytes, "test setup must produce divergent local vs backend bytes")
+	require.Equal(t, v1Backend, backendBytes, "backend must hold rolled-back v1 bytes")
+
+	// Reopen — must succeed and surface the v3 StateSeqNum, proving the
 	// backend rollback lost the tie-break.
-	vb2 := newFileBackedVB(t, "vol-rollback", key)
-	vb2.BaseDir = vb.BaseDir
+	cfg2 := file.FileConfig{BaseDir: backendDir, VolumeName: "vol-rollback"}
+	vb2, err := New(&VB{
+		VolumeName:        "vol-rollback",
+		VolumeSize:        4 * 1024 * 1024,
+		BaseDir:           localDir,
+		MasterKey:         key,
+		EncryptionEnabled: true,
+	}, "file", cfg2)
+	require.NoError(t, err)
+	require.NoError(t, vb2.Backend.Init())
 	require.NoError(t, vb2.LoadState())
-	assert.GreaterOrEqual(t, vb2.SeqNum.Load(), uint64(200),
-		"LoadState must select the higher-SeqNum local copy over the rolled-back backend")
+	assert.GreaterOrEqual(t, vb2.nextStateSeqNum.Load(), uint64(3),
+		"LoadState must select the higher-StateSeqNum local copy over the rolled-back backend")
 }
 
 // TestVBStateMeta_FirstOpenNoPriorState — a fresh encrypted volume with
