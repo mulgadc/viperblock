@@ -442,3 +442,60 @@ func randUint64(t *testing.T, upper uint64) uint64 {
 	require.NoError(t, err)
 	return n.Uint64()
 }
+
+// TestEncryptedWAL_RecoveryAEADTamperSurfacesErrIntegrity — flipping a
+// single byte in an encrypted WAL record on the recovery path must
+// surface as ErrIntegrity from readWALFileForRecovery and the WAL file
+// must remain on disk so RecoverLocalWALs does NOT silently truncate
+// recovery. The legacy CRC path tolerates bit-rot and breaks the read
+// loop; AEAD failure is tamper, not rot, so we fail closed.
+func TestEncryptedWAL_RecoveryAEADTamperSurfacesErrIntegrity(t *testing.T) {
+	env := newEncryptedTamperEnv(t, "vol-wal-recovery-tamper", testKey(t, 0x42))
+
+	// Write two records: tampering the SECOND one must not allow the
+	// caller to silently drop it (or any later records) on the floor.
+	plain0 := make([]byte, env.blockSize)
+	plain1 := make([]byte, env.blockSize)
+	_, err := rand.Read(plain0)
+	require.NoError(t, err)
+	_, err = rand.Read(plain1)
+	require.NoError(t, err)
+
+	require.NoError(t, env.vb.Write(0, plain0))
+	require.NoError(t, env.vb.Write(1, plain1))
+	require.NoError(t, env.vb.Flush())
+
+	walPath := filepath.Join(env.vb.WAL.BaseDir,
+		types.GetFilePath(types.FileTypeWALChunk, env.vb.WAL.WallNum.Load(), env.vb.GetVolume()))
+	env.vb.WAL.mu.Lock()
+	require.NoError(t, env.vb.WAL.DB[len(env.vb.WAL.DB)-1].Sync())
+	env.vb.WAL.mu.Unlock()
+
+	raw, err := os.ReadFile(walPath)
+	require.NoError(t, err)
+
+	headerSize := env.vb.WALHeaderSize()
+	recordSize := 40 + env.blockSize // 24-byte hdr + ct + 16-byte tag
+	// Flip a byte in the SECOND record's ciphertext body.
+	secondRecordStart := headerSize + recordSize
+	tamperOff := secondRecordStart + 24 + 10
+	require.Greater(t, len(raw), tamperOff)
+	raw[tamperOff] ^= 0x01
+	require.NoError(t, os.WriteFile(walPath, raw, 0600))
+
+	// 1) Direct call: readWALFileForRecovery must return ErrIntegrity.
+	blocks, _, err := env.vb.readWALFileForRecovery(walPath)
+	require.Error(t, err, "AEAD tamper must NOT be swallowed as a bit-rot tear")
+	assert.ErrorIs(t, err, ErrIntegrity)
+	assert.Nil(t, blocks, "no blocks must be returned alongside an integrity error")
+
+	// 2) RecoverLocalWALs must NOT delete the tampered WAL file.
+	_, statErr := os.Stat(walPath)
+	require.NoError(t, statErr, "WAL must still exist before RecoverLocalWALs")
+
+	require.NoError(t, env.vb.RecoverLocalWALs(),
+		"RecoverLocalWALs keeps tampered files for retry; it must not propagate the per-file error")
+
+	_, statErr = os.Stat(walPath)
+	assert.NoError(t, statErr, "tampered WAL must NOT be deleted by RecoverLocalWALs — silent truncation of recovery is the bug being fixed")
+}
