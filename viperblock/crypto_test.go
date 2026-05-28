@@ -4,10 +4,9 @@
 
 // Crypto-helper tests for the encryption-at-rest plumbing. Layout invariants
 // (nonce byte positions, 56-bit SeqNum truncation, AAD shape, domain
-// separation) live alongside the full Stage 5 matrix: AEAD round-trip,
-// ciphertext + tag tamper detection, sealMeta / openMeta round-trip and
-// tamper, ciphertext-level domain separation, and a 10^6-triple nonce
-// uniqueness sweep.
+// separation) live alongside AEAD round-trip, ciphertext + tag tamper
+// detection, sealMeta / openMeta round-trip and tamper, ciphertext-level
+// domain separation, and a 10^6-triple nonce uniqueness sweep.
 
 package viperblock
 
@@ -95,7 +94,7 @@ func TestMakeAAD_Layout(t *testing.T) {
 }
 
 func TestMakeAAD_TamperDetectionPrecondition(t *testing.T) {
-	// makeAAD itself is pure; Stage 3's aead.Open is what catches tampering.
+	// makeAAD itself is pure; aead.Open on the decrypt path catches tampering.
 	// What we verify here is that any single-field bit-flip yields a
 	// different AAD byte string, which is the precondition for AEAD tamper
 	// detection to fire.

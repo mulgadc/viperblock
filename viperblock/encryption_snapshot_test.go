@@ -2,7 +2,7 @@
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
-// Stage 5 snapshot/clone encryption tests. Snapshot clones inherit the
+// Snapshot/clone encryption tests. Snapshot clones inherit the
 // source volume's encryption identity (SourceVolumeUUID,
 // SourceVolumeNameHash) so base-chunk reads decrypt under the source's
 // nonce + AAD, not the clone's. Any drift between source and clone

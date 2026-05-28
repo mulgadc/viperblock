@@ -2,10 +2,10 @@
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
-// Stage 1 unit tests for the encryption-at-rest plumbing — minimal coverage
-// for the new code paths (New validation, writeFileAtomic, SaveState first-
-// open bootstrap, LoadState fingerprint + high-water advance, reserveSeqNum
-// slow path, bumpSeqNumHighWater). Stage 5 lands the comprehensive matrix.
+// Unit tests for the encryption-at-rest plumbing — coverage for New
+// validation, writeFileAtomic, SaveState first-open bootstrap, LoadState
+// fingerprint + high-water advance, reserveSeqNum slow path, and
+// bumpSeqNumHighWater.
 
 package viperblock
 
