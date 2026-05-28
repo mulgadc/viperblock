@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -113,18 +112,10 @@ func main() {
 		Host:       *host,
 	}
 
-	keyPath := *encryptionKeyFile
-	if keyPath == "" {
-		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
-	}
-	var mkey *masterkey.Key
-	if keyPath != "" {
-		var err error
-		mkey, err = masterkey.LoadShared(keyPath)
-		if err != nil {
-			slog.Error("Could not load encryption key", "path", keyPath, "error", err)
-			os.Exit(1)
-		}
+	mkey, err := viperblock.LoadMasterKeyFromFlagOrEnv(*encryptionKeyFile)
+	if err != nil {
+		slog.Error("Could not load encryption key", "error", err)
+		os.Exit(1)
 	}
 
 	vbConfig := viperblock.VB{
@@ -141,7 +132,7 @@ func main() {
 		EncryptionEnabled: mkey != nil,
 	}
 
-	err := v_utils.ImportDiskImage(&s3Config, &vbConfig, *file)
+	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, *file)
 
 	if err != nil {
 		log.Fatalf("Failed to import disk image: %v", err)

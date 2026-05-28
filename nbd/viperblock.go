@@ -10,7 +10,6 @@ import (
 import (
 	"fmt"
 	"log/slog"
-	"os"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
@@ -134,17 +133,11 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 
 	// Resolve and load the master key once at plugin startup so per-NBD-
 	// connection Open avoids a disk read + permission check on every attach.
-	keyPath := encryption_key_file
-	if keyPath == "" {
-		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
+	mkey, err := viperblock.LoadMasterKeyFromFlagOrEnv(encryption_key_file)
+	if err != nil {
+		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load encryption key: %v", err)}
 	}
-	if keyPath != "" {
-		mkey, err := masterkey.LoadShared(keyPath)
-		if err != nil {
-			return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load encryption key: %v", err)}
-		}
-		loadedMasterKey = mkey
-	}
+	loadedMasterKey = mkey
 	if use_shardwal && loadedMasterKey != nil {
 		return nbdkit.PluginError{Errmsg: "shardwal is incompatible with encryption: sharded WAL is not supported on encrypted volumes"}
 	}
@@ -337,7 +330,9 @@ func (c *ViperBlockConnection) CanFlush() (bool, error) {
 
 func (c *ViperBlockConnection) Flush(flags uint32) error {
 
-	c.vb.Flush()
+	if err := c.vb.Flush(); err != nil {
+		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Flush failed: %v", err)}
+	}
 
 	var err error
 	if c.vb.UseShardedWAL {

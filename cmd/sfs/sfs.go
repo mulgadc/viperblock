@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/simplefs"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
@@ -127,17 +126,10 @@ func main() {
 		}
 	}
 
-	keyPath := *encryptionKeyFile
-	if keyPath == "" {
-		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
-	}
-	var mkey *masterkey.Key
-	if keyPath != "" {
-		mkey, err = masterkey.LoadShared(keyPath)
-		if err != nil {
-			slog.Error("Could not load encryption key", "path", keyPath, "error", err)
-			os.Exit(1)
-		}
+	mkey, err := viperblock.LoadMasterKeyFromFlagOrEnv(*encryptionKeyFile)
+	if err != nil {
+		slog.Error("Could not load encryption key", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("Creating Viperblock backend with btype, config", *btype, cfg)
