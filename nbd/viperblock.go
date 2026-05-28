@@ -162,7 +162,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	}
 
 	if use_shardwal && mkey != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: "shardwal is incompatible with encryption (plan §Scope discipline — sharded WAL is out of scope for encryption-at-rest)"}
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: "shardwal is incompatible with encryption: sharded WAL is not supported on encrypted volumes"}
 	}
 
 	vbconfig := viperblock.VB{

@@ -2,11 +2,11 @@
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
-// Stage 3 round-trip smoke tests for the decrypt-on-read paths. The
-// comprehensive matrix (tamper detection, cross-volume swap, in-place
-// replay, snapshot-clone source identity, magic-bump rejection, property
-// tests) lands in Stage 5; these are the minimum to gate that the read
-// paths see plaintext after Stage 2 sealed it on write.
+// Round-trip smoke tests for the decrypt-on-read paths — the minimum to
+// gate that reads see plaintext after the write path sealed it. Deeper
+// coverage (tamper detection, cross-volume swap, in-place replay,
+// snapshot-clone source identity, magic-bump rejection, property tests)
+// lives in the dedicated tamper and snapshot test files.
 
 package viperblock
 

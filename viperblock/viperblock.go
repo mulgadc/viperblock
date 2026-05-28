@@ -82,7 +82,7 @@ type VBState struct {
 	// encrypted volume. SeqNumHighWater is the durable upper bound on the
 	// next SeqNum the volume may hand out post-restart — crash-safe nonce
 	// uniqueness. StateSeqNum is a monotonic SaveState generation counter
-	// used by the metadata HMAC (Stage 4) and to break ties in LoadState.
+	// used by the metadata HMAC and to break ties in LoadState.
 	// KeyFingerprint surfaces master-key mismatch at Open with a clear error
 	// instead of silent decrypt failure.
 	EncryptionEnabled bool    `json:"EncryptionEnabled,omitempty"`
@@ -181,8 +181,8 @@ type VB struct {
 	// refuses. volumeNameHash is SHA256(VolumeName) cached at New for AAD
 	// construction. VolumeUUID is the per-volume nonce subspace, persisted in
 	// VBState. SourceVolumeUUID / sourceVolumeNameHash carry the source
-	// volume's identity when this is a snapshot clone (Stage 3 populates
-	// them from SnapshotState; Stage 1 leaves them zero).
+	// volume's identity when this is a snapshot clone, populated from
+	// SnapshotState on OpenFromSnapshot and zero otherwise.
 	MasterKey            *masterkey.Key
 	EncryptionEnabled    bool
 	aead                 cipher.AEAD
@@ -210,9 +210,9 @@ type VB struct {
 	seqNumHighWaterMu sync.Mutex
 
 	// nextStateSeqNum is the monotonic SaveState generation counter mirrored
-	// from VBState.StateSeqNum. Each SaveState increments it before marshal.
-	// Stage 4 binds the value into the VBState metadata HMAC; Stage 1 uses
-	// it only for LoadState tie-breaking.
+	// from VBState.StateSeqNum. Each SaveState increments it before marshal;
+	// the value is bound into the VBState metadata HMAC and breaks ties when
+	// LoadState picks between local and backend copies.
 	nextStateSeqNum atomic.Uint64
 }
 
@@ -1517,9 +1517,9 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 //
 //	[StartBlock(8) | NumBlocks(2) | ObjectID(8) | ObjectOffset(4) | SeqNum(8) | CRC32(4)]
 //
-// SeqNum was added to drive nonce + AAD reconstruction on the decrypt path
-// (Stage 3); the field is populated unconditionally so encrypted and
-// unencrypted volumes share a single checkpoint format. Pre-encryption
+// SeqNum drives nonce + AAD reconstruction on the decrypt path; the field
+// is populated unconditionally so encrypted and unencrypted volumes share
+// a single checkpoint format. Pre-encryption
 // checkpoints written under the previous 26-byte layout are unreadable by
 // post-cutover binaries — volumes must be recreated. CRC32 is retained on
 // metadata because the checkpoint stays plaintext (not AEAD-sealed).
@@ -2768,8 +2768,8 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 // For encrypted volumes, SaveState bootstraps the per-volume nonce subspace
 // on first call: if VolumeUUID is zero we mint it via crypto/rand and seed
 // SeqNumHighWater = seqNumReservation. Subsequent calls preserve the existing
-// UUID and advance StateSeqNum monotonically (Stage 4 binds the value into
-// the metadata HMAC). The local write is atomic — tmp file + fsync + rename
+// UUID and advance StateSeqNum monotonically (the value is bound into the
+// metadata HMAC). The local write is atomic — tmp file + fsync + rename
 // + fsync parent dir — so a crash mid-persist cannot leave a torn config.json
 // that would let reserveSeqNum re-hand-out values on restart.
 func (vb *VB) SaveState() error {
@@ -2810,7 +2810,7 @@ func (vb *VB) SaveState() error {
 		SeqNumHighWater:     vb.seqNumHighWater.Load(),
 	}
 
-	if vb.EncryptionEnabled && vb.MasterKey != nil {
+	if vb.EncryptionEnabled {
 		state.KeyFingerprint = vb.MasterKey.Fingerprint
 	}
 
@@ -2999,12 +2999,11 @@ func (vb *VB) LoadState() error {
 		if vb.MasterKey == nil {
 			return fmt.Errorf("%w: volume %s requires master key", ErrEncryptionMismatch, vb.VolumeName)
 		}
-		if state.KeyFingerprint != "" && state.KeyFingerprint != vb.MasterKey.Fingerprint {
+		if state.KeyFingerprint != vb.MasterKey.Fingerprint {
 			return fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
 				ErrEncryptionMismatch, vb.VolumeName, state.KeyFingerprint, vb.MasterKey.Fingerprint)
 		}
 		vb.VolumeUUID = state.VolumeUUID
-		vb.volumeNameHash = computeVolumeNameHash(state.VolumeName)
 		vb.SeqNum.Store(state.SeqNumHighWater)
 		vb.seqNumHighWater.Store(state.SeqNumHighWater)
 		if err := vb.bumpSeqNumHighWater(); err != nil {
@@ -3120,7 +3119,7 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 		if err := json.Unmarshal(peekJSON, &peek); err != nil {
 			return state, fmt.Errorf("%w: VBState peek parse: %w", ErrIntegrity, err)
 		}
-		if peek.KeyFingerprint != "" && peek.KeyFingerprint != vb.MasterKey.Fingerprint {
+		if peek.KeyFingerprint != vb.MasterKey.Fingerprint {
 			return state, fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
 				ErrEncryptionMismatch, vb.VolumeName, peek.KeyFingerprint, vb.MasterKey.Fingerprint)
 		}

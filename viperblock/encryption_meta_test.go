@@ -2,7 +2,7 @@
 // Use of this source code is governed by an Apache 2.0 license
 // that can be found in the LICENSE file.
 
-// Stage 5 metadata HMAC tests. Closes the cross-volume metadata pivot
+// Metadata HMAC tests. Closes the cross-volume metadata pivot
 // critical: a backend writer cannot substitute volume A's tagged
 // VBState/SnapshotState into volume B's prefix, cannot bit-flip the
 // JSON, and cannot rollback to an older authentic blob without losing
