@@ -2406,10 +2406,16 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 		for {
 			record := make([]byte, recordSize)
 			if _, err := io.ReadFull(f, record); err != nil {
-				if err != io.EOF && err != io.ErrUnexpectedEOF {
-					slog.Warn("WAL recovery: I/O error reading record, stopping", "file", filename, "error", err, "valid_records_so_far", len(blocks))
+				// Tail tear: the last record was only partially written
+				// before a crash. Same fail-tolerant posture as the
+				// legacy CRC path — stop replay and return what we have.
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
 				}
-				break
+				// Any other I/O error means we can't be sure whether
+				// the remainder is a tear or tamper; keep the WAL for
+				// retry rather than dropping records on the floor.
+				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: read record: %w", filename, err)
 			}
 
 			seqNum := binary.BigEndian.Uint64(record[0:8])
@@ -2420,8 +2426,11 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 			aad := makeAAD(vb.volumeNameHash, blockNum, seqNum)
 			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad)
 			if err != nil {
-				slog.Warn("WAL recovery: aead.Open failed, stopping read", "file", filename, "block", blockNum, "seqNum", seqNum, "valid_records_so_far", len(blocks))
-				break
+				// AEAD failure on a fully-read record is tamper, not
+				// tear. Surface as ErrIntegrity so RecoverLocalWALs
+				// keeps the file (no silent truncation of recovery).
+				slog.Error("WAL recovery: aead.Open failed", "file", filename, "block", blockNum, "seqNum", seqNum, "valid_records_so_far", len(blocks))
+				return nil, 0, fmt.Errorf("readWALFileForRecovery: %w: WAL record block %d seqNum %d in %s: %v", ErrIntegrity, blockNum, seqNum, filename, err)
 			}
 
 			blocks = append(blocks, Block{
