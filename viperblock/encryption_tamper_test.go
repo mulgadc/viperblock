@@ -16,6 +16,7 @@ package viperblock
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -394,10 +395,63 @@ func TestEncryptedWAL_PreEncryptionMagicRejected(t *testing.T) {
 
 	err = env.vb.WriteWALToChunk(true)
 	require.Error(t, err, "VBWL magic must be rejected under encryption")
-	// Production returns "magic mismatch"; we don't constrain the
-	// exact text but it must not silently succeed and must not return
-	// an unrelated error like ErrZeroBlock.
+	// Under encryption, the magic mismatch must surface as
+	// ErrPreEncryptionFormat so callers (and operators) get an
+	// actionable migration signal rather than an opaque "magic
+	// mismatch" or a deep ErrIntegrity from a downstream AEAD open.
+	assert.ErrorIs(t, err, ErrPreEncryptionFormat)
 	assert.Contains(t, err.Error(), "magic")
+}
+
+// TestEncryptedChunk_PreEncryptionMagicRejected — an encrypted runtime
+// opening a chunk file that still carries the legacy VBCH magic must
+// surface ErrPreEncryptionFormat before any AEAD-open is attempted on
+// the body. Without this preflight, the chunk read path would feed
+// pre-encryption plaintext bytes to aead.Open and return a generic
+// ErrIntegrity, leaving operators with no actionable migration cue.
+func TestEncryptedChunk_PreEncryptionMagicRejected(t *testing.T) {
+	env := newEncryptedTamperEnv(t, "vol-chunk-vbch", testKey(t, 0x42))
+
+	plaintext := make([]byte, env.blockSize)
+	_, err := rand.Read(plaintext)
+	require.NoError(t, err)
+	env.writeAndChunk(t, 0, plaintext)
+
+	// Bypass caches so the next Read hits the backend (and therefore
+	// the magic preflight).
+	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
+	env.vb.UseBlockStore = false
+	env.vb.BlocksToObject.mu.Lock()
+	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+		StartBlock:   0,
+		NumBlocks:    1,
+		ObjectID:     0,
+		ObjectOffset: uint32(env.blockOffset(0)),
+		SeqNum:       1,
+	}
+	env.vb.BlocksToObject.mu.Unlock()
+
+	// Rewrite the chunk file's first 4 bytes to the legacy VBCH magic
+	// in place. The body stays valid VBCE ciphertext, but the
+	// preflight must reject before any decrypt is attempted.
+	chunkFile := env.chunkPath(env.vb.VolumeName, 0)
+	raw, err := os.ReadFile(chunkFile)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(raw), 4)
+	copy(raw[:4], []byte{'V', 'B', 'C', 'H'})
+	require.NoError(t, os.WriteFile(chunkFile, raw, 0600))
+
+	// Clear the magic-preflight memo so the preflight re-reads.
+	env.vb.chunkMagicChecked.Delete(fmt.Sprintf("%s:%d", env.vb.VolumeName, uint64(0)))
+
+	_, err = env.vb.ReadAt(0, uint64(env.blockSize))
+	require.Error(t, err, "VBCH chunk magic must be rejected under encryption")
+	assert.ErrorIs(t, err, ErrPreEncryptionFormat,
+		"chunk magic mismatch must surface as ErrPreEncryptionFormat, not a generic ErrIntegrity")
+	// Should NOT be ErrIntegrity — the whole point of the preflight is
+	// to avoid the AEAD-open path on pre-encryption data.
+	assert.False(t, errors.Is(err, ErrIntegrity),
+		"preflight must reject before AEAD open; got integrity error instead")
 }
 
 // TestEncrypted_PropertyRoundTrip — randomised write/read round-trip

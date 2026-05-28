@@ -191,6 +191,16 @@ type VB struct {
 	SourceVolumeUUID     [4]byte
 	sourceVolumeNameHash [32]byte
 
+	// chunkMagicChecked memoises the per-(volume,objectID) result of the chunk
+	// magic preflight in checkChunkMagic. The chunk-read fast path is hit once
+	// per consecutive run; without this cache every coalesced run would issue
+	// an extra 4-byte backend Read just to validate the header. Keyed by
+	// "<volumeName>:<objectID>" so snapshot-clone reads against the source
+	// volume's chunks don't collide with our own. Stores struct{} for
+	// validated-OK; errors are not cached (transient backend failures must
+	// re-try).
+	chunkMagicChecked sync.Map
+
 	// SeqNumHighWater is the in-memory mirror of VBState.SeqNumHighWater —
 	// the largest SeqNum that may be handed out without persisting a new
 	// VBState. reserveSeqNum hands out values lock-free via SeqNum.Add until
@@ -422,6 +432,15 @@ var ErrEncryptionMismatch = errors.New("viperblock: encryption configuration mis
 // one volume's chunk into another's prefix, or replayed an older authentic
 // ciphertext at the same offset. Callers must fail-closed on any wrap.
 var ErrIntegrity = errors.New("viperblock: integrity check failed")
+
+// ErrPreEncryptionFormat is returned when an encrypted runtime
+// (EncryptionEnabled=true) encounters an on-disk artifact that still carries
+// the pre-encryption magic — VBCH for chunks, VBWL for the single-file WAL.
+// Without this dedicated signal the chunk read path would try to AEAD-open
+// plaintext bytes and surface a generic ErrIntegrity, leaving operators with
+// no actionable migration cue. Callers must refuse to open the volume and
+// direct the operator to the migration tool before retrying.
+var ErrPreEncryptionFormat = errors.New("viperblock: chunk has pre-encryption format (VBCH) but volume opened with EncryptionEnabled=true; migrate via the viperblock migration tool before re-opening")
 
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
@@ -1849,7 +1868,14 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 	}
 
 	if !bytes.Equal(headers[:4], vb.WAL.WALMagic[:]) {
-		return fmt.Errorf("magic mismatch")
+		// Under encryption a VBWL header here means a pre-encryption WAL
+		// file is being replayed by an encrypted runtime; surface the
+		// dedicated migration error so callers can route the operator to
+		// the migration tool instead of an opaque "magic mismatch".
+		if vb.EncryptionEnabled && bytes.Equal(headers[:4], []byte{'V', 'B', 'W', 'L'}) {
+			return fmt.Errorf("%w: WAL magic mismatch in %s (file=VBWL, runtime=VBWE)", ErrPreEncryptionFormat, filename)
+		}
+		return fmt.Errorf("WAL magic mismatch in %s: got %q, expected %q", filename, headers[:4], vb.WAL.WALMagic[:])
 	}
 
 	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
@@ -2383,7 +2409,10 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	}
 
 	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
-		return nil, 0, fmt.Errorf("WAL magic mismatch in %s", filename)
+		if vb.EncryptionEnabled && bytes.Equal(header[:4], []byte{'V', 'B', 'W', 'L'}) {
+			return nil, 0, fmt.Errorf("%w: WAL magic mismatch in %s (file=VBWL, runtime=VBWE)", ErrPreEncryptionFormat, filename)
+		}
+		return nil, 0, fmt.Errorf("WAL magic mismatch in %s: got %q, expected %q", filename, header[:4], vb.WAL.WALMagic[:])
 	}
 	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
 		return nil, 0, fmt.Errorf("WAL version mismatch in %s", filename)
@@ -2627,6 +2656,46 @@ func (vb *VB) RecoverLocalWALs() error {
 
 	slog.Info("WAL recovery: complete", "recovered_blocks", len(sortedBlocks))
 
+	return nil
+}
+
+// checkChunkMagic preflights the first 4 bytes of a chunk file before the
+// body decrypt path runs, so a pre-encryption volume opened under
+// EncryptionEnabled=true fails with a dedicated, actionable
+// ErrPreEncryptionFormat instead of a generic ErrIntegrity from aead.Open on
+// every read. The result is memoised in vb.chunkMagicChecked: hot read paths
+// (coalesced consecutive runs) hit one extra 4-byte backend Read per chunk
+// per process lifetime, not per run.
+//
+// volumeName parameterises the cache key so snapshot-clone reads of the
+// source volume's chunks (fetchBaseBlocksFromBackend, ReadFrom path) don't
+// collide with the local volume's entries. read is a function so the caller
+// can pass the right backend method — Backend.Read for self, Backend.ReadFrom
+// for source-volume reads.
+func (vb *VB) checkChunkMagic(volumeName string, objectID uint64, read func(offset, length uint32) ([]byte, error)) error {
+	if !vb.EncryptionEnabled {
+		return nil
+	}
+	key := fmt.Sprintf("%s:%d", volumeName, objectID)
+	if _, ok := vb.chunkMagicChecked.Load(key); ok {
+		return nil
+	}
+	header, err := read(0, 4)
+	if err != nil {
+		return fmt.Errorf("chunk magic preflight: read object %d: %w", objectID, err)
+	}
+	if len(header) < 4 {
+		return fmt.Errorf("chunk magic preflight: short header on object %d (got %d bytes)", objectID, len(header))
+	}
+	preEncrypted := [4]byte{'V', 'B', 'C', 'H'}
+	encrypted := [4]byte{'V', 'B', 'C', 'E'}
+	if bytes.Equal(header[:4], preEncrypted[:]) {
+		return fmt.Errorf("%w (volume=%q objectID=%d)", ErrPreEncryptionFormat, volumeName, objectID)
+	}
+	if !bytes.Equal(header[:4], encrypted[:]) {
+		return fmt.Errorf("chunk magic preflight: object %d in volume %q has unknown magic %q", objectID, volumeName, header[:4])
+	}
+	vb.chunkMagicChecked.Store(key, struct{}{})
 	return nil
 }
 
@@ -3262,6 +3331,13 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
+		objectID := cb.ObjectID
+		if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, length uint32) ([]byte, error) {
+			return vb.Backend.Read(types.FileTypeChunk, objectID, off, length)
+		}); err != nil {
+			return nil, err
+		}
+
 		blockData, err := vb.Backend.Read(types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
 			return nil, err
@@ -3717,6 +3793,13 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
+		objectID := cb.ObjectID
+		if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, length uint32) ([]byte, error) {
+			return vb.Backend.Read(types.FileTypeChunk, objectID, off, length)
+		}); err != nil {
+			return err
+		}
+
 		blockData, err := vb.Backend.Read(types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
 			return err
@@ -3817,6 +3900,13 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
+
+		objectID := cb.ObjectID
+		if err := vb.checkChunkMagic(sourceVolume, objectID, func(off, length uint32) ([]byte, error) {
+			return vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, objectID, off, length)
+		}); err != nil {
+			return fmt.Errorf("ReadFrom source %s: %w", sourceVolume, err)
+		}
 
 		blockData, err := vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
