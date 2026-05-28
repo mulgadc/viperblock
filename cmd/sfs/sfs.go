@@ -105,7 +105,8 @@ func main() {
 		// Create a volume
 		err = sfs.CreateVolume(*vol, *volsize)
 		if err != nil {
-			fmt.Println(err)
+			slog.Error("sfs: CreateVolume failed", "error", err)
+			os.Exit(1)
 		}
 	}
 
@@ -161,7 +162,8 @@ func main() {
 	err = vb.LoadState()
 
 	if err != nil {
-		fmt.Println(err)
+		slog.Error("sfs: LoadState failed", "error", err)
+		os.Exit(1)
 	}
 
 	/*
