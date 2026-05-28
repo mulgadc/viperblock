@@ -46,6 +46,12 @@ var encryption_key_file string
 
 var disk []byte
 
+// loadedMasterKey is populated once in ConfigComplete from
+// -encryption-key-file / ENCRYPTION_KEY_FILE so per-connection Open does not
+// re-read the key file on every NBD client attach. nil iff encryption is
+// disabled for this plugin instance.
+var loadedMasterKey *masterkey.Key
+
 // NOTE: For profiling viperblock/nbdkit, use Linux perf instead of Go pprof.
 // Go's pprof does NOT work correctly when running as a CGO shared library.
 //
@@ -125,6 +131,23 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 	} else if host == "" {
 		return nbdkit.PluginError{Errmsg: "host parameter is required"}
 	}
+
+	// Resolve and load the master key once at plugin startup so per-NBD-
+	// connection Open avoids a disk read + permission check on every attach.
+	keyPath := encryption_key_file
+	if keyPath == "" {
+		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
+	}
+	if keyPath != "" {
+		mkey, err := masterkey.LoadShared(keyPath)
+		if err != nil {
+			return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load encryption key: %v", err)}
+		}
+		loadedMasterKey = mkey
+	}
+	if use_shardwal && loadedMasterKey != nil {
+		return nbdkit.PluginError{Errmsg: "shardwal is incompatible with encryption: sharded WAL is not supported on encrypted volumes"}
+	}
 	return nil
 }
 
@@ -144,27 +167,6 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		Host:       host,
 	}
 
-	// Resolve the encryption key path: explicit flag takes precedence over
-	// the ENCRYPTION_KEY_FILE env var so an operator running the daemon with
-	// the env set can still override per-instance.
-	keyPath := encryption_key_file
-	if keyPath == "" {
-		keyPath = os.Getenv("ENCRYPTION_KEY_FILE")
-	}
-
-	var mkey *masterkey.Key
-	if keyPath != "" {
-		var err error
-		mkey, err = masterkey.LoadShared(keyPath)
-		if err != nil {
-			return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load encryption key: %v", err)}
-		}
-	}
-
-	if use_shardwal && mkey != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: "shardwal is incompatible with encryption: sharded WAL is not supported on encrypted volumes"}
-	}
-
 	vbconfig := viperblock.VB{
 		VolumeName: volume,
 		VolumeSize: size,
@@ -174,8 +176,8 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 				Size: cache_size,
 			},
 		},
-		MasterKey:         mkey,
-		EncryptionEnabled: mkey != nil,
+		MasterKey:         loadedMasterKey,
+		EncryptionEnabled: loadedMasterKey != nil,
 	}
 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)

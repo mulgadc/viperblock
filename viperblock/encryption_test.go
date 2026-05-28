@@ -270,6 +270,42 @@ func TestReserveSeqNum_ConcurrentCallersSerializeHighWaterBumps(t *testing.T) {
 	assert.Zero(t, hw%seqNumReservation, "high-water advances in multiples of seqNumReservation")
 }
 
+// A failed SaveState in the high-water slow path must not publish the
+// speculative high-water to vb.seqNumHighWater. If it did, concurrent
+// fast-path callers would issue SeqNums above the persisted high-water; a
+// crash + restart would restore vb.SeqNum from the lower on-disk value and
+// re-issue the same SeqNums, causing AES-GCM nonce reuse under the same
+// (key, VolumeUUID, domain) triple (NIST SP 800-38D §8.3 — catastrophic).
+func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
+	key := testKey(t, 0x42)
+	vb := newFileBackedVB(t, "vol-faulty", key)
+	vb.BlockSize = DefaultBlockSize
+	require.NoError(t, vb.SaveState())
+
+	hwBefore := vb.seqNumHighWater.Load()
+
+	// Wedge both writeFileAtomic (local) and Backend.Write (file backend) by
+	// removing the directory both target. The next SaveState's tmp-file
+	// OpenFile fails immediately.
+	configDir := filepath.Join(vb.BaseDir, vb.GetVolume())
+	require.NoError(t, os.RemoveAll(configDir))
+
+	vb.SeqNum.Store(hwBefore + 5)
+	_, err := vb.reserveSeqNum(1)
+	require.Error(t, err, "reserveSeqNum must propagate SaveState failure")
+
+	assert.Equal(t, hwBefore, vb.seqNumHighWater.Load(),
+		"failed SaveState must not publish the speculative high-water")
+
+	// And after the failure is cleared, a successor reservation must persist
+	// and publish the same target hw — no skipped window, no double-count.
+	require.NoError(t, os.MkdirAll(configDir, 0700))
+	_, err = vb.reserveSeqNum(1)
+	require.NoError(t, err)
+	assert.Greater(t, vb.seqNumHighWater.Load(), hwBefore,
+		"successor reservation persists and publishes new high-water")
+}
+
 func TestSaveState_AtomicRenameLeavesNoTmp(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-atomic", key)

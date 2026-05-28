@@ -287,12 +287,11 @@ type ConsecutiveBlock struct {
 	ObjectID      uint64
 	ObjectOffset  uint32
 	// SeqNum is the chunk-write generation that sealed this block's
-	// ciphertext on the backend. On pre-coalesce per-block entries it is
-	// populated from BlockLookup.SeqNum (or BlockEntry.SeqNum on the
-	// BlockStore path). After coalescing, the head block's SeqNum is left
-	// here and per-block SeqNums for the full run land in SeqNums; on the
-	// decrypt path we iterate SeqNums to reconstruct each block's nonce +
-	// AAD. Unused on unencrypted reads.
+	// ciphertext, used on pre-coalesce per-block entries (NumBlocks=1)
+	// populated from BlockLookup.SeqNum or BlockEntry.SeqNum.
+	// After coalescing, SeqNums holds the per-block SeqNums for the full
+	// run and SeqNum is left zero — openChunkRun iterates SeqNums for nonce
+	// + AAD reconstruction. Unused on unencrypted reads.
 	SeqNum  uint64
 	SeqNums []uint64
 }
@@ -1893,8 +1892,10 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		// subsumes the dropped CRC32; aead.Open validates confidentiality
 		// and integrity in one pass.
 		recordSize := 40 + int(vb.BlockSize)
+		record := make([]byte, recordSize)
+		var aad [AADLen]byte
+		initAAD(&aad, vb.volumeNameHash)
 		for {
-			record := make([]byte, recordSize)
 			if _, err := io.ReadFull(pendingWAL2, record); err != nil {
 				if err == io.EOF {
 					break
@@ -1907,8 +1908,8 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 			blockLen := binary.BigEndian.Uint64(record[16:24])
 
 			nonce := makeNonce(seqNum, vb.VolumeUUID, DomainWAL)
-			aad := makeAAD(vb.volumeNameHash, blockNum, seqNum)
-			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad)
+			updateAAD(&aad, blockNum, seqNum)
+			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad[:])
 			if err != nil {
 				pos, _ := pendingWAL2.Seek(0, io.SeekCurrent)
 				slog.Error("WAL aead.Open failed", "filename", filename, "pos", pos, "block", blockNum, "seqNum", seqNum)
@@ -2114,6 +2115,8 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	if vb.EncryptionEnabled {
 		bs := int(vb.BlockSize)
 		sealed := make([]byte, 0, len(*matchedBlocks)*(bs+16))
+		var aad [AADLen]byte
+		initAAD(&aad, vb.volumeNameHash)
 		for i, mb := range *matchedBlocks {
 			start := i * bs
 			end := start + bs
@@ -2121,8 +2124,8 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 				return fmt.Errorf("createChunkFile: matchedBlocks/chunkBuffer length mismatch (block %d of %d, buffer %d bytes)", i, len(*matchedBlocks), len(*chunkBuffer))
 			}
 			nonce := makeNonce(mb.SeqNum, vb.VolumeUUID, DomainChunk)
-			aad := makeAAD(vb.volumeNameHash, mb.Block, mb.SeqNum)
-			sealed = vb.aead.Seal(sealed, nonce[:], (*chunkBuffer)[start:end], aad)
+			updateAAD(&aad, mb.Block, mb.SeqNum)
+			sealed = vb.aead.Seal(sealed, nonce[:], (*chunkBuffer)[start:end], aad[:])
 		}
 		bodyBuffer = &sealed
 	}
@@ -2432,8 +2435,10 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	// record (same fail-tolerant posture as the legacy CRC path).
 	if vb.EncryptionEnabled {
 		recordSize := 40 + int(vb.BlockSize)
+		record := make([]byte, recordSize)
+		var aad [AADLen]byte
+		initAAD(&aad, vb.volumeNameHash)
 		for {
-			record := make([]byte, recordSize)
 			if _, err := io.ReadFull(f, record); err != nil {
 				// Tail tear: the last record was only partially written
 				// before a crash. Same fail-tolerant posture as the
@@ -2452,8 +2457,8 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 			blockLen := binary.BigEndian.Uint64(record[16:24])
 
 			nonce := makeNonce(seqNum, vb.VolumeUUID, DomainWAL)
-			aad := makeAAD(vb.volumeNameHash, blockNum, seqNum)
-			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad)
+			updateAAD(&aad, blockNum, seqNum)
+			plain, err := vb.aead.Open(nil, nonce[:], record[24:], aad[:])
 			if err != nil {
 				// AEAD failure on a fully-read record is tamper, not
 				// tear. Surface as ErrIntegrity so RecoverLocalWALs
@@ -2729,16 +2734,18 @@ func (vb *VB) openChunkRun(ciphertext []byte, cb ConsecutiveBlock, volumeUUID [4
 	if len(cb.SeqNums) != int(cb.NumBlocks) {
 		return fmt.Errorf("openChunkRun: SeqNums length %d does not match NumBlocks %d", len(cb.SeqNums), cb.NumBlocks)
 	}
+	var aad [AADLen]byte
+	initAAD(&aad, volumeNameHash)
 	for k := 0; k < int(cb.NumBlocks); k++ {
 		seqNum := cb.SeqNums[k]
 		blockNum := cb.StartBlock + uint64(k)
 		nonce := makeNonce(seqNum, volumeUUID, DomainChunk)
-		aad := makeAAD(volumeNameHash, blockNum, seqNum)
+		updateAAD(&aad, blockNum, seqNum)
 		sealedStart := k * sealedStride
 		sealedEnd := sealedStart + sealedStride
 		dstStart := k * bs
 		dstEnd := dstStart + bs
-		if _, err := vb.aead.Open(dst[dstStart:dstStart:dstEnd], nonce[:], ciphertext[sealedStart:sealedEnd], aad); err != nil {
+		if _, err := vb.aead.Open(dst[dstStart:dstStart:dstEnd], nonce[:], ciphertext[sealedStart:sealedEnd], aad[:]); err != nil {
 			return fmt.Errorf("%w: chunk %d block %d (seqNum %d): %w", ErrIntegrity, cb.ObjectID, blockNum, seqNum, err)
 		}
 	}
@@ -2772,10 +2779,11 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 // metadata HMAC). The local write is atomic — tmp file + fsync + rename
 // + fsync parent dir — so a crash mid-persist cannot leave a torn config.json
 // that would let reserveSeqNum re-hand-out values on restart.
+// SaveState persists VBState with the currently-committed SeqNumHighWater.
+// Bootstraps VolumeUUID + initial high-water on first call of an encrypted
+// volume — safe because Open serializes its bootstrap SaveState before any
+// data writer can run.
 func (vb *VB) SaveState() error {
-	vb.BlocksToObject.mu.Lock()
-	defer vb.BlocksToObject.mu.Unlock()
-
 	if vb.EncryptionEnabled {
 		var zero [4]byte
 		if vb.VolumeUUID == zero {
@@ -2785,6 +2793,32 @@ func (vb *VB) SaveState() error {
 			vb.seqNumHighWater.Store(seqNumReservation)
 		}
 	}
+	return vb.saveStateWithHighWater(vb.seqNumHighWater.Load())
+}
+
+// saveStateWithHighWater persists VBState with an explicit SeqNumHighWater
+// value rather than reading vb.seqNumHighWater. reserveSeqNum needs to durably
+// commit a NEW high-water before publishing it via vb.seqNumHighWater.Store —
+// publishing first and then persisting would race the lock-free fast path:
+// concurrent writers observing the speculative in-memory value would issue
+// SeqNums above the persisted high-water, and a crash before persist
+// completion would let those values be re-issued on restart (catastrophic
+// AES-GCM nonce reuse, NIST SP 800-38D §8.3).
+func (vb *VB) saveStateWithHighWater(highWater uint64) error {
+	persisted, err := vb.persistStateLocal(highWater)
+	if err != nil {
+		return err
+	}
+	return vb.pushStateToBackend(persisted)
+}
+
+// persistStateLocal marshals VBState, seals it for encrypted volumes, and
+// fsyncs the local config.json. Returns the persisted bytes so callers can
+// hand them to pushStateToBackend without re-marshaling. Crash-safety lives
+// in this step: when it returns nil, the new state is durable on local disk.
+func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
+	vb.BlocksToObject.mu.Lock()
+	defer vb.BlocksToObject.mu.Unlock()
 
 	walNum := vb.WAL.WallNum.Load()
 	if vb.UseShardedWAL && vb.ShardedWAL != nil {
@@ -2807,7 +2841,7 @@ func (vb *VB) SaveState() error {
 		SourceVolumeName:    vb.SourceVolumeName,
 		EncryptionEnabled:   vb.EncryptionEnabled,
 		VolumeUUID:          vb.VolumeUUID,
-		SeqNumHighWater:     vb.seqNumHighWater.Load(),
+		SeqNumHighWater:     highWater,
 	}
 
 	if vb.EncryptionEnabled {
@@ -2818,15 +2852,14 @@ func (vb *VB) SaveState() error {
 
 	jsonData, err := json.Marshal(state)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Encrypted volumes append a 16-byte AES-GCM tag binding the JSON bytes to
-	// (volumeNameHash, "vbstate", StateSeqNum). Closes the cross-volume
-	// metadata pivot: an attacker swapping volume A's config.json into volume
-	// B's prefix is rejected at LoadStateRequest because the AAD
-	// reconstruction uses vb.volumeNameHash (our own identity), which differs
-	// from the seal-time hash for volume A.
+	// (volumeNameHash, "vbstate", StateSeqNum). An attacker swapping volume
+	// A's config.json into volume B's prefix is rejected at LoadStateRequest
+	// because the AAD reconstruction uses vb.volumeNameHash (our own
+	// identity), which differs from the seal-time hash for volume A.
 	persisted := jsonData
 	if vb.EncryptionEnabled {
 		nonce := makeNonce(state.StateSeqNum, vb.VolumeUUID, DomainVBStateMeta)
@@ -2836,16 +2869,20 @@ func (vb *VB) SaveState() error {
 
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	if err := writeFileAtomic(filename, persisted, 0600); err != nil {
-		return fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
+		return nil, fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
 	}
 
-	// Next, write to the backend.
+	return persisted, nil
+}
+
+// pushStateToBackend writes pre-marshaled VBState bytes to the backend (S3
+// PUT for the S3 backend). Safe to call without seqNumHighWaterMu held —
+// LoadState reconciles local vs backend by max(SeqNum), so a stale or
+// in-flight backend write is non-fatal as long as the local fsync from
+// persistStateLocal succeeded.
+func (vb *VB) pushStateToBackend(persisted []byte) error {
 	headers := []byte{}
-	if err := vb.Backend.Write(types.FileTypeConfig, 0, &headers, &persisted); err != nil {
-		return err
-	}
-
-	return nil
+	return vb.Backend.Write(types.FileTypeConfig, 0, &headers, &persisted)
 }
 
 // writeFileAtomic writes data to path atomically via tmp + fsync + rename +
@@ -3049,18 +3086,38 @@ func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
 		return start, nil
 	}
 	vb.seqNumHighWaterMu.Lock()
-	defer vb.seqNumHighWaterMu.Unlock()
 	// Re-check under the mutex: another caller may have advanced past us.
 	hw := vb.seqNumHighWater.Load()
 	if end <= hw {
+		vb.seqNumHighWaterMu.Unlock()
 		return start, nil
 	}
 	for end > hw {
 		hw += seqNumReservation
 	}
+	// Persist locally BEFORE publishing the new hw to vb.seqNumHighWater.
+	// While we hold the mutex, concurrent fast-path callers checking
+	// vb.seqNumHighWater see the OLD value: below it they proceed safely
+	// within the already-persisted range; above it they take the slow path
+	// and block here. Either way, no SeqNum above the durable hw is issued.
+	// If persistStateLocal fails, hw is never published — recovery is just
+	// "retry on next reserve."
+	persisted, err := vb.persistStateLocal(hw)
+	if err != nil {
+		vb.seqNumHighWaterMu.Unlock()
+		return 0, fmt.Errorf("reserveSeqNum: persistStateLocal: %w", err)
+	}
 	vb.seqNumHighWater.Store(hw)
-	if err := vb.SaveState(); err != nil {
-		return 0, fmt.Errorf("reserveSeqNum: SaveState: %w", err)
+	vb.seqNumHighWaterMu.Unlock()
+
+	// Backend push happens outside the mutex — the S3 PUT can be tens to
+	// hundreds of ms and would otherwise gate every reservation-window
+	// crossing. Crash-safety lives in the local fsync above; LoadState picks
+	// max(local, backend) SeqNum so a lagged or failed backend write is
+	// recoverable on next SaveState.
+	if perr := vb.pushStateToBackend(persisted); perr != nil {
+		slog.Warn("reserveSeqNum: backend state push failed; local fsync is durable",
+			"volume", vb.VolumeName, "highWater", hw, "err", perr)
 	}
 	return start, nil
 }
@@ -3071,9 +3128,20 @@ func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
 // SeqNum that overlaps the pre-crash range.
 func (vb *VB) bumpSeqNumHighWater() error {
 	vb.seqNumHighWaterMu.Lock()
-	defer vb.seqNumHighWaterMu.Unlock()
-	vb.seqNumHighWater.Add(seqNumReservation)
-	return vb.SaveState()
+	newHW := vb.seqNumHighWater.Load() + seqNumReservation
+	persisted, err := vb.persistStateLocal(newHW)
+	if err != nil {
+		vb.seqNumHighWaterMu.Unlock()
+		return err
+	}
+	vb.seqNumHighWater.Store(newHW)
+	vb.seqNumHighWaterMu.Unlock()
+
+	if perr := vb.pushStateToBackend(persisted); perr != nil {
+		slog.Warn("bumpSeqNumHighWater: backend state push failed; local fsync is durable",
+			"volume", vb.VolumeName, "highWater", newHW, "err", perr)
+	}
+	return nil
 }
 
 // Query the local state from file or the backend
@@ -3309,7 +3377,6 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
-			SeqNum:        consecutiveBlocks[i].SeqNum,
 			SeqNums:       seqNums,
 		})
 	}
@@ -3775,7 +3842,6 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
-			SeqNum:        consecutiveBlocks[i].SeqNum,
 			SeqNums:       seqNums,
 		})
 	}
@@ -3883,7 +3949,6 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
-			SeqNum:        consecutiveBlocks[i].SeqNum,
 			SeqNums:       seqNums,
 		})
 	}
