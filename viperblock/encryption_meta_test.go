@@ -130,26 +130,29 @@ func TestVBStateMeta_RollbackLosesTieToFsync(t *testing.T) {
 	require.NoError(t, vb.Backend.Init())
 	vb.BlockSize = DefaultBlockSize
 
-	// v1: first SaveState. Snapshot the backend blob.
-	require.NoError(t, vb.SaveState())
-	// Force a write to bump SeqNum on disk so v1 vs v2 differ by more
-	// than just StateSeqNum.
-	vb.SeqNum.Store(100)
+	// v1: first SaveState. Snapshot the backend blob immediately so
+	// v1Backend captures the true v1 bytes (SeqNum=0), not a later rev.
 	require.NoError(t, vb.SaveState())
 	v1Backend, err := vb.Backend.Read(types.FileTypeConfig, 0, 0, 0)
 	require.NoError(t, err)
+	// v1Backend now holds the sealed v1 blob (SeqNum=0, StateSeqNum=1).
 
-	// v2: bump SeqNum and persist again.
+	// v2: bump SeqNum and persist (overwrites backend and local fsync).
+	vb.SeqNum.Store(100)
+	require.NoError(t, vb.SaveState())
+
+	// v3: bump SeqNum again and persist (overwrites backend and local
+	// fsync). After this, both backend and local hold v3 (SeqNum=200).
 	vb.SeqNum.Store(200)
 	require.NoError(t, vb.SaveState())
 
 	// Roll the BACKEND copy back to v1, leave the local fsync'd copy at
-	// v2. LoadState's tie-break by SeqNum (or StateSeqNum) must prefer
-	// local v2; HMAC verify of v2 succeeds.
+	// v3. LoadState's tie-break by SeqNum (or StateSeqNum) must prefer
+	// the local higher-SeqNum copy; HMAC verify of v3 succeeds.
 	emptyHeaders := []byte{}
 	require.NoError(t, vb.Backend.Write(types.FileTypeConfig, 0, &emptyHeaders, &v1Backend))
 
-	// Reopen — must succeed and surface the v2 SeqNum, proving the
+	// Reopen — must succeed and surface the v3 SeqNum, proving the
 	// backend rollback lost the tie-break.
 	vb2 := newFileBackedVB(t, "vol-rollback", key)
 	vb2.BaseDir = vb.BaseDir
