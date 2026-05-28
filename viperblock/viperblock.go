@@ -967,6 +967,18 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 	endOffset := offset + dataLen
 	endBlock := (endOffset - 1) / blockSize
 
+	// Reserve a contiguous SeqNum batch up-front. reserveSeqNum may call
+	// SaveState (which takes BlocksToObject.mu), so it must run before we
+	// acquire vb.Writes.mu below to keep the lock order consistent. We issue
+	// start+1..start+n to preserve the legacy "atomic.Add(1) post-increment"
+	// semantics (issued SeqNums are >= 1; SeqNum == 0 reads as uninitialised
+	// in BlockStore).
+	start, err := vb.reserveSeqNum(endBlock - startBlock + 1)
+	if err != nil {
+		return err
+	}
+	nextSeqNum := start + 1
+
 	var writes []Block
 
 	for b := startBlock; b <= endBlock; b++ {
@@ -1008,11 +1020,12 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 		copy(blockData[writeStart:writeEnd], data[blockStart+writeStart-offset:blockStart+writeEnd-offset])
 
 		writes = append(writes, Block{
-			SeqNum: vb.SeqNum.Add(1),
+			SeqNum: nextSeqNum,
 			Block:  b,
 			Len:    blockSize,
 			Data:   blockData,
 		})
+		nextSeqNum++
 	}
 
 	// Thread-safe write into memory buffer
@@ -1052,6 +1065,18 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 
 	//slog.Info("\tVBWRITE:", "blockRequests", blockRequests, "block", block, "blockLen", blockLen)
 
+	// Reserve a contiguous SeqNum batch up-front. reserveSeqNum may call
+	// SaveState (which takes BlocksToObject.mu), so it must run before we
+	// acquire vb.Writes.mu below to keep the lock order consistent. We issue
+	// start+1..start+n to preserve the legacy "atomic.Add(1) post-increment"
+	// semantics (issued SeqNums are >= 1; SeqNum == 0 reads as uninitialised
+	// in BlockStore).
+	start, err := vb.reserveSeqNum(blockRequests)
+	if err != nil {
+		return err
+	}
+	seqNum := start + 1
+
 	vb.Writes.mu.Lock()
 
 	// Loop through each block request
@@ -1066,9 +1091,6 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 
 		//slog.Info("\t\tBLOCKWRITE:", "currentBlock", currentBlock, "start", start, "end", end, "i", i)
 
-		// Write raw data received, first to the main memory Block, which will be flushed to the WAL
-		seqNum := vb.SeqNum.Add(1)
-
 		vb.Writes.Blocks = append(vb.Writes.Blocks, Block{
 			SeqNum: seqNum,
 			Block:  currentBlock,
@@ -1081,6 +1103,8 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 		}
 
 		//slog.Info("WRITE:", "seqNum", seqNum, "BLOCK:", currentBlock, "start", start, "end", end)
+
+		seqNum++
 	}
 
 	vb.Writes.mu.Unlock()
@@ -2908,9 +2932,10 @@ func (vb *VB) LoadState() error {
 // reserveSeqNum hands out n consecutive sequence numbers for the data path.
 // Common path is lock-free atomic.Add; the high-water is checked after the
 // fact and only when crossed do we take seqNumHighWaterMu and SaveState to
-// advance it. Stage 1 wires the helper into LoadState's startup reservation
-// only — Stage 2 plugs it into WriteWAL/createChunkFile in place of the
-// existing vb.SeqNum.Add calls. Refuses past MaxSeqNum (56-bit nonce slot).
+// advance it. Refuses past MaxSeqNum (56-bit nonce slot).
+//
+// Lock order: callers must NOT hold BlocksToObject.mu — the slow path takes
+// seqNumHighWaterMu then calls SaveState, which acquires BlocksToObject.mu.
 //
 // Unencrypted volumes fall through to plain atomic.Add — the high-water is a
 // nonce-uniqueness mechanism and is irrelevant when no nonce exists.
