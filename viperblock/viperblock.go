@@ -1155,8 +1155,14 @@ func (vb *VB) flushLocked() error {
 	flushBlocks := make([]Block, len(vb.Writes.Blocks))
 	copy(flushBlocks, vb.Writes.Blocks)
 
-	// Map to track successfully flushed blocks
-	flushed := make(map[uint64]uint64) // block -> seqnum
+	// flushed maps block number -> latest SeqNum that landed in the WAL,
+	// used to filter vb.Writes.Blocks and feed PendingBackendWrites. It
+	// dedupes by block number, so its cardinality CANNOT be used to detect
+	// partial flushes: when a hot block is rewritten N times in a window,
+	// N successful WriteWAL calls collapse into one map entry. successCount
+	// tracks records persisted, which is what "partial flush" actually means.
+	flushed := make(map[uint64]uint64)
+	successCount := 0
 
 	for _, block := range flushBlocks {
 		if err := vb.WriteWAL(block); err != nil {
@@ -1164,7 +1170,7 @@ func (vb *VB) flushLocked() error {
 			break
 		}
 
-		// Record successful flush
+		successCount++
 		flushed[block.Block] = block.SeqNum
 
 		// Mark block as Pending in BlockStore (Hot -> Pending transition)
@@ -1178,8 +1184,6 @@ func (vb *VB) flushLocked() error {
 		remaining := make([]Block, 0)
 		for _, b := range vb.Writes.Blocks {
 			if _, ok := flushed[b.Block]; !ok {
-				//slog.Info("REMAINING:", "block", b.Block, "seqnum", b.SeqNum)
-				// Either this block wasn't flushed, or it was rewritten after flush started
 				remaining = append(remaining, b)
 			}
 		}
@@ -1196,8 +1200,8 @@ func (vb *VB) flushLocked() error {
 	}
 	vb.PendingBackendWrites.mu.Unlock()
 
-	if len(flushed) < len(flushBlocks) {
-		return fmt.Errorf("partial flush: %d of %d blocks flushed", len(flushed), len(flushBlocks))
+	if successCount < len(flushBlocks) {
+		return fmt.Errorf("partial flush: %d of %d records flushed", successCount, len(flushBlocks))
 	}
 
 	return nil
@@ -1223,8 +1227,9 @@ func (vb *VB) flushLockedSharded() error {
 
 	// Write to each shard in parallel
 	type shardError struct {
-		err     error
-		flushed map[uint64]uint64
+		err          error
+		flushed      map[uint64]uint64
+		successCount int
 	}
 	results := make([]shardError, NumShards)
 	var wg sync.WaitGroup
@@ -1238,13 +1243,16 @@ func (vb *VB) flushLockedSharded() error {
 		go func(shardID int) {
 			defer wg.Done()
 			flushed := make(map[uint64]uint64)
+			successCount := 0
 			for _, block := range shardGroups[shardID] {
 				if err := vb.WriteShardedWAL(block); err != nil {
 					slog.Error("ERROR FLUSHING SHARD:", "shard", shardID, "block", block.Block, "error", err)
 					results[shardID].err = err
 					results[shardID].flushed = flushed
+					results[shardID].successCount = successCount
 					return
 				}
+				successCount++
 				flushed[block.Block] = block.SeqNum
 
 				if vb.UseBlockStore && vb.BlockStore != nil {
@@ -1252,15 +1260,20 @@ func (vb *VB) flushLockedSharded() error {
 				}
 			}
 			results[shardID].flushed = flushed
+			results[shardID].successCount = successCount
 		}(i)
 	}
 	wg.Wait()
 
-	// Merge flushed maps from all shards
+	// Merge flushed maps from all shards. allFlushed dedupes by block number
+	// so its cardinality CANNOT be used to detect partial flushes — see
+	// flushLocked. totalSuccess sums records persisted per shard.
 	allFlushed := make(map[uint64]uint64)
 	var firstErr error
+	totalSuccess := 0
 	for i := range NumShards {
 		maps.Copy(allFlushed, results[i].flushed)
+		totalSuccess += results[i].successCount
 		if results[i].err != nil && firstErr == nil {
 			firstErr = results[i].err
 		}
@@ -1287,7 +1300,7 @@ func (vb *VB) flushLockedSharded() error {
 	vb.PendingBackendWrites.mu.Unlock()
 
 	if firstErr != nil {
-		return fmt.Errorf("partial sharded flush: %d of %d blocks flushed: %w", len(allFlushed), len(flushBlocks), firstErr)
+		return fmt.Errorf("partial sharded flush: %d of %d records flushed: %w", totalSuccess, len(flushBlocks), firstErr)
 	}
 
 	return nil
@@ -4093,6 +4106,7 @@ func (vb *VB) FlushBlockStore() error {
 	}
 
 	flushed := make(map[uint64]uint64) // block -> seqnum
+	successCount := 0
 
 	for _, block := range hotBlocks {
 		if err := vb.WriteWAL(block); err != nil {
@@ -4100,6 +4114,7 @@ func (vb *VB) FlushBlockStore() error {
 			break
 		}
 
+		successCount++
 		flushed[block.Block] = block.SeqNum
 		// Transition to Pending in BlockStore
 		vb.BlockStore.MarkPending(block.Block)
@@ -4123,8 +4138,8 @@ func (vb *VB) FlushBlockStore() error {
 		vb.PendingBackendWrites.mu.Unlock()
 	}
 
-	if len(flushed) < len(hotBlocks) {
-		return fmt.Errorf("partial flush: %d of %d blocks flushed", len(flushed), len(hotBlocks))
+	if successCount < len(hotBlocks) {
+		return fmt.Errorf("partial flush: %d of %d records flushed", successCount, len(hotBlocks))
 	}
 
 	return nil
