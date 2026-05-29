@@ -1803,13 +1803,12 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 				assert.NoError(t, err)
 			}
 
-			// Flush() returns "partial flush" error when duplicate block numbers exist
-			// because the flushed map deduplicates by block number.
-			// 9 writes (5 to block 700, 4 to 701-704) result in 5 unique blocks.
-			// This is expected behavior - we just need the data to be persisted.
-			_ = vb.Flush()
+			// All 9 records (5 to block 700, 4 to 701-704) land in the WAL.
+			// Flush must succeed regardless of duplicate block numbers.
+			err := vb.Flush()
+			assert.NoError(t, err)
 
-			err := vb.WriteWALToChunk(true)
+			err = vb.WriteWALToChunk(true)
 			assert.NoError(t, err)
 
 			// All pending should be cleared after chunk creation
