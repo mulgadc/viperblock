@@ -11,8 +11,7 @@
         "VolumeType": "gp3",
         "IOPS": 1000,
         "Tags": null,
-        "SnapshotID": "",
-        "IsEncrypted": false
+        "SnapshotID": ""
     },
     "AMIMetadata": {
         "ImageID": "",
