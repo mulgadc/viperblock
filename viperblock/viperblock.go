@@ -75,13 +75,11 @@ type VBState struct {
 	SourceVolumeName string `json:"SourceVolumeName,omitempty"`
 
 	// Encryption-at-rest fields (populated when EncryptionEnabled is true).
-	// EncryptionEnabled is the authoritative persistent flag; replaces the
-	// dead VolumeMetadata.IsEncrypted (which remains deprecated pending
-	// spinifex caller migration). VolumeUUID seeds the per-volume nonce
-	// subspace and is generated via crypto/rand on first SaveState of an
-	// encrypted volume. SeqNumHighWater is the durable upper bound on the
-	// next SeqNum the volume may hand out post-restart — crash-safe nonce
-	// uniqueness. StateSeqNum is a monotonic SaveState generation counter
+	// EncryptionEnabled is the authoritative persistent flag. VolumeUUID seeds
+	// the per-volume nonce subspace and is generated via crypto/rand on first
+	// SaveState of an encrypted volume. SeqNumHighWater is the durable upper
+	// bound on the next SeqNum the volume may hand out post-restart — crash-safe
+	// nonce uniqueness. StateSeqNum is a monotonic SaveState generation counter
 	// used by the metadata HMAC and to break ties in LoadState.
 	// KeyFingerprint surfaces master-key mismatch at Open with a clear error
 	// instead of silent decrypt failure.
@@ -385,7 +383,6 @@ type VolumeMetadata struct {
 	IOPS                int               `json:"IOPS"`                // For provisioned volumes
 	Tags                map[string]string `json:"Tags"`                // User-defined metadata
 	SnapshotID          string            `json:"SnapshotID"`          // If created from a snapshot
-	IsEncrypted         bool              `json:"IsEncrypted"`         // Deprecated: superseded by VBState.EncryptionEnabled. Field retained until spinifex callers migrate to the VBState source of truth; do not branch on this for encryption decisions.
 	DeleteOnTermination bool              `json:"DeleteOnTermination"` // Whether to delete volume when instance terminates
 }
 

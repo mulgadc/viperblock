@@ -15,7 +15,6 @@
             "env": "prod",
             "team": "infra"
         },
-        "SnapshotID": "",
-        "IsEncrypted": false
+        "SnapshotID": ""
     }
 }
