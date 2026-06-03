@@ -8,18 +8,16 @@ import (
 	"libguestfs.org/nbdkit"
 )
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
-	"github.com/nats-io/nats.go"
 
 	_ "github.com/mulgadc/viperblock/internal/fipsboot"
 )
@@ -43,9 +41,8 @@ type ViperBlockPlugin struct {
 
 type ViperBlockConnection struct {
 	nbdkit.Connection
-	vb      *viperblock.VB
-	nc      *nats.Conn
-	snapSub *nats.Subscription
+	vb           *viperblock.VB
+	snapListener net.Listener
 }
 
 var size uint64
@@ -60,9 +57,7 @@ var base_dir string
 var cache_size int = 20
 var use_shardwal bool = false
 var encryption_key_file string
-var nats_url string
-var nats_token string
-var nats_ca_cert string
+var snapshot_socket string
 
 var disk []byte
 
@@ -126,14 +121,8 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 	} else if key == "encryption_key_file" {
 		encryption_key_file = value
 		return nil
-	} else if key == "nats_url" {
-		nats_url = value
-		return nil
-	} else if key == "nats_token" {
-		nats_token = value
-		return nil
-	} else if key == "nats_ca_cert" {
-		nats_ca_cert = value
+	} else if key == "snapshot_socket" {
+		snapshot_socket = value
 		return nil
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
@@ -271,74 +260,60 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	conn := &ViperBlockConnection{vb: vb}
 
-	if nats_url != "" {
-		nc, snapSub, err := subscribeSnapshot(vb, nats_url, nats_token, nats_ca_cert)
+	if snapshot_socket != "" {
+		ln, err := serveSnapshotSocket(vb, snapshot_socket)
 		if err != nil {
-			slog.Error("NBD plugin: failed to subscribe to snapshot topic", "volume", volume, "err", err)
+			slog.Error("NBD plugin: failed to start snapshot socket", "volume", volume, "socket", snapshot_socket, "err", err)
 		} else {
-			conn.nc = nc
-			conn.snapSub = snapSub
+			conn.snapListener = ln
 		}
 	}
 
 	return conn, nil
 }
 
-// subscribeSnapshot connects to NATS and subscribes to the per-volume snapshot
-// topic so the plugin (which owns the WAL) handles CreateSnapshot for running instances.
-func subscribeSnapshot(vb *viperblock.VB, natsURL, token, caCertPath string) (*nats.Conn, *nats.Subscription, error) {
-	opts := []nats.Option{nats.Name("viperblock-nbd-" + vb.VolumeName)}
-	if token != "" {
-		opts = append(opts, nats.Token(token))
-	}
-	if caCertPath != "" {
-		pemData, err := os.ReadFile(caCertPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read CA cert: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pemData) {
-			return nil, nil, fmt.Errorf("failed to parse CA cert %s", caCertPath)
-		}
-		opts = append(opts, nats.Secure(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12})) //nolint:gosec
-	}
-
-	nc, err := nats.Connect(natsURL, opts...)
+// serveSnapshotSocket starts a Unix domain socket listener so viperblockd can
+// forward snapshot requests to this plugin process (which owns the WAL).
+// The listener is returned so Close() can shut it down cleanly.
+func serveSnapshotSocket(vb *viperblock.VB, socketPath string) (net.Listener, error) {
+	_ = os.Remove(socketPath) // clean up stale socket from a previous run
+	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("nats connect: %w", err)
+		return nil, fmt.Errorf("listen snapshot socket: %w", err)
 	}
-
-	topic := fmt.Sprintf("ebs.snapshot.%s", vb.VolumeName)
-	sub, err := nc.Subscribe(topic, func(msg *nats.Msg) {
-		var req ebsSnapshotRequest
-		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			resp, _ := json.Marshal(ebsSnapshotResponse{Error: fmt.Sprintf("bad request: %v", err)})
-			_ = msg.Respond(resp)
-			return
+	slog.Info("NBD plugin: snapshot socket ready", "volume", vb.VolumeName, "socket", socketPath)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener was closed
+			}
+			go handleSnapshotConn(vb, conn)
 		}
+	}()
+	return ln, nil
+}
 
-		slog.Info("NBD plugin: handling snapshot request", "volume", vb.VolumeName, "snapshotId", req.SnapshotID)
-
-		_, snapErr := vb.CreateSnapshot(req.SnapshotID)
-		var resp ebsSnapshotResponse
-		if snapErr != nil {
-			slog.Error("NBD plugin: CreateSnapshot failed", "volume", vb.VolumeName, "snapshotId", req.SnapshotID, "err", snapErr)
-			resp = ebsSnapshotResponse{SnapshotID: req.SnapshotID, Error: snapErr.Error()}
-		} else {
-			slog.Info("NBD plugin: snapshot created", "volume", vb.VolumeName, "snapshotId", req.SnapshotID)
-			resp = ebsSnapshotResponse{SnapshotID: req.SnapshotID, Success: true}
-		}
-
-		data, _ := json.Marshal(resp)
-		_ = msg.Respond(data)
-	})
-	if err != nil {
-		nc.Close()
-		return nil, nil, fmt.Errorf("nats subscribe %s: %w", topic, err)
+func handleSnapshotConn(vb *viperblock.VB, conn net.Conn) {
+	defer conn.Close()
+	var req ebsSnapshotRequest
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		resp, _ := json.Marshal(ebsSnapshotResponse{Error: fmt.Sprintf("bad request: %v", err)})
+		_, _ = conn.Write(resp)
+		return
 	}
-
-	slog.Info("NBD plugin: subscribed to snapshot topic", "topic", topic)
-	return nc, sub, nil
+	slog.Info("NBD plugin: handling snapshot request", "volume", vb.VolumeName, "snapshotId", req.SnapshotID)
+	_, snapErr := vb.CreateSnapshot(req.SnapshotID)
+	var resp ebsSnapshotResponse
+	if snapErr != nil {
+		slog.Error("NBD plugin: CreateSnapshot failed", "volume", vb.VolumeName, "snapshotId", req.SnapshotID, "err", snapErr)
+		resp = ebsSnapshotResponse{SnapshotID: req.SnapshotID, Error: snapErr.Error()}
+	} else {
+		slog.Info("NBD plugin: snapshot created", "volume", vb.VolumeName, "snapshotId", req.SnapshotID)
+		resp = ebsSnapshotResponse{SnapshotID: req.SnapshotID, Success: true}
+	}
+	data, _ := json.Marshal(resp)
+	_, _ = conn.Write(data)
 }
 
 func (c *ViperBlockConnection) GetSize() (uint64, error) {
@@ -452,13 +427,11 @@ func (c *ViperBlockConnection) Close() {
 
 	slog.Info("Close, flushing block state to disk")
 
-	if c.snapSub != nil {
-		if err := c.snapSub.Unsubscribe(); err != nil {
-			slog.Error("NBD plugin: failed to unsubscribe snapshot topic", "err", err)
+	if c.snapListener != nil {
+		if err := c.snapListener.Close(); err != nil {
+			slog.Error("NBD plugin: failed to close snapshot socket", "err", err)
 		}
-	}
-	if c.nc != nil {
-		c.nc.Close()
+		_ = os.Remove(snapshot_socket)
 	}
 
 	// Gracefully close VB and save state to disk
