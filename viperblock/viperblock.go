@@ -172,6 +172,13 @@ type VB struct {
 	// SnapshotID is set when this volume was created from a snapshot.
 	SnapshotID string
 
+	// GrandparentBlockMap is the frozen block-to-object map from the grandparent
+	// snapshot — i.e. the snapshot that the parent clone was itself cloned from.
+	// Populated by OpenFromSnapshot when the loaded snapshot carries a
+	// ParentSnapshotID (snapshot of a COW clone). Nil otherwise.
+	GrandparentBlockMap         *BlocksToObject
+	GrandparentSourceVolumeName string
+
 	// Encryption-at-rest. MasterKey is supplied by the caller (NBD plugin /
 	// CLI) via masterkey.LoadShared; aead caches MasterKey.AEAD for the hot
 	// path. EncryptionEnabled is the caller-supplied flag for this volume; it
@@ -188,6 +195,9 @@ type VB struct {
 	VolumeUUID           [4]byte
 	SourceVolumeUUID     [4]byte
 	sourceVolumeNameHash [32]byte
+	// grandparent encryption identity — decrypts chunks from GrandparentSourceVolumeName
+	grandparentSourceVolumeUUID     [4]byte
+	grandparentSourceVolumeNameHash [32]byte
 
 	// chunkMagicChecked memoises the per-(volume,objectID) result of the chunk
 	// magic preflight in checkChunkMagic. The chunk-read fast path is hit once
@@ -3322,6 +3332,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
+	var grandConsecutiveBlocks ConsecutiveBlocks
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -3373,6 +3384,23 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 						ObjectID:      baseObjectID,
 						ObjectOffset:  baseObjectOffset,
 						SeqNum:        baseSeqNum,
+					})
+					continue
+				}
+			}
+			// Base map miss — check grandparent (system-image snapshot)
+			if vb.GrandparentBlockMap != nil {
+				gpObjectID, gpObjectOffset, gpSeqNum, gpErr := vb.LookupGrandparentBlockToObject(currentBlock)
+				if gpErr == nil {
+					grandConsecutiveBlocks = append(grandConsecutiveBlocks, ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      gpObjectID,
+						ObjectOffset:  gpObjectOffset,
+						SeqNum:        gpSeqNum,
 					})
 					continue
 				}
@@ -3498,7 +3526,15 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
 	if len(baseConsecutiveBlocks) > 0 {
-		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
+		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch blocks from the grandparent snapshot (system-image fallback)
+	if len(grandConsecutiveBlocks) > 0 {
+		err := vb.fetchBaseBlocksFromBackend(vb.GrandparentSourceVolumeName, vb.grandparentSourceVolumeUUID, vb.grandparentSourceVolumeNameHash, grandConsecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -3794,6 +3830,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
+	var grandConsecutiveBlocks ConsecutiveBlocks
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -3846,6 +3883,23 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 					continue
 				}
 			}
+			// Base map miss — check grandparent (system-image snapshot)
+			if vb.GrandparentBlockMap != nil {
+				gpObjectID, gpObjectOffset, gpSeqNum, gpErr := vb.LookupGrandparentBlockToObject(currentBlock)
+				if gpErr == nil {
+					grandConsecutiveBlocks = append(grandConsecutiveBlocks, ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      gpObjectID,
+						ObjectOffset:  gpObjectOffset,
+						SeqNum:        gpSeqNum,
+					})
+					continue
+				}
+			}
 			if errors.Is(err, ErrZeroBlock) {
 				zeroBlockErr = ErrZeroBlock
 			}
@@ -3862,7 +3916,15 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
 	if len(baseConsecutiveBlocks) > 0 {
-		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
+		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch blocks from the grandparent snapshot (system-image fallback)
+	if len(grandConsecutiveBlocks) > 0 {
+		err = vb.fetchBaseBlocksFromBackend(vb.GrandparentSourceVolumeName, vb.grandparentSourceVolumeUUID, vb.grandparentSourceVolumeNameHash, grandConsecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -3972,12 +4034,11 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
 // Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
 //
-// Encrypted clones decrypt the fetched ciphertext under the SOURCE volume's
-// identity (vb.SourceVolumeUUID, vb.sourceVolumeNameHash), not the clone's
-// own identity — the chunk was sealed by the source on its original write,
-// so its nonce + AAD bind the source-volume hash and the source-side SeqNum
-// carried forward via SnapshotState.
-func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+// uuid and nameHash are the encryption identity of the source volume whose chunks
+// are being read (either SourceVolumeUUID/sourceVolumeNameHash for the base layer
+// or grandparentSourceVolumeUUID/grandparentSourceVolumeNameHash for the grandparent).
+// On unencrypted volumes these values are ignored.
+func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, uuid [4]byte, nameHash [32]byte, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	if sourceVolume == "" {
 		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
 	}
@@ -4050,7 +4111,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 		}
 
 		if vb.EncryptionEnabled {
-			if err := vb.openChunkRun(blockData, cb, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, data[start:end]); err != nil {
+			if err := vb.openChunkRun(blockData, cb, uuid, nameHash, data[start:end]); err != nil {
 				return fmt.Errorf("base chunk decrypt source %s: %w", sourceVolume, err)
 			}
 		} else {

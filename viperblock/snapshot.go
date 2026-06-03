@@ -30,6 +30,12 @@ import (
 // CreateSnapshot sealed this state — bound into the snapshot-meta nonce so
 // back-to-back snapshots on the same volume use disjoint nonces (domain
 // separation alone does not protect two seals in the same domain).
+//
+// ParentSnapshotID is set when the snapshotted volume was itself a COW clone
+// (vb.SnapshotID != "" at CreateSnapshot time). It records the snapshot that
+// formed that clone's BaseBlockMap so OpenFromSnapshot can reconstruct the
+// full read chain: own delta → parent delta → grandparent blocks. Empty on
+// first-generation snapshots; omitempty keeps existing snapshot metadata valid.
 type SnapshotState struct {
 	SnapshotID           string    `json:"SnapshotID"`
 	SourceVolumeName     string    `json:"SourceVolumeName"`
@@ -42,6 +48,7 @@ type SnapshotState struct {
 	SourceVolumeUUID     string    `json:"SourceVolumeUUID,omitempty"`
 	SourceVolumeNameHash string    `json:"SourceVolumeNameHash,omitempty"`
 	StateSeqNum          uint64    `json:"StateSeqNum,omitempty"`
+	ParentSnapshotID     string    `json:"ParentSnapshotID,omitempty"`
 }
 
 // CreateSnapshot flushes all in-flight data and creates a frozen snapshot of
@@ -99,6 +106,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		ObjBlockSize:     vb.ObjBlockSize,
 		BlockCount:       blockCount,
 		CreatedAt:        time.Now(),
+		ParentSnapshotID: vb.SnapshotID,
 	}
 
 	if vb.EncryptionEnabled {
@@ -152,10 +160,12 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 // recovered from SnapshotState so clone reads can reconstruct the source's
 // nonce + AAD. Zero-valued on snapshots of unencrypted volumes; callers
 // branch on vb.EncryptionEnabled rather than testing zero.
+// ParentSnapshotID is forwarded from SnapshotState for use by OpenFromSnapshot.
 type SnapshotIdentity struct {
 	SourceVolumeName     string
 	SourceVolumeUUID     [4]byte
 	SourceVolumeNameHash [32]byte
+	ParentSnapshotID     string
 }
 
 // LoadSnapshotBlockMap reads a snapshot's frozen block-to-object map from the
@@ -217,6 +227,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	}
 
 	ident.SourceVolumeName = snap.SourceVolumeName
+	ident.ParentSnapshotID = snap.ParentSnapshotID
 	if snap.SourceVolumeUUID != "" {
 		uuid, err := hex.DecodeString(snap.SourceVolumeUUID)
 		if err != nil || len(uuid) != 4 {
@@ -311,11 +322,23 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 	vb.SourceVolumeUUID = ident.SourceVolumeUUID
 	vb.sourceVolumeNameHash = ident.SourceVolumeNameHash
 
+	if ident.ParentSnapshotID != "" {
+		parentMap, parentIdent, err := vb.LoadSnapshotBlockMap(ident.ParentSnapshotID)
+		if err != nil {
+			return fmt.Errorf("failed to load parent snapshot %s: %w", ident.ParentSnapshotID, err)
+		}
+		vb.GrandparentBlockMap = parentMap
+		vb.GrandparentSourceVolumeName = parentIdent.SourceVolumeName
+		vb.grandparentSourceVolumeUUID = parentIdent.SourceVolumeUUID
+		vb.grandparentSourceVolumeNameHash = parentIdent.SourceVolumeNameHash
+	}
+
 	slog.Debug("OpenFromSnapshot: clone ready",
 		"volume", vb.VolumeName,
 		"snapshotID", snapshotID,
 		"sourceVolume", ident.SourceVolumeName,
-		"baseBlocks", len(baseMap.BlockLookup))
+		"baseBlocks", len(baseMap.BlockLookup),
+		"grandparentSnapshotID", ident.ParentSnapshotID)
 
 	return nil
 }
@@ -332,6 +355,24 @@ func (vb *VB) LookupBaseBlockToObject(block uint64) (uint64, uint32, uint64, err
 	vb.BaseBlockMap.mu.RLock()
 	lookup, ok := vb.BaseBlockMap.BlockLookup[block]
 	vb.BaseBlockMap.mu.RUnlock()
+
+	if !ok {
+		return 0, 0, 0, ErrZeroBlock
+	}
+	return lookup.ObjectID, lookup.ObjectOffset, lookup.SeqNum, nil
+}
+
+// LookupGrandparentBlockToObject looks up a block in the grandparent block map.
+// This is the second-generation base: the snapshot that the parent clone was
+// itself cloned from (typically the system image snapshot).
+func (vb *VB) LookupGrandparentBlockToObject(block uint64) (uint64, uint32, uint64, error) {
+	if vb.GrandparentBlockMap == nil {
+		return 0, 0, 0, ErrZeroBlock
+	}
+
+	vb.GrandparentBlockMap.mu.RLock()
+	lookup, ok := vb.GrandparentBlockMap.BlockLookup[block]
+	vb.GrandparentBlockMap.mu.RUnlock()
 
 	if !ok {
 		return 0, 0, 0, ErrZeroBlock
