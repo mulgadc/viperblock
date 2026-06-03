@@ -458,3 +458,57 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 
 	return clone
 }
+
+// TestSnapshotCOWChain verifies that a snapshot taken from a COW clone carries
+// the parent chain reference and that a second-generation clone can read blocks
+// from all three layers: own delta, parent delta, and grandparent (base image).
+func TestSnapshotCOWChain(t *testing.T) {
+	runWithBackends(t, "snapshot_cow_chain", func(t *testing.T, base *VB) {
+		blockSize := uint64(base.BlockSize)
+
+		// Layer 0 (base image): write known data to blocks 0–1 only; block 2
+		// is intentionally left unwritten to test the zero-read path.
+		baseData := make([]byte, blockSize*2)
+		rand.Read(baseData)
+		require.NoError(t, base.Write(0, baseData))
+		require.NoError(t, base.Flush())
+		require.NoError(t, base.WriteWALToChunk(true))
+
+		baseSnapID := fmt.Sprintf("snap-%s-base", base.VolumeName)
+		_, err := base.CreateSnapshot(baseSnapID)
+		require.NoError(t, err)
+
+		// Layer 1 (instance A clone): only write to block 1
+		cloneA := createCloneVB(t, base, baseSnapID)
+		cloneAData := make([]byte, blockSize)
+		rand.Read(cloneAData)
+		require.NoError(t, cloneA.Write(1, cloneAData))
+		require.NoError(t, cloneA.Flush())
+		require.NoError(t, cloneA.WriteWALToChunk(true))
+
+		// Snapshot the clone — this should record baseSnapID as ParentSnapshotID
+		cloneASnapID := fmt.Sprintf("snap-%s-clone", cloneA.VolumeName)
+		snap, err := cloneA.CreateSnapshot(cloneASnapID)
+		require.NoError(t, err)
+		assert.Equal(t, baseSnapID, snap.ParentSnapshotID, "snapshot of COW clone must record parent snapshot ID")
+
+		// Layer 2 (instance B): clone from the clone's snapshot
+		cloneB := createCloneVB(t, cloneA, cloneASnapID)
+		assert.NotNil(t, cloneB.GrandparentBlockMap, "grandparent block map must be populated")
+
+		// Block 0: never written by cloneA — must come from grandparent (base image)
+		got, err := cloneB.ReadAt(0, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, baseData[:blockSize], got, "block 0 must be read from grandparent")
+
+		// Block 1: written by cloneA — must come from parent delta
+		got, err = cloneB.ReadAt(blockSize, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, cloneAData, got, "block 1 must be read from parent delta")
+
+		// Block 2: never written by anyone — ReadAt returns ErrZeroBlock and zeros
+		got, err = cloneB.ReadAt(2*blockSize, blockSize)
+		assert.ErrorIs(t, err, ErrZeroBlock, "unwritten block must return ErrZeroBlock")
+		assert.Equal(t, make([]byte, blockSize), got, "unwritten block must read as zeros")
+	})
+}
