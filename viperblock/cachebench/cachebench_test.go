@@ -1,169 +1,155 @@
-// Package cachebench isolates the read-cache retention behaviour of the
-// viperblock NBD plugin. It models the exact construct at
-// viperblock/viperblock.go:3925 & :4036 — the read cache stores a 4 KiB
-// subslice of the (large) per-NBD-request read buffer:
+// Package cachebench drives the REAL viperblock read path (file backend,
+// UseBlockStore=true — the production NBD default) to guard against the
+// read-cache buffer-aliasing leak fixed at viperblock.go:3925 & :4036.
 //
-//	data := make([]byte, blockLen)               // viperblock.go:3254/3753
-//	...
-//	vb.Cache.lru.Add(block, data[blockStart:blockEnd])   // subslice -> pins data
+// The bug: readBlockStore allocates one large per-request buffer
 //
-// In Go a subslice retains its whole backing array, so a single live 4 KiB
-// entry pins the entire request buffer. This benchmark drives the SAME LRU
-// dependency (hashicorp/golang-lru/v2, viperblock.go:31/615) and measures
-// retained heap for the current code (subslice) vs the proposed fix (clone),
-// across three access patterns:
+//	data := make([]byte, blockLen)                       // viperblock.go:3753
 //
-//   - clustered:  large reads at well-separated aligned offsets. Each buffer's
-//     blocks enter and leave the LRU together, so aliasing barely bites — best
-//     case for the current code.
-//   - random:     overlapping unaligned reads over a hot region. Older buffers
-//     are partially overwritten; modest retention overhead — typical case.
-//   - streaming:  a sliding read window advancing one block at a time (e.g.
-//     sequential I/O with overlapping prefetch). Each read overwrites all but
-//     one of the previous buffer's block-entries, so EVERY cached entry ends up
-//     aliasing its own distinct backing buffer. With the subslice Add this pins
-//     bufLen/blockSize (24x here) the intended bytes — the worst case, and the
-//     mechanism behind the observed nbdkit RSS blowup / host OOM.
+// and previously cached each 4 KiB block as a SUBSLICE of it
+//
+//	vb.Cache.lru.Add(block, data[blockStart:blockEnd])   // pins all of data
+//
+// In Go a subslice retains its whole backing array, so a single live cache
+// entry pins the entire request buffer. Under streaming/prefetch I/O (a read
+// window sliding one block at a time) every surviving LRU entry ends up
+// aliasing its own distinct request buffer, so retained heap balloons to
+// roughly cacheSize*requestBytes instead of cacheSize*blockSize — the nbdkit
+// RSS blowup / host OOM. The fix wraps each insert in clone() so the LRU owns
+// an independent BlockSize buffer.
+//
+// Unlike a synthetic model, this test exercises vb.ReadAt -> read ->
+// readBlockStore against a real persisted volume, so it FAILS if the clone()
+// fix is reverted: it asserts the post-streaming retained heap stays within a
+// multiple of the intended cache footprint, a bound the subslice variant
+// (~16x larger here) cannot satisfy.
 //
 // Lives in its own package so it does not inherit the viperblock package's
-// TestMain (predastore server); avoids the WAL/backend path so it is fast and
-// deterministic.
+// TestMain (predastore server); the file backend keeps it hermetic.
 package cachebench
 
 import (
-	"math/rand"
+	"errors"
+	"fmt"
+	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/mulgadc/viperblock/types"
+	vblib "github.com/mulgadc/viperblock/viperblock"
+	"github.com/mulgadc/viperblock/viperblock/backends/file"
 )
 
 const (
-	cacheSize = 8192 // 1/4 of production nbd cache_size (32768)
 	blockSize = 4096 // viperblock DefaultBlockSize
-	largeReq  = 24   // 96 KiB read buffer (bounds worst-case retention < 1 GiB)
-	prodScale = 4    // cacheSize * prodScale == production 32768
+	cacheSize = 4096 // LRU entry cap -> intended ceiling = cacheSize*blockSize = 16 MiB
+	largeReq  = 32   // blocks per ReadAt -> 128 KiB request buffer (the thing a subslice pins)
+	numReads  = cacheSize + 512
+	allBlocks = numReads + largeReq // distinct blocks written/persisted
+
+	// retainFactor bounds legitimate retained heap (clone LRU + never-evicted
+	// BlockStore Cached copies) as a multiple of (cacheSize+allBlocks) blocks.
+	// The reverted subslice variant retains ~cacheSize*largeReq*blockSize
+	// (512 MiB here), far beyond this bound.
+	retainFactor = 2.5
 )
 
-func TestCacheRetentionMemory(t *testing.T) {
-	intended := float64(cacheSize*blockSize) / (1024 * 1024)
+// TestReadCacheDoesNotPinRequestBuffers persists a volume, then issues a
+// sliding-window stream of multi-block ReadAt calls and checks that the read
+// cache did not pin the per-request buffers. Guards viperblock.go:3925 (and the
+// identical pattern at :3455 legacy / :4036 snapshot-base).
+func TestReadCacheDoesNotPinRequestBuffers(t *testing.T) {
+	vb := setupVB(t)
 
-	var streamBefore, streamAfter float64
-	for _, w := range []struct {
-		name string
-		fn   func(useClone bool) float64
-	}{
-		{"clustered (aligned, separated)", runClustered},
-		{"random    (unaligned overlap) ", runRandom},
-		{"streaming (sliding prefetch)  ", runStreaming},
-	} {
-		before := w.fn(false)
-		after := w.fn(true)
-		t.Logf("=== %s ===", w.name)
-		t.Logf("  intended ceiling : %7.1f MiB", intended)
-		t.Logf("  BEFORE (subslice): %7.1f MiB  (%5.1fx intended)", before, before/intended)
-		t.Logf("  AFTER  (clone)   : %7.1f MiB  (%5.1fx intended)", after, after/intended)
-		t.Logf("  reduction        : %7.1f MiB  (%5.1fx smaller)", before-after, before/after)
-		t.Logf("  @prod 32768 (x%d) : BEFORE %.0f MiB -> AFTER %.0f MiB", prodScale, before*prodScale, after*prodScale)
-		if w.name[:9] == "streaming" {
-			streamBefore, streamAfter = before, after
+	// Write every block once and force it out to the backend so reads come back
+	// as BlockStatePersisted (BlockStore data freed) and populate the cache.
+	buf := make([]byte, blockSize)
+	for b := range allBlocks {
+		bn := uint64(b)
+		buf[0], buf[blockSize-1] = byte(bn), byte(bn>>8)
+		if err := vb.WriteAt(bn*blockSize, buf); err != nil {
+			t.Fatalf("WriteAt block %d: %v", bn, err)
 		}
 	}
-
-	// Headline guard: under the streaming worst case the subslice Add must pin
-	// dramatically more than the clone fix (each entry pins a whole buffer).
-	if streamBefore < streamAfter*5 {
-		t.Fatalf("streaming worst case did not show the leak: before=%.1f after=%.1f (want before >= 5x after)",
-			streamBefore, streamAfter)
+	if err := vb.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
-}
+	if err := vb.WriteWALToChunk(true); err != nil {
+		t.Fatalf("WriteWALToChunk: %v", err)
+	}
 
-// runClustered: large reads at block-aligned offsets over a keyspace 4x the
-// cache. A request's blocks share recency and evict together, so buffers stay
-// fully resident while cached — aliasing has little to pin. Best case.
-func runClustered(useClone bool) float64 {
-	const (
-		keyspace = cacheSize * 4
-		numReads = 12000
-	)
-	rng := rand.New(rand.NewSource(42))
-	maxStart := (keyspace - largeReq) / largeReq
-	return drive(useClone, numReads, func() uint64 {
-		return uint64(rng.Intn(maxStart) * largeReq) // aligned, well-separated
-	})
-}
-
-// runRandom: overlapping unaligned reads over a hot region ~3x the cache.
-// Successive reads share blocks with earlier ones and overwrite those entries,
-// eroding older buffers. Modest overhead — typical case.
-func runRandom(useClone bool) float64 {
-	const (
-		region   = cacheSize * 3
-		numReads = 30000
-	)
-	rng := rand.New(rand.NewSource(42))
-	maxStart := region - largeReq
-	return drive(useClone, numReads, func() uint64 {
-		return uint64(rng.Intn(maxStart)) // unaligned -> overlap
-	})
-}
-
-// runStreaming: a read window advancing one block per read. Read s caches keys
-// [s, s+largeReq); the next read overwrites keys [s+1, s+largeReq), leaving
-// buffer s referenced only by key s. Every live cache entry therefore aliases a
-// distinct backing buffer — maximal pinning. Worst case.
-func runStreaming(useClone bool) float64 {
-	const numReads = 40000
-	var s uint64
-	return drive(useClone, numReads, func() uint64 {
-		cur := s
-		s++ // slide by one block each read
-		return cur
-	})
-}
-
-// drive runs numReads large reads, each allocating a fresh backing buffer and
-// caching its blocks at the offset returned by start(). Returns retained heap.
-func drive(useClone bool, numReads int, start func() uint64) float64 {
+	// Baseline after persist: LRU empty, BlockStore entries Persisted (no data).
 	base := heapInuseMiB()
-	cache, _ := lru.New[uint64, []byte](cacheSize)
-	for range numReads {
-		buf := newBuf(largeReq * blockSize)
-		s := start()
-		for b := range largeReq {
-			addBlock(cache, s+uint64(b), buf, b, useClone)
+
+	// Streaming read: window slides one block per read. Each read pulls exactly
+	// one new leading block from the backend (the rest are already Cached), so
+	// each surviving LRU entry maps to a distinct request buffer — maximal
+	// pinning if the cache stored subslices.
+	for s := range numReads {
+		sn := uint64(s)
+		if _, err := vb.ReadAt(sn*blockSize, largeReq*blockSize); err != nil && !errors.Is(err, vblib.ErrZeroBlock) {
+			t.Fatalf("ReadAt offset-block %d: %v", sn, err)
 		}
 	}
+
 	retained := heapInuseMiB() - base
-	runtime.KeepAlive(cache)
-	return retained
-}
+	runtime.KeepAlive(vb)
 
-// addBlock mirrors viperblock.go:3925/4036: store the b-th 4 KiB block of buf.
-// useClone=false stores a subslice (aliases buf); true stores an independent copy.
-func addBlock(cache *lru.Cache[uint64, []byte], key uint64, buf []byte, b int, useClone bool) {
-	val := buf[b*blockSize : (b+1)*blockSize]
-	if useClone {
-		val = clone(val)
+	intended := float64(cacheSize*blockSize) / (1024 * 1024)
+	// Legitimate footprint with the clone fix: the bounded LRU plus the
+	// (currently never-evicted) BlockStore Cached copies of every block read.
+	legit := float64((cacheSize+allBlocks)*blockSize) / (1024 * 1024)
+	threshold := legit * retainFactor
+	subsliceWorst := float64(cacheSize*largeReq*blockSize) / (1024 * 1024)
+
+	t.Logf("intended LRU ceiling : %7.1f MiB (cacheSize=%d x %d B)", intended, cacheSize, blockSize)
+	t.Logf("retained after stream: %7.1f MiB", retained)
+	t.Logf("clone threshold      : %7.1f MiB (legit %.1f x %.1f)", threshold, legit, retainFactor)
+	t.Logf("subslice worst case  : %7.1f MiB (what a revert would retain)", subsliceWorst)
+
+	if retained > threshold {
+		t.Fatalf("read cache retained %.1f MiB > %.1f MiB threshold: entries are pinning whole "+
+			"request buffers — the clone() fix at viperblock.go:3925/4036 is missing or reverted",
+			retained, threshold)
 	}
-	cache.Add(key, val)
 }
 
-// newBuf allocates a per-request read buffer and faults both ends in, matching
-// read()'s data = make([]byte, blockLen).
-func newBuf(n int) []byte {
-	buf := make([]byte, n)
-	buf[0] = 1
-	buf[n-1] = 1
-	return buf
-}
+func setupVB(t *testing.T) *vblib.VB {
+	t.Helper()
+	dir := t.TempDir()
+	vol := fmt.Sprintf("cbench_%d", time.Now().UnixNano())
+	volBytes := uint64(allBlocks+largeReq) * blockSize
 
-// clone matches viperblock's clone() helper (viperblock.go:3703): a fresh copy
-// that does not alias the source's backing array.
-func clone(in []byte) []byte {
-	out := make([]byte, len(in))
-	copy(out, in)
-	return out
+	bcfg := file.FileConfig{VolumeName: vol, VolumeSize: volBytes, BaseDir: dir}
+	cfg := &vblib.VB{
+		VolumeName:      vol,
+		VolumeSize:      volBytes,
+		BaseDir:         filepath.Join(dir, "viperblock"),
+		WALSyncInterval: -1, // standalone recipe: no background syncer
+		Cache:           vblib.Cache{Config: vblib.CacheConfig{Size: cacheSize}},
+	}
+	vb, err := vblib.New(cfg, "file", bcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vb.UseShardedWAL = false
+	vb.ShardedWAL = nil
+
+	if err := vb.Backend.Init(); err != nil {
+		t.Fatal(err)
+	}
+	walPath := fmt.Sprintf("%s/%s", vb.WAL.BaseDir,
+		types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))
+	if err := vb.OpenWAL(&vb.WAL, walPath); err != nil {
+		t.Fatal(err)
+	}
+	blkPath := fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir,
+		types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))
+	if err := vb.OpenWAL(&vb.BlockToObjectWAL, blkPath); err != nil {
+		t.Fatal(err)
+	}
+	return vb
 }
 
 func heapInuseMiB() float64 {
