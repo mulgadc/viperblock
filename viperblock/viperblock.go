@@ -3189,30 +3189,29 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 		}
 	}
 
-	// Encrypted volumes carry a trailing 16-byte AES-GCM tag binding the JSON
-	// to (volumeNameHash, "vbstate", StateSeqNum). The nonce + structured AAD
-	// reconstruction needs StateSeqNum + VolumeUUID, both of which live in
-	// the JSON — extract them via a minimal peek struct over the pre-tag
-	// bytes, then verify before unmarshalling the full state. The peek's
-	// VolumeUUID is the nonce subspace identifier (binds the seal-time
-	// nonce); vb.volumeNameHash is the trusted volume identity (caller-
-	// supplied at New, untouched by the parsed JSON) — splicing in another
-	// volume's blob is rejected because the AAD's volumeNameHash differs.
-	// KeyFingerprint is checked pre-verify so a wrong-key open surfaces as
-	// ErrEncryptionMismatch (with both fingerprints in the error) rather
-	// than the generic "tag verify failed" that AEAD would otherwise return.
+	// Encrypted volumes wrap the JSON in a metaEnvelope whose authtag binds
+	// the payload to (volumeNameHash, "vbstate", StateSeqNum). The nonce +
+	// structured AAD reconstruction needs StateSeqNum + VolumeUUID, both of
+	// which live in the payload — split the envelope, extract them via a
+	// minimal peek struct over the verbatim payload, then verify before
+	// unmarshalling the full state. The peek's VolumeUUID is the nonce
+	// subspace identifier (binds the seal-time nonce); vb.volumeNameHash is
+	// the trusted volume identity (caller-supplied at New, untouched by the
+	// parsed JSON) — splicing in another volume's blob is rejected because
+	// the AAD's volumeNameHash differs. KeyFingerprint is checked pre-verify
+	// so a wrong-key open surfaces as ErrEncryptionMismatch (with both
+	// fingerprints in the error) rather than the generic "tag verify failed".
 	if vb.EncryptionEnabled {
-		tagLen := vb.aead.Overhead()
-		if len(jsonData) < tagLen {
-			return state, fmt.Errorf("%w: VBState blob %d bytes shorter than %d-byte tag", ErrIntegrity, len(jsonData), tagLen)
+		payload, tag, splitErr := splitEnvelope(jsonData)
+		if splitErr != nil {
+			return state, fmt.Errorf("%w: VBState envelope: %w", ErrIntegrity, splitErr)
 		}
 		var peek struct {
 			VolumeUUID     [4]byte `json:"VolumeUUID"`
 			StateSeqNum    uint64  `json:"StateSeqNum"`
 			KeyFingerprint string  `json:"KeyFingerprint"`
 		}
-		peekJSON := jsonData[:len(jsonData)-tagLen]
-		if err := json.Unmarshal(peekJSON, &peek); err != nil {
+		if err := json.Unmarshal(payload, &peek); err != nil {
 			return state, fmt.Errorf("%w: VBState peek parse: %w", ErrIntegrity, err)
 		}
 		if peek.KeyFingerprint != vb.MasterKey.Fingerprint {
@@ -3221,19 +3220,19 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 		}
 		nonce := makeNonce(peek.StateSeqNum, peek.VolumeUUID, DomainVBStateMeta)
 		aad := makeMetaAAD(vb.volumeNameHash, "vbstate", peek.StateSeqNum)
-		verified, openErr := openMeta(vb.aead, jsonData, aad, nonce)
-		if openErr != nil {
-			return state, fmt.Errorf("%w: VBState tag verify: %w", ErrIntegrity, openErr)
+		if err := verifyMeta(vb.aead, payload, tag, aad, nonce); err != nil {
+			return state, fmt.Errorf("%w: VBState tag verify: %w", ErrIntegrity, err)
 		}
-		jsonData = verified
+		jsonData = payload
 	}
 
-	// Use a Decoder rather than Unmarshal so a plain-mode runtime reading a
-	// sealed blob does not error on the trailing 16-byte tag. The Decoder
-	// reads one JSON value and stops; LoadState's existing
-	// EncryptionEnabled mismatch check then surfaces the misconfig as
-	// ErrEncryptionMismatch instead of swallowing it as parse failure.
-	err = json.NewDecoder(bytes.NewReader(jsonData)).Decode(&state)
+	// StateBody strips the envelope so a plain-mode runtime reading an
+	// encrypted blob still decodes the inner payload (which carries
+	// EncryptionEnabled=true) — LoadState's flag-mismatch check then surfaces
+	// the misconfig as ErrEncryptionMismatch rather than silently decoding the
+	// envelope wrapper into a zero-valued state. For the encrypted path
+	// jsonData is already the verified payload, so StateBody is a no-op.
+	err = json.NewDecoder(bytes.NewReader(StateBody(jsonData))).Decode(&state)
 
 	return state, err
 }

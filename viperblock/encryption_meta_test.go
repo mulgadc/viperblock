@@ -22,11 +22,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// metaPayloadOffset is a byte index that lands inside the envelope's verbatim
+// payload (past the `{"v":1,"payload":` prefix), so a flip there exercises tag
+// verification on the payload rather than envelope JSON well-formedness.
+var metaPayloadOffset = len(`{"v":1,"payload":`) + 5
+
 // TestVBStateMeta_BitFlipFailsLoad — a one-byte flip in the persisted
-// config.json after the HMAC seal must surface as ErrIntegrity at
-// LoadStateRequest. This is the literal byte-tamper check: the JSON
-// ships plaintext, the trailing 16-byte tag binds the bytes to the
-// AAD via sealMeta, so any modification fails openMeta.
+// config.json payload after the HMAC seal must surface as ErrIntegrity at
+// LoadStateRequest. The payload ships plaintext inside the envelope; the
+// authtag binds it to the AAD via sealMeta, so any modification fails verify.
 func TestVBStateMeta_BitFlipFailsLoad(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-meta-bitflip", key)
@@ -36,8 +40,8 @@ func TestVBStateMeta_BitFlipFailsLoad(t *testing.T) {
 	configPath := filepath.Join(vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	raw, err := os.ReadFile(configPath)
 	require.NoError(t, err)
-	require.Greater(t, len(raw), 20)
-	raw[5] ^= 0x01 // flip a JSON byte
+	require.Greater(t, len(raw), metaPayloadOffset)
+	raw[metaPayloadOffset] ^= 0x01 // flip a payload byte
 	require.NoError(t, os.WriteFile(configPath, raw, 0600))
 
 	_, err = vb.LoadStateRequest(configPath)
@@ -45,10 +49,10 @@ func TestVBStateMeta_BitFlipFailsLoad(t *testing.T) {
 	assert.ErrorIs(t, err, ErrIntegrity)
 }
 
-// TestVBStateMeta_TagFlipFailsLoad — flipping a byte in the trailing
-// 16-byte tag must also fail. Distinct from the body flip: tag bytes
-// are not parsed as JSON, so a regression that verifies the tag length
-// but not its contents would pass the body-flip test and fail here.
+// TestVBStateMeta_TagFlipFailsLoad — flipping a byte in the base64 authtag
+// must also fail. Distinct from the payload flip: a regression that parses
+// the envelope but skips tag verification would pass the payload-flip test
+// (if it re-derived a tag) and fail here.
 func TestVBStateMeta_TagFlipFailsLoad(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-meta-tag", key)
@@ -58,7 +62,9 @@ func TestVBStateMeta_TagFlipFailsLoad(t *testing.T) {
 	configPath := filepath.Join(vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	raw, err := os.ReadFile(configPath)
 	require.NoError(t, err)
-	raw[len(raw)-1] ^= 0x01 // flip last byte of tag
+	// Flip a base64 char of the authtag (the tail is `…<base64>=="}`; index
+	// -5 is a real base64 char, clear of the `=="}` suffix).
+	raw[len(raw)-5] ^= 0x01
 	require.NoError(t, os.WriteFile(configPath, raw, 0600))
 
 	_, err = vb.LoadStateRequest(configPath)
@@ -242,7 +248,8 @@ func TestSnapshotMeta_BitFlipFailsLoad(t *testing.T) {
 	configPath := filepath.Join(env.dir, types.GetFilePath(types.FileTypeConfig, 0, snapshotID))
 	raw, err := os.ReadFile(configPath)
 	require.NoError(t, err)
-	raw[10] ^= 0x01
+	require.Greater(t, len(raw), metaPayloadOffset)
+	raw[metaPayloadOffset] ^= 0x01 // flip a payload byte
 	require.NoError(t, os.WriteFile(configPath, raw, 0600))
 
 	_, _, err = env.source.LoadSnapshotBlockMap(snapshotID)
@@ -296,11 +303,10 @@ func TestBlockStoreReadEncrypted(t *testing.T) {
 	assert.ErrorIs(t, err, ErrIntegrity)
 }
 
-// TestVBStateMeta_TruncatedBlobFails — a backend-side truncation of
-// the VBState blob below the 16-byte tag boundary must surface a
-// clear error rather than panic on the slice arithmetic in
-// LoadStateRequest. Defensive: an external operator who half-uploads
-// a backend object should see a refused open, not a runtime panic.
+// TestVBStateMeta_TruncatedBlobFails — a backend-side truncation/corruption
+// of the VBState blob into a non-envelope must surface a clear error rather
+// than panic in LoadStateRequest. Defensive: an external operator who
+// half-uploads a backend object should see a refused open, not a panic.
 func TestVBStateMeta_TruncatedBlobFails(t *testing.T) {
 	key := testKey(t, 0x42)
 	dir := t.TempDir()
@@ -318,13 +324,13 @@ func TestVBStateMeta_TruncatedBlobFails(t *testing.T) {
 	require.NoError(t, vb.SaveState())
 
 	configPath := filepath.Join(dir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
-	// Truncate to fewer bytes than the tag length — must fail with a
-	// clear "shorter than tag" message, not a slice-bounds panic.
+	// Overwrite with bytes that are not a valid envelope — must fail with a
+	// clear error, not a slice-bounds panic.
 	require.NoError(t, os.WriteFile(configPath, []byte{0x01, 0x02, 0x03}, 0600))
 
 	_, err = vb.LoadStateRequest(configPath)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrIntegrity)
 	// Make sure the error message is informative.
-	assert.Contains(t, err.Error(), "shorter")
+	assert.Contains(t, err.Error(), "envelope")
 }
