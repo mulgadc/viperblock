@@ -3452,7 +3452,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				vb.Cache.lru.Add(currentBlock, data[start+i*uint64(vb.BlockSize):start+(i+1)*uint64(vb.BlockSize)])
+				vb.Cache.lru.Add(currentBlock, clone(data[start+i*uint64(vb.BlockSize):start+(i+1)*uint64(vb.BlockSize)]))
 			}
 		}
 	}
@@ -3922,7 +3922,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 				currentBlock := cb.StartBlock + i
 				blockStart := start + i*uint64(vb.BlockSize)
 				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.Cache.lru.Add(currentBlock, data[blockStart:blockEnd])
+				vb.Cache.lru.Add(currentBlock, clone(data[blockStart:blockEnd]))
 			}
 		}
 	}
@@ -4033,7 +4033,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 				currentBlock := cb.StartBlock + i
 				blockStart := start + i*uint64(vb.BlockSize)
 				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.Cache.lru.Add(currentBlock, data[blockStart:blockEnd])
+				vb.Cache.lru.Add(currentBlock, clone(data[blockStart:blockEnd]))
 			}
 		}
 	}
