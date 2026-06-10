@@ -166,25 +166,24 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		return nil, ident, fmt.Errorf("failed to read snapshot config %s: %w", snapshotID, err)
 	}
 
-	// Encrypted snapshots carry a trailing 16-byte AES-GCM tag. Two-stage
-	// parse: peek the pre-tag bytes for SourceVolumeUUID +
+	// Encrypted snapshots wrap the JSON in a metaEnvelope. Two-stage parse:
+	// split the envelope, peek the verbatim payload for SourceVolumeUUID +
 	// SourceVolumeNameHash + StateSeqNum (needed to reconstruct nonce + AAD),
 	// verify, then unmarshal the verified bytes into the full struct. The
 	// snapshotID parameter is the trusted external identity bound into the
 	// AAD — splicing in another snapshot's blob fails because the literal
 	// "snap:"||snapshotID differs from the seal-time value.
 	if vb.EncryptionEnabled {
-		tagLen := vb.aead.Overhead()
-		if len(configData) < tagLen {
-			return nil, ident, fmt.Errorf("%w: snapshot %s config %d bytes shorter than %d-byte tag", ErrIntegrity, snapshotID, len(configData), tagLen)
+		payload, tag, splitErr := splitEnvelope(configData)
+		if splitErr != nil {
+			return nil, ident, fmt.Errorf("%w: snapshot %s envelope: %w", ErrIntegrity, snapshotID, splitErr)
 		}
 		var peek struct {
 			SourceVolumeUUID     string `json:"SourceVolumeUUID"`
 			SourceVolumeNameHash string `json:"SourceVolumeNameHash"`
 			StateSeqNum          uint64 `json:"StateSeqNum"`
 		}
-		peekJSON := configData[:len(configData)-tagLen]
-		if err := json.Unmarshal(peekJSON, &peek); err != nil {
+		if err := json.Unmarshal(payload, &peek); err != nil {
 			return nil, ident, fmt.Errorf("%w: snapshot %s peek parse: %w", ErrIntegrity, snapshotID, err)
 		}
 		uuid, uuidErr := hex.DecodeString(peek.SourceVolumeUUID)
@@ -201,11 +200,10 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		copy(aadNameHash[:], nameHash)
 		nonce := makeNonce(peek.StateSeqNum, nonceUUID, DomainSnapshotMeta)
 		aad := makeMetaAAD(aadNameHash, "snap:"+snapshotID, peek.StateSeqNum)
-		verified, openErr := openMeta(vb.aead, configData, aad, nonce)
-		if openErr != nil {
-			return nil, ident, fmt.Errorf("%w: snapshot %s tag verify: %w", ErrIntegrity, snapshotID, openErr)
+		if err := verifyMeta(vb.aead, payload, tag, aad, nonce); err != nil {
+			return nil, ident, fmt.Errorf("%w: snapshot %s tag verify: %w", ErrIntegrity, snapshotID, err)
 		}
-		configData = verified
+		configData = payload
 	}
 
 	var snap SnapshotState

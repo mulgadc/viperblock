@@ -20,7 +20,9 @@ package viperblock
 import (
 	"crypto/cipher"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 )
 
@@ -111,12 +113,33 @@ func computeVolumeNameHash(name string) [32]byte {
 	return sha256.Sum256([]byte(name))
 }
 
-// sealMeta authenticates VBState/SnapshotState JSON with AES-GCM-as-MAC: the
-// JSON bytes stay plaintext-readable so operators can still `cat config.json`,
-// while a 16-byte trailing tag binds the bytes to the structured metadata AAD
-// (volumeNameHash || domain || stateSeqNum) and to the nonce. Returns
-// jsonBytes || tag. The full AAD covered by the tag is aad || jsonBytes — the
-// JSON content is authenticated even though it ships in the clear.
+// envelopeVersion is the schema tag written into the metadata envelope so a
+// future format change is self-describing on read.
+const envelopeVersion = 1
+
+// metaEnvelope is the on-disk wrapper for authenticated VBState/SnapshotState
+// metadata: {"v":1,"payload":<json>,"authtag":"<base64 tag>"}. The whole file
+// stays valid JSON — `jq .payload config.json` works, and non-crypto consumers
+// (e.g. the AWS gateway enumerating AMIs) parse it with a plain json.Unmarshal
+// after StateBody strips the wrapper. Payload is the verbatim metadata JSON;
+// authtag is the base64 AES-GCM tag binding the payload to the structured AAD.
+type metaEnvelope struct {
+	Version int             `json:"v"`
+	Payload json.RawMessage `json:"payload"`
+	AuthTag string          `json:"authtag"`
+}
+
+// sealMeta authenticates VBState/SnapshotState JSON with AES-GCM-as-MAC and
+// wraps it in the valid-JSON metaEnvelope. The JSON body ships in the clear
+// (authenticated, not encrypted); the tag covers aad || jsonBytes and binds
+// the bytes to the structured metadata AAD (volumeNameHash || domain ||
+// stateSeqNum) and to the nonce.
+//
+// The envelope is assembled by concatenation so the payload is spliced in
+// verbatim — splitEnvelope recovers those exact bytes via json.RawMessage with
+// no re-serialization, which is what keeps verification robust against JSON
+// canonicalization drift (e.g. time.Time marshal round-trips are not byte-
+// identical, so a re-marshal-to-verify scheme would corrupt the tag input).
 //
 // Caller is responsible for (key, nonce) uniqueness: callers must allocate a
 // fresh stateSeqNum (via VB.nextStateSeqNum.Add(1)) for every seal, since
@@ -127,29 +150,71 @@ func sealMeta(aead cipher.AEAD, jsonBytes, aad []byte, nonce [12]byte) []byte {
 	fullAAD = append(fullAAD, aad...)
 	fullAAD = append(fullAAD, jsonBytes...)
 	tag := aead.Seal(nil, nonce[:], nil, fullAAD)
-	out := make([]byte, 0, len(jsonBytes)+len(tag))
+
+	prefix := fmt.Sprintf(`{"v":%d,"payload":`, envelopeVersion)
+	suffix := `,"authtag":"` + base64.StdEncoding.EncodeToString(tag) + `"}`
+	out := make([]byte, 0, len(prefix)+len(jsonBytes)+len(suffix))
+	out = append(out, prefix...)
 	out = append(out, jsonBytes...)
-	out = append(out, tag...)
+	out = append(out, suffix...)
 	return out
 }
 
-// openMeta verifies the trailing AES-GCM tag on a sealMeta blob and returns
-// the leading JSON bytes on success. Any tampering with the JSON, the tag,
-// the structured AAD, or the nonce inputs surfaces as a non-nil error;
-// callers must wrap with ErrIntegrity and fail-closed.
-func openMeta(aead cipher.AEAD, blob, aad []byte, nonce [12]byte) ([]byte, error) {
-	tagLen := aead.Overhead()
-	if len(blob) < tagLen {
-		return nil, fmt.Errorf("metadata blob %d bytes shorter than %d-byte tag", len(blob), tagLen)
+// splitEnvelope parses a metaEnvelope and returns the verbatim payload JSON
+// bytes and the decoded AES-GCM tag. It performs NO cryptographic
+// verification — callers that need authentication pass the result to
+// verifyMeta. Returns an error if the blob is not a well-formed envelope.
+func splitEnvelope(blob []byte) (payload []byte, tag []byte, err error) {
+	var env metaEnvelope
+	if err := json.Unmarshal(blob, &env); err != nil {
+		return nil, nil, fmt.Errorf("metadata envelope parse: %w", err)
 	}
-	split := len(blob) - tagLen
-	jsonBytes := blob[:split]
-	tag := blob[split:]
-	fullAAD := make([]byte, 0, len(aad)+len(jsonBytes))
+	if len(env.Payload) == 0 || env.AuthTag == "" {
+		return nil, nil, fmt.Errorf("metadata envelope missing payload or authtag")
+	}
+	tag, err = base64.StdEncoding.DecodeString(env.AuthTag)
+	if err != nil {
+		return nil, nil, fmt.Errorf("metadata envelope authtag decode: %w", err)
+	}
+	return env.Payload, tag, nil
+}
+
+// verifyMeta checks the AES-GCM tag over aad || payload (payload + tag come
+// from splitEnvelope). Any tampering with the payload, the tag, the structured
+// AAD, or the nonce inputs surfaces as a non-nil error; callers must wrap with
+// ErrIntegrity and fail-closed.
+func verifyMeta(aead cipher.AEAD, payload, tag, aad []byte, nonce [12]byte) error {
+	if len(tag) != aead.Overhead() {
+		return fmt.Errorf("metadata tag %d bytes, want %d", len(tag), aead.Overhead())
+	}
+	fullAAD := make([]byte, 0, len(aad)+len(payload))
 	fullAAD = append(fullAAD, aad...)
-	fullAAD = append(fullAAD, jsonBytes...)
+	fullAAD = append(fullAAD, payload...)
 	if _, err := aead.Open(nil, nonce[:], tag, fullAAD); err != nil {
-		return nil, err
+		return err
 	}
-	return jsonBytes, nil
+	return nil
+}
+
+// StateBody returns the inner VBState/SnapshotState JSON from a config.json
+// blob, transparently unwrapping the encrypted metadata envelope when present.
+// It does NOT verify the authentication tag and needs no master key — it is
+// for read-only metadata consumers (e.g. the AWS gateway enumerating AMIs and
+// volumes) that read fields but do not authenticate them. Callers that must
+// authenticate the bytes use VB.LoadStateRequest / VB.LoadSnapshotBlockMap.
+//
+// Plain (unencrypted) config.json is returned unchanged, so a single call site
+// transparently handles both encrypted and legacy-cleartext volumes.
+func StateBody(raw []byte) []byte {
+	var probe struct {
+		Payload json.RawMessage `json:"payload"`
+		AuthTag string          `json:"authtag"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return raw
+	}
+	if len(probe.Payload) > 0 && probe.AuthTag != "" {
+		return probe.Payload
+	}
+	return raw
 }

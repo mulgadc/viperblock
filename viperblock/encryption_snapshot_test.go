@@ -14,6 +14,7 @@ package viperblock
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -181,12 +182,13 @@ func TestSnapshotEncrypted_CrossVolumeSubstitutionFailsHMAC(t *testing.T) {
 	configPath := filepath.Join(env.dir, types.GetFilePath(types.FileTypeConfig, 0, snapshotID))
 	raw, err := os.ReadFile(configPath)
 	require.NoError(t, err)
-	// Decode the JSON (without the trailing tag) so we can find the
-	// SourceVolumeUUID field and flip a byte in the hex string.
-	tagLen := env.source.aead.Overhead()
-	jsonBytes := raw[:len(raw)-tagLen]
+	// Split the envelope so we can rewrite the SourceVolumeUUID field in the
+	// payload, then re-wrap with the ORIGINAL tag — verify must fail because
+	// the payload bytes (bound into the AAD via sealMeta) have changed.
+	payload, tag, err := splitEnvelope(raw)
+	require.NoError(t, err)
 	var snap SnapshotState
-	require.NoError(t, json.Unmarshal(jsonBytes, &snap))
+	require.NoError(t, json.Unmarshal(payload, &snap))
 	require.NotEmpty(t, snap.SourceVolumeUUID)
 	// Flip the first hex char.
 	tampered := []byte(snap.SourceVolumeUUID)
@@ -198,9 +200,8 @@ func TestSnapshotEncrypted_CrossVolumeSubstitutionFailsHMAC(t *testing.T) {
 	snap.SourceVolumeUUID = string(tampered)
 	tamperedJSON, err := json.Marshal(snap)
 	require.NoError(t, err)
-	// Append the original tag — verify must fail because the JSON bytes
-	// (which are part of the AAD via sealMeta) have changed.
-	newBlob := append(tamperedJSON, raw[len(raw)-tagLen:]...)
+	newBlob := fmt.Appendf(nil, `{"v":1,"payload":%s,"authtag":"%s"}`,
+		tamperedJSON, base64.StdEncoding.EncodeToString(tag))
 	require.NoError(t, os.WriteFile(configPath, newBlob, 0600))
 
 	_, _, err = env.source.LoadSnapshotBlockMap(snapshotID)

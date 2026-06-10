@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"testing"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
@@ -240,11 +241,26 @@ func TestAEAD_DomainSeparationAtCiphertext(t *testing.T) {
 	assert.Error(t, err, "WAL ciphertext must not verify under chunk nonce")
 }
 
-// TestSealMeta_RoundTrip exercises the metadata HMAC primitive: seal a
-// JSON blob with structured AAD + nonce, recover the JSON via openMeta.
-// jsonBytes ship in the clear (operators can `cat config.json`) — the tag
-// binds them to (volumeNameHash, domainTag, stateSeqNum) so cross-volume
-// substitution and bit-flip are detectable.
+// openMetaTest mirrors the production read path (splitEnvelope + verifyMeta):
+// parse the envelope, verify the tag over the verbatim payload, return the
+// payload. Keeps the tamper assertions below readable as a single call.
+func openMetaTest(aead cipher.AEAD, blob, aad []byte, nonce [12]byte) ([]byte, error) {
+	payload, tag, err := splitEnvelope(blob)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyMeta(aead, payload, tag, aad, nonce); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+// TestSealMeta_RoundTrip exercises the metadata HMAC primitive: seal a JSON
+// blob with structured AAD + nonce into the valid-JSON envelope, recover the
+// payload via splitEnvelope + verifyMeta. The payload ships in the clear
+// (operators can `jq .payload config.json`) — the tag binds it to
+// (volumeNameHash, domainTag, stateSeqNum) so cross-volume substitution and
+// bit-flip are detectable.
 func TestSealMeta_RoundTrip(t *testing.T) {
 	aead := freshAEAD(t)
 	hash := sha256.Sum256([]byte("vol-meta"))
@@ -253,19 +269,25 @@ func TestSealMeta_RoundTrip(t *testing.T) {
 	aad := makeMetaAAD(hash, "vbstate", 7)
 
 	blob := sealMeta(aead, jsonBytes, aad, nonce)
-	require.Len(t, blob, len(jsonBytes)+aead.Overhead())
-	assert.Equal(t, jsonBytes, blob[:len(jsonBytes)], "jsonBytes ship plaintext in the prefix")
+	assert.True(t, json.Valid(blob), "sealed envelope must be valid JSON")
 
-	recovered, err := openMeta(aead, blob, aad, nonce)
+	payload, _, err := splitEnvelope(blob)
+	require.NoError(t, err)
+	assert.Equal(t, jsonBytes, payload, "payload recovered verbatim from the envelope")
+
+	recovered, err := openMetaTest(aead, blob, aad, nonce)
 	require.NoError(t, err)
 	assert.Equal(t, jsonBytes, recovered)
+
+	// StateBody strips the wrapper without a key (the unverified consumer path).
+	assert.Equal(t, jsonBytes, StateBody(blob))
 }
 
-// TestSealMeta_TamperFails — bit-flip in the JSON, the tag, or the
-// structured AAD inputs (domainTag / stateSeqNum / volumeNameHash) all
-// surface as openMeta errors. This is the cross-volume metadata pivot
-// closer: an attacker swapping volume A's tagged config.json into volume
-// B's prefix is rejected because the AAD's volumeNameHash differs.
+// TestSealMeta_TamperFails — bit-flip in the payload, the tag, or the
+// structured AAD inputs (domainTag / stateSeqNum / volumeNameHash) all surface
+// as errors on the read path. This is the cross-volume metadata pivot closer:
+// an attacker swapping volume A's envelope into volume B's prefix is rejected
+// because the AAD's volumeNameHash differs.
 func TestSealMeta_TamperFails(t *testing.T) {
 	aead := freshAEAD(t)
 	hash := sha256.Sum256([]byte("vol-meta-tamper"))
@@ -274,40 +296,45 @@ func TestSealMeta_TamperFails(t *testing.T) {
 	aad := makeMetaAAD(hash, "vbstate", 99)
 	blob := sealMeta(aead, jsonBytes, aad, nonce)
 
-	t.Run("json byte flip", func(t *testing.T) {
+	// payloadOffset points inside the verbatim payload (after the
+	// `{"v":1,"payload":` prefix) so the flip exercises tag verification on
+	// the payload, not envelope JSON well-formedness.
+	payloadOffset := len(`{"v":1,"payload":`) + 5
+
+	t.Run("payload byte flip", func(t *testing.T) {
 		tampered := append([]byte(nil), blob...)
-		tampered[3] ^= 0x01
-		_, err := openMeta(aead, tampered, aad, nonce)
+		tampered[payloadOffset] ^= 0x01
+		_, err := openMetaTest(aead, tampered, aad, nonce)
 		assert.Error(t, err)
 	})
 
 	t.Run("tag byte flip", func(t *testing.T) {
 		tampered := append([]byte(nil), blob...)
-		tampered[len(tampered)-1] ^= 0x01
-		_, err := openMeta(aead, tampered, aad, nonce)
+		// Flip a base64 char of the authtag (before the closing `"}`).
+		tampered[len(tampered)-3] ^= 0x01
+		_, err := openMetaTest(aead, tampered, aad, nonce)
 		assert.Error(t, err)
 	})
 
 	t.Run("wrong volumeNameHash", func(t *testing.T) {
 		other := sha256.Sum256([]byte("vol-meta-OTHER"))
-		_, err := openMeta(aead, blob, makeMetaAAD(other, "vbstate", 99), nonce)
+		_, err := openMetaTest(aead, blob, makeMetaAAD(other, "vbstate", 99), nonce)
 		assert.Error(t, err, "cross-volume AAD must fail verify")
 	})
 
 	t.Run("wrong domain tag", func(t *testing.T) {
-		_, err := openMeta(aead, blob, makeMetaAAD(hash, "snap:foo", 99), nonce)
+		_, err := openMetaTest(aead, blob, makeMetaAAD(hash, "snap:foo", 99), nonce)
 		assert.Error(t, err, "vbstate blob must not verify under snapshot AAD")
 	})
 
 	t.Run("wrong stateSeqNum", func(t *testing.T) {
-		_, err := openMeta(aead, blob, makeMetaAAD(hash, "vbstate", 100), nonce)
+		_, err := openMetaTest(aead, blob, makeMetaAAD(hash, "vbstate", 100), nonce)
 		assert.Error(t, err)
 	})
 
-	t.Run("blob shorter than tag", func(t *testing.T) {
-		short := blob[:aead.Overhead()-1]
-		_, err := openMeta(aead, short, aad, nonce)
-		assert.Error(t, err, "undersized blob must surface a clear error")
+	t.Run("not an envelope", func(t *testing.T) {
+		_, err := openMetaTest(aead, []byte(`{"VolumeName":"x"}`), aad, nonce)
+		assert.Error(t, err, "plain JSON without payload/authtag must fail split")
 	})
 }
 
