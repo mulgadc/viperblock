@@ -90,6 +90,15 @@ type VBState struct {
 	KeyFingerprint    string  `json:"KeyFingerprint,omitempty"`
 }
 
+// snapshotAncestor carries one level of the flattened read chain for a COW clone.
+// Index 0 is the grandparent (parent's base), with deeper ancestors at higher indices.
+type snapshotAncestor struct {
+	blocks               *BlocksToObject
+	sourceVolumeName     string
+	sourceVolumeUUID     [4]byte
+	sourceVolumeNameHash [32]byte
+}
+
 type VB struct {
 	VolumeName string
 	VolumeSize uint64
@@ -172,12 +181,12 @@ type VB struct {
 	// SnapshotID is set when this volume was created from a snapshot.
 	SnapshotID string
 
-	// GrandparentBlockMap is the frozen block-to-object map from the grandparent
-	// snapshot — i.e. the snapshot that the parent clone was itself cloned from.
-	// Populated by OpenFromSnapshot when the loaded snapshot carries a
-	// ParentSnapshotID (snapshot of a COW clone). Nil otherwise.
-	GrandparentBlockMap         *BlocksToObject
-	GrandparentSourceVolumeName string
+	// ancestors holds the flattened read chain beyond the immediate base.
+	// For flat snapshots: populated from the inherited layers section of the
+	// checkpoint at OpenFromSnapshot time. For legacy snapshots with a
+	// ParentSnapshotID chain: populated by walking the chain recursively.
+	// Index 0 = grandparent (base of the parent snapshot), higher = deeper.
+	ancestors []snapshotAncestor
 
 	// Encryption-at-rest. MasterKey is supplied by the caller (NBD plugin /
 	// CLI) via masterkey.LoadShared; aead caches MasterKey.AEAD for the hot
@@ -195,9 +204,6 @@ type VB struct {
 	VolumeUUID           [4]byte
 	SourceVolumeUUID     [4]byte
 	sourceVolumeNameHash [32]byte
-	// grandparent encryption identity — decrypts chunks from GrandparentSourceVolumeName
-	grandparentSourceVolumeUUID     [4]byte
-	grandparentSourceVolumeNameHash [32]byte
 
 	// chunkMagicChecked memoises the per-(volume,objectID) result of the chunk
 	// magic preflight in checkChunkMagic. The chunk-read fast path is hit once
@@ -3332,7 +3338,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
-	var grandConsecutiveBlocks ConsecutiveBlocks
+	ancestorConsBlocks := make([]ConsecutiveBlocks, len(vb.ancestors))
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -3388,22 +3394,29 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 					continue
 				}
 			}
-			// Base map miss — check grandparent (system-image snapshot)
-			if vb.GrandparentBlockMap != nil {
-				gpObjectID, gpObjectOffset, gpSeqNum, gpErr := vb.LookupGrandparentBlockToObject(currentBlock)
-				if gpErr == nil {
-					grandConsecutiveBlocks = append(grandConsecutiveBlocks, ConsecutiveBlock{
+			// Base map miss — check ancestor layers
+			ancFound := false
+			for ai := range vb.ancestors {
+				vb.ancestors[ai].blocks.mu.RLock()
+				lookup, ok := vb.ancestors[ai].blocks.BlockLookup[currentBlock]
+				vb.ancestors[ai].blocks.mu.RUnlock()
+				if ok {
+					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
 						BlockPosition: i,
 						StartBlock:    currentBlock,
 						NumBlocks:     1,
 						OffsetStart:   start,
 						OffsetEnd:     end,
-						ObjectID:      gpObjectID,
-						ObjectOffset:  gpObjectOffset,
-						SeqNum:        gpSeqNum,
+						ObjectID:      lookup.ObjectID,
+						ObjectOffset:  lookup.ObjectOffset,
+						SeqNum:        lookup.SeqNum,
 					})
-					continue
+					ancFound = true
+					break
 				}
+			}
+			if ancFound {
+				continue
 			}
 			zeroBlockErr = ErrZeroBlock
 			slog.Debug("[READ] ZERO BLOCK:", "block", currentBlock)
@@ -3532,10 +3545,12 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		}
 	}
 
-	// Fetch blocks from the grandparent snapshot (system-image fallback)
-	if len(grandConsecutiveBlocks) > 0 {
-		err := vb.fetchBaseBlocksFromBackend(vb.GrandparentSourceVolumeName, vb.grandparentSourceVolumeUUID, vb.grandparentSourceVolumeNameHash, grandConsecutiveBlocks, data)
-		if err != nil {
+	// Fetch blocks from ancestor snapshot layers
+	for ai, anc := range vb.ancestors {
+		if len(ancestorConsBlocks[ai]) == 0 {
+			continue
+		}
+		if err := vb.fetchBaseBlocksFromBackend(anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
 			return nil, err
 		}
 	}
@@ -3830,7 +3845,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
-	var grandConsecutiveBlocks ConsecutiveBlocks
+	ancestorConsBlocks := make([]ConsecutiveBlocks, len(vb.ancestors))
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -3883,22 +3898,29 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 					continue
 				}
 			}
-			// Base map miss — check grandparent (system-image snapshot)
-			if vb.GrandparentBlockMap != nil {
-				gpObjectID, gpObjectOffset, gpSeqNum, gpErr := vb.LookupGrandparentBlockToObject(currentBlock)
-				if gpErr == nil {
-					grandConsecutiveBlocks = append(grandConsecutiveBlocks, ConsecutiveBlock{
+			// Base map miss — check ancestor layers
+			ancFound := false
+			for ai := range vb.ancestors {
+				vb.ancestors[ai].blocks.mu.RLock()
+				lookup, ok := vb.ancestors[ai].blocks.BlockLookup[currentBlock]
+				vb.ancestors[ai].blocks.mu.RUnlock()
+				if ok {
+					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
 						BlockPosition: i,
 						StartBlock:    currentBlock,
 						NumBlocks:     1,
 						OffsetStart:   start,
 						OffsetEnd:     end,
-						ObjectID:      gpObjectID,
-						ObjectOffset:  gpObjectOffset,
-						SeqNum:        gpSeqNum,
+						ObjectID:      lookup.ObjectID,
+						ObjectOffset:  lookup.ObjectOffset,
+						SeqNum:        lookup.SeqNum,
 					})
-					continue
+					ancFound = true
+					break
 				}
+			}
+			if ancFound {
+				continue
 			}
 			if errors.Is(err, ErrZeroBlock) {
 				zeroBlockErr = ErrZeroBlock
@@ -3922,10 +3944,12 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 		}
 	}
 
-	// Fetch blocks from the grandparent snapshot (system-image fallback)
-	if len(grandConsecutiveBlocks) > 0 {
-		err = vb.fetchBaseBlocksFromBackend(vb.GrandparentSourceVolumeName, vb.grandparentSourceVolumeUUID, vb.grandparentSourceVolumeNameHash, grandConsecutiveBlocks, data)
-		if err != nil {
+	// Fetch blocks from ancestor snapshot layers
+	for ai, anc := range vb.ancestors {
+		if len(ancestorConsBlocks[ai]) == 0 {
+			continue
+		}
+		if err = vb.fetchBaseBlocksFromBackend(anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
 			return nil, err
 		}
 	}
@@ -4032,12 +4056,9 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 }
 
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
-// Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
-//
-// uuid and nameHash are the encryption identity of the source volume whose chunks
-// are being read (either SourceVolumeUUID/sourceVolumeNameHash for the base layer
-// or grandparentSourceVolumeUUID/grandparentSourceVolumeNameHash for the grandparent).
-// On unencrypted volumes these values are ignored.
+// Used by clone volumes to read blocks from the base or an ancestor snapshot layer.
+// uuid and nameHash carry the encryption identity of the source volume; ignored on
+// unencrypted volumes.
 func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, uuid [4]byte, nameHash [32]byte, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	if sourceVolume == "" {
 		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/mulgadc/viperblock/types"
@@ -31,11 +32,13 @@ import (
 // back-to-back snapshots on the same volume use disjoint nonces (domain
 // separation alone does not protect two seals in the same domain).
 //
-// ParentSnapshotID is set when the snapshotted volume was itself a COW clone
-// (vb.SnapshotID != "" at CreateSnapshot time). It records the snapshot that
-// formed that clone's BaseBlockMap so OpenFromSnapshot can reconstruct the
-// full read chain: own delta → parent delta → grandparent blocks. Empty on
-// first-generation snapshots; omitempty keeps existing snapshot metadata valid.
+// ParentSnapshotID is set on legacy snapshots (pre-flat) when the snapshotted
+// volume was itself a COW clone. Empty on flat snapshots (HasFlatSection=true)
+// and first-generation snapshots. omitempty keeps existing snapshot metadata valid.
+//
+// HasFlatSection marks checkpoints that carry an inherited-blocks section after
+// the own-blocks entries. When true, BlockCount is exact and the section starts
+// at headerSize + BlockCount*blockWalChunkSize bytes into the checkpoint.
 type SnapshotState struct {
 	SnapshotID           string    `json:"SnapshotID"`
 	SourceVolumeName     string    `json:"SourceVolumeName"`
@@ -49,6 +52,20 @@ type SnapshotState struct {
 	SourceVolumeNameHash string    `json:"SourceVolumeNameHash,omitempty"`
 	StateSeqNum          uint64    `json:"StateSeqNum,omitempty"`
 	ParentSnapshotID     string    `json:"ParentSnapshotID,omitempty"`
+	HasFlatSection       bool      `json:"HasFlatSection,omitempty"`
+}
+
+// flatSectionMagic is the 4-byte header that identifies the inherited-blocks
+// section appended after own-block entries in a flat snapshot checkpoint.
+var flatSectionMagic = [4]byte{'F', 'L', 'A', 'T'}
+
+// InheritedLayer carries the block map and source identity for one ancestor
+// level decoded from a flat snapshot's inherited-blocks section.
+type InheritedLayer struct {
+	Blocks               *BlocksToObject
+	SourceVolumeName     string
+	SourceVolumeUUID     [4]byte
+	SourceVolumeNameHash [32]byte
 }
 
 // CreateSnapshot flushes all in-flight data and creates a frozen snapshot of
@@ -81,7 +98,9 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		}
 	}
 
-	// 2. Serialize the current block-to-object map as the snapshot checkpoint
+	// 2. Serialize the current block-to-object map as the snapshot checkpoint.
+	// For COW clones (vb.BaseBlockMap != nil), also write a flat inherited-blocks
+	// section so the snapshot is self-contained with no ancestry chain to walk.
 	vb.BlocksToObject.mu.RLock()
 	blockCount := uint64(len(vb.BlocksToObject.BlockLookup))
 	checkpoint := vb.BlockToObjectWALHeader()
@@ -90,13 +109,23 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
+	hasFlatSection := vb.BaseBlockMap != nil
+	if hasFlatSection {
+		flatBytes, err := vb.buildFlatSection()
+		if err != nil {
+			return nil, fmt.Errorf("build flat section: %w", err)
+		}
+		checkpoint = append(checkpoint, flatBytes...)
+	}
+
 	// Write checkpoint to {snapshotID}/checkpoints/blocks.00000001.bin
 	emptyHeaders := []byte{}
 	if err := vb.Backend.WriteTo(snapshotID, types.FileTypeBlockCheckpoint, 0, &emptyHeaders, &checkpoint); err != nil {
 		return nil, fmt.Errorf("failed to write snapshot checkpoint: %w", err)
 	}
 
-	// 3. Build and save snapshot metadata
+	// 3. Build and save snapshot metadata.
+	// Flat snapshots clear ParentSnapshotID — there is no ancestry chain to walk.
 	snap := &SnapshotState{
 		SnapshotID:       snapshotID,
 		SourceVolumeName: vb.VolumeName,
@@ -106,7 +135,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		ObjBlockSize:     vb.ObjBlockSize,
 		BlockCount:       blockCount,
 		CreatedAt:        time.Now(),
-		ParentSnapshotID: vb.SnapshotID,
+		HasFlatSection:   hasFlatSection,
 	}
 
 	if vb.EncryptionEnabled {
@@ -161,11 +190,14 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 // nonce + AAD. Zero-valued on snapshots of unencrypted volumes; callers
 // branch on vb.EncryptionEnabled rather than testing zero.
 // ParentSnapshotID is forwarded from SnapshotState for use by OpenFromSnapshot.
+// InheritedLayers is non-nil for flat snapshots and carries the decoded
+// inherited-blocks section (all ancestor layers, no further I/O needed).
 type SnapshotIdentity struct {
 	SourceVolumeName     string
 	SourceVolumeUUID     [4]byte
 	SourceVolumeNameHash [32]byte
 	ParentSnapshotID     string
+	InheritedLayers      []InheritedLayer
 }
 
 // LoadSnapshotBlockMap reads a snapshot's frozen block-to-object map from the
@@ -263,19 +295,28 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		return nil, ident, fmt.Errorf("snapshot checkpoint version mismatch")
 	}
 
-	// 4. Validate checkpoint size: must contain only complete entries after header.
+	// 4. Validate own-blocks section size. For flat snapshots BlockCount is exact;
+	// for legacy snapshots the entire data section must be a multiple of entry size.
 	dataSize := len(checkpoint) - headerSize
-	if dataSize%blockWalChunkSize != 0 {
-		return nil, ident, fmt.Errorf("snapshot checkpoint has %d trailing bytes (data section %d bytes is not a multiple of %d-byte entries)", dataSize%blockWalChunkSize, dataSize, blockWalChunkSize)
+	ownBlocksSize := dataSize
+	if snap.HasFlatSection {
+		if snap.BlockCount > math.MaxInt/blockWalChunkSize {
+			return nil, ident, fmt.Errorf("snapshot BlockCount %d overflows addressable size", snap.BlockCount)
+		}
+		ownBlocksSize = int(snap.BlockCount) * blockWalChunkSize
+	}
+	if ownBlocksSize%blockWalChunkSize != 0 {
+		return nil, ident, fmt.Errorf("snapshot checkpoint has %d trailing bytes (own-blocks section %d bytes is not a multiple of %d-byte entries)", ownBlocksSize%blockWalChunkSize, ownBlocksSize, blockWalChunkSize)
 	}
 
-	// 5. Deserialize block lookup entries
+	// 5. Deserialize own block lookup entries
 	baseMap := &BlocksToObject{
 		BlockLookup: make(map[uint64]BlockLookup),
 	}
 
 	offset := headerSize
-	for offset+blockWalChunkSize <= len(checkpoint) {
+	end := headerSize + ownBlocksSize
+	for offset+blockWalChunkSize <= end {
 		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
 		if err != nil {
 			return nil, ident, fmt.Errorf("failed to read snapshot block entry at offset %d: %w", offset, err)
@@ -284,16 +325,25 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		offset += blockWalChunkSize
 	}
 
-	// 6. Validate block count against metadata if available (BlockCount > 0 means
-	// the snapshot was created with the block count field present)
+	// 6. Validate block count against metadata
 	if snap.BlockCount > 0 && uint64(len(baseMap.BlockLookup)) != snap.BlockCount {
 		return nil, ident, fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, len(baseMap.BlockLookup))
+	}
+
+	// 7. Parse the flat inherited-blocks section if present
+	if snap.HasFlatSection {
+		layers, err := parseFlatSection(checkpoint[end:])
+		if err != nil {
+			return nil, ident, fmt.Errorf("snapshot %s flat section: %w", snapshotID, err)
+		}
+		ident.InheritedLayers = layers
 	}
 
 	slog.Debug("LoadSnapshotBlockMap: loaded",
 		"snapshotID", snapshotID,
 		"sourceVolume", snap.SourceVolumeName,
-		"blocks", len(baseMap.BlockLookup))
+		"blocks", len(baseMap.BlockLookup),
+		"inheritedLayers", len(ident.InheritedLayers))
 
 	return baseMap, ident, nil
 }
@@ -321,16 +371,34 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 	vb.SnapshotID = snapshotID
 	vb.SourceVolumeUUID = ident.SourceVolumeUUID
 	vb.sourceVolumeNameHash = ident.SourceVolumeNameHash
+	vb.ancestors = nil
 
-	if ident.ParentSnapshotID != "" {
-		parentMap, parentIdent, err := vb.LoadSnapshotBlockMap(ident.ParentSnapshotID)
-		if err != nil {
-			return fmt.Errorf("failed to load parent snapshot %s: %w", ident.ParentSnapshotID, err)
+	if len(ident.InheritedLayers) > 0 {
+		// Flat snapshot: all ancestor layers are embedded in the checkpoint.
+		for _, layer := range ident.InheritedLayers {
+			vb.ancestors = append(vb.ancestors, snapshotAncestor{
+				blocks:               layer.Blocks,
+				sourceVolumeName:     layer.SourceVolumeName,
+				sourceVolumeUUID:     layer.SourceVolumeUUID,
+				sourceVolumeNameHash: layer.SourceVolumeNameHash,
+			})
 		}
-		vb.GrandparentBlockMap = parentMap
-		vb.GrandparentSourceVolumeName = parentIdent.SourceVolumeName
-		vb.grandparentSourceVolumeUUID = parentIdent.SourceVolumeUUID
-		vb.grandparentSourceVolumeNameHash = parentIdent.SourceVolumeNameHash
+	} else if ident.ParentSnapshotID != "" {
+		// Legacy snapshot: walk the ParentSnapshotID chain to any depth.
+		parentID := ident.ParentSnapshotID
+		for parentID != "" {
+			parentMap, parentIdent, err := vb.LoadSnapshotBlockMap(parentID)
+			if err != nil {
+				return fmt.Errorf("failed to load ancestor snapshot %s: %w", parentID, err)
+			}
+			vb.ancestors = append(vb.ancestors, snapshotAncestor{
+				blocks:               parentMap,
+				sourceVolumeName:     parentIdent.SourceVolumeName,
+				sourceVolumeUUID:     parentIdent.SourceVolumeUUID,
+				sourceVolumeNameHash: parentIdent.SourceVolumeNameHash,
+			})
+			parentID = parentIdent.ParentSnapshotID
+		}
 	}
 
 	slog.Debug("OpenFromSnapshot: clone ready",
@@ -338,7 +406,7 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 		"snapshotID", snapshotID,
 		"sourceVolume", ident.SourceVolumeName,
 		"baseBlocks", len(baseMap.BlockLookup),
-		"grandparentSnapshotID", ident.ParentSnapshotID)
+		"ancestorLayers", len(vb.ancestors))
 
 	return nil
 }
@@ -362,20 +430,147 @@ func (vb *VB) LookupBaseBlockToObject(block uint64) (uint64, uint32, uint64, err
 	return lookup.ObjectID, lookup.ObjectOffset, lookup.SeqNum, nil
 }
 
-// LookupGrandparentBlockToObject looks up a block in the grandparent block map.
-// This is the second-generation base: the snapshot that the parent clone was
-// itself cloned from (typically the system image snapshot).
-func (vb *VB) LookupGrandparentBlockToObject(block uint64) (uint64, uint32, uint64, error) {
-	if vb.GrandparentBlockMap == nil {
-		return 0, 0, 0, ErrZeroBlock
+// buildFlatSection serialises all inherited ancestor blocks into a binary
+// section appended after the own-block entries in a flat snapshot checkpoint.
+//
+// Format:
+//
+//	magic[4] version[1] numSources[1]
+//	For each source:
+//	  nameLen[2] name[N] uuid[4] nameHash[32] numBlocks[4]
+//	  [BlockWalChunk × numBlocks]
+func (vb *VB) buildFlatSection() ([]byte, error) {
+	type sourceGroup struct {
+		name     string
+		uuid     [4]byte
+		nameHash [32]byte
+		blocks   []BlockLookup
 	}
 
-	vb.GrandparentBlockMap.mu.RLock()
-	lookup, ok := vb.GrandparentBlockMap.BlockLookup[block]
-	vb.GrandparentBlockMap.mu.RUnlock()
-
-	if !ok {
-		return 0, 0, 0, ErrZeroBlock
+	// Build a seen-set from own blocks so inherited entries only include blocks
+	// not already covered by the volume's own delta.
+	seen := make(map[uint64]struct{}, len(vb.BlocksToObject.BlockLookup))
+	vb.BlocksToObject.mu.RLock()
+	for k := range vb.BlocksToObject.BlockLookup {
+		seen[k] = struct{}{}
 	}
-	return lookup.ObjectID, lookup.ObjectOffset, lookup.SeqNum, nil
+	vb.BlocksToObject.mu.RUnlock()
+
+	// Collect layers in priority order: base map first, then deeper ancestors.
+	sources := make([]sourceGroup, 0, 1+len(vb.ancestors))
+
+	baseGroup := sourceGroup{name: vb.SourceVolumeName, uuid: vb.SourceVolumeUUID, nameHash: vb.sourceVolumeNameHash}
+	vb.BaseBlockMap.mu.RLock()
+	for k, v := range vb.BaseBlockMap.BlockLookup {
+		if _, exists := seen[k]; !exists {
+			baseGroup.blocks = append(baseGroup.blocks, v)
+			seen[k] = struct{}{}
+		}
+	}
+	vb.BaseBlockMap.mu.RUnlock()
+	sources = append(sources, baseGroup)
+
+	for _, anc := range vb.ancestors {
+		g := sourceGroup{name: anc.sourceVolumeName, uuid: anc.sourceVolumeUUID, nameHash: anc.sourceVolumeNameHash}
+		anc.blocks.mu.RLock()
+		for k, v := range anc.blocks.BlockLookup {
+			if _, exists := seen[k]; !exists {
+				g.blocks = append(g.blocks, v)
+				seen[k] = struct{}{}
+			}
+		}
+		anc.blocks.mu.RUnlock()
+		sources = append(sources, g)
+	}
+
+	if len(sources) > math.MaxUint8 {
+		return nil, fmt.Errorf("too many ancestor sources (%d > %d)", len(sources), math.MaxUint8)
+	}
+
+	var buf []byte
+	buf = append(buf, flatSectionMagic[:]...)
+	buf = append(buf, 1)                   // version
+	buf = append(buf, uint8(len(sources))) //nolint:gosec // G115: bounded above
+	for _, src := range sources {
+		nameBytes := []byte(src.name)
+		if len(nameBytes) > math.MaxUint16 {
+			return nil, fmt.Errorf("source name too long (%d bytes)", len(nameBytes))
+		}
+		if len(src.blocks) > math.MaxUint32 {
+			return nil, fmt.Errorf("source block count %d exceeds uint32 limit", len(src.blocks))
+		}
+		nameLenBuf := make([]byte, 2)
+		binary.BigEndian.PutUint16(nameLenBuf, uint16(len(nameBytes))) //nolint:gosec // G115: bounded above
+		buf = append(buf, nameLenBuf...)
+		buf = append(buf, nameBytes...)
+		buf = append(buf, src.uuid[:]...)
+		buf = append(buf, src.nameHash[:]...)
+		numBlocksBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(numBlocksBuf, uint32(len(src.blocks))) //nolint:gosec // G115: bounded above
+		buf = append(buf, numBlocksBuf...)
+		for i := range src.blocks {
+			buf = append(buf, vb.writeBlockWalChunk(&src.blocks[i])...)
+		}
+	}
+	return buf, nil
+}
+
+// parseFlatSection decodes the inherited-blocks section produced by buildFlatSection.
+func parseFlatSection(data []byte) ([]InheritedLayer, error) {
+	if len(data) < 6 {
+		return nil, fmt.Errorf("flat section too short (%d bytes)", len(data))
+	}
+	if [4]byte(data[0:4]) != flatSectionMagic {
+		return nil, fmt.Errorf("flat section magic mismatch")
+	}
+	// data[4] = version (reserved, must be 1)
+	numSources := int(data[5])
+	offset := 6
+
+	layers := make([]InheritedLayer, 0, numSources)
+	for i := range numSources {
+		if offset+2 > len(data) {
+			return nil, fmt.Errorf("flat section: source %d: truncated name length", i)
+		}
+		nameLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if offset+nameLen > len(data) {
+			return nil, fmt.Errorf("flat section: source %d: truncated name", i)
+		}
+		name := string(data[offset : offset+nameLen])
+		offset += nameLen
+		if offset+4+32+4 > len(data) {
+			return nil, fmt.Errorf("flat section: source %d: truncated identity", i)
+		}
+		var uuid [4]byte
+		copy(uuid[:], data[offset:offset+4])
+		offset += 4
+		var nameHash [32]byte
+		copy(nameHash[:], data[offset:offset+32])
+		offset += 32
+		numBlocks := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+		offset += 4
+
+		bm := &BlocksToObject{BlockLookup: make(map[uint64]BlockLookup, numBlocks)}
+		// Reuse a zero-value VB just to call readBlockWalChunk (pure function on data).
+		var tmp VB
+		for j := range numBlocks {
+			if offset+blockWalChunkSize > len(data) {
+				return nil, fmt.Errorf("flat section: source %d: block %d: truncated", i, j)
+			}
+			block, err := tmp.readBlockWalChunk(data[offset : offset+blockWalChunkSize])
+			if err != nil {
+				return nil, fmt.Errorf("flat section: source %d: block %d: %w", i, j, err)
+			}
+			bm.BlockLookup[block.StartBlock] = block
+			offset += blockWalChunkSize
+		}
+		layers = append(layers, InheritedLayer{
+			Blocks:               bm,
+			SourceVolumeName:     name,
+			SourceVolumeUUID:     uuid,
+			SourceVolumeNameHash: nameHash,
+		})
+	}
+	return layers, nil
 }
