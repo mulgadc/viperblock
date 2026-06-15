@@ -2810,15 +2810,32 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 // that would let reserveSeqNum re-hand-out values on restart.
 func (vb *VB) SaveState() error {
 	if vb.EncryptionEnabled {
-		var zero [4]byte
-		if vb.VolumeUUID == zero {
-			if _, err := rand.Read(vb.VolumeUUID[:]); err != nil {
-				return fmt.Errorf("SaveState: mint VolumeUUID: %w", err)
-			}
+		minted, err := vb.mintVolumeUUID()
+		if err != nil {
+			return fmt.Errorf("SaveState: %w", err)
+		}
+		if minted {
 			vb.seqNumHighWater.Store(seqNumReservation)
 		}
 	}
 	return vb.saveStateWithHighWater(vb.seqNumHighWater.Load())
+}
+
+// mintVolumeUUID seeds the per-volume nonce subspace via crypto/rand when it is
+// still zero, returning true if it minted. VolumeUUID seeds every chunk/WAL
+// AES-GCM nonce, so it must be non-zero before any block is sealed; minting it
+// lazily and persisting a different value later makes read-back reconstruct a
+// divergent nonce and fail tag verify. Callers persist the result durably in
+// the same critical section. No-op (false) once VolumeUUID is set.
+func (vb *VB) mintVolumeUUID() (bool, error) {
+	var zero [4]byte
+	if vb.VolumeUUID != zero {
+		return false, nil
+	}
+	if _, err := rand.Read(vb.VolumeUUID[:]); err != nil {
+		return false, fmt.Errorf("mint VolumeUUID: %w", err)
+	}
+	return true, nil
 }
 
 // saveStateWithHighWater persists VBState with an explicit SeqNumHighWater
@@ -3059,6 +3076,21 @@ func (vb *VB) LoadState() error {
 
 	vb.nextStateSeqNum.Store(state.StateSeqNum)
 
+	// If this volume was created from a snapshot, restore the base block map
+	// BEFORE the encrypted SeqNum bootstrap below. OpenFromSnapshot sets
+	// SnapshotID/SourceVolumeName, and the encrypted bumpSeqNumHighWater
+	// durably persists VBState. Restoring the snapshot link after that persist
+	// would write a config.json with an empty SnapshotID, so the next open
+	// loads no base map and serves an all-zeros disk. OpenFromSnapshot verifies
+	// the snapshot under the source identity, independent of this volume's
+	// VolumeUUID, so it is safe to run first.
+	if state.SnapshotID != "" {
+		if err := vb.OpenFromSnapshot(state.SnapshotID); err != nil {
+			slog.Error("Failed to load snapshot base map", "snapshotID", state.SnapshotID, "error", err)
+			return fmt.Errorf("failed to load snapshot %s: %w", state.SnapshotID, err)
+		}
+	}
+
 	// Encryption SeqNum bootstrap. On a successful Open of an existing
 	// encrypted volume, restart SeqNum at the persisted high-water and
 	// reserve the next window durably before any data write can hand out a
@@ -3072,16 +3104,6 @@ func (vb *VB) LoadState() error {
 		vb.seqNumHighWater.Store(state.SeqNumHighWater)
 		if err := vb.bumpSeqNumHighWater(); err != nil {
 			return fmt.Errorf("LoadState: reserve initial SeqNum window: %w", err)
-		}
-	}
-
-	// If this volume was created from a snapshot, load the base block map.
-	// OpenFromSnapshot sets SnapshotID and SourceVolumeName from the snapshot
-	// config, so we don't set them separately to avoid two sources of truth.
-	if state.SnapshotID != "" {
-		if err := vb.OpenFromSnapshot(state.SnapshotID); err != nil {
-			slog.Error("Failed to load snapshot base map", "snapshotID", state.SnapshotID, "error", err)
-			return fmt.Errorf("failed to load snapshot %s: %w", state.SnapshotID, err)
 		}
 	}
 
@@ -3119,6 +3141,17 @@ func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
 	if end <= hw {
 		vb.seqNumHighWaterMu.Unlock()
 		return start, nil
+	}
+	// Mint the per-volume nonce subspace before the first durable persist or
+	// seal. The first encrypted write always reaches here (seqNumHighWater
+	// starts at zero), so minting under this mutex guarantees VolumeUUID is
+	// non-zero and persisted by persistStateLocal below before any block is
+	// sealed under it. Without this, freshly-seeded volumes (EFI varstore, raw
+	// imports) seal chunk 0 under the zero UUID while a later SaveState mints a
+	// random one, breaking read-back with a tag-verify failure.
+	if _, err := vb.mintVolumeUUID(); err != nil {
+		vb.seqNumHighWaterMu.Unlock()
+		return 0, fmt.Errorf("reserveSeqNum: %w", err)
 	}
 	for end > hw {
 		hw += seqNumReservation

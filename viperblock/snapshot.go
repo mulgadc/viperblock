@@ -102,7 +102,6 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	}
 
 	if vb.EncryptionEnabled {
-		snap.SourceVolumeUUID = hex.EncodeToString(vb.VolumeUUID[:])
 		snap.SourceVolumeNameHash = hex.EncodeToString(vb.volumeNameHash[:])
 		snap.StateSeqNum = vb.nextStateSeqNum.Add(1)
 		// Persist the bumped counter before sealing under it: a crash
@@ -116,6 +115,12 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		if err := vb.SaveState(); err != nil {
 			return nil, fmt.Errorf("snapshot StateSeqNum persist: %w", err)
 		}
+		// Capture VolumeUUID AFTER SaveState: SaveState mints it on first
+		// use for an encrypted volume, and the meta nonce below seals under
+		// the minted value. Recording it earlier persists the pre-mint zero
+		// UUID, so open-time nonce reconstruction diverges from the seal
+		// nonce and every read fails tag verify.
+		snap.SourceVolumeUUID = hex.EncodeToString(vb.VolumeUUID[:])
 	}
 
 	snapJSON, err := json.Marshal(snap)
