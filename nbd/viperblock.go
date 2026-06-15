@@ -8,11 +8,8 @@ import (
 	"libguestfs.org/nbdkit"
 )
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
-	"os"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
@@ -22,17 +19,6 @@ import (
 	_ "github.com/mulgadc/viperblock/internal/fipsboot"
 )
 
-type ebsSnapshotRequest struct {
-	Volume     string `json:"Volume"`
-	SnapshotID string `json:"SnapshotID"`
-}
-
-type ebsSnapshotResponse struct {
-	SnapshotID string `json:"SnapshotID"`
-	Success    bool   `json:"Success"`
-	Error      string `json:"Error,omitempty"`
-}
-
 var pluginName = "viperblock"
 
 type ViperBlockPlugin struct {
@@ -41,8 +27,7 @@ type ViperBlockPlugin struct {
 
 type ViperBlockConnection struct {
 	nbdkit.Connection
-	vb           *viperblock.VB
-	snapListener net.Listener
+	vb *viperblock.VB
 }
 
 var size uint64
@@ -57,7 +42,6 @@ var base_dir string
 var cache_size int = 20
 var use_shardwal bool = false
 var encryption_key_file string
-var snapshot_socket string
 
 var disk []byte
 
@@ -120,9 +104,6 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "encryption_key_file" {
 		encryption_key_file = value
-		return nil
-	} else if key == "snapshot_socket" {
-		snapshot_socket = value
 		return nil
 	} else {
 		return nbdkit.PluginError{Errmsg: "unknown parameter"}
@@ -258,62 +239,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
 	}
 
-	conn := &ViperBlockConnection{vb: vb}
-
-	if snapshot_socket != "" {
-		ln, err := serveSnapshotSocket(vb, snapshot_socket)
-		if err != nil {
-			slog.Error("NBD plugin: failed to start snapshot socket", "volume", volume, "socket", snapshot_socket, "err", err)
-		} else {
-			conn.snapListener = ln
-		}
-	}
-
-	return conn, nil
-}
-
-// serveSnapshotSocket starts a Unix domain socket listener so viperblockd can
-// forward snapshot requests to this plugin process (which owns the WAL).
-// The listener is returned so Close() can shut it down cleanly.
-func serveSnapshotSocket(vb *viperblock.VB, socketPath string) (net.Listener, error) {
-	_ = os.Remove(socketPath) // clean up stale socket from a previous run
-	ln, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return nil, fmt.Errorf("listen snapshot socket: %w", err)
-	}
-	slog.Info("NBD plugin: snapshot socket ready", "volume", vb.VolumeName, "socket", socketPath)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return // listener was closed
-			}
-			go handleSnapshotConn(vb, conn)
-		}
-	}()
-	return ln, nil
-}
-
-func handleSnapshotConn(vb *viperblock.VB, conn net.Conn) {
-	defer conn.Close()
-	var req ebsSnapshotRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		resp, _ := json.Marshal(ebsSnapshotResponse{Error: fmt.Sprintf("bad request: %v", err)})
-		_, _ = conn.Write(resp)
-		return
-	}
-	slog.Info("NBD plugin: handling snapshot request", "volume", vb.VolumeName, "snapshotId", req.SnapshotID)
-	_, snapErr := vb.CreateSnapshot(req.SnapshotID)
-	var resp ebsSnapshotResponse
-	if snapErr != nil {
-		slog.Error("NBD plugin: CreateSnapshot failed", "volume", vb.VolumeName, "snapshotId", req.SnapshotID, "err", snapErr)
-		resp = ebsSnapshotResponse{SnapshotID: req.SnapshotID, Error: snapErr.Error()}
-	} else {
-		slog.Info("NBD plugin: snapshot created", "volume", vb.VolumeName, "snapshotId", req.SnapshotID)
-		resp = ebsSnapshotResponse{SnapshotID: req.SnapshotID, Success: true}
-	}
-	data, _ := json.Marshal(resp)
-	_, _ = conn.Write(data)
+	return &ViperBlockConnection{vb: vb}, nil
 }
 
 func (c *ViperBlockConnection) GetSize() (uint64, error) {
@@ -426,13 +352,6 @@ func (c *ViperBlockConnection) Flush(flags uint32) error {
 func (c *ViperBlockConnection) Close() {
 
 	slog.Info("Close, flushing block state to disk")
-
-	if c.snapListener != nil {
-		if err := c.snapListener.Close(); err != nil {
-			slog.Error("NBD plugin: failed to close snapshot socket", "err", err)
-		}
-		_ = os.Remove(snapshot_socket)
-	}
 
 	// Gracefully close VB and save state to disk
 	err := c.vb.Close()

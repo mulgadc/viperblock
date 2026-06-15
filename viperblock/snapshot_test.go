@@ -486,15 +486,15 @@ func TestSnapshotCOWChain(t *testing.T) {
 		require.NoError(t, cloneA.Flush())
 		require.NoError(t, cloneA.WriteWALToChunk(true))
 
-		// Snapshot the clone — this should record baseSnapID as ParentSnapshotID
+		// Snapshot the clone — flat snapshot: no ParentSnapshotID, HasFlatSection=true
 		cloneASnapID := fmt.Sprintf("snap-%s-clone", cloneA.VolumeName)
 		snap, err := cloneA.CreateSnapshot(cloneASnapID)
 		require.NoError(t, err)
-		assert.Equal(t, baseSnapID, snap.ParentSnapshotID, "snapshot of COW clone must record parent snapshot ID")
+		assert.True(t, snap.HasFlatSection, "snapshot of COW clone must embed inherited blocks (flat section)")
+		assert.Empty(t, snap.ParentSnapshotID, "flat snapshot must not set a ParentSnapshotID")
 
-		// Layer 2 (instance B): clone from the clone's snapshot
+		// Layer 2 (instance B): clone from the clone's snapshot; ancestors populated from flat section
 		cloneB := createCloneVB(t, cloneA, cloneASnapID)
-		assert.NotNil(t, cloneB.GrandparentBlockMap, "grandparent block map must be populated")
 
 		// Block 0: never written by cloneA — must come from grandparent (base image)
 		got, err := cloneB.ReadAt(0, blockSize)
