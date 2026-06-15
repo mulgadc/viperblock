@@ -117,6 +117,63 @@ func TestSnapshotEncrypted_PersistsSourceIdentity(t *testing.T) {
 	assert.Equal(t, env.source.volumeNameHash, ident.SourceVolumeNameHash)
 }
 
+// TestSnapshotEncrypted_SnapshotBeforeSaveStateMintsConsistentUUID gates the
+// AMI-import ordering. ImportDiskImage writes blocks and snapshots WITHOUT a
+// prior SaveState, so VolumeUUID is still zero entering CreateSnapshot, where
+// SaveState mints it. CreateSnapshot must record the SAME (minted) UUID it
+// seals the metadata nonce under — recording the pre-mint zero while sealing
+// under the minted value makes LoadSnapshotBlockMap reconstruct the wrong
+// nonce and fail tag verify. This is the exact "snapshot ... tag verify:
+// message authentication failed" seen on every encrypted AMI launch.
+func TestSnapshotEncrypted_SnapshotBeforeSaveStateMintsConsistentUUID(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t, 0x42)
+	cfg := file.FileConfig{BaseDir: dir, VolumeName: "src-import-order"}
+	vb, err := New(&VB{
+		VolumeName:        "src-import-order",
+		VolumeSize:        64 * 1024 * 1024,
+		BaseDir:           dir,
+		MasterKey:         key,
+		EncryptionEnabled: true,
+		WALSyncInterval:   -1,
+	}, "file", cfg)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	vb.BlockSize = DefaultBlockSize
+	vb.ObjBlockSize = 16 * DefaultBlockSize
+	// Deliberately NO SaveState here — mirrors ImportDiskImage, which leaves
+	// VolumeUUID unminted entering CreateSnapshot.
+	require.NoError(t, vb.OpenWAL(&vb.WAL,
+		fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL,
+		fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	var zero [4]byte
+	require.Equal(t, zero, vb.VolumeUUID, "precondition: VolumeUUID must be unminted entering the snapshot")
+
+	data := make([]byte, vb.BlockSize*4)
+	_, err = rand.Read(data)
+	require.NoError(t, err)
+	require.NoError(t, vb.Write(0, data))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	snapshotID := "snap-import-order"
+	snap, err := vb.CreateSnapshot(snapshotID)
+	require.NoError(t, err)
+	require.NotNil(t, snap)
+
+	require.NotEqual(t, zero, vb.VolumeUUID, "CreateSnapshot must mint VolumeUUID")
+	assert.Equal(t, hex.EncodeToString(vb.VolumeUUID[:]), snap.SourceVolumeUUID,
+		"snapshot must record the minted UUID it sealed the nonce under, not the pre-mint zero")
+
+	// Decisive gate: the metadata envelope must verify. Pre-fix this returns
+	// ErrIntegrity — sealed under the minted UUID, recorded (and reopened) as zero.
+	_, ident, err := vb.LoadSnapshotBlockMap(snapshotID)
+	require.NoError(t, err, "snapshot metadata must verify when VolumeUUID is minted during CreateSnapshot")
+	assert.Equal(t, vb.VolumeUUID, ident.SourceVolumeUUID)
+}
+
 // TestSnapshotEncrypted_CloneReadsBaseChunks — the clone opens the
 // snapshot and reads blocks 0-3 through the base-chunk path. Each read
 // must decrypt the source's chunks under the source's identity (the

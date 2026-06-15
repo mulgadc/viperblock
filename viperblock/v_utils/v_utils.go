@@ -140,6 +140,18 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		return fmt.Errorf("failed to load block WAL: %v", err)
 	}
 
+	// Encrypted volumes derive the AES-GCM nonce from VolumeUUID, which
+	// SaveState mints on first use. Mint it now, before the first chunk is
+	// sealed in the write loop, so every chunk and the AMI snapshot share one
+	// stable UUID. Deferring the mint to CreateSnapshot would seal the chunks
+	// under the zero UUID while the snapshot records the minted one, breaking
+	// clone reads with a tag-verify failure.
+	if vb.EncryptionEnabled {
+		if err := vb.SaveState(); err != nil {
+			return fmt.Errorf("failed to persist initial state: %w", err)
+		}
+	}
+
 	var block uint64 = 0
 
 	totalBytes := fileInfo.Size()
