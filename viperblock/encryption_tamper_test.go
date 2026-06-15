@@ -558,3 +558,62 @@ func TestEncryptedWAL_RecoveryAEADTamperSurfacesErrIntegrity(t *testing.T) {
 	_, statErr = os.Stat(walPath)
 	assert.NoError(t, statErr, "tampered WAL must NOT be deleted by RecoverLocalWALs — kept on disk for forensics + retry")
 }
+
+// TestReserveSeqNum_MintsVolumeUUIDBeforeFirstSeal gates the fresh-seeded
+// volume path (EFI varstore seed, raw AMI import): a volume written and chunked
+// WITHOUT a prior SaveState must still round-trip after a later SaveState.
+// reserveSeqNum mints VolumeUUID on the first encrypted write and persists it
+// before any block is sealed, so the chunk and config.json agree on the nonce
+// subspace. Without that mint, the chunk seals under the zero UUID while the
+// deferred SaveState (Close) mints a random one, and read-back fails tag verify
+// — the exact "integrity check failed: chunk 0 block 0 (seqNum 1): cipher:
+// message authentication failed" seen on the EFI pflash drive at instance launch.
+func TestReserveSeqNum_MintsVolumeUUIDBeforeFirstSeal(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t, 0x42)
+	cfg := file.FileConfig{BaseDir: dir, VolumeName: "vol-efi-seed"}
+	vb, err := New(&VB{
+		VolumeName:        "vol-efi-seed",
+		VolumeSize:        64 * 1024 * 1024,
+		BaseDir:           dir,
+		MasterKey:         key,
+		EncryptionEnabled: true,
+		WALSyncInterval:   -1,
+	}, "file", cfg)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	vb.BlockSize = DefaultBlockSize
+	vb.ObjBlockSize = 16 * DefaultBlockSize
+	// Deliberately NO SaveState before writing — mirrors prepareEFIVolume,
+	// which seeds the varstore via WriteAt -> Flush -> Close with no prior mint.
+	require.NoError(t, vb.OpenWAL(&vb.WAL,
+		fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL,
+		fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	var zero [4]byte
+	require.Equal(t, zero, vb.VolumeUUID, "precondition: VolumeUUID unminted before first write")
+
+	plaintext := make([]byte, vb.BlockSize*4)
+	_, err = rand.Read(plaintext)
+	require.NoError(t, err)
+	require.NoError(t, vb.Write(0, plaintext))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	// The first encrypted write must have minted the UUID via reserveSeqNum, so
+	// the chunk just sealed is bound to a non-zero, persisted nonce subspace.
+	minted := vb.VolumeUUID
+	require.NotEqual(t, zero, minted, "reserveSeqNum must mint VolumeUUID on the first encrypted write")
+
+	// A deferred SaveState (Close calls this after sealing) must PRESERVE the
+	// write-minted UUID, not overwrite it with a fresh random value.
+	require.NoError(t, vb.SaveState())
+	require.Equal(t, minted, vb.VolumeUUID, "deferred SaveState must preserve the write-minted UUID")
+
+	// Decisive gate: read block 0 back through the chunk decrypt path. Pre-fix
+	// this fails ErrIntegrity (chunk sealed under zero, reopened under random).
+	got, err := vb.ReadAt(0, uint64(vb.BlockSize))
+	require.NoError(t, err, "fresh-seeded encrypted volume must round-trip after a deferred SaveState")
+	assert.True(t, bytes.Equal(plaintext[:vb.BlockSize], got), "block 0 plaintext mismatch after decrypt")
+}
