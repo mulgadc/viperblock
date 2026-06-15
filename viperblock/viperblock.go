@@ -3076,6 +3076,21 @@ func (vb *VB) LoadState() error {
 
 	vb.nextStateSeqNum.Store(state.StateSeqNum)
 
+	// If this volume was created from a snapshot, restore the base block map
+	// BEFORE the encrypted SeqNum bootstrap below. OpenFromSnapshot sets
+	// SnapshotID/SourceVolumeName, and the encrypted bumpSeqNumHighWater
+	// durably persists VBState. Restoring the snapshot link after that persist
+	// would write a config.json with an empty SnapshotID, so the next open
+	// loads no base map and serves an all-zeros disk. OpenFromSnapshot verifies
+	// the snapshot under the source identity, independent of this volume's
+	// VolumeUUID, so it is safe to run first.
+	if state.SnapshotID != "" {
+		if err := vb.OpenFromSnapshot(state.SnapshotID); err != nil {
+			slog.Error("Failed to load snapshot base map", "snapshotID", state.SnapshotID, "error", err)
+			return fmt.Errorf("failed to load snapshot %s: %w", state.SnapshotID, err)
+		}
+	}
+
 	// Encryption SeqNum bootstrap. On a successful Open of an existing
 	// encrypted volume, restart SeqNum at the persisted high-water and
 	// reserve the next window durably before any data write can hand out a
@@ -3089,16 +3104,6 @@ func (vb *VB) LoadState() error {
 		vb.seqNumHighWater.Store(state.SeqNumHighWater)
 		if err := vb.bumpSeqNumHighWater(); err != nil {
 			return fmt.Errorf("LoadState: reserve initial SeqNum window: %w", err)
-		}
-	}
-
-	// If this volume was created from a snapshot, load the base block map.
-	// OpenFromSnapshot sets SnapshotID and SourceVolumeName from the snapshot
-	// config, so we don't set them separately to avoid two sources of truth.
-	if state.SnapshotID != "" {
-		if err := vb.OpenFromSnapshot(state.SnapshotID); err != nil {
-			slog.Error("Failed to load snapshot base map", "snapshotID", state.SnapshotID, "error", err)
-			return fmt.Errorf("failed to load snapshot %s: %w", state.SnapshotID, err)
 		}
 	}
 

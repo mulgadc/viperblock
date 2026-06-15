@@ -174,6 +174,80 @@ func TestSnapshotEncrypted_SnapshotBeforeSaveStateMintsConsistentUUID(t *testing
 	assert.Equal(t, vb.VolumeUUID, ident.SourceVolumeUUID)
 }
 
+// TestSnapshotEncrypted_ReopenPreservesSnapshotLink gates the LoadState
+// ordering for encrypted snapshot clones. The encrypted SeqNum bootstrap
+// (bumpSeqNumHighWater) durably rewrites config.json during LoadState; it must
+// run AFTER OpenFromSnapshot restores SnapshotID, or the rewritten config
+// records an empty SnapshotID. The next open then loads no base map and serves
+// an all-zeros disk — the exact "guest drops to UEFI shell, no FS0:" failure on
+// every encrypted AMI launch. In-memory SnapshotID is restored either way
+// (OpenFromSnapshot runs at the end), so this asserts the PERSISTED config and
+// a fresh-open base read, which is what the runtime nbdkit plugin process sees.
+func TestSnapshotEncrypted_ReopenPreservesSnapshotLink(t *testing.T) {
+	env := newSnapshotEnv(t, "src-reopen", testKey(t, 0x42))
+
+	blockCount := uint64(4)
+	plaintext := make([]byte, uint64(env.source.BlockSize)*blockCount)
+	_, err := rand.Read(plaintext)
+	require.NoError(t, err)
+	require.NoError(t, env.source.Write(0, plaintext))
+	require.NoError(t, env.source.Flush())
+	require.NoError(t, env.source.WriteWALToChunk(true))
+
+	snapshotID := "snap-reopen"
+	_, err = env.source.CreateSnapshot(snapshotID)
+	require.NoError(t, err)
+
+	// Open an encrypted clone and persist its state — config.json now records
+	// SnapshotID, exactly as RunInstances' cloneAMIToVolume does.
+	clone := env.openEncryptedClone(t, "clone-reopen", snapshotID)
+	require.NoError(t, clone.SaveState())
+	require.Equal(t, snapshotID, clone.SnapshotID)
+
+	// Reopen the clone. Pre-fix, LoadState's bumpSeqNumHighWater persists
+	// config.json before OpenFromSnapshot restores the link, clobbering
+	// SnapshotID on disk.
+	reopened := newCloneReopen(t, env.dir, "clone-reopen", env.key)
+	require.NoError(t, reopened.LoadState())
+
+	// Decisive gate 1: the persisted config must still carry the snapshot link.
+	configPath := filepath.Join(env.dir, types.GetFilePath(types.FileTypeConfig, 0, "clone-reopen"))
+	persistedState, err := reopened.LoadStateRequest(configPath)
+	require.NoError(t, err)
+	require.Equal(t, snapshotID, persistedState.SnapshotID,
+		"LoadState must not persist an empty SnapshotID — that bricks base-map reads on the next open")
+
+	// Decisive gate 2: a brand-new open (mirrors the nbdkit plugin process)
+	// must load the base map from disk and decrypt source blocks, not zeros.
+	fresh := newCloneReopen(t, env.dir, "clone-reopen", env.key)
+	require.NoError(t, fresh.LoadState())
+	require.Equal(t, snapshotID, fresh.SnapshotID, "fresh open must recover SnapshotID from disk")
+	got, err := fresh.ReadAt(0, uint64(fresh.BlockSize))
+	require.NoError(t, err, "fresh open of an encrypted clone must read base blocks, not an all-zeros disk")
+	assert.True(t, bytes.Equal(plaintext[:fresh.BlockSize], got), "base block 0 must decrypt to source plaintext")
+}
+
+// newCloneReopen constructs a fresh encrypted VB over an existing on-disk
+// volume in dir WITHOUT a pre-write SaveState, so LoadState reads the persisted
+// config exactly as a cold reopen (or the out-of-process nbdkit plugin) would.
+func newCloneReopen(t *testing.T, dir, volumeName string, key *masterkey.Key) *VB {
+	t.Helper()
+	cfg := file.FileConfig{BaseDir: dir, VolumeName: volumeName}
+	vb, err := New(&VB{
+		VolumeName:        volumeName,
+		VolumeSize:        64 * 1024 * 1024,
+		BaseDir:           dir,
+		MasterKey:         key,
+		EncryptionEnabled: key != nil,
+		WALSyncInterval:   -1,
+	}, "file", cfg)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	vb.BlockSize = DefaultBlockSize
+	vb.ObjBlockSize = 16 * DefaultBlockSize
+	return vb
+}
+
 // TestSnapshotEncrypted_CloneReadsBaseChunks — the clone opens the
 // snapshot and reads blocks 0-3 through the base-chunk path. Each read
 // must decrypt the source's chunks under the source's identity (the
