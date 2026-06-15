@@ -7,7 +7,7 @@ replace libguestfs.org/nbdkit => ./nbd/libguestfs.org/nbdkit
 require (
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/predastore v1.7.0
+	github.com/mulgadc/predastore v1.8.0
 	github.com/pterm/pterm v0.12.83
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.56.0
@@ -19,7 +19,7 @@ require (
 	atomicgo.dev/keyboard v0.2.9 // indirect
 	atomicgo.dev/schedule v0.1.0 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.41.12 // indirect
+	github.com/aws/aws-sdk-go-v2 v1.42.0 // indirect
 	github.com/aws/smithy-go v1.27.1 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/buraksezer/consistent v0.10.0 // indirect
@@ -27,7 +27,7 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/dgraph-io/badger/v4 v4.9.1 // indirect
+	github.com/dgraph-io/badger/v4 v4.9.2 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.19.0 // indirect
