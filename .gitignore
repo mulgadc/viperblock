@@ -1,9 +1,5 @@
 lib/nbdkit-viperblock-plugin.so
 
-# Go workspace
-go.work
-go.work.sum
-
 # Build outputs
 bin/
 tmp/
