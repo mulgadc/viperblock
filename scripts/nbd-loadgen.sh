@@ -38,7 +38,7 @@ FLOOR=2048
 RDEV=/dev/vdb
 WRITE=0
 KEY="${SPINIFEX_KEY:-$HOME/.ssh/spinifex-key}"
-SSH_USER=ec2-user
+SSH_USER=ubuntu
 
 while [ $# -gt 0 ]; do
 	case "$1" in
