@@ -2345,6 +2345,39 @@ func (vb *VB) SaveBlockState() (err error) {
 	return err
 }
 
+// parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
+// Caller must hold BlocksToObject.mu (write).
+func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
+	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
+
+	slog.Debug("Loaded checkpoint", "checkpoint", checkpoint)
+
+	headers := checkpoint[:vb.BlockToObjectWALHeaderSize()]
+
+	if !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]) {
+		return fmt.Errorf("magic mismatch")
+	}
+
+	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
+		return fmt.Errorf("version mismatch")
+	}
+
+	offset := vb.BlockToObjectWALHeaderSize()
+	for offset < len(checkpoint) {
+		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
+		if err != nil {
+			slog.Error("Error reading block", "error", err)
+			return err
+		}
+		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
+		}
+		offset += blockWalChunkSize
+	}
+	return nil
+}
+
 // Load the previous blockstate from disk
 func (vb *VB) LoadBlockState() (err error) {
 	var checkpoint []byte
@@ -2370,65 +2403,38 @@ func (vb *VB) LoadBlockState() (err error) {
 		}
 	}
 
-	// TODO: Rebuild the checkpoint if corrupted or missing based on previous WAL
-
-	// Step 2. Build the BlockLookup from the binary checkpoint
-
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
+	return vb.parseBlockCheckpoint(checkpoint)
+}
 
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
+// SaveLiveCheckpoint writes the current block map to a fixed S3 key so a concurrent
+// process can read a crash-consistent checkpoint without stopping nbdkit. Unlike
+// SaveBlockState, this does not write a local file and does not increment WallNum —
+// the key is always overwritten in place.
+func (vb *VB) SaveLiveCheckpoint() error {
+	vb.BlocksToObject.mu.RLock()
+	defer vb.BlocksToObject.mu.RUnlock()
 
-	slog.Debug("Loaded checkpoint", "checkpoint", checkpoint)
-
-	headers := checkpoint[:vb.BlockToObjectWALHeaderSize()]
-
-	// Validate the header
-	//if !bytes.Equal(headers, vb.BlockToObjectWALHeader()) {
-	//	return fmt.Errorf("invalid header")
-	//}
-
-	// Check the magic
-	if !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]) {
-		return fmt.Errorf("magic mismatch")
+	checkpoint := vb.BlockToObjectWALHeader()
+	for _, block := range vb.BlocksToObject.BlockLookup {
+		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
 	}
 
-	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
-		return fmt.Errorf("version mismatch")
+	headers := []byte{}
+	return vb.Backend.Write(types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
+}
+
+// LoadLiveCheckpoint reads the live checkpoint written by SaveLiveCheckpoint. If no
+// live checkpoint exists yet, it falls back to LoadBlockState (numbered checkpoint).
+func (vb *VB) LoadLiveCheckpoint() error {
+	checkpoint, err := vb.Backend.Read(types.FileTypeBlockCheckpointLive, 0, 0, 0)
+	if err != nil {
+		return vb.LoadBlockState()
 	}
-
-	// Check file written within the last 2 seconds
-	// TODO: Move to _test.go
-	//now := time.Now().Unix()
-	//writtenAt := binary.BigEndian.Uint64(headers[6:14])
-	//if now-int64(writtenAt) > 2 {
-	//	return fmt.Errorf("file written more than 2 seconds ago")
-	//}
-
-	// Check the wall number
-
-	// Read each block from the checkpoint buffer (blockWalChunkSize bytes each).
-	offset := vb.BlockToObjectWALHeaderSize()
-
-	for offset < len(checkpoint) {
-		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
-
-		if err != nil {
-			slog.Error("Error reading block", "error", err)
-			return err
-		}
-
-		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
-
-		// Also update BlockStore if enabled
-		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
-		}
-
-		offset += blockWalChunkSize
-	}
-
-	return err
+	vb.BlocksToObject.mu.Lock()
+	defer vb.BlocksToObject.mu.Unlock()
+	return vb.parseBlockCheckpoint(checkpoint)
 }
 
 // readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.
@@ -3597,56 +3603,51 @@ func (vb *VB) Close() error {
 		slog.Error("failed to flush during Close", "error", err)
 	}
 
-	var err error
+	var walErr error
 	if vb.UseShardedWAL {
-		err = vb.WriteShardedWALToChunk(true)
+		walErr = vb.WriteShardedWALToChunk(true)
 	} else {
-		err = vb.WriteWALToChunk(true)
+		walErr = vb.WriteWALToChunk(true)
 	}
-
-	if err != nil {
-		slog.Error("Could not Write WAL to Chunk", "err", err)
-		return err
+	if walErr != nil {
+		slog.Error("Could not Write WAL to Chunk during Close, proceeding to save block state", "err", walErr)
 	}
 
 	path := fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, vb.GetVolume())
 
 	slog.Debug("Saving Close state to", "path", path)
 
-	// Upload the state to the backend
-	err = vb.SaveState()
+	var firstErr error
 
-	if err != nil {
+	// Upload the state to the backend
+	if err := vb.SaveState(); err != nil {
 		slog.Error("Could not save state", "err", err)
-		return err
+		firstErr = err
 	}
 
-	// Should not be required with Flush and WriteWALToChunk prior
-	/*
-		err = vb.SaveHotState(fmt.Sprintf("%s/hotstate.json", path))
-
-		if err != nil {
-			slog.Error("Could not save hot state", "err", err)
-			return err
-		}
-	*/
-
-	err = vb.SaveBlockState()
-
-	if err != nil {
+	// Always attempt to save the block checkpoint even if SaveState or WAL
+	// flush failed — in-memory BlockLookup may reflect successfully flushed
+	// writes from earlier Flush calls and must not be lost.
+	if err := vb.SaveBlockState(); err != nil {
 		slog.Error("Could not save block state", "err", err)
-		return err
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr != nil {
+		return firstErr
 	}
 
 	// Remove local WAL and block state files, upload/sync in prior steps.
-	// TODO: Consider retention policy for local files, and remove older files
-	// TODO: Consider rebuilding the checkpoint locally if the file is corrupted or missing on the remote S3.
-
-	err = vb.RemoveLocalFiles()
+	err := vb.RemoveLocalFiles()
 	if err != nil {
 		slog.Error("Failed to remove local files", "err", err)
 	}
 
+	if walErr != nil {
+		return walErr
+	}
 	return nil
 }
 

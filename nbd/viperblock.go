@@ -30,6 +30,13 @@ type ViperBlockConnection struct {
 	vb *viperblock.VB
 }
 
+// activeVB holds the VB for the current open connection. CanMultiConn returns
+// false so at most one connection exists at a time. Unload uses this as a
+// fallback flush when nbdkit exits without calling the per-connection Close
+// (observed when the NBD client is killed while nbdkit is already in SIGTERM
+// shutdown mode).
+var activeVB *viperblock.VB
+
 var size uint64
 
 var volume string
@@ -239,6 +246,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
 	}
 
+	activeVB = vb
 	return &ViperBlockConnection{vb: vb}, nil
 }
 
@@ -336,13 +344,17 @@ func (c *ViperBlockConnection) Flush(flags uint32) error {
 
 	var err error
 	if c.vb.UseShardedWAL {
-		err = c.vb.WriteShardedWALToChunk(false)
+		err = c.vb.WriteShardedWALToChunk(true)
 	} else {
-		err = c.vb.WriteWALToChunk(false)
+		err = c.vb.WriteWALToChunk(true)
 	}
 
 	if err != nil {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not Write WAL to Chunk: %v", err)}
+	}
+
+	if err := c.vb.SaveLiveCheckpoint(); err != nil {
+		slog.Error("Flush: SaveLiveCheckpoint failed", "err", err)
 	}
 
 	return nil
@@ -359,6 +371,23 @@ func (c *ViperBlockConnection) Close() {
 	if err != nil {
 		slog.Error("Could not close VB", "err", err)
 	}
+	activeVB = nil
+}
+
+// Unload is called by nbdkit immediately before the process exits. It flushes
+// and saves block state if Close was not called on the active connection — this
+// happens when the NBD client is killed abruptly while nbdkit is already in
+// SIGTERM shutdown mode, which causes nbdkit to skip the per-connection close
+// callback.
+func (p *ViperBlockPlugin) Unload() {
+	if activeVB == nil {
+		return
+	}
+	slog.Info("Unload: Close was not called, flushing block state now")
+	if err := activeVB.Close(); err != nil {
+		slog.Error("Unload: could not close VB", "err", err)
+	}
+	activeVB = nil
 }
 
 //----------------------------------------------------------------------
