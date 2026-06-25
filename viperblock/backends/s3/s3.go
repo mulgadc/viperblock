@@ -21,7 +21,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/viperblock/types"
-	"golang.org/x/net/http2"
 )
 
 // wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error code
@@ -81,12 +80,9 @@ func (backend *Backend) Init() error {
 
 	client := backend.config.HTTPClient
 	if client == nil {
-		// Create HTTP client with HTTP/2 support for connection multiplexing.
-		// HTTP/2 allows multiple requests over a single TCP connection, eliminating
-		// TLS handshake overhead for each request.
-		//
-		// IMPORTANT: When using a custom TLSClientConfig, you MUST call
-		// http2.ConfigureTransport() to properly enable HTTP/2.
+		// HTTP/2 multiplexes requests over a single TCP connection, avoiding a
+		// TLS handshake per request. ForceAttemptHTTP2 enables stdlib ALPN h2
+		// negotiation against an h2-capable server
 		tr := &http.Transport{
 			TLSClientConfig: &tls.Config{
 				// Enable TLS session resumption for faster reconnects if HTTP/2 fails
@@ -103,21 +99,12 @@ func (backend *Backend) Init() error {
 
 			// Keep-alive settings
 			DisableKeepAlives: false,
-
-			// ForceAttemptHTTP2 alone is NOT enough with custom TLSClientConfig!
-			// We must also call http2.ConfigureTransport() below.
 			ForceAttemptHTTP2: true,
 
 			// Timeouts
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: 60 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
-		}
-
-		// CRITICAL: Configure HTTP/2 support with custom TLS config
-		// Without this, the transport falls back to HTTP/1.1
-		if err := http2.ConfigureTransport(tr); err != nil {
-			slog.Warn("Failed to configure HTTP/2, falling back to HTTP/1.1", "error", err)
 		}
 
 		client = &http.Client{
