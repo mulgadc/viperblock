@@ -1,8 +1,6 @@
 // Package writebench drives the REAL viperblock write/flush path (file
 // backend, legacy single-file WAL) to quantify heavy-write latency and the
-// flush-path memory growth described in
-// docs/development/bugs/nbd-write-latency-and-flush-oom.md, and to compare the
-// proposed fixes:
+// flush-path memory growth, and to compare the proposed fixes:
 //
 //	#1 demote hot-path INFO logging to Debug
 //	#2 move chunk consolidation/upload off the guest-fsync path (async drain)
