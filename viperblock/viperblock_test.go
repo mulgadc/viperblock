@@ -2424,7 +2424,7 @@ func TestVolumeConfig_ModificationJSONRoundTrip(t *testing.T) {
 }
 
 // TestClassifyStateLoad pins the local/backend error → sentinel mapping for
-// recovery callers (mulga-siv-25). The classification decides whether the
+// recovery callers. The classification decides whether the
 // caller should retry (transient backend) or fail (genuine missing state).
 func TestClassifyStateLoad(t *testing.T) {
 	transient := fmt.Errorf("connection refused: tls handshake timeout")

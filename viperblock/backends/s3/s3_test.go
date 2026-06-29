@@ -17,7 +17,7 @@ import (
 
 // TestWrapNotFound pins the AWS-error → os.ErrNotExist mapping that callers
 // (e.g. viperblock.LoadState) rely on to tell "object missing" apart from
-// "backend unreachable". Required by mulga-siv-25 medium-term fix.
+// "backend unreachable". Required by the medium-term fix.
 func TestWrapNotFound(t *testing.T) {
 	cases := []struct {
 		name         string
