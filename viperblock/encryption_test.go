@@ -130,6 +130,20 @@ func TestWriteFileAtomic_RoundTrip(t *testing.T) {
 	assert.True(t, errors.Is(err, os.ErrNotExist), "tmp file should not remain after rename")
 }
 
+// A remount on a node that never held the volume locally has no per-volume
+// dir; LoadState pulls backend state then persists it, so writeFileAtomic must
+// create the missing parent rather than fail opening the tmp file with ENOENT.
+func TestWriteFileAtomic_CreatesMissingParentDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vol-remount", "config.json")
+	payload := []byte("state from backend")
+
+	require.NoError(t, writeFileAtomic(path, payload, 0600))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+}
+
 func TestSaveState_BootstrapsVolumeUUIDAndHighWater(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-bootstrap", key)
@@ -284,11 +298,12 @@ func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
 
 	hwBefore := vb.seqNumHighWater.Load()
 
-	// Wedge both writeFileAtomic (local) and Backend.Write (file backend) by
-	// removing the directory both target. The next SaveState's tmp-file
-	// OpenFile fails immediately.
+	// Wedge writeFileAtomic by parking a directory at the tmp path: the next
+	// SaveState's OpenFile(O_CREATE|O_WRONLY) fails with EISDIR. Removing the
+	// per-volume dir no longer wedges since writeFileAtomic recreates it.
 	configDir := filepath.Join(vb.BaseDir, vb.GetVolume())
-	require.NoError(t, os.RemoveAll(configDir))
+	tmpPath := filepath.Join(configDir, "config.json.tmp")
+	require.NoError(t, os.MkdirAll(tmpPath, 0700))
 
 	vb.SeqNum.Store(hwBefore + 5)
 	_, err := vb.reserveSeqNum(1)
@@ -299,7 +314,7 @@ func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
 
 	// And after the failure is cleared, a successor reservation must persist
 	// and publish the same target hw — no skipped window, no double-count.
-	require.NoError(t, os.MkdirAll(configDir, 0700))
+	require.NoError(t, os.RemoveAll(tmpPath))
 	_, err = vb.reserveSeqNum(1)
 	require.NoError(t, err)
 	assert.Greater(t, vb.seqNumHighWater.Load(), hwBefore,
