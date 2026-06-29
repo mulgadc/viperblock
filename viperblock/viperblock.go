@@ -2931,8 +2931,15 @@ func (vb *VB) pushStateToBackend(persisted []byte) error {
 // fsync(parent). On return without error, the file exists at path with the
 // new contents fully durable on disk. A crash before return may leave a
 // stale path.tmp behind (caller-tolerable: next SaveState rewrites it).
+//
+// The parent dir is created if absent so a remount on a node that never held
+// the volume locally (LoadState pulls authoritative state from the backend,
+// then persists it locally) does not fail opening the tmp file with ENOENT.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
