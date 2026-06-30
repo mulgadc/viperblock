@@ -7,7 +7,7 @@ replace libguestfs.org/nbdkit => ./nbd/libguestfs.org/nbdkit
 require (
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/predastore v1.9.0
+	github.com/mulgadc/predastore v1.10.0
 	github.com/pterm/pterm v0.12.83
 	github.com/stretchr/testify v1.11.1
 	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000
@@ -55,7 +55,7 @@ require (
 	github.com/nats-io/nats.go v1.52.0 // indirect
 	github.com/nats-io/nkeys v0.4.15 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/pelletier/go-toml/v2 v2.4.0 // indirect
+	github.com/pelletier/go-toml/v2 v2.4.2 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/quic-go v0.60.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
