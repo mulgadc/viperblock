@@ -353,8 +353,14 @@ func (c *ViperBlockConnection) Flush(flags uint32) error {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not Write WAL to Chunk: %v", err)}
 	}
 
-	if err := c.vb.SaveLiveCheckpoint(); err != nil {
-		slog.Error("Flush: SaveLiveCheckpoint failed", "err", err)
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := c.vb.SaveLiveCheckpoint(); err == nil {
+			break
+		} else if attempt < 2 {
+			slog.Warn("Flush: SaveLiveCheckpoint failed, retrying", "attempt", attempt+1, "err", err)
+		} else {
+			slog.Error("Flush: SaveLiveCheckpoint failed after retries", "err", err)
+		}
 	}
 
 	return nil
