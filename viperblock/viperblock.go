@@ -2430,7 +2430,10 @@ func (vb *VB) SaveLiveCheckpoint() error {
 func (vb *VB) LoadLiveCheckpoint() error {
 	checkpoint, err := vb.Backend.Read(types.FileTypeBlockCheckpointLive, 0, 0, 0)
 	if err != nil {
-		return vb.LoadBlockState()
+		if errors.Is(err, os.ErrNotExist) {
+			return vb.LoadBlockState()
+		}
+		return fmt.Errorf("read live checkpoint: %w", err)
 	}
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
@@ -3767,7 +3770,7 @@ func (vb *VB) WALHeaderSize() int {
 func (vb *VB) BlockToObjectWALHeader() []byte {
 	header := make([]byte, vb.BlockToObjectWALHeaderSize())
 
-	slog.Info("Writing BlockToObjectWALHeader", "header", header, "size", vb.BlockToObjectWALHeaderSize())
+	slog.Debug("Writing BlockToObjectWALHeader", "header", header, "size", vb.BlockToObjectWALHeaderSize())
 	copy(header[:len(vb.BlockToObjectWAL.WALMagic)], vb.BlockToObjectWAL.WALMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
 	binary.BigEndian.PutUint64(header[6:14], utils.SafeInt64ToUint64(time.Now().Unix()))
