@@ -383,22 +383,6 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 				sourceVolumeNameHash: layer.SourceVolumeNameHash,
 			})
 		}
-	} else if ident.ParentSnapshotID != "" {
-		// Legacy snapshot: walk the ParentSnapshotID chain to any depth.
-		parentID := ident.ParentSnapshotID
-		for parentID != "" {
-			parentMap, parentIdent, err := vb.LoadSnapshotBlockMap(parentID)
-			if err != nil {
-				return fmt.Errorf("failed to load ancestor snapshot %s: %w", parentID, err)
-			}
-			vb.ancestors = append(vb.ancestors, snapshotAncestor{
-				blocks:               parentMap,
-				sourceVolumeName:     parentIdent.SourceVolumeName,
-				sourceVolumeUUID:     parentIdent.SourceVolumeUUID,
-				sourceVolumeNameHash: parentIdent.SourceVolumeNameHash,
-			})
-			parentID = parentIdent.ParentSnapshotID
-		}
 	}
 
 	slog.Debug("OpenFromSnapshot: clone ready",

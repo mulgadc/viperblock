@@ -363,6 +363,10 @@ func (c *ViperBlockConnection) Flush(flags uint32) error {
 		}
 	}
 
+	// WAL and chunks are already durable above. A stale or missing live checkpoint
+	// means the next snapshot falls back to the numbered checkpoint (older delta),
+	// but guest data is not at risk. Propagating would fail the guest fsync for a
+	// snapshot-metadata-only issue.
 	return nil
 
 }
