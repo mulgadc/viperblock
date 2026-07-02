@@ -430,7 +430,6 @@ func TestSnapshotCOWChainDeep(t *testing.T) {
 		snapB, err := cloneB.CreateSnapshot(cloneBSnapID)
 		require.NoError(t, err)
 		assert.True(t, snapB.HasFlatSection)
-		assert.Empty(t, snapB.ParentSnapshotID)
 
 		_, ident, err := cloneB.LoadSnapshotBlockMap(cloneBSnapID)
 		require.NoError(t, err)
@@ -729,12 +728,12 @@ func TestSnapshotCOWChain(t *testing.T) {
 		require.NoError(t, cloneA.Flush())
 		require.NoError(t, cloneA.WriteWALToChunk(true))
 
-		// Snapshot the clone — flat snapshot: no ParentSnapshotID, HasFlatSection=true
+		// Snapshot the clone — flat snapshot: HasFlatSection=true, all ancestor
+		// blocks embedded in the checkpoint with no chain to walk.
 		cloneASnapID := fmt.Sprintf("snap-%s-clone", cloneA.VolumeName)
 		snap, err := cloneA.CreateSnapshot(cloneASnapID)
 		require.NoError(t, err)
 		assert.True(t, snap.HasFlatSection, "snapshot of COW clone must embed inherited blocks (flat section)")
-		assert.Empty(t, snap.ParentSnapshotID, "flat snapshot must not set a ParentSnapshotID")
 
 		// Layer 2 (instance B): clone from the clone's snapshot; ancestors populated from flat section
 		cloneB := createCloneVB(t, cloneA, cloneASnapID)

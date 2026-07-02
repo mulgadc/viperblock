@@ -32,10 +32,6 @@ import (
 // back-to-back snapshots on the same volume use disjoint nonces (domain
 // separation alone does not protect two seals in the same domain).
 //
-// ParentSnapshotID is set on legacy snapshots (pre-flat) when the snapshotted
-// volume was itself a COW clone. Empty on flat snapshots (HasFlatSection=true)
-// and first-generation snapshots. omitempty keeps existing snapshot metadata valid.
-//
 // HasFlatSection marks checkpoints that carry an inherited-blocks section after
 // the own-blocks entries. When true, BlockCount is exact and the section starts
 // at headerSize + BlockCount*blockWalChunkSize bytes into the checkpoint.
@@ -51,7 +47,6 @@ type SnapshotState struct {
 	SourceVolumeUUID     string    `json:"SourceVolumeUUID,omitempty"`
 	SourceVolumeNameHash string    `json:"SourceVolumeNameHash,omitempty"`
 	StateSeqNum          uint64    `json:"StateSeqNum,omitempty"`
-	ParentSnapshotID     string    `json:"ParentSnapshotID,omitempty"`
 	HasFlatSection       bool      `json:"HasFlatSection,omitempty"`
 }
 
@@ -125,7 +120,6 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	}
 
 	// 3. Build and save snapshot metadata.
-	// Flat snapshots clear ParentSnapshotID — there is no ancestry chain to walk.
 	snap := &SnapshotState{
 		SnapshotID:       snapshotID,
 		SourceVolumeName: vb.VolumeName,
@@ -189,14 +183,12 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 // recovered from SnapshotState so clone reads can reconstruct the source's
 // nonce + AAD. Zero-valued on snapshots of unencrypted volumes; callers
 // branch on vb.EncryptionEnabled rather than testing zero.
-// ParentSnapshotID is forwarded from SnapshotState for use by OpenFromSnapshot.
 // InheritedLayers is non-nil for flat snapshots and carries the decoded
 // inherited-blocks section (all ancestor layers, no further I/O needed).
 type SnapshotIdentity struct {
 	SourceVolumeName     string
 	SourceVolumeUUID     [4]byte
 	SourceVolumeNameHash [32]byte
-	ParentSnapshotID     string
 	InheritedLayers      []InheritedLayer
 }
 
@@ -259,7 +251,6 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	}
 
 	ident.SourceVolumeName = snap.SourceVolumeName
-	ident.ParentSnapshotID = snap.ParentSnapshotID
 	if snap.SourceVolumeUUID != "" {
 		uuid, err := hex.DecodeString(snap.SourceVolumeUUID)
 		if err != nil || len(uuid) != 4 {
