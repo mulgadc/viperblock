@@ -41,6 +41,7 @@ const DefaultObjBlockSize uint32 = 1024 * 1024 * 4
 const DefaultFlushInterval time.Duration = 5 * time.Second
 const DefaultFlushSize uint32 = 64 * 1024 * 1024
 const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
+const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 
 // seqNumReservation is the size of each SeqNum high-water reservation window.
 // reserveSeqNum hands out values lock-free via atomic.Add until the persisted
@@ -117,6 +118,14 @@ type VB struct {
 	walSyncTicker *time.Ticker
 	walSyncStop   chan struct{}
 	walSyncDone   chan struct{}
+
+	// ChunkUploadInterval controls how often the background goroutine flushes WAL
+	// chunks and the live checkpoint to S3 (default 30s). <= 0 disables.
+	ChunkUploadInterval time.Duration
+
+	chunkUploadTicker *time.Ticker
+	chunkUploadStop   chan struct{}
+	chunkUploadDone   chan struct{}
 
 	// Sequence number for the next block to be written
 	SeqNum atomic.Uint64
@@ -615,6 +624,10 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	if config.WALSyncInterval == 0 {
 		config.WALSyncInterval = DefaultWALSyncInterval
 	}
+	// ChunkUploadInterval: 0 means use default, negative means disabled
+	if config.ChunkUploadInterval == 0 {
+		config.ChunkUploadInterval = DefaultChunkUploadInterval
+	}
 
 	var lruCache *lru.Cache[uint64, []byte]
 
@@ -648,16 +661,17 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	}
 
 	vb = &VB{
-		VolumeName:       config.VolumeName,
-		VolumeSize:       config.VolumeSize,
-		BlockSize:        config.BlockSize,
-		ObjBlockSize:     config.ObjBlockSize,
-		FlushInterval:    config.FlushInterval,
-		FlushSize:        config.FlushSize,
-		WALSyncInterval:  config.WALSyncInterval,
-		Writes:           Blocks{},
-		WAL:              WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
-		BlockToObjectWAL: WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
+		VolumeName:          config.VolumeName,
+		VolumeSize:          config.VolumeSize,
+		BlockSize:           config.BlockSize,
+		ObjBlockSize:        config.ObjBlockSize,
+		FlushInterval:       config.FlushInterval,
+		FlushSize:           config.FlushSize,
+		WALSyncInterval:     config.WALSyncInterval,
+		ChunkUploadInterval: config.ChunkUploadInterval,
+		Writes:              Blocks{},
+		WAL:                 WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
+		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
 		Cache: Cache{
 			lru: lruCache,
 			Config: CacheConfig{
@@ -710,6 +724,9 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 	// Start background WAL syncer for periodic fsync (if interval > 0)
 	vb.StartWALSyncer()
+
+	// Start background chunk uploader (if interval > 0)
+	vb.StartChunkUploader()
 
 	return vb, nil
 }
@@ -794,6 +811,54 @@ func (vb *VB) StopWALSyncer() {
 	vb.walSyncTicker = nil
 
 	slog.Debug("WAL syncer stopped")
+}
+
+// StartChunkUploader starts a background goroutine that periodically calls
+// DrainToBackend so snapshots have a reasonably current S3 view without
+// blocking the guest fsync path.
+func (vb *VB) StartChunkUploader() {
+	if vb.ChunkUploadInterval <= 0 {
+		slog.Debug("chunk uploader disabled (interval <= 0)")
+		return
+	}
+
+	vb.chunkUploadStop = make(chan struct{})
+	vb.chunkUploadDone = make(chan struct{})
+	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
+
+	go func() {
+		defer close(vb.chunkUploadDone)
+		defer vb.chunkUploadTicker.Stop()
+
+		for {
+			select {
+			case <-vb.chunkUploadTicker.C:
+				if err := vb.DrainToBackend(); err != nil {
+					slog.Warn("chunk uploader: DrainToBackend failed", "err", err)
+				}
+			case <-vb.chunkUploadStop:
+				return
+			}
+		}
+	}()
+
+	slog.Debug("chunk uploader started", "interval", vb.ChunkUploadInterval)
+}
+
+// StopChunkUploader stops the background chunk upload goroutine.
+func (vb *VB) StopChunkUploader() {
+	if vb.chunkUploadStop == nil {
+		return
+	}
+
+	close(vb.chunkUploadStop)
+	<-vb.chunkUploadDone
+
+	vb.chunkUploadStop = nil
+	vb.chunkUploadDone = nil
+	vb.chunkUploadTicker = nil
+
+	slog.Debug("chunk uploader stopped")
 }
 
 // syncWALIfDirty performs fsync on the active WAL file if there are pending writes.
@@ -1159,6 +1224,28 @@ func (vb *VB) Flush() error {
 		return vb.flushLockedSharded()
 	}
 	return vb.flushLocked()
+}
+
+// DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
+// WAL chunks to S3, and saves the live checkpoint. Call this at snapshot-prepare
+// time or on clean shutdown to ensure S3 state is fully current.
+func (vb *VB) DrainToBackend() error {
+	if err := vb.Flush(); err != nil {
+		return fmt.Errorf("drain flush: %w", err)
+	}
+	var err error
+	if vb.UseShardedWAL {
+		err = vb.WriteShardedWALToChunk(true)
+	} else {
+		err = vb.WriteWALToChunk(true)
+	}
+	if err != nil {
+		return fmt.Errorf("drain chunk upload: %w", err)
+	}
+	if err := vb.SaveLiveCheckpoint(); err != nil {
+		return fmt.Errorf("drain live checkpoint: %w", err)
+	}
+	return nil
 }
 
 // flushLocked flushes hot writes to WAL. Caller must hold vb.Writes.mu.Lock().
@@ -3597,7 +3684,8 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 func (vb *VB) Close() error {
 	slog.Info("VB Close, flushing block state to disk")
 
-	// Stop the WAL syncer goroutine (performs final sync before stopping)
+	// Stop background goroutines before flushing
+	vb.StopChunkUploader()
 	vb.StopWALSyncer()
 
 	if err := vb.Flush(); err != nil {
