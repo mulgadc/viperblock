@@ -181,11 +181,9 @@ type VB struct {
 	// SnapshotID is set when this volume was created from a snapshot.
 	SnapshotID string
 
-	// ancestors holds the flattened read chain beyond the immediate base.
-	// For flat snapshots: populated from the inherited layers section of the
-	// checkpoint at OpenFromSnapshot time. For legacy snapshots with a
-	// ParentSnapshotID chain: populated by walking the chain recursively.
-	// Index 0 = grandparent (base of the parent snapshot), higher = deeper.
+	// ancestors holds the flattened read chain beyond the immediate base,
+	// populated from the inherited-layers section of the flat snapshot checkpoint
+	// at OpenFromSnapshot time. Index 0 = grandparent, higher = deeper.
 	ancestors []snapshotAncestor
 
 	// Encryption-at-rest. MasterKey is supplied by the caller (NBD plugin /
