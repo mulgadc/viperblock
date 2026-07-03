@@ -1,7 +1,3 @@
-// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
-// Use of this source code is governed by an Apache 2.0 license
-// that can be found in the LICENSE file.
-
 // Tamper and on-disk integrity tests. Every test here exercises an
 // adversary action that the AEAD construction is supposed to detect:
 // - on-disk plaintext leakage (confidentiality — SC.L1-3.13.1)

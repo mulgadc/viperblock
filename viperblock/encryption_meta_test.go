@@ -1,7 +1,3 @@
-// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
-// Use of this source code is governed by an Apache 2.0 license
-// that can be found in the LICENSE file.
-
 // Metadata HMAC tests. Closes the cross-volume metadata pivot
 // critical: a backend writer cannot substitute volume A's tagged
 // VBState/SnapshotState into volume B's prefix, cannot bit-flip the

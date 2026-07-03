@@ -1,7 +1,3 @@
-// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
-// Use of this source code is governed by an Apache 2.0 license
-// that can be found in the LICENSE file.
-
 // Package viperblock — crypto helpers for AES-256-GCM at-rest encryption.
 //
 // Nonce layout (12 bytes, big-endian throughout, NIST SP 800-38D §8.2.1

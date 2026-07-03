@@ -1,7 +1,3 @@
-// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
-// Use of this source code is governed by an Apache 2.0 license
-// that can be found in the LICENSE file.
-
 // Round-trip smoke tests for the decrypt-on-read paths — the minimum to
 // gate that reads see plaintext after the write path sealed it. Deeper
 // coverage (tamper detection, cross-volume swap, in-place replay,

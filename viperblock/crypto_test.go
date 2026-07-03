@@ -1,7 +1,3 @@
-// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
-// Use of this source code is governed by an Apache 2.0 license
-// that can be found in the LICENSE file.
-
 // Crypto-helper tests for the encryption-at-rest plumbing. Layout invariants
 // (nonce byte positions, 56-bit SeqNum truncation, AAD shape, domain
 // separation) live alongside AEAD round-trip, ciphertext + tag tamper
