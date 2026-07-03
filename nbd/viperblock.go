@@ -10,6 +10,9 @@ import (
 import (
 	"fmt"
 	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
@@ -29,6 +32,19 @@ type ViperBlockConnection struct {
 	nbdkit.Connection
 	vb *viperblock.VB
 }
+
+// activeVB holds the VB for the current open connection. CanMultiConn returns
+// false so at most one connection exists at a time. Unload uses this as a
+// fallback flush when nbdkit exits without calling the per-connection Close
+// (observed when the NBD client is killed while nbdkit is already in SIGTERM
+// shutdown mode).
+var activeVB *viperblock.VB
+
+// snapshotListener is the unix socket that spinifex connects to before calling
+// CreateSnapshot. The handler calls DrainToBackend and acks "OK\n", ensuring S3
+// state is current without requiring every guest fsync to hit S3.
+var snapshotListener net.Listener
+var snapshotListenerDone chan struct{}
 
 var size uint64
 
@@ -239,7 +255,65 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
 	}
 
+	activeVB = vb
+	snapshotListenerDone = startSnapshotListener(vb, filepath.Join(base_dir, volume, "snapshot.sock"))
 	return &ViperBlockConnection{vb: vb}, nil
+}
+
+// startSnapshotListener opens a unix socket that spinifex connects to before
+// calling CreateSnapshot. The handler calls DrainToBackend — flushing WAL
+// chunks and the live checkpoint to S3 — then acks "OK\n". Returns a channel
+// closed when the goroutine exits.
+func startSnapshotListener(vb *viperblock.VB, sockPath string) chan struct{} {
+	done := make(chan struct{})
+
+	// Remove any stale socket file from a previous run
+	_ = os.Remove(sockPath)
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		slog.Error("snapshot socket: listen failed", "path", sockPath, "err", err)
+		close(done)
+		return done
+	}
+	snapshotListener = ln
+
+	go func() {
+		defer close(done)
+		defer os.Remove(sockPath)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				// Listener closed — normal shutdown path
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				if err := vb.DrainToBackend(); err != nil {
+					slog.Error("snapshot socket: DrainToBackend failed", "err", err)
+					_, _ = c.Write([]byte("ERR\n"))
+					return
+				}
+				_, _ = c.Write([]byte("OK\n"))
+			}(conn)
+		}
+	}()
+
+	slog.Info("snapshot socket listening", "path", sockPath)
+	return done
+}
+
+// stopSnapshotListener closes the unix socket and waits for the goroutine to exit.
+func stopSnapshotListener() {
+	if snapshotListener == nil {
+		return
+	}
+	snapshotListener.Close()
+	if snapshotListenerDone != nil {
+		<-snapshotListenerDone
+	}
+	snapshotListener = nil
+	snapshotListenerDone = nil
 }
 
 func (c *ViperBlockConnection) GetSize() (uint64, error) {
@@ -329,36 +403,47 @@ func (c *ViperBlockConnection) CanFlush() (bool, error) {
 }
 
 func (c *ViperBlockConnection) Flush(flags uint32) error {
-
 	if err := c.vb.Flush(); err != nil {
 		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Flush failed: %v", err)}
 	}
-
-	var err error
-	if c.vb.UseShardedWAL {
-		err = c.vb.WriteShardedWALToChunk(false)
-	} else {
-		err = c.vb.WriteWALToChunk(false)
-	}
-
-	if err != nil {
-		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not Write WAL to Chunk: %v", err)}
-	}
-
 	return nil
-
 }
 
 func (c *ViperBlockConnection) Close() {
-
 	slog.Info("Close, flushing block state to disk")
 
-	// Gracefully close VB and save state to disk
-	err := c.vb.Close()
+	stopSnapshotListener()
 
-	if err != nil {
+	// DrainToBackend before Close so the live checkpoint is current. Close
+	// will also flush WAL chunks, but does not save the live checkpoint.
+	if err := c.vb.DrainToBackend(); err != nil {
+		slog.Error("Close: DrainToBackend failed", "err", err)
+	}
+
+	if err := c.vb.Close(); err != nil {
 		slog.Error("Could not close VB", "err", err)
 	}
+	activeVB = nil
+}
+
+// Unload is called by nbdkit immediately before the process exits. It flushes
+// and saves block state if Close was not called on the active connection — this
+// happens when the NBD client is killed abruptly while nbdkit is already in
+// SIGTERM shutdown mode, which causes nbdkit to skip the per-connection close
+// callback.
+func (p *ViperBlockPlugin) Unload() {
+	if activeVB == nil {
+		return
+	}
+	slog.Info("Unload: Close was not called, flushing block state now")
+	stopSnapshotListener()
+	if err := activeVB.DrainToBackend(); err != nil {
+		slog.Error("Unload: DrainToBackend failed", "err", err)
+	}
+	if err := activeVB.Close(); err != nil {
+		slog.Error("Unload: could not close VB", "err", err)
+	}
+	activeVB = nil
 }
 
 //----------------------------------------------------------------------

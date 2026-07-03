@@ -384,6 +384,248 @@ func TestLoadFromSnapshot(t *testing.T) {
 	})
 }
 
+// TestSnapshotCOWChainDeep exercises the buildFlatSection ancestors loop by
+// creating a 3-generation chain (base→cloneA→cloneB→cloneC). cloneB's snapshot
+// must encode 2 inherited layers, and cloneC must resolve reads from all three.
+func TestSnapshotCOWChainDeep(t *testing.T) {
+	runWithBackends(t, "snapshot_cow_chain_deep", func(t *testing.T, base *VB) {
+		blockSize := uint64(base.BlockSize)
+
+		// Layer 0 (base): block 0 only.
+		baseData := make([]byte, blockSize)
+		rand.Read(baseData)
+		require.NoError(t, base.Write(0, baseData))
+		require.NoError(t, base.Flush())
+		require.NoError(t, base.WriteWALToChunk(true))
+
+		// Use short snapshot IDs to prevent the cascading clone-name from exceeding
+		// the filesystem path length limit at 3+ generations.
+		baseSnapID := "s0"
+		_, err := base.CreateSnapshot(baseSnapID)
+		require.NoError(t, err)
+
+		// Layer 1 (cloneA): block 1 only; snapshot has 1 inherited layer (base).
+		cloneA := createCloneVB(t, base, baseSnapID)
+		cloneAData := make([]byte, blockSize)
+		rand.Read(cloneAData)
+		require.NoError(t, cloneA.Write(1, cloneAData))
+		require.NoError(t, cloneA.Flush())
+		require.NoError(t, cloneA.WriteWALToChunk(true))
+
+		cloneASnapID := "s1"
+		snapA, err := cloneA.CreateSnapshot(cloneASnapID)
+		require.NoError(t, err)
+		assert.True(t, snapA.HasFlatSection)
+
+		// Layer 2 (cloneB): block 2 only; snapshot must encode 2 inherited layers
+		// (cloneA delta + base) because cloneB.ancestors is non-empty.
+		cloneB := createCloneVB(t, cloneA, cloneASnapID)
+		cloneBData := make([]byte, blockSize)
+		rand.Read(cloneBData)
+		require.NoError(t, cloneB.Write(2, cloneBData))
+		require.NoError(t, cloneB.Flush())
+		require.NoError(t, cloneB.WriteWALToChunk(true))
+
+		cloneBSnapID := "s2"
+		snapB, err := cloneB.CreateSnapshot(cloneBSnapID)
+		require.NoError(t, err)
+		assert.True(t, snapB.HasFlatSection)
+
+		_, ident, err := cloneB.LoadSnapshotBlockMap(cloneBSnapID)
+		require.NoError(t, err)
+		assert.Len(t, ident.InheritedLayers, 2, "flat section must encode cloneA delta and base blocks as separate layers")
+
+		// Layer 3 (cloneC): read-only; resolves each block through a different ancestor.
+		cloneC := createCloneVB(t, cloneB, cloneBSnapID)
+
+		got, err := cloneC.ReadAt(0, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, baseData, got, "block 0 must come from base (deepest ancestor)")
+
+		got, err = cloneC.ReadAt(blockSize, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, cloneAData, got, "block 1 must come from cloneA (ancestors[0])")
+
+		got, err = cloneC.ReadAt(2*blockSize, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, cloneBData, got, "block 2 must come from cloneB (BaseBlockMap)")
+
+		got, err = cloneC.ReadAt(3*blockSize, blockSize)
+		assert.ErrorIs(t, err, ErrZeroBlock)
+		assert.Equal(t, make([]byte, blockSize), got)
+	})
+}
+
+// TestFlatSectionBinaryRoundtrip calls buildFlatSection directly on a COW clone
+// and verifies the wire format (magic, version, numSources, source name, block
+// entries) before confirming parseFlatSection decodes it back with fidelity.
+func TestFlatSectionBinaryRoundtrip(t *testing.T) {
+	runWithBackends(t, "flat_section_roundtrip", func(t *testing.T, vb *VB) {
+		blockSize := uint64(vb.BlockSize)
+
+		data := make([]byte, blockSize*2)
+		rand.Read(data)
+		require.NoError(t, vb.Write(0, data))
+		require.NoError(t, vb.Flush())
+		require.NoError(t, vb.WriteWALToChunk(true))
+
+		baseSnapID := fmt.Sprintf("snap-%s", vb.VolumeName)
+		_, err := vb.CreateSnapshot(baseSnapID)
+		require.NoError(t, err)
+
+		// Clone has vb's blocks as BaseBlockMap and no own writes or ancestors.
+		// buildFlatSection must encode exactly 1 source group.
+		clone := createCloneVB(t, vb, baseSnapID)
+
+		raw, err := clone.buildFlatSection()
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(raw), 6, "flat section must be at least 6 bytes")
+
+		assert.Equal(t, []byte("FLAT"), raw[0:4], "magic")
+		assert.Equal(t, uint8(1), raw[4], "version")
+		assert.Equal(t, uint8(1), raw[5], "numSources must be 1")
+
+		layers, err := parseFlatSection(raw)
+		require.NoError(t, err)
+		require.Len(t, layers, 1)
+
+		assert.Equal(t, vb.VolumeName, layers[0].SourceVolumeName, "decoded source name")
+
+		vb.BlocksToObject.mu.RLock()
+		defer vb.BlocksToObject.mu.RUnlock()
+
+		assert.Len(t, layers[0].Blocks.BlockLookup, len(vb.BlocksToObject.BlockLookup),
+			"decoded block count must match parent")
+
+		for blockNum, want := range vb.BlocksToObject.BlockLookup {
+			got, ok := layers[0].Blocks.BlockLookup[blockNum]
+			assert.True(t, ok, "block %d missing from decoded flat section", blockNum)
+			if ok {
+				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
+				assert.Equal(t, want.ObjectOffset, got.ObjectOffset, "block %d ObjectOffset", blockNum)
+				assert.Equal(t, want.SeqNum, got.SeqNum, "block %d SeqNum", blockNum)
+			}
+		}
+	})
+}
+
+// TestLiveCheckpointFallback verifies that when no live checkpoint exists,
+// LoadLiveCheckpoint falls back to LoadBlockState and recovers the block map.
+func TestLiveCheckpointFallback(t *testing.T) {
+	runWithBackends(t, "live_checkpoint_fallback", func(t *testing.T, vb *VB) {
+		data := make([]byte, DefaultBlockSize*3)
+		rand.Read(data)
+
+		require.NoError(t, vb.Write(0, data))
+		require.NoError(t, vb.Flush())
+
+		if vb.UseShardedWAL {
+			require.NoError(t, vb.WriteShardedWALToChunk(true))
+		} else {
+			require.NoError(t, vb.WriteWALToChunk(true))
+		}
+
+		// SaveBlockState (not SaveLiveCheckpoint) — no live checkpoint will exist.
+		require.NoError(t, vb.SaveBlockState())
+
+		reader := &VB{
+			VolumeName:   vb.VolumeName,
+			VolumeSize:   vb.VolumeSize,
+			BlockSize:    vb.BlockSize,
+			ObjBlockSize: vb.ObjBlockSize,
+			Version:      vb.Version,
+			BaseDir:      vb.BaseDir,
+			Backend:      vb.Backend,
+			BlockToObjectWAL: WAL{
+				WALMagic: vb.BlockToObjectWAL.WALMagic,
+			},
+			BlocksToObject: BlocksToObject{
+				BlockLookup: make(map[uint64]BlockLookup),
+			},
+		}
+
+		// No live checkpoint exists: must fall back to LoadBlockState.
+		require.NoError(t, reader.LoadLiveCheckpoint())
+
+		vb.BlocksToObject.mu.RLock()
+		defer vb.BlocksToObject.mu.RUnlock()
+
+		assert.Equal(t, len(vb.BlocksToObject.BlockLookup), len(reader.BlocksToObject.BlockLookup),
+			"fallback must restore the full block map")
+
+		for blockNum, want := range vb.BlocksToObject.BlockLookup {
+			got, ok := reader.BlocksToObject.BlockLookup[blockNum]
+			assert.True(t, ok, "block %d missing after fallback", blockNum)
+			if ok {
+				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
+				assert.Equal(t, want.ObjectOffset, got.ObjectOffset, "block %d ObjectOffset", blockNum)
+			}
+		}
+	})
+}
+
+// TestLiveCheckpointRoundtrip verifies that SaveLiveCheckpoint serialises the
+// block map to a fixed backend key and LoadLiveCheckpoint restores it exactly
+// in a separate VB instance, including small writes below the 4 MB WAL flush threshold.
+func TestLiveCheckpointRoundtrip(t *testing.T) {
+	runWithBackends(t, "live_checkpoint", func(t *testing.T, vb *VB) {
+		// 3 blocks = 12 KiB — well below the 4 MB WAL consolidation threshold.
+		data := make([]byte, DefaultBlockSize*3)
+		rand.Read(data)
+
+		require.NoError(t, vb.Write(0, data))
+		require.NoError(t, vb.Flush())
+
+		// Force-flush WAL to the backend before checkpointing; without force=true
+		// blocks below the threshold stay in the local WAL and are absent from
+		// the checkpoint.
+		if vb.UseShardedWAL {
+			require.NoError(t, vb.WriteShardedWALToChunk(true))
+		} else {
+			require.NoError(t, vb.WriteWALToChunk(true))
+		}
+
+		require.NoError(t, vb.SaveLiveCheckpoint())
+
+		// Reader VB shares the same backend but has no WAL files open —
+		// this mirrors the snapshotRunningVolume path in spinifex.
+		reader := &VB{
+			VolumeName:   vb.VolumeName,
+			VolumeSize:   vb.VolumeSize,
+			BlockSize:    vb.BlockSize,
+			ObjBlockSize: vb.ObjBlockSize,
+			Version:      vb.Version,
+			BaseDir:      vb.BaseDir,
+			Backend:      vb.Backend,
+			BlockToObjectWAL: WAL{
+				WALMagic: vb.BlockToObjectWAL.WALMagic,
+			},
+			BlocksToObject: BlocksToObject{
+				BlockLookup: make(map[uint64]BlockLookup),
+			},
+		}
+
+		require.NoError(t, reader.LoadLiveCheckpoint())
+
+		vb.BlocksToObject.mu.RLock()
+		defer vb.BlocksToObject.mu.RUnlock()
+
+		assert.Equal(t, len(vb.BlocksToObject.BlockLookup), len(reader.BlocksToObject.BlockLookup),
+			"live checkpoint must contain all written blocks")
+
+		for blockNum, want := range vb.BlocksToObject.BlockLookup {
+			got, ok := reader.BlocksToObject.BlockLookup[blockNum]
+			assert.True(t, ok, "block %d missing from live checkpoint", blockNum)
+			if ok {
+				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d: ObjectID mismatch", blockNum)
+				assert.Equal(t, want.ObjectOffset, got.ObjectOffset, "block %d: ObjectOffset mismatch", blockNum)
+				assert.Equal(t, want.NumBlocks, got.NumBlocks, "block %d: NumBlocks mismatch", blockNum)
+				assert.Equal(t, want.SeqNum, got.SeqNum, "block %d: SeqNum mismatch", blockNum)
+			}
+		}
+	})
+}
+
 // createCloneVB creates a new VB instance configured as a clone of the given
 // snapshot. It creates its own backend so that writes target the clone's
 // namespace, while ReadFrom can still access the source volume's chunks.
@@ -457,4 +699,58 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 	})
 
 	return clone
+}
+
+// TestSnapshotCOWChain verifies that a snapshot taken from a COW clone carries
+// the parent chain reference and that a second-generation clone can read blocks
+// from all three layers: own delta, parent delta, and grandparent (base image).
+func TestSnapshotCOWChain(t *testing.T) {
+	runWithBackends(t, "snapshot_cow_chain", func(t *testing.T, base *VB) {
+		blockSize := uint64(base.BlockSize)
+
+		// Layer 0 (base image): write known data to blocks 0–1 only; block 2
+		// is intentionally left unwritten to test the zero-read path.
+		baseData := make([]byte, blockSize*2)
+		rand.Read(baseData)
+		require.NoError(t, base.Write(0, baseData))
+		require.NoError(t, base.Flush())
+		require.NoError(t, base.WriteWALToChunk(true))
+
+		baseSnapID := fmt.Sprintf("snap-%s-base", base.VolumeName)
+		_, err := base.CreateSnapshot(baseSnapID)
+		require.NoError(t, err)
+
+		// Layer 1 (instance A clone): only write to block 1
+		cloneA := createCloneVB(t, base, baseSnapID)
+		cloneAData := make([]byte, blockSize)
+		rand.Read(cloneAData)
+		require.NoError(t, cloneA.Write(1, cloneAData))
+		require.NoError(t, cloneA.Flush())
+		require.NoError(t, cloneA.WriteWALToChunk(true))
+
+		// Snapshot the clone — flat snapshot: HasFlatSection=true, all ancestor
+		// blocks embedded in the checkpoint with no chain to walk.
+		cloneASnapID := fmt.Sprintf("snap-%s-clone", cloneA.VolumeName)
+		snap, err := cloneA.CreateSnapshot(cloneASnapID)
+		require.NoError(t, err)
+		assert.True(t, snap.HasFlatSection, "snapshot of COW clone must embed inherited blocks (flat section)")
+
+		// Layer 2 (instance B): clone from the clone's snapshot; ancestors populated from flat section
+		cloneB := createCloneVB(t, cloneA, cloneASnapID)
+
+		// Block 0: never written by cloneA — must come from grandparent (base image)
+		got, err := cloneB.ReadAt(0, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, baseData[:blockSize], got, "block 0 must be read from grandparent")
+
+		// Block 1: written by cloneA — must come from parent delta
+		got, err = cloneB.ReadAt(blockSize, blockSize)
+		require.NoError(t, err)
+		assert.Equal(t, cloneAData, got, "block 1 must be read from parent delta")
+
+		// Block 2: never written by anyone — ReadAt returns ErrZeroBlock and zeros
+		got, err = cloneB.ReadAt(2*blockSize, blockSize)
+		assert.ErrorIs(t, err, ErrZeroBlock, "unwritten block must return ErrZeroBlock")
+		assert.Equal(t, make([]byte, blockSize), got, "unwritten block must read as zeros")
+	})
 }
