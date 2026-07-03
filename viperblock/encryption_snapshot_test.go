@@ -1,7 +1,3 @@
-// Copyright 2026 Mulga Defense Corporation (MDC). All rights reserved.
-// Use of this source code is governed by an Apache 2.0 license
-// that can be found in the LICENSE file.
-
 // Snapshot/clone encryption tests. Snapshot clones inherit the
 // source volume's encryption identity (SourceVolumeUUID,
 // SourceVolumeNameHash) so base-chunk reads decrypt under the source's
