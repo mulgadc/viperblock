@@ -37,6 +37,7 @@ const DefaultObjBlockSize uint32 = 1024 * 1024 * 4
 const DefaultFlushInterval time.Duration = 5 * time.Second
 const DefaultFlushSize uint32 = 64 * 1024 * 1024
 const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
+const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 
 // seqNumReservation is the size of each SeqNum high-water reservation window.
 // reserveSeqNum hands out values lock-free via atomic.Add until the persisted
@@ -86,6 +87,15 @@ type VBState struct {
 	KeyFingerprint    string  `json:"KeyFingerprint,omitempty"`
 }
 
+// snapshotAncestor carries one level of the flattened read chain for a COW clone.
+// Index 0 is the grandparent (parent's base), with deeper ancestors at higher indices.
+type snapshotAncestor struct {
+	blocks               *BlocksToObject
+	sourceVolumeName     string
+	sourceVolumeUUID     [4]byte
+	sourceVolumeNameHash [32]byte
+}
+
 type VB struct {
 	VolumeName string
 	VolumeSize uint64
@@ -104,6 +114,14 @@ type VB struct {
 	walSyncTicker *time.Ticker
 	walSyncStop   chan struct{}
 	walSyncDone   chan struct{}
+
+	// ChunkUploadInterval controls how often the background goroutine flushes WAL
+	// chunks and the live checkpoint to S3 (default 30s). <= 0 disables.
+	ChunkUploadInterval time.Duration
+
+	chunkUploadTicker *time.Ticker
+	chunkUploadStop   chan struct{}
+	chunkUploadDone   chan struct{}
 
 	// Sequence number for the next block to be written
 	SeqNum atomic.Uint64
@@ -167,6 +185,11 @@ type VB struct {
 
 	// SnapshotID is set when this volume was created from a snapshot.
 	SnapshotID string
+
+	// ancestors holds the flattened read chain beyond the immediate base,
+	// populated from the inherited-layers section of the flat snapshot checkpoint
+	// at OpenFromSnapshot time. Index 0 = grandparent, higher = deeper.
+	ancestors []snapshotAncestor
 
 	// Encryption-at-rest. MasterKey is supplied by the caller (NBD plugin /
 	// CLI) via masterkey.LoadShared; aead caches MasterKey.AEAD for the hot
@@ -597,6 +620,10 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	if config.WALSyncInterval == 0 {
 		config.WALSyncInterval = DefaultWALSyncInterval
 	}
+	// ChunkUploadInterval: 0 means use default, negative means disabled
+	if config.ChunkUploadInterval == 0 {
+		config.ChunkUploadInterval = DefaultChunkUploadInterval
+	}
 
 	var lruCache *lru.Cache[uint64, []byte]
 
@@ -630,16 +657,17 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	}
 
 	vb = &VB{
-		VolumeName:       config.VolumeName,
-		VolumeSize:       config.VolumeSize,
-		BlockSize:        config.BlockSize,
-		ObjBlockSize:     config.ObjBlockSize,
-		FlushInterval:    config.FlushInterval,
-		FlushSize:        config.FlushSize,
-		WALSyncInterval:  config.WALSyncInterval,
-		Writes:           Blocks{},
-		WAL:              WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
-		BlockToObjectWAL: WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
+		VolumeName:          config.VolumeName,
+		VolumeSize:          config.VolumeSize,
+		BlockSize:           config.BlockSize,
+		ObjBlockSize:        config.ObjBlockSize,
+		FlushInterval:       config.FlushInterval,
+		FlushSize:           config.FlushSize,
+		WALSyncInterval:     config.WALSyncInterval,
+		ChunkUploadInterval: config.ChunkUploadInterval,
+		Writes:              Blocks{},
+		WAL:                 WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
+		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
 		Cache: Cache{
 			lru: lruCache,
 			Config: CacheConfig{
@@ -692,6 +720,9 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 	// Start background WAL syncer for periodic fsync (if interval > 0)
 	vb.StartWALSyncer()
+
+	// Start background chunk uploader (if interval > 0)
+	vb.StartChunkUploader()
 
 	return vb, nil
 }
@@ -776,6 +807,54 @@ func (vb *VB) StopWALSyncer() {
 	vb.walSyncTicker = nil
 
 	slog.Debug("WAL syncer stopped")
+}
+
+// StartChunkUploader starts a background goroutine that periodically calls
+// DrainToBackend so snapshots have a reasonably current S3 view without
+// blocking the guest fsync path.
+func (vb *VB) StartChunkUploader() {
+	if vb.ChunkUploadInterval <= 0 {
+		slog.Debug("chunk uploader disabled (interval <= 0)")
+		return
+	}
+
+	vb.chunkUploadStop = make(chan struct{})
+	vb.chunkUploadDone = make(chan struct{})
+	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
+
+	go func() {
+		defer close(vb.chunkUploadDone)
+		defer vb.chunkUploadTicker.Stop()
+
+		for {
+			select {
+			case <-vb.chunkUploadTicker.C:
+				if err := vb.DrainToBackend(); err != nil {
+					slog.Warn("chunk uploader: DrainToBackend failed", "err", err)
+				}
+			case <-vb.chunkUploadStop:
+				return
+			}
+		}
+	}()
+
+	slog.Debug("chunk uploader started", "interval", vb.ChunkUploadInterval)
+}
+
+// StopChunkUploader stops the background chunk upload goroutine.
+func (vb *VB) StopChunkUploader() {
+	if vb.chunkUploadStop == nil {
+		return
+	}
+
+	close(vb.chunkUploadStop)
+	<-vb.chunkUploadDone
+
+	vb.chunkUploadStop = nil
+	vb.chunkUploadDone = nil
+	vb.chunkUploadTicker = nil
+
+	slog.Debug("chunk uploader stopped")
 }
 
 // syncWALIfDirty performs fsync on the active WAL file if there are pending writes.
@@ -1141,6 +1220,28 @@ func (vb *VB) Flush() error {
 		return vb.flushLockedSharded()
 	}
 	return vb.flushLocked()
+}
+
+// DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
+// WAL chunks to S3, and saves the live checkpoint. Call this at snapshot-prepare
+// time or on clean shutdown to ensure S3 state is fully current.
+func (vb *VB) DrainToBackend() error {
+	if err := vb.Flush(); err != nil {
+		return fmt.Errorf("drain flush: %w", err)
+	}
+	var err error
+	if vb.UseShardedWAL {
+		err = vb.WriteShardedWALToChunk(true)
+	} else {
+		err = vb.WriteWALToChunk(true)
+	}
+	if err != nil {
+		return fmt.Errorf("drain chunk upload: %w", err)
+	}
+	if err := vb.SaveLiveCheckpoint(); err != nil {
+		return fmt.Errorf("drain live checkpoint: %w", err)
+	}
+	return nil
 }
 
 // flushLocked flushes hot writes to WAL. Caller must hold vb.Writes.mu.Lock().
@@ -2325,6 +2426,39 @@ func (vb *VB) SaveBlockState() (err error) {
 	return err
 }
 
+// parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
+// Caller must hold BlocksToObject.mu (write).
+func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
+	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
+
+	slog.Debug("Loaded checkpoint", "checkpoint", checkpoint)
+
+	headers := checkpoint[:vb.BlockToObjectWALHeaderSize()]
+
+	if !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]) {
+		return fmt.Errorf("magic mismatch")
+	}
+
+	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
+		return fmt.Errorf("version mismatch")
+	}
+
+	offset := vb.BlockToObjectWALHeaderSize()
+	for offset < len(checkpoint) {
+		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
+		if err != nil {
+			slog.Error("Error reading block", "error", err)
+			return err
+		}
+		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
+		}
+		offset += blockWalChunkSize
+	}
+	return nil
+}
+
 // Load the previous blockstate from disk
 func (vb *VB) LoadBlockState() (err error) {
 	var checkpoint []byte
@@ -2350,65 +2484,41 @@ func (vb *VB) LoadBlockState() (err error) {
 		}
 	}
 
-	// TODO: Rebuild the checkpoint if corrupted or missing based on previous WAL
-
-	// Step 2. Build the BlockLookup from the binary checkpoint
-
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
+	return vb.parseBlockCheckpoint(checkpoint)
+}
 
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
+// SaveLiveCheckpoint writes the current block map to a fixed S3 key so a concurrent
+// process can read a crash-consistent checkpoint without stopping nbdkit. Unlike
+// SaveBlockState, this does not write a local file and does not increment WallNum —
+// the key is always overwritten in place.
+func (vb *VB) SaveLiveCheckpoint() error {
+	vb.BlocksToObject.mu.RLock()
+	defer vb.BlocksToObject.mu.RUnlock()
 
-	slog.Debug("Loaded checkpoint", "checkpoint", checkpoint)
-
-	headers := checkpoint[:vb.BlockToObjectWALHeaderSize()]
-
-	// Validate the header
-	//if !bytes.Equal(headers, vb.BlockToObjectWALHeader()) {
-	//	return fmt.Errorf("invalid header")
-	//}
-
-	// Check the magic
-	if !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]) {
-		return fmt.Errorf("magic mismatch")
+	checkpoint := vb.BlockToObjectWALHeader()
+	for _, block := range vb.BlocksToObject.BlockLookup {
+		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
 	}
 
-	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
-		return fmt.Errorf("version mismatch")
-	}
+	headers := []byte{}
+	return vb.Backend.Write(types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
+}
 
-	// Check file written within the last 2 seconds
-	// TODO: Move to _test.go
-	//now := time.Now().Unix()
-	//writtenAt := binary.BigEndian.Uint64(headers[6:14])
-	//if now-int64(writtenAt) > 2 {
-	//	return fmt.Errorf("file written more than 2 seconds ago")
-	//}
-
-	// Check the wall number
-
-	// Read each block from the checkpoint buffer (blockWalChunkSize bytes each).
-	offset := vb.BlockToObjectWALHeaderSize()
-
-	for offset < len(checkpoint) {
-		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
-
-		if err != nil {
-			slog.Error("Error reading block", "error", err)
-			return err
+// LoadLiveCheckpoint reads the live checkpoint written by SaveLiveCheckpoint. If no
+// live checkpoint exists yet, it falls back to LoadBlockState (numbered checkpoint).
+func (vb *VB) LoadLiveCheckpoint() error {
+	checkpoint, err := vb.Backend.Read(types.FileTypeBlockCheckpointLive, 0, 0, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return vb.LoadBlockState()
 		}
-
-		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
-
-		// Also update BlockStore if enabled
-		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
-		}
-
-		offset += blockWalChunkSize
+		return fmt.Errorf("read live checkpoint: %w", err)
 	}
-
-	return err
+	vb.BlocksToObject.mu.Lock()
+	defer vb.BlocksToObject.mu.Unlock()
+	return vb.parseBlockCheckpoint(checkpoint)
 }
 
 // readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.
@@ -3318,6 +3428,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
+	ancestorConsBlocks := make([]ConsecutiveBlocks, len(vb.ancestors))
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -3372,6 +3483,30 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 					})
 					continue
 				}
+			}
+			// Base map miss — check ancestor layers
+			ancFound := false
+			for ai := range vb.ancestors {
+				vb.ancestors[ai].blocks.mu.RLock()
+				lookup, ok := vb.ancestors[ai].blocks.BlockLookup[currentBlock]
+				vb.ancestors[ai].blocks.mu.RUnlock()
+				if ok {
+					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      lookup.ObjectID,
+						ObjectOffset:  lookup.ObjectOffset,
+						SeqNum:        lookup.SeqNum,
+					})
+					ancFound = true
+					break
+				}
+			}
+			if ancFound {
+				continue
 			}
 			zeroBlockErr = ErrZeroBlock
 			slog.Debug("[READ] ZERO BLOCK:", "block", currentBlock)
@@ -3494,8 +3629,18 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
 	if len(baseConsecutiveBlocks) > 0 {
-		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
+		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
 		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch blocks from ancestor snapshot layers
+	for ai, anc := range vb.ancestors {
+		if len(ancestorConsBlocks[ai]) == 0 {
+			continue
+		}
+		if err := vb.fetchBaseBlocksFromBackend(anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
 			return nil, err
 		}
 	}
@@ -3535,63 +3680,59 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 func (vb *VB) Close() error {
 	slog.Info("VB Close, flushing block state to disk")
 
-	// Stop the WAL syncer goroutine (performs final sync before stopping)
+	// Stop background goroutines before flushing
+	vb.StopChunkUploader()
 	vb.StopWALSyncer()
 
 	if err := vb.Flush(); err != nil {
 		slog.Error("failed to flush during Close", "error", err)
 	}
 
-	var err error
+	var walErr error
 	if vb.UseShardedWAL {
-		err = vb.WriteShardedWALToChunk(true)
+		walErr = vb.WriteShardedWALToChunk(true)
 	} else {
-		err = vb.WriteWALToChunk(true)
+		walErr = vb.WriteWALToChunk(true)
 	}
-
-	if err != nil {
-		slog.Error("Could not Write WAL to Chunk", "err", err)
-		return err
+	if walErr != nil {
+		slog.Error("Could not Write WAL to Chunk during Close, proceeding to save block state", "err", walErr)
 	}
 
 	path := fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, vb.GetVolume())
 
 	slog.Debug("Saving Close state to", "path", path)
 
-	// Upload the state to the backend
-	err = vb.SaveState()
+	var firstErr error
 
-	if err != nil {
+	// Upload the state to the backend
+	if err := vb.SaveState(); err != nil {
 		slog.Error("Could not save state", "err", err)
-		return err
+		firstErr = err
 	}
 
-	// Should not be required with Flush and WriteWALToChunk prior
-	/*
-		err = vb.SaveHotState(fmt.Sprintf("%s/hotstate.json", path))
-
-		if err != nil {
-			slog.Error("Could not save hot state", "err", err)
-			return err
-		}
-	*/
-
-	err = vb.SaveBlockState()
-
-	if err != nil {
+	// Always attempt to save the block checkpoint even if SaveState or WAL
+	// flush failed — in-memory BlockLookup may reflect successfully flushed
+	// writes from earlier Flush calls and must not be lost.
+	if err := vb.SaveBlockState(); err != nil {
 		slog.Error("Could not save block state", "err", err)
-		return err
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	if firstErr != nil {
+		return firstErr
 	}
 
 	// Remove local WAL and block state files, upload/sync in prior steps.
-	// TODO: Consider retention policy for local files, and remove older files
-	// TODO: Consider rebuilding the checkpoint locally if the file is corrupted or missing on the remote S3.
-
-	err = vb.RemoveLocalFiles()
+	err := vb.RemoveLocalFiles()
 	if err != nil {
 		slog.Error("Failed to remove local files", "err", err)
 	}
 
+	if walErr != nil {
+		return walErr
+	}
 	return nil
 }
 
@@ -3711,7 +3852,7 @@ func (vb *VB) WALHeaderSize() int {
 func (vb *VB) BlockToObjectWALHeader() []byte {
 	header := make([]byte, vb.BlockToObjectWALHeaderSize())
 
-	slog.Info("Writing BlockToObjectWALHeader", "header", header, "size", vb.BlockToObjectWALHeaderSize())
+	slog.Debug("Writing BlockToObjectWALHeader", "header", header, "size", vb.BlockToObjectWALHeaderSize())
 	copy(header[:len(vb.BlockToObjectWAL.WALMagic)], vb.BlockToObjectWAL.WALMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
 	binary.BigEndian.PutUint64(header[6:14], utils.SafeInt64ToUint64(time.Now().Unix()))
@@ -3790,6 +3931,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
+	ancestorConsBlocks := make([]ConsecutiveBlocks, len(vb.ancestors))
 
 	for i := range blockRequests {
 		currentBlock := block + i
@@ -3842,6 +3984,30 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 					continue
 				}
 			}
+			// Base map miss — check ancestor layers
+			ancFound := false
+			for ai := range vb.ancestors {
+				vb.ancestors[ai].blocks.mu.RLock()
+				lookup, ok := vb.ancestors[ai].blocks.BlockLookup[currentBlock]
+				vb.ancestors[ai].blocks.mu.RUnlock()
+				if ok {
+					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
+						BlockPosition: i,
+						StartBlock:    currentBlock,
+						NumBlocks:     1,
+						OffsetStart:   start,
+						OffsetEnd:     end,
+						ObjectID:      lookup.ObjectID,
+						ObjectOffset:  lookup.ObjectOffset,
+						SeqNum:        lookup.SeqNum,
+					})
+					ancFound = true
+					break
+				}
+			}
+			if ancFound {
+				continue
+			}
 			if errors.Is(err, ErrZeroBlock) {
 				zeroBlockErr = ErrZeroBlock
 			}
@@ -3858,8 +4024,18 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
 	if len(baseConsecutiveBlocks) > 0 {
-		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, baseConsecutiveBlocks, data)
+		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
 		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch blocks from ancestor snapshot layers
+	for ai, anc := range vb.ancestors {
+		if len(ancestorConsBlocks[ai]) == 0 {
+			continue
+		}
+		if err = vb.fetchBaseBlocksFromBackend(anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
 			return nil, err
 		}
 	}
@@ -3966,14 +4142,10 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 }
 
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
-// Used by clone volumes to read blocks that exist in the snapshot's frozen block map.
-//
-// Encrypted clones decrypt the fetched ciphertext under the SOURCE volume's
-// identity (vb.SourceVolumeUUID, vb.sourceVolumeNameHash), not the clone's
-// own identity — the chunk was sealed by the source on its original write,
-// so its nonce + AAD bind the source-volume hash and the source-side SeqNum
-// carried forward via SnapshotState.
-func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+// Used by clone volumes to read blocks from the base or an ancestor snapshot layer.
+// uuid and nameHash carry the encryption identity of the source volume; ignored on
+// unencrypted volumes.
+func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, uuid [4]byte, nameHash [32]byte, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	if sourceVolume == "" {
 		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
 	}
@@ -4046,7 +4218,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, consecutiveBlocks 
 		}
 
 		if vb.EncryptionEnabled {
-			if err := vb.openChunkRun(blockData, cb, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, data[start:end]); err != nil {
+			if err := vb.openChunkRun(blockData, cb, uuid, nameHash, data[start:end]); err != nil {
 				return fmt.Errorf("base chunk decrypt source %s: %w", sourceVolume, err)
 			}
 		} else {
