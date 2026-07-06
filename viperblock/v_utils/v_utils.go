@@ -109,6 +109,14 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		return fmt.Errorf("failed to initialize backend: %v", err)
 	}
 
+	// Import drains its WAL explicitly (Flush + WriteWALToChunk in the loop,
+	// then CreateSnapshot + Close). The background chunk uploader started by
+	// New() would otherwise race those foreground drains and corrupt the AMI
+	// snapshot's block map. Stop it (and the WAL syncer) up front; Close()
+	// re-runs both stops idempotently.
+	vb.StopChunkUploader()
+	vb.StopWALSyncer()
+
 	//var walNum uint64
 
 	// First, fetch the state from the remote backend
