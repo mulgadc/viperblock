@@ -1896,7 +1896,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		})
 
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+			err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
 			if err != nil {
 				return fmt.Errorf("failed to create chunk file: %w", err)
 			}
@@ -1907,7 +1907,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 
 	// Write remaining data
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+		err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
 		if err != nil {
 			return fmt.Errorf("failed to create final chunk file: %w", err)
 		}
@@ -2108,7 +2108,7 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 		// If buffer is full (default 4MB), write to file
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+			err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
 			if err != nil {
 				slog.Error("Failed to create chunk file", "error", err)
 				//vb.WAL.mu.Unlock()
@@ -2123,7 +2123,7 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 	// Write any remaining data as the last chunkAdd commentMore actions
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(currentWALNum, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks)
+		err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
 		if err != nil {
 			slog.Error("Failed to create chunk file", "error", err)
 
@@ -2217,9 +2217,14 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 }
 */
 
-func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
+func (vb *VB) createChunkFile(currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
+
+	// Atomically allocate this chunk's ObjectID so concurrent consolidations
+	// never share a chunk key. The old Load-at-caller/Add-at-end split let two
+	// drains reuse an ID and overwrite a chunk (fatal AEAD mismatch on read).
+	chunkIndex := vb.ObjectNum.Add(1) - 1
 
 	//slog.Info("Creating chunk file", "chunkIndex", chunkIndex, "currentWALNum", currentWALNum)
 
@@ -2333,9 +2338,6 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 	if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
 		slog.Warn("createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
 	}
-
-	// Increment the object number
-	vb.ObjectNum.Add(1)
 
 	return nil
 }
@@ -2737,7 +2739,7 @@ func (vb *VB) RecoverLocalWALs() error {
 		})
 
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			if err := vb.createChunkFile(0, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks); err != nil {
+			if err := vb.createChunkFile(0, &chunkBuffer, &matchedBlocks); err != nil {
 				return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
 			}
 			chunkBuffer = chunkBuffer[:0]
@@ -2746,7 +2748,7 @@ func (vb *VB) RecoverLocalWALs() error {
 	}
 
 	if len(chunkBuffer) > 0 {
-		if err := vb.createChunkFile(0, vb.ObjectNum.Load(), &chunkBuffer, &matchedBlocks); err != nil {
+		if err := vb.createChunkFile(0, &chunkBuffer, &matchedBlocks); err != nil {
 			return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
 		}
 	}
