@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -64,6 +65,8 @@ type Backend struct {
 	Config S3Config
 }
 
+var _ types.Backend = (*Backend)(nil)
+
 func New(config any) (backend *Backend) {
 	cfg, ok := config.(S3Config)
 	if !ok {
@@ -73,7 +76,11 @@ func New(config any) (backend *Backend) {
 }
 
 func (backend *Backend) Init() error {
-	slog.Info("Initializing S3 backend", "config", backend.config)
+	return backend.InitCtx(context.Background())
+}
+
+func (backend *Backend) InitCtx(ctx context.Context) error {
+	slog.InfoContext(ctx, "Initializing S3 backend", "config", backend.config)
 
 	client := backend.config.HTTPClient
 	if client == nil {
@@ -135,18 +142,18 @@ func (backend *Backend) Init() error {
 	})
 
 	if err != nil {
-		slog.Error("Error creating session", "error", err)
+		slog.ErrorContext(ctx, "Error creating session", "error", err)
 		return err
 	}
 
 	backend.config.S3Client = s3.New(sess)
 
-	_, err = backend.config.S3Client.ListObjectsV2(&s3.ListObjectsV2Input{
+	_, err = backend.config.S3Client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
 		Bucket: aws.String(backend.config.Bucket),
 	})
 
 	if err != nil {
-		slog.Error("Error listing objects", "error", err)
+		slog.ErrorContext(ctx, "Error listing objects", "error", err)
 		return err
 	}
 
@@ -158,7 +165,11 @@ func (backend *Backend) Open(fname string) error {
 }
 
 func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
-	slog.Debug("[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
+	return backend.ReadCtx(context.Background(), fileType, objectId, offset, length)
+}
+
+func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+	slog.DebugContext(ctx, "[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
 
 	if backend.config.S3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -177,13 +188,13 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 	if length > 0 {
 		// Request exactly the bytes we need: offset to offset+length-1
 		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-		slog.Debug("[S3 READ] Requesting range", "range", *requestObject.Range)
+		slog.DebugContext(ctx, "[S3 READ] Requesting range", "range", *requestObject.Range)
 	} else {
-		slog.Debug("[S3 READ] Reading entire file", "key", filename)
+		slog.DebugContext(ctx, "[S3 READ] Reading entire file", "key", filename)
 	}
 
-	// TODO: Add ctx support and retry from S3 timeout/500/etc
-	textResult, err := backend.config.S3Client.GetObject(requestObject)
+	// TODO: Add retry from S3 timeout/500/etc
+	textResult, err := backend.config.S3Client.GetObjectWithContext(ctx, requestObject)
 
 	if err != nil {
 		return nil, wrapNotFound(err)
@@ -202,6 +213,10 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 }
 
 func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	return backend.WriteCtx(context.Background(), fileType, objectId, headers, data)
+}
+
+func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
 	if backend.config.S3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
@@ -232,12 +247,10 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 		Body:   bytes.NewReader(body),
 	}
 
-	_, err = backend.config.S3Client.PutObject(object)
-
-	//slog.Info("Write object", "output", output)
+	_, err = backend.config.S3Client.PutObjectWithContext(ctx, object)
 
 	if err != nil {
-		slog.Error("Error writing object", "error", err)
+		slog.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
 	}
 
@@ -245,7 +258,11 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
-	slog.Debug("[S3 READFROM] Reading object", "volumeName", volumeName, "objectId", objectId, "offset", offset, "length", length)
+	return backend.ReadFromCtx(context.Background(), volumeName, fileType, objectId, offset, length)
+}
+
+func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+	slog.DebugContext(ctx, "[S3 READFROM] Reading object", "volumeName", volumeName, "objectId", objectId, "offset", offset, "length", length)
 
 	if backend.config.S3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -262,7 +279,7 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 	}
 
-	textResult, err := backend.config.S3Client.GetObject(requestObject)
+	textResult, err := backend.config.S3Client.GetObjectWithContext(ctx, requestObject)
 	if err != nil {
 		return nil, wrapNotFound(err)
 	}
@@ -277,6 +294,10 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 }
 
 func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	return backend.WriteToCtx(context.Background(), volumeName, fileType, objectId, headers, data)
+}
+
+func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
 	if backend.config.S3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
@@ -304,9 +325,9 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 		Body:   bytes.NewReader(body),
 	}
 
-	_, err = backend.config.S3Client.PutObject(object)
+	_, err = backend.config.S3Client.PutObjectWithContext(ctx, object)
 	if err != nil {
-		slog.Error("Error writing object", "error", err)
+		slog.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
 	}
 

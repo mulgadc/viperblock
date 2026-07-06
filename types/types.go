@@ -1,14 +1,22 @@
 package types
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 type Backend interface {
 	Init() error
+	InitCtx(ctx context.Context) error
 	Open(fname string) error
 	Read(fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
+	ReadCtx(ctx context.Context, fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
 	Write(fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
+	WriteCtx(ctx context.Context, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	ReadFrom(volumeName string, fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
+	ReadFromCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
 	WriteTo(volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
+	WriteToCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	Sync()
 	GetBackendType() string
 	GetHost() string

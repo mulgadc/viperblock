@@ -1,6 +1,7 @@
 package file
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,6 +24,30 @@ type FileBackend struct {
 
 type Backend struct {
 	FileBackend
+}
+
+var _ types.Backend = (*Backend)(nil)
+
+// Ctx variants satisfy the context-aware half of types.Backend; local file
+// I/O has no cancellation points so they delegate to the plain methods.
+func (backend *Backend) InitCtx(_ context.Context) error {
+	return backend.Init()
+}
+
+func (backend *Backend) ReadCtx(_ context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
+	return backend.Read(fileType, objectId, offset, length)
+}
+
+func (backend *Backend) WriteCtx(_ context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	return backend.Write(fileType, objectId, headers, data)
+}
+
+func (backend *Backend) ReadFromCtx(_ context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
+	return backend.ReadFrom(volumeName, fileType, objectId, offset, length)
+}
+
+func (backend *Backend) WriteToCtx(_ context.Context, volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	return backend.WriteTo(volumeName, fileType, objectId, headers, data)
 }
 
 // 3. Implement WithConfig for each backend
