@@ -123,15 +123,6 @@ type VB struct {
 	chunkUploadStop   chan struct{}
 	chunkUploadDone   chan struct{}
 
-	// chunkWriteMu serializes WAL-to-chunk consolidation. WriteWALToChunk /
-	// WriteShardedWALToChunk allocate chunk ObjectIDs via a non-atomic
-	// ObjectNum.Load()+Add(1) around the seal, so two concurrent callers (e.g.
-	// the background chunk uploader's DrainToBackend racing a foreground
-	// ImportDiskImage/CreateSnapshot drain) can grab the same ObjectID and
-	// overwrite each other's chunk, leaving BlockLookup pointing at ciphertext
-	// sealed for different blocks (fatal AEAD tag mismatch on later reads).
-	chunkWriteMu sync.Mutex
-
 	// Sequence number for the next block to be written
 	SeqNum atomic.Uint64
 
@@ -1689,11 +1680,6 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 // It briefly locks all shards to rotate to the next generation, then reads
 // the closed shard files in parallel, deduplicates, sorts, and creates chunks.
 func (vb *VB) WriteShardedWALToChunk(force bool) error {
-	// Serialize chunk consolidation so concurrent drains cannot collide on the
-	// ObjectNum allocation in createChunkFile.
-	vb.chunkWriteMu.Lock()
-	defer vb.chunkWriteMu.Unlock()
-
 	sw := vb.ShardedWAL
 	if sw == nil {
 		return fmt.Errorf("ShardedWAL not initialized")
@@ -1938,17 +1924,10 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 }
 
 func (vb *VB) WriteWALToChunk(force bool) error {
-	// Dispatch to sharded implementation when enabled. The lock lives inside
-	// WriteShardedWALToChunk, so do NOT take chunkWriteMu before dispatching or
-	// the two would double-lock.
+	// Dispatch to sharded implementation when enabled
 	if vb.UseShardedWAL {
 		return vb.WriteShardedWALToChunk(force)
 	}
-
-	// Serialize chunk consolidation so concurrent drains cannot collide on the
-	// ObjectNum allocation in createChunkFile.
-	vb.chunkWriteMu.Lock()
-	defer vb.chunkWriteMu.Unlock()
 
 	// First, lock, and close the current WAL file
 	vb.WAL.mu.Lock()
