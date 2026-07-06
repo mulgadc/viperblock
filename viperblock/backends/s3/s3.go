@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/viperblock/types"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error code
@@ -104,7 +105,9 @@ func (backend *Backend) Init() error {
 		}
 
 		client = &http.Client{
-			Transport: tr,
+			// otelhttp emits a client span per S3 request, parented to any
+			// span carried on the request context.
+			Transport: otelhttp.NewTransport(tr),
 			Timeout:   120 * time.Second,
 		}
 	}

@@ -26,6 +26,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
@@ -735,9 +736,9 @@ func (vb *VB) SetDebug(debug bool) {
 		level = slog.LevelError
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	logger := slog.New(telemetry.NewSlogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
-	}))
+	})))
 	slog.SetDefault(logger)
 }
 
