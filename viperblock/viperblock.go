@@ -2285,11 +2285,6 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 
 	headerLen := len(headers)
 
-	// Loop through the chunk buffer, and write each block to the file
-	i := 0
-
-	BlockObjectsToWAL := make([]BlockLookup, 0, len(*matchedBlocks))
-
 	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
 	// each ciphertext block; unencrypted chunks stay at BlockSize.
 	stride := int(vb.BlockSize)
@@ -2313,31 +2308,30 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkIndex uint64, chunkBuff
 			StartBlock:   block.Block,
 			NumBlocks:    utils.SafeIntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
-			ObjectOffset: utils.SafeIntToUint32(headerLen + (i * stride)),
+			ObjectOffset: utils.SafeIntToUint32(headerLen + (k * stride)),
 			SeqNum:       block.SeqNum,
 		}
 
 		// TODO: Optimise for number of consecutive blocks to reduce the memory size
 		vb.BlocksToObject.BlockLookup[block.Block] = newBlock
 
-		//slog.Info("Added block to BlockLookup", "block", block.Block, "newBlock", newBlock)
-
-		BlockObjectsToWAL = append(BlockObjectsToWAL, newBlock)
-
 		// Update BlockStore: transition from Pending to Persisted
 		if vb.UseBlockStore && vb.BlockStore != nil {
 			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset)
 		}
-
-		i++
 	}
 
 	vb.BlocksToObject.mu.Unlock()
 
-	// Lastly, write the Block objects to it's own WAL for redundancy and checkpointing.
-	err = vb.WriteBlockWAL(&BlockObjectsToWAL)
-	if err != nil {
-		return err
+	// Flush the updated block→chunk mapping to S3 immediately after each chunk
+	// upload so the live checkpoint stays consistent with what is in S3. This
+	// shrinks the window in which a crash can leave the checkpoint pointing at a
+	// stale seqNum relative to the just-uploaded chunk ciphertext (the remaining
+	// window is the gap between Backend.Write and this call, not the full 30s
+	// background-uploader interval). Non-fatal: DrainToBackend will retry at the
+	// end of the current cycle regardless.
+	if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
+		slog.Warn("createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
 	}
 
 	// Increment the object number
