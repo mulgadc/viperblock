@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error code
@@ -112,10 +113,13 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 		}
 
 		client = &http.Client{
-			// otelhttp emits a client span per S3 request, parented to any
-			// span carried on the request context.
-			Transport: otelhttp.NewTransport(tr),
-			Timeout:   120 * time.Second,
+			// otelhttp emits a client span per S3 request, but only when the
+			// request context already carries a span: background chunk I/O and
+			// guest block reads would otherwise root a trace per S3 call.
+			Transport: otelhttp.NewTransport(tr, otelhttp.WithFilter(func(r *http.Request) bool {
+				return trace.SpanFromContext(r.Context()).SpanContext().IsValid()
+			})),
+			Timeout: 120 * time.Second,
 		}
 	}
 
