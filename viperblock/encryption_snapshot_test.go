@@ -382,3 +382,57 @@ func TestSnapshotEncrypted_CloneWriteUsesCloneIdentity(t *testing.T) {
 	assert.True(t, bytes.Equal(srcData, got),
 		"clone read of source-snapshot block must still decrypt under source identity")
 }
+
+// TestEncryptedChunk_LiveCheckpointSeqNumConsistency gates the ordering fix in
+// createChunkFile (mulga-be2ev): after a chunk is sealed, SaveLiveCheckpoint is
+// called immediately so the recorded BlockLookup.SeqNum matches the seal-time
+// SeqNum. A stale SeqNum causes the nonce reconstructed on ReadAt to diverge
+// from the seal nonce, making AES-GCM tag verification fail with ErrIntegrity.
+//
+// This mirrors the crash/remount scenario: a VB drains to a chunk, then a
+// "remounted" VB loads the live checkpoint and reads the same blocks back via
+// the backend. If the checkpoint SeqNum is stale (pre-fix: 30s async timer;
+// runtime: leaked goroutine overwriting with clone-point data), ReadAt fails.
+func TestEncryptedChunk_LiveCheckpointSeqNumConsistency(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t, 0x77)
+
+	// Writer: seal blocks into a chunk. Our fix has createChunkFile call
+	// SaveLiveCheckpoint immediately after updating BlockLookup.
+	writer := openEncryptedVBInDir(t, dir, "seqnum-consistency", key)
+	defer writer.StopChunkUploader()
+
+	data := make([]byte, writer.BlockSize*4)
+	_, err := rand.Read(data)
+	require.NoError(t, err)
+	require.NoError(t, writer.Write(0, data))
+	require.NoError(t, writer.Flush())
+	// WriteWALToChunk → createChunkFile → SaveLiveCheckpoint (ordering fix).
+	require.NoError(t, writer.WriteWALToChunk(true))
+
+	// Remount: fresh VB over the same backend loading only from the live
+	// checkpoint — no in-memory write buffer. This is what happens on remount
+	// after a crash or after a leaked goroutine overwrites the checkpoint.
+	remounted := newCloneReopen(t, dir, "seqnum-consistency", key)
+	require.NoError(t, remounted.LoadState())
+	require.NoError(t, remounted.LoadLiveCheckpoint())
+
+	// Every BlockLookup entry in the live checkpoint must carry the exact
+	// SeqNum that was used to seal the corresponding chunk ciphertext.
+	writer.BlocksToObject.mu.RLock()
+	defer writer.BlocksToObject.mu.RUnlock()
+	for blockNum, want := range writer.BlocksToObject.BlockLookup {
+		got, ok := remounted.BlocksToObject.BlockLookup[blockNum]
+		require.True(t, ok, "block %d missing from live checkpoint after createChunkFile", blockNum)
+		assert.Equal(t, want.SeqNum, got.SeqNum,
+			"block %d: live checkpoint SeqNum must match seal-time SeqNum (AEAD nonce component)", blockNum)
+	}
+
+	// ReadAt on the remounted VB must decrypt using the checkpoint SeqNum.
+	// Pre-fix, a stale SeqNum here returns ErrIntegrity (cipher: message
+	// authentication failed) — the exact error logged by nbdkit on env19.
+	got, err := remounted.ReadAt(0, uint64(remounted.BlockSize))
+	require.NoError(t, err, "ReadAt on remounted encrypted VB must not fail with AEAD auth error")
+	assert.True(t, bytes.Equal(data[:remounted.BlockSize], got),
+		"remounted read must decrypt to original plaintext")
+}
