@@ -1913,13 +1913,6 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		}
 	}
 
-	// Update block store state for all consolidated blocks
-	if vb.UseBlockStore && vb.BlockStore != nil {
-		for _, block := range sortedBlocks {
-			vb.BlockStore.MarkPersisted(block.Block, vb.ObjectNum.Load(), 0)
-		}
-	}
-
 	return nil
 }
 
@@ -2320,9 +2313,11 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkBuffer *[]byte, matched
 		// TODO: Optimise for number of consecutive blocks to reduce the memory size
 		vb.BlocksToObject.BlockLookup[block.Block] = newBlock
 
-		// Update BlockStore: transition from Pending to Persisted
+		// Update BlockStore: transition from Pending to Persisted. Pass the
+		// sealed SeqNum so the location and seqNum stay bound as a unit; a
+		// stale drain whose block was since re-written is rejected here.
 		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset)
+			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset, block.SeqNum)
 		}
 	}
 
@@ -2439,6 +2434,11 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 		return fmt.Errorf("version mismatch")
 	}
 
+	// Track the highest chunk ObjectID the map references so ObjectNum can be
+	// reconciled to max+1 below, mirroring SeqNum -> maxSeqNum in RecoverLocalWALs.
+	var maxObjectID uint64
+	haveObject := false
+
 	offset := vb.BlockToObjectWALHeaderSize()
 	for offset < len(checkpoint) {
 		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
@@ -2447,11 +2447,32 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 			return err
 		}
 		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
+		if !haveObject || block.ObjectID > maxObjectID {
+			maxObjectID = block.ObjectID
+			haveObject = true
+		}
 		if vb.UseBlockStore && vb.BlockStore != nil {
 			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
 		}
 		offset += blockWalChunkSize
 	}
+
+	// Runtime drains persist chunks but not config.json ObjectNum, so a re-Open can
+	// load a stale-low ObjectNum. Force it past every referenced chunk ID here so
+	// createChunkFile cannot reuse a live ID and cause a durable AEAD tag failure.
+	if haveObject {
+		next := maxObjectID + 1
+		for {
+			current := vb.ObjectNum.Load()
+			if next <= current {
+				break
+			}
+			if vb.ObjectNum.CompareAndSwap(current, next) {
+				break
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -2728,6 +2749,34 @@ func (vb *VB) RecoverLocalWALs() error {
 
 	slog.Info("WAL recovery: replaying blocks", "unique_blocks", len(sortedBlocks))
 
+	// Reconcile ObjectNum past every chunk the loaded map already references
+	// before replay allocates new chunk IDs. createChunkFile hands out IDs via
+	// ObjectNum.Add, so a stale-low ObjectNum here would let a replayed chunk
+	// reuse a live chunk ID and overwrite it, corrupting reads with a durable
+	// AEAD tag failure. Mirrors the SeqNum -> maxSeqNum reconcile below.
+	vb.BlocksToObject.mu.RLock()
+	var maxObjectID uint64
+	haveObject := false
+	for _, lookup := range vb.BlocksToObject.BlockLookup {
+		if !haveObject || lookup.ObjectID > maxObjectID {
+			maxObjectID = lookup.ObjectID
+			haveObject = true
+		}
+	}
+	vb.BlocksToObject.mu.RUnlock()
+	if haveObject {
+		next := maxObjectID + 1
+		for {
+			current := vb.ObjectNum.Load()
+			if next <= current {
+				break
+			}
+			if vb.ObjectNum.CompareAndSwap(current, next) {
+				break
+			}
+		}
+	}
+
 	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
 	matchedBlocks := make([]Block, 0)
 
@@ -2938,6 +2987,44 @@ func (vb *VB) mintVolumeUUID() (bool, error) {
 		return false, fmt.Errorf("mint VolumeUUID: %w", err)
 	}
 	return true, nil
+}
+
+// EnsureVolumeUUID mints and durably persists the per-volume nonce subspace
+// eagerly, before any block is sealed. Callers run it at Open while still
+// single-threaded so a lazy mint cannot race lock-free VolumeUUID reads in the
+// seal path (a torn read corrupts one block with a durable AEAD tag failure).
+// Unlike SaveState, it never regresses SeqNumHighWater — clones inherit a high
+// water mark, and reseeding it to seqNumReservation could re-issue SeqNums.
+// No-op on unencrypted volumes or once the UUID is set.
+func (vb *VB) EnsureVolumeUUID() error {
+	if !vb.EncryptionEnabled {
+		return nil
+	}
+	var zero [4]byte
+	if vb.VolumeUUID != zero {
+		return nil
+	}
+	vb.seqNumHighWaterMu.Lock()
+	defer vb.seqNumHighWaterMu.Unlock()
+	minted, err := vb.mintVolumeUUID()
+	if err != nil {
+		return fmt.Errorf("EnsureVolumeUUID: %w", err)
+	}
+	if !minted {
+		return nil
+	}
+	// Keep a high water that already covers every issued SeqNum; advance in
+	// whole reservation windows so it is never below the current SeqNum.
+	hw := max(vb.seqNumHighWater.Load(), seqNumReservation)
+	for hw < vb.SeqNum.Load() {
+		hw += seqNumReservation
+	}
+	persisted, err := vb.persistStateLocal(hw)
+	if err != nil {
+		return fmt.Errorf("EnsureVolumeUUID: persistStateLocal: %w", err)
+	}
+	vb.seqNumHighWater.Store(hw)
+	return vb.pushStateToBackend(persisted)
 }
 
 // saveStateWithHighWater persists VBState with an explicit SeqNumHighWater

@@ -221,7 +221,22 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load state: %v", err)}
 	}
 
-	err = vb.LoadBlockState()
+	// Mint + persist VolumeUUID now, single-threaded, before WAL recovery or any
+	// served write seals a block. A lazy mint under concurrent boot load lets a
+	// drain read a half-written UUID (or seal recovery chunks under the zero
+	// UUID), corrupting a block with a durable AEAD tag failure.
+	if err = vb.EnsureVolumeUUID(); err != nil {
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not mint volume UUID: %v", err)}
+	}
+
+	// Load the LIVE checkpoint, not the numbered one. Runtime drains rewrite the
+	// live checkpoint on every chunk upload but only bump the numbered checkpoint
+	// on a clean Close — which a killed nbdkit VB (qemu reconnect) never reaches.
+	// Loading the stale numbered map here would reconcile ObjectNum too low, so
+	// recovery/drains would reuse a live chunk ID and overwrite it, leaving a
+	// durable AEAD tag failure. LoadLiveCheckpoint falls back to the numbered
+	// checkpoint when no live one exists yet (brand-new volume).
+	err = vb.LoadLiveCheckpoint()
 
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
