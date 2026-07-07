@@ -2,6 +2,7 @@ package viperblock
 
 import (
 	"bytes"
+	"context"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
@@ -26,6 +27,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
@@ -735,9 +737,9 @@ func (vb *VB) SetDebug(debug bool) {
 		level = slog.LevelError
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	logger := slog.New(telemetry.NewSlogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
-	}))
+	})))
 	slog.SetDefault(logger)
 }
 
@@ -829,7 +831,7 @@ func (vb *VB) StartChunkUploader() {
 		for {
 			select {
 			case <-vb.chunkUploadTicker.C:
-				if err := vb.DrainToBackend(); err != nil {
+				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					slog.Warn("chunk uploader: DrainToBackend failed", "err", err)
 				}
 			case <-vb.chunkUploadStop:
@@ -1038,6 +1040,12 @@ func (vb *VB) OpenShardedWAL() error {
 }
 
 func (vb *VB) WriteAt(offset uint64, data []byte) error {
+	return vb.WriteAtCtx(context.Background(), offset, data)
+}
+
+// WriteAtCtx is WriteAt with a caller-supplied context that flows through any
+// read-modify-write backend fetches for trace propagation.
+func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error {
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
 		return ErrRequestTooLarge
@@ -1073,7 +1081,7 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 	// start+1..start+n to preserve the legacy "atomic.Add(1) post-increment"
 	// semantics (issued SeqNums are >= 1; SeqNum == 0 reads as uninitialised
 	// in BlockStore).
-	start, err := vb.reserveSeqNum(endBlock - startBlock + 1)
+	start, err := vb.reserveSeqNum(ctx, endBlock-startBlock+1)
 	if err != nil {
 		return err
 	}
@@ -1105,7 +1113,7 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 		// Read existing block if partial write, else skip
 		var blockData []byte
 		if writeStart > 0 || writeEnd < blockSize {
-			existing, err := vb.ReadAt(b*blockSize, blockSize)
+			existing, err := vb.ReadAtCtx(ctx, b*blockSize, blockSize)
 
 			if err != nil && !errors.Is(err, ErrZeroBlock) {
 				return fmt.Errorf("failed to read block %d for RMW: %w", b, err)
@@ -1171,7 +1179,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 	// start+1..start+n to preserve the legacy "atomic.Add(1) post-increment"
 	// semantics (issued SeqNums are >= 1; SeqNum == 0 reads as uninitialised
 	// in BlockStore).
-	start, err := vb.reserveSeqNum(blockRequests)
+	start, err := vb.reserveSeqNum(context.Background(), blockRequests)
 	if err != nil {
 		return err
 	}
@@ -1226,19 +1234,25 @@ func (vb *VB) Flush() error {
 // WAL chunks to S3, and saves the live checkpoint. Call this at snapshot-prepare
 // time or on clean shutdown to ensure S3 state is fully current.
 func (vb *VB) DrainToBackend() error {
+	return vb.DrainToBackendCtx(context.Background())
+}
+
+// DrainToBackendCtx is DrainToBackend with a caller-supplied context threaded
+// through the chunk-upload and checkpoint S3 writes.
+func (vb *VB) DrainToBackendCtx(ctx context.Context) error {
 	if err := vb.Flush(); err != nil {
 		return fmt.Errorf("drain flush: %w", err)
 	}
 	var err error
 	if vb.UseShardedWAL {
-		err = vb.WriteShardedWALToChunk(true)
+		err = vb.WriteShardedWALToChunkCtx(ctx, true)
 	} else {
-		err = vb.WriteWALToChunk(true)
+		err = vb.WriteWALToChunkCtx(ctx, true)
 	}
 	if err != nil {
 		return fmt.Errorf("drain chunk upload: %w", err)
 	}
-	if err := vb.SaveLiveCheckpoint(); err != nil {
+	if err := vb.SaveLiveCheckpointCtx(ctx); err != nil {
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
 	return nil
@@ -1680,6 +1694,12 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 // It briefly locks all shards to rotate to the next generation, then reads
 // the closed shard files in parallel, deduplicates, sorts, and creates chunks.
 func (vb *VB) WriteShardedWALToChunk(force bool) error {
+	return vb.WriteShardedWALToChunkCtx(context.Background(), force)
+}
+
+// WriteShardedWALToChunkCtx is WriteShardedWALToChunk with a caller-supplied
+// context threaded through the chunk uploads.
+func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 	sw := vb.ShardedWAL
 	if sw == nil {
 		return fmt.Errorf("ShardedWAL not initialized")
@@ -1717,7 +1737,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 			shard.mu.RUnlock()
 		}
 		if totalSize < int64(vb.ObjBlockSize) {
-			slog.Info("Sharded WAL total size less than chunk size, skipping", "totalSize", totalSize)
+			slog.InfoContext(ctx, "Sharded WAL total size less than chunk size, skipping", "totalSize", totalSize)
 			return nil
 		}
 	}
@@ -1896,7 +1916,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 		})
 
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
+			err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
 			if err != nil {
 				return fmt.Errorf("failed to create chunk file: %w", err)
 			}
@@ -1907,7 +1927,7 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 
 	// Write remaining data
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
+		err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
 		if err != nil {
 			return fmt.Errorf("failed to create final chunk file: %w", err)
 		}
@@ -1917,9 +1937,15 @@ func (vb *VB) WriteShardedWALToChunk(force bool) error {
 }
 
 func (vb *VB) WriteWALToChunk(force bool) error {
+	return vb.WriteWALToChunkCtx(context.Background(), force)
+}
+
+// WriteWALToChunkCtx is WriteWALToChunk with a caller-supplied context
+// threaded through the chunk uploads.
+func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) error {
 	// Dispatch to sharded implementation when enabled
 	if vb.UseShardedWAL {
-		return vb.WriteShardedWALToChunk(force)
+		return vb.WriteShardedWALToChunkCtx(ctx, force)
 	}
 
 	// First, lock, and close the current WAL file
@@ -1940,7 +1966,7 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 		}
 		if fstat.Size() < int64(vb.ObjBlockSize) {
 			vb.WAL.mu.Unlock()
-			slog.Info("WAL is less than 4MB, skipping chunk write")
+			slog.InfoContext(ctx, "WAL is less than 4MB, skipping chunk write")
 			return nil
 		}
 	}
@@ -2101,9 +2127,9 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 		// If buffer is full (default 4MB), write to file
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
+			err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
 			if err != nil {
-				slog.Error("Failed to create chunk file", "error", err)
+				slog.ErrorContext(ctx, "Failed to create chunk file", "error", err)
 				//vb.WAL.mu.Unlock()
 
 				return err
@@ -2116,9 +2142,9 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 
 	// Write any remaining data as the last chunkAdd commentMore actions
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(currentWALNum, &chunkBuffer, &matchedBlocks)
+		err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
 		if err != nil {
-			slog.Error("Failed to create chunk file", "error", err)
+			slog.ErrorContext(ctx, "Failed to create chunk file", "error", err)
 
 			return err
 		}
@@ -2210,7 +2236,7 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 }
 */
 
-func (vb *VB) createChunkFile(currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
+func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
 
@@ -2247,7 +2273,7 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkBuffer *[]byte, matched
 		bodyBuffer = &sealed
 	}
 
-	err = vb.Backend.Write(types.FileTypeChunk, chunkIndex, &headers, bodyBuffer)
+	err = vb.Backend.WriteCtx(ctx, types.FileTypeChunk, chunkIndex, &headers, bodyBuffer)
 	if err != nil {
 		return err
 	}
@@ -2330,8 +2356,8 @@ func (vb *VB) createChunkFile(currentWALNum uint64, chunkBuffer *[]byte, matched
 	// window is the gap between Backend.Write and this call, not the full 30s
 	// background-uploader interval). Non-fatal: DrainToBackend will retry at the
 	// end of the current cycle regardless.
-	if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
-		slog.Warn("createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
+	if cpErr := vb.SaveLiveCheckpointCtx(ctx); cpErr != nil {
+		slog.WarnContext(ctx, "createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
 	}
 
 	return nil
@@ -2359,6 +2385,12 @@ func (vb *VB) SaveHotState(filename string) (err error) {
 }
 
 func (vb *VB) SaveBlockState() (err error) {
+	return vb.SaveBlockStateCtx(context.Background())
+}
+
+// SaveBlockStateCtx is SaveBlockState with a caller-supplied context threaded
+// through the checkpoint upload.
+func (vb *VB) SaveBlockStateCtx(ctx context.Context) (err error) {
 	vb.BlocksToObject.mu.RLock()
 	defer vb.BlocksToObject.mu.RUnlock()
 
@@ -2406,7 +2438,7 @@ func (vb *VB) SaveBlockState() (err error) {
 	headers := []byte{}
 
 	// Next, upload the file to the backend
-	err = vb.Backend.Write(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), &headers, &checkpoint)
+	err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), &headers, &checkpoint)
 	if err != nil {
 		return err
 	}
@@ -2478,6 +2510,12 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 
 // Load the previous blockstate from disk
 func (vb *VB) LoadBlockState() (err error) {
+	return vb.LoadBlockStateCtx(context.Background())
+}
+
+// LoadBlockStateCtx is LoadBlockState with a caller-supplied context threaded
+// through the checkpoint fetch.
+func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 	var checkpoint []byte
 
 	// Step 1. Validate the local persistant disk contains the state
@@ -2485,10 +2523,10 @@ func (vb *VB) LoadBlockState() (err error) {
 
 	_, err = os.Stat(filename)
 	if err != nil {
-		slog.Info("No state found in local file, using backend state", "error", err)
+		slog.InfoContext(ctx, "No state found in local file, using backend state", "error", err)
 
 		// Open the latest checkpoint from the backend
-		checkpoint, err = vb.Backend.Read(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), 0, 0)
+		checkpoint, err = vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), 0, 0)
 
 		if err != nil {
 			// If no file found, volume is empty, return nil
@@ -2511,6 +2549,11 @@ func (vb *VB) LoadBlockState() (err error) {
 // SaveBlockState, this does not write a local file and does not increment WallNum —
 // the key is always overwritten in place.
 func (vb *VB) SaveLiveCheckpoint() error {
+	return vb.SaveLiveCheckpointCtx(context.Background())
+}
+
+// SaveLiveCheckpointCtx is SaveLiveCheckpoint with a caller-supplied context.
+func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	vb.BlocksToObject.mu.RLock()
 	defer vb.BlocksToObject.mu.RUnlock()
 
@@ -2520,16 +2563,21 @@ func (vb *VB) SaveLiveCheckpoint() error {
 	}
 
 	headers := []byte{}
-	return vb.Backend.Write(types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
+	return vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
 }
 
 // LoadLiveCheckpoint reads the live checkpoint written by SaveLiveCheckpoint. If no
 // live checkpoint exists yet, it falls back to LoadBlockState (numbered checkpoint).
 func (vb *VB) LoadLiveCheckpoint() error {
-	checkpoint, err := vb.Backend.Read(types.FileTypeBlockCheckpointLive, 0, 0, 0)
+	return vb.LoadLiveCheckpointCtx(context.Background())
+}
+
+// LoadLiveCheckpointCtx is LoadLiveCheckpoint with a caller-supplied context.
+func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
+	checkpoint, err := vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpointLive, 0, 0, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return vb.LoadBlockState()
+			return vb.LoadBlockStateCtx(ctx)
 		}
 		return fmt.Errorf("read live checkpoint: %w", err)
 	}
@@ -2788,7 +2836,7 @@ func (vb *VB) RecoverLocalWALs() error {
 		})
 
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			if err := vb.createChunkFile(0, &chunkBuffer, &matchedBlocks); err != nil {
+			if err := vb.createChunkFile(context.Background(), 0, &chunkBuffer, &matchedBlocks); err != nil {
 				return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
 			}
 			chunkBuffer = chunkBuffer[:0]
@@ -2797,7 +2845,7 @@ func (vb *VB) RecoverLocalWALs() error {
 	}
 
 	if len(chunkBuffer) > 0 {
-		if err := vb.createChunkFile(0, &chunkBuffer, &matchedBlocks); err != nil {
+		if err := vb.createChunkFile(context.Background(), 0, &chunkBuffer, &matchedBlocks); err != nil {
 			return fmt.Errorf("WAL recovery: failed to create chunk file: %w", err)
 		}
 	}
@@ -2960,6 +3008,12 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 // fsync parent dir — so a crash mid-persist cannot leave a torn config.json
 // that would let reserveSeqNum re-hand-out values on restart.
 func (vb *VB) SaveState() error {
+	return vb.SaveStateCtx(context.Background())
+}
+
+// SaveStateCtx is SaveState with a caller-supplied context threaded through
+// the backend state push.
+func (vb *VB) SaveStateCtx(ctx context.Context) error {
 	if vb.EncryptionEnabled {
 		minted, err := vb.mintVolumeUUID()
 		if err != nil {
@@ -2969,7 +3023,7 @@ func (vb *VB) SaveState() error {
 			vb.seqNumHighWater.Store(seqNumReservation)
 		}
 	}
-	return vb.saveStateWithHighWater(vb.seqNumHighWater.Load())
+	return vb.saveStateWithHighWater(ctx, vb.seqNumHighWater.Load())
 }
 
 // mintVolumeUUID seeds the per-volume nonce subspace via crypto/rand when it is
@@ -3035,12 +3089,12 @@ func (vb *VB) EnsureVolumeUUID() error {
 // SeqNums above the persisted high-water, and a crash before persist
 // completion would let those values be re-issued on restart (catastrophic
 // AES-GCM nonce reuse, NIST SP 800-38D §8.3).
-func (vb *VB) saveStateWithHighWater(highWater uint64) error {
+func (vb *VB) saveStateWithHighWater(ctx context.Context, highWater uint64) error {
 	persisted, err := vb.persistStateLocal(highWater)
 	if err != nil {
 		return err
 	}
-	return vb.pushStateToBackend(persisted)
+	return vb.pushStateToBackend(ctx, persisted)
 }
 
 // persistStateLocal marshals VBState, seals it for encrypted volumes, and
@@ -3111,9 +3165,9 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
 // LoadState reconciles local vs backend by max(SeqNum), so a stale or
 // in-flight backend write is non-fatal as long as the local fsync from
 // persistStateLocal succeeded.
-func (vb *VB) pushStateToBackend(persisted []byte) error {
+func (vb *VB) pushStateToBackend(ctx context.Context, persisted []byte) error {
 	headers := []byte{}
-	return vb.Backend.Write(types.FileTypeConfig, 0, &headers, &persisted)
+	return vb.Backend.WriteCtx(ctx, types.FileTypeConfig, 0, &headers, &persisted)
 }
 
 // writeFileAtomic writes data to path atomically via tmp + fsync + rename +
@@ -3172,33 +3226,39 @@ func fsyncDir(dir string) error {
 
 // Load the block tracking state from disk
 func (vb *VB) LoadState() error {
+	return vb.LoadStateCtx(context.Background())
+}
+
+// LoadStateCtx is LoadState with a caller-supplied context threaded through
+// the backend state fetch.
+func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	// Step 1. Query the state locally
 	localPath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
-	state, localErr := vb.LoadStateRequest(localPath)
+	state, localErr := vb.LoadStateRequestCtx(ctx, localPath)
 	if errors.Is(localErr, ErrIntegrity) || errors.Is(localErr, ErrEncryptionMismatch) {
 		return fmt.Errorf("LoadState: local %s: %w", localPath, localErr)
 	}
 	if localErr != nil {
-		slog.Info("No state found in local file, using backend state", "error", localErr)
+		slog.InfoContext(ctx, "No state found in local file, using backend state", "error", localErr)
 	}
 
 	// Step 2. Query the state from the backend
-	stateBackend, backendErr := vb.LoadStateRequest("")
+	stateBackend, backendErr := vb.LoadStateRequestCtx(ctx, "")
 
 	if errors.Is(backendErr, ErrIntegrity) || errors.Is(backendErr, ErrEncryptionMismatch) {
 		return fmt.Errorf("LoadState: backend: %w", backendErr)
 	}
 	if backendErr != nil {
-		slog.Warn("Failed to load state from backend", "error", backendErr)
+		slog.WarnContext(ctx, "Failed to load state from backend", "error", backendErr)
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
 		classified := classifyStateLoad(localErr, backendErr)
 		if errors.Is(classified, ErrStateBackendUnavailable) {
-			slog.Warn("LoadState: backend unavailable, retry recommended",
+			slog.WarnContext(ctx, "LoadState: backend unavailable, retry recommended",
 				"volume", vb.GetVolume(), "err", backendErr)
 		} else {
-			slog.Debug("LoadState: no state in local or backend",
+			slog.DebugContext(ctx, "LoadState: no state in local or backend",
 				"volume", vb.GetVolume())
 		}
 		return classified
@@ -3298,12 +3358,12 @@ func (vb *VB) LoadState() error {
 		vb.VolumeUUID = state.VolumeUUID
 		vb.SeqNum.Store(state.SeqNumHighWater)
 		vb.seqNumHighWater.Store(state.SeqNumHighWater)
-		if err := vb.bumpSeqNumHighWater(); err != nil {
+		if err := vb.bumpSeqNumHighWater(ctx); err != nil {
 			return fmt.Errorf("LoadState: reserve initial SeqNum window: %w", err)
 		}
 	}
 
-	slog.Debug("Loaded state", "state", state)
+	slog.DebugContext(ctx, "Loaded state", "state", state)
 
 	return nil
 }
@@ -3319,7 +3379,7 @@ func (vb *VB) LoadState() error {
 //
 // Unencrypted volumes fall through to plain atomic.Add — the high-water is a
 // nonce-uniqueness mechanism and is irrelevant when no nonce exists.
-func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
+func (vb *VB) reserveSeqNum(ctx context.Context, n uint64) (start uint64, err error) {
 	end := vb.SeqNum.Add(n)
 	start = end - n
 	if !vb.EncryptionEnabled {
@@ -3372,8 +3432,8 @@ func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
 	// crossing. Crash-safety lives in the local fsync above; LoadState picks
 	// max(local, backend) SeqNum so a lagged or failed backend write is
 	// recoverable on next SaveState.
-	if perr := vb.pushStateToBackend(persisted); perr != nil {
-		slog.Warn("reserveSeqNum: backend state push failed; local fsync is durable",
+	if perr := vb.pushStateToBackend(ctx, persisted); perr != nil {
+		slog.WarnContext(ctx, "reserveSeqNum: backend state push failed; local fsync is durable",
 			"volume", vb.VolumeName, "highWater", hw, "err", perr)
 	}
 	return start, nil
@@ -3383,7 +3443,7 @@ func (vb *VB) reserveSeqNum(n uint64) (start uint64, err error) {
 // seqNumReservation and durably SaveStates. Called from LoadState's startup
 // path to claim a fresh reservation window before any data write can issue a
 // SeqNum that overlaps the pre-crash range.
-func (vb *VB) bumpSeqNumHighWater() error {
+func (vb *VB) bumpSeqNumHighWater(ctx context.Context) error {
 	vb.seqNumHighWaterMu.Lock()
 	newHW := vb.seqNumHighWater.Load() + seqNumReservation
 	persisted, err := vb.persistStateLocal(newHW)
@@ -3394,8 +3454,8 @@ func (vb *VB) bumpSeqNumHighWater() error {
 	vb.seqNumHighWater.Store(newHW)
 	vb.seqNumHighWaterMu.Unlock()
 
-	if perr := vb.pushStateToBackend(persisted); perr != nil {
-		slog.Warn("bumpSeqNumHighWater: backend state push failed; local fsync is durable",
+	if perr := vb.pushStateToBackend(ctx, persisted); perr != nil {
+		slog.WarnContext(ctx, "bumpSeqNumHighWater: backend state push failed; local fsync is durable",
 			"volume", vb.VolumeName, "highWater", newHW, "err", perr)
 	}
 	return nil
@@ -3403,6 +3463,12 @@ func (vb *VB) bumpSeqNumHighWater() error {
 
 // Query the local state from file or the backend
 func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
+	return vb.LoadStateRequestCtx(context.Background(), filename)
+}
+
+// LoadStateRequestCtx is LoadStateRequest with a caller-supplied context
+// threaded through the backend fetch.
+func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state VBState, err error) {
 	var jsonData []byte
 
 	// Read from file
@@ -3412,7 +3478,7 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 			return state, err
 		}
 	} else {
-		jsonData, err = vb.Backend.Read(types.FileTypeConfig, 0, 0, 0)
+		jsonData, err = vb.Backend.ReadCtx(ctx, types.FileTypeConfig, 0, 0, 0)
 		if err != nil {
 			return state, err
 		}
@@ -3467,10 +3533,10 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 }
 
 // Private function to read a block from the storage backend, use ReadAt for public access
-func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
+func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []byte, err error) {
 	// Use optimized BlockStore path if enabled
 	if vb.UseBlockStore {
-		return vb.readBlockStore(block, blockLen)
+		return vb.readBlockStore(ctx, block, blockLen)
 	}
 
 	// Check blockLen a multiple of a blocksize
@@ -3680,18 +3746,18 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 		objectID := cb.ObjectID
 		if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.Read(types.FileTypeChunk, objectID, off, length)
+			return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, length)
 		}); err != nil {
 			return nil, err
 		}
 
-		blockData, err := vb.Backend.Read(types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		blockData, err := vb.Backend.ReadCtx(ctx, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
 			return nil, err
 		}
 
-		slog.Debug("[READ] COPYING BLOCK DATA:", "start", start, "end", end)
-		slog.Debug("[READ] DATA:", "data len", len(data))
+		slog.DebugContext(ctx, "[READ] COPYING BLOCK DATA:", "start", start, "end", end)
+		slog.DebugContext(ctx, "[READ] DATA:", "data len", len(data))
 
 		if vb.EncryptionEnabled {
 			if err := vb.openChunkRun(blockData, cb, vb.VolumeUUID, vb.volumeNameHash, data[start:end]); err != nil {
@@ -3712,7 +3778,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
 	if len(baseConsecutiveBlocks) > 0 {
-		err := vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
+		err := vb.fetchBaseBlocksFromBackend(ctx, vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -3723,7 +3789,7 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 		if len(ancestorConsBlocks[ai]) == 0 {
 			continue
 		}
-		if err := vb.fetchBaseBlocksFromBackend(anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
+		if err := vb.fetchBaseBlocksFromBackend(ctx, anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
 			return nil, err
 		}
 	}
@@ -3732,6 +3798,12 @@ func (vb *VB) read(block uint64, blockLen uint64) (data []byte, err error) {
 }
 
 func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
+	return vb.ReadAtCtx(context.Background(), offset, length)
+}
+
+// ReadAtCtx is ReadAt with a caller-supplied context that flows through
+// backend chunk fetches for trace propagation.
+func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]byte, error) {
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
 		return nil, ErrRequestTooLarge
@@ -3749,7 +3821,7 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 	blockCount := lastBlock - firstBlock + 1
 
 	// Read entire range of needed blocks
-	fullData, err := vb.read(firstBlock, blockCount*blockSize)
+	fullData, err := vb.read(ctx, firstBlock, blockCount*blockSize)
 
 	if err != nil && err != ErrZeroBlock {
 		return nil, err
@@ -4002,7 +4074,7 @@ func (vb *VB) DisableBlockStore() {
 
 // readBlockStore is the optimized read path using UnifiedBlockStore
 // Provides O(1) lookups instead of O(n) map rebuilding per read
-func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err error) {
+func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64) (data []byte, err error) {
 	// Check blockLen is a multiple of blocksize
 	if blockLen%uint64(vb.BlockSize) != 0 {
 		return nil, ErrRequestBlockSize
@@ -4099,7 +4171,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	// Fetch consecutive blocks from our own backend
 	if len(consecutiveBlocks) > 0 {
-		err = vb.fetchConsecutiveBlocksFromBackend(consecutiveBlocks, data)
+		err = vb.fetchConsecutiveBlocksFromBackend(ctx, consecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -4107,7 +4179,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
 	if len(baseConsecutiveBlocks) > 0 {
-		err = vb.fetchBaseBlocksFromBackend(vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
+		err = vb.fetchBaseBlocksFromBackend(ctx, vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, baseConsecutiveBlocks, data)
 		if err != nil {
 			return nil, err
 		}
@@ -4118,7 +4190,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 		if len(ancestorConsBlocks[ai]) == 0 {
 			continue
 		}
-		if err = vb.fetchBaseBlocksFromBackend(anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
+		if err = vb.fetchBaseBlocksFromBackend(ctx, anc.sourceVolumeName, anc.sourceVolumeUUID, anc.sourceVolumeNameHash, ancestorConsBlocks[ai], data); err != nil {
 			return nil, err
 		}
 	}
@@ -4128,7 +4200,7 @@ func (vb *VB) readBlockStore(block uint64, blockLen uint64) (data []byte, err er
 
 // fetchConsecutiveBlocksFromBackend fetches blocks from backend storage
 // Used by both legacy and BlockStore read paths
-func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
 
@@ -4174,7 +4246,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 	}
 
 	for _, cb := range consecutiveBlocksToRead {
-		slog.Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
+		slog.DebugContext(ctx, "[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
 
 		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 		start := cb.BlockPosition * uint64(vb.BlockSize)
@@ -4182,12 +4254,12 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 
 		objectID := cb.ObjectID
 		if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.Read(types.FileTypeChunk, objectID, off, length)
+			return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, length)
 		}); err != nil {
 			return err
 		}
 
-		blockData, err := vb.Backend.Read(types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		blockData, err := vb.Backend.ReadCtx(ctx, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
 			return err
 		}
@@ -4228,7 +4300,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(consecutiveBlocks ConsecutiveBlo
 // Used by clone volumes to read blocks from the base or an ancestor snapshot layer.
 // uuid and nameHash carry the encryption identity of the source volume; ignored on
 // unencrypted volumes.
-func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, uuid [4]byte, nameHash [32]byte, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume string, uuid [4]byte, nameHash [32]byte, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	if sourceVolume == "" {
 		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
 	}
@@ -4277,7 +4349,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, uuid [4]byte, name
 	}
 
 	for _, cb := range consecutiveBlocksToRead {
-		slog.Debug("[READ] READING BASE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "sourceVolume", sourceVolume)
+		slog.DebugContext(ctx, "[READ] READING BASE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "sourceVolume", sourceVolume)
 
 		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 		start := cb.BlockPosition * uint64(vb.BlockSize)
@@ -4285,12 +4357,12 @@ func (vb *VB) fetchBaseBlocksFromBackend(sourceVolume string, uuid [4]byte, name
 
 		objectID := cb.ObjectID
 		if err := vb.checkChunkMagic(sourceVolume, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, objectID, off, length)
+			return vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, off, length)
 		}); err != nil {
 			return fmt.Errorf("ReadFrom source %s: %w", sourceVolume, err)
 		}
 
-		blockData, err := vb.Backend.ReadFrom(sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		blockData, err := vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
 			return fmt.Errorf("ReadFrom source %s object %d: %w", sourceVolume, cb.ObjectID, err)
 		}

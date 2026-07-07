@@ -15,6 +15,7 @@
 package writebench
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -268,9 +269,19 @@ func (s *slowBackend) Write(ft types.FileType, id uint64, headers *[]byte, data 
 	return s.Backend.Write(ft, id, headers, data)
 }
 
+func (s *slowBackend) WriteCtx(ctx context.Context, ft types.FileType, id uint64, headers *[]byte, data *[]byte) error {
+	time.Sleep(s.delay)
+	return s.Backend.WriteCtx(ctx, ft, id, headers, data)
+}
+
 func (s *slowBackend) WriteTo(vol string, ft types.FileType, id uint64, headers *[]byte, data *[]byte) error {
 	time.Sleep(s.delay)
 	return s.Backend.WriteTo(vol, ft, id, headers, data)
+}
+
+func (s *slowBackend) WriteToCtx(ctx context.Context, vol string, ft types.FileType, id uint64, headers *[]byte, data *[]byte) error {
+	time.Sleep(s.delay)
+	return s.Backend.WriteToCtx(ctx, vol, ft, id, headers, data)
 }
 
 func pct(sorted []float64, p int) float64 {

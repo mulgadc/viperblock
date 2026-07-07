@@ -6,6 +6,7 @@
 package viperblock
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -205,7 +206,7 @@ func TestReserveSeqNum_FastAndSlowPath(t *testing.T) {
 
 	// Fast path: a single reservation well below the high-water must not
 	// bump it (no extra SaveState).
-	start, err := vb.reserveSeqNum(10)
+	start, err := vb.reserveSeqNum(context.Background(), 10)
 	require.NoError(t, err)
 	assert.Equal(t, hwBefore, vb.seqNumHighWater.Load(), "fast path must not advance high-water")
 	assert.Equal(t, start+10, vb.SeqNum.Load(), "reservation advances SeqNum by n")
@@ -213,7 +214,7 @@ func TestReserveSeqNum_FastAndSlowPath(t *testing.T) {
 	// Slow path: jump SeqNum past the current window and reserve one. The
 	// helper must bump the high-water and persist.
 	vb.SeqNum.Store(hwBefore + 5)
-	_, err = vb.reserveSeqNum(1)
+	_, err = vb.reserveSeqNum(context.Background(), 1)
 	require.NoError(t, err)
 	assert.Greater(t, vb.seqNumHighWater.Load(), hwBefore, "slow path must advance high-water")
 }
@@ -230,7 +231,7 @@ func TestReserveSeqNum_UnencryptedFallthrough(t *testing.T) {
 	require.NoError(t, vb.Backend.Init())
 
 	// Plain atomic.Add — no high-water consultation.
-	start, err := vb.reserveSeqNum(5)
+	start, err := vb.reserveSeqNum(context.Background(), 5)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(0), start)
 	assert.Equal(t, uint64(5), vb.SeqNum.Load())
@@ -244,7 +245,7 @@ func TestReserveSeqNum_RefusesPastMaxSeqNum(t *testing.T) {
 
 	// Set SeqNum to one below the limit so a 2-wide reservation would cross it.
 	vb.SeqNum.Store(MaxSeqNum - 1)
-	_, err := vb.reserveSeqNum(2)
+	_, err := vb.reserveSeqNum(context.Background(), 2)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds 56-bit nonce limit")
 }
@@ -268,7 +269,7 @@ func TestReserveSeqNum_ConcurrentCallersSerializeHighWaterBumps(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range perWorker {
-				_, err := vb.reserveSeqNum(1)
+				_, err := vb.reserveSeqNum(context.Background(), 1)
 				assert.NoError(t, err)
 			}
 		}()
@@ -302,7 +303,7 @@ func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
 	require.NoError(t, os.MkdirAll(tmpPath, 0700))
 
 	vb.SeqNum.Store(hwBefore + 5)
-	_, err := vb.reserveSeqNum(1)
+	_, err := vb.reserveSeqNum(context.Background(), 1)
 	require.Error(t, err, "reserveSeqNum must propagate SaveState failure")
 
 	assert.Equal(t, hwBefore, vb.seqNumHighWater.Load(),
@@ -311,7 +312,7 @@ func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
 	// And after the failure is cleared, a successor reservation must persist
 	// and publish the same target hw — no skipped window, no double-count.
 	require.NoError(t, os.RemoveAll(tmpPath))
-	_, err = vb.reserveSeqNum(1)
+	_, err = vb.reserveSeqNum(context.Background(), 1)
 	require.NoError(t, err)
 	assert.Greater(t, vb.seqNumHighWater.Load(), hwBefore,
 		"successor reservation persists and publishes new high-water")
