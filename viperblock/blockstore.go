@@ -116,9 +116,20 @@ func (ubs *UnifiedBlockStore) ReadBlock(blockNum uint64) (*BlockEntry, bool) {
 	shard := ubs.getShard(blockNum)
 	shard.mu.RLock()
 	entry, exists := shard.entries[blockNum]
+	// Return an immutable snapshot, not the live pointer: the caller reads
+	// (ObjectID, ObjectOffset, SeqNum) as a unit to rebuild the chunk nonce,
+	// and a concurrent MarkPersisted mutating the live entry would otherwise
+	// hand back a torn triple (old location, new seqNum) that fails AEAD.
+	var snapshot BlockEntry
+	if exists {
+		snapshot = *entry
+	}
 	shard.mu.RUnlock()
 	ubs.stats.Reads.Add(1)
-	return entry, exists
+	if !exists {
+		return nil, false
+	}
+	return &snapshot, true
 }
 
 // ReadSingle is the fast path for single-block reads (most common case)
@@ -234,8 +245,10 @@ func (ubs *UnifiedBlockStore) MarkPending(blockNum uint64) bool {
 }
 
 // MarkPersisted transitions a block from Pending to Persisted state
-// Called by createChunkFile() after backend upload succeeds
-func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset uint32) bool {
+// Called by createChunkFile() after backend upload succeeds. seqNum is the
+// sequence number the chunk sealed this block under: the location and seqNum
+// must be bound as a unit so the read path rebuilds the correct nonce.
+func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset uint32, seqNum uint64) bool {
 	shard := ubs.getShard(blockNum)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -245,10 +258,17 @@ func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset ui
 		return false
 	}
 
-	if entry.State == BlockStatePending {
+	// Only bind the location for the exact write this chunk sealed. A newer
+	// re-write bumps entry.SeqNum (back to Hot); a stale drain completing here
+	// must not staple its old chunk location onto the newer seqNum, or the
+	// read reconstructs the wrong nonce and fails AEAD ("message
+	// authentication failed"). seqNum can only equal the head or be older, so
+	// an exact match means no newer write has superseded this one.
+	if entry.State == BlockStatePending && seqNum == entry.SeqNum {
 		entry.State = BlockStatePersisted
 		entry.ObjectID = objectID
 		entry.ObjectOffset = offset
+		entry.SeqNum = seqNum
 		entry.Data = nil // Release memory - data is now on backend
 		return true
 	}

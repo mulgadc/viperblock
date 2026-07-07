@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
@@ -624,6 +626,154 @@ func TestLiveCheckpointRoundtrip(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestObjectNumReconcileOnLoad verifies that loading a block map reconciles
+// ObjectNum to max(ObjectID)+1. Runtime chunk drains do not persist config.json
+// ObjectNum, so a re-Open can load a stale-low value; without reconciliation the
+// next createChunkFile would reuse a live chunk ID and corrupt it (durable AEAD
+// tag failure). A pre-set higher ObjectNum must not be lowered.
+func TestObjectNumReconcileOnLoad(t *testing.T) {
+	runWithBackends(t, "objectnum_reconcile", func(t *testing.T, vb *VB) {
+		// Three separate write+drain cycles produce three chunks with distinct
+		// ObjectIDs 0,1,2, leaving vb.ObjectNum at 3.
+		for i := range uint64(3) {
+			data := make([]byte, DefaultBlockSize)
+			rand.Read(data)
+			require.NoError(t, vb.Write(i, data))
+			require.NoError(t, vb.Flush())
+			if vb.UseShardedWAL {
+				require.NoError(t, vb.WriteShardedWALToChunk(true))
+			} else {
+				require.NoError(t, vb.WriteWALToChunk(true))
+			}
+		}
+		require.NoError(t, vb.SaveLiveCheckpoint())
+
+		var maxObjectID uint64
+		vb.BlocksToObject.mu.RLock()
+		for _, bl := range vb.BlocksToObject.BlockLookup {
+			if bl.ObjectID > maxObjectID {
+				maxObjectID = bl.ObjectID
+			}
+		}
+		vb.BlocksToObject.mu.RUnlock()
+		require.Greater(t, maxObjectID, uint64(0), "expected multiple chunks")
+
+		newReader := func() *VB {
+			return &VB{
+				VolumeName:   vb.VolumeName,
+				VolumeSize:   vb.VolumeSize,
+				BlockSize:    vb.BlockSize,
+				ObjBlockSize: vb.ObjBlockSize,
+				Version:      vb.Version,
+				BaseDir:      vb.BaseDir,
+				Backend:      vb.Backend,
+				BlockToObjectWAL: WAL{
+					WALMagic: vb.BlockToObjectWAL.WALMagic,
+				},
+				BlocksToObject: BlocksToObject{
+					BlockLookup: make(map[uint64]BlockLookup),
+				},
+			}
+		}
+
+		// Stale-low reader (ObjectNum defaults to 0) is bumped to max+1.
+		stale := newReader()
+		require.NoError(t, stale.LoadLiveCheckpoint())
+		assert.Equal(t, maxObjectID+1, stale.ObjectNum.Load(),
+			"stale ObjectNum must reconcile to max chunk ID + 1")
+
+		// Already-ahead reader is left untouched (max semantics, never lowered).
+		ahead := newReader()
+		ahead.ObjectNum.Store(maxObjectID + 100)
+		require.NoError(t, ahead.LoadLiveCheckpoint())
+		assert.Equal(t, maxObjectID+100, ahead.ObjectNum.Load(),
+			"reconcile must never lower an already-higher ObjectNum")
+	})
+}
+
+// TestRecoverLocalWALsNoChunkReuse reproduces the durable AEAD corruption where
+// a re-Open with a stale-low ObjectNum lets WAL recovery reuse a chunk ID that
+// the loaded map still references, overwriting live chunk data. It drives the
+// legacy-WAL file path (shardwal=false) that nbdkit runs in production. Without
+// the ObjectNum reconcile in RecoverLocalWALs the recovered chunks collide with
+// the existing ones and the pre-existing blocks fail to read back.
+func TestRecoverLocalWALsNoChunkReuse(t *testing.T) {
+	backend := BackendTest{
+		Name:          "file_legacywal",
+		BackendType:   FileBackend,
+		CacheConfig:   CacheConfig{Size: 0},
+		UseShardedWAL: false,
+	}
+	vb, _, shutdown, err := setupTestVB(t, TestVB{name: "recover_no_reuse"}, backend)
+	require.NoError(t, err)
+	defer shutdown(vb.GetVolume())
+
+	// Three write+drain cycles produce chunks with ObjectIDs 0,1,2 (ObjectNum=3),
+	// each block widely separated so recovery re-buffers them into fresh chunks.
+	seeded := []uint64{100, 200, 300}
+	want := make(map[uint64][]byte, len(seeded))
+	for _, blk := range seeded {
+		data := make([]byte, DefaultBlockSize)
+		rand.Read(data)
+		want[blk] = data
+		require.NoError(t, vb.Write(blk, data))
+		require.NoError(t, vb.Flush())
+		require.NoError(t, vb.WriteWALToChunk(true))
+	}
+
+	var maxObjectID uint64
+	vb.BlocksToObject.mu.RLock()
+	for _, bl := range vb.BlocksToObject.BlockLookup {
+		if bl.ObjectID > maxObjectID {
+			maxObjectID = bl.ObjectID
+		}
+	}
+	vb.BlocksToObject.mu.RUnlock()
+	require.Equal(t, uint64(2), maxObjectID, "expected three chunks with ObjectIDs 0,1,2")
+
+	// Delete the drained WAL files (keeping the highest-numbered active one) so
+	// the seeded blocks stay mapped to chunks 0,1,2 but are no longer replayable.
+	// This is the orphaned-map-entry state a killed VB leaves after consolidation:
+	// the chunk objects and their map entries are live, their source WALs are not.
+	walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+	walEntries, err := os.ReadDir(walDir)
+	require.NoError(t, err)
+	var walNames []string
+	for _, e := range walEntries {
+		if !e.IsDir() {
+			walNames = append(walNames, e.Name())
+		}
+	}
+	require.Greater(t, len(walNames), 1, "expected drained WALs to be retained")
+	sort.Strings(walNames)
+	for _, name := range walNames[:len(walNames)-1] {
+		require.NoError(t, os.Remove(filepath.Join(walDir, name)))
+	}
+
+	// A fourth block flushed to the surviving active WAL but never chunked — the
+	// only block recovery will replay.
+	orphan := make([]byte, DefaultBlockSize)
+	rand.Read(orphan)
+	want[400] = orphan
+	require.NoError(t, vb.Write(400, orphan))
+	require.NoError(t, vb.Flush())
+
+	// Inject the stale-low ObjectNum a re-Open would load from config.json, then
+	// recover. Without the reconcile, replaying block 400 reuses chunk ID 0 and
+	// overwrites the chunk still mapped for block 100 — a durable corruption.
+	vb.ObjectNum.Store(0)
+	require.NoError(t, vb.RecoverLocalWALs())
+
+	assert.Greater(t, vb.ObjectNum.Load(), maxObjectID,
+		"RecoverLocalWALs must reconcile ObjectNum past every mapped chunk before allocating")
+
+	for blk, data := range want {
+		got, err := vb.ReadAt(blk*uint64(vb.BlockSize), uint64(vb.BlockSize))
+		require.NoError(t, err, "read block %d", blk)
+		assert.Equal(t, data, got, "block %d corrupted after WAL recovery", blk)
+	}
 }
 
 // createCloneVB creates a new VB instance configured as a clone of the given

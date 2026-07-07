@@ -94,7 +94,7 @@ func TestBlockStore_StateTransitions(t *testing.T) {
 	}
 
 	// Pending -> Persisted
-	if !bs.MarkPersisted(50, 1, 1024) {
+	if !bs.MarkPersisted(50, 1, 1024, entry.SeqNum) {
 		t.Error("MarkPersisted failed")
 	}
 	entry, _ = bs.ReadBlock(50)
@@ -365,7 +365,8 @@ func TestBlockStore_CountByState(t *testing.T) {
 	}
 	for i := uint64(20); i < 30; i++ {
 		bs.MarkPending(i)
-		bs.MarkPersisted(i, 0, 0)
+		e, _ := bs.ReadBlock(i)
+		bs.MarkPersisted(i, 0, 0, e.SeqNum)
 	}
 
 	counts := bs.CountByState()
@@ -590,9 +591,9 @@ func BenchmarkBlockStore_StateTransition(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		blockNum := uint64(i)
-		bs.Write(blockNum, data)
+		seqNum := bs.Write(blockNum, data)
 		bs.MarkPending(blockNum)
-		bs.MarkPersisted(blockNum, uint64(i), uint32(i*4096))
+		bs.MarkPersisted(blockNum, uint64(i), uint32(i*4096), seqNum)
 		bs.Cache(blockNum, data)
 		bs.EvictCache(blockNum)
 	}
