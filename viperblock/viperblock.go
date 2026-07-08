@@ -3078,7 +3078,7 @@ func (vb *VB) EnsureVolumeUUID() error {
 		return fmt.Errorf("EnsureVolumeUUID: persistStateLocal: %w", err)
 	}
 	vb.seqNumHighWater.Store(hw)
-	return vb.pushStateToBackend(persisted)
+	return vb.pushStateToBackend(context.Background(), persisted)
 }
 
 // saveStateWithHighWater persists VBState with an explicit SeqNumHighWater
