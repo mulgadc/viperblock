@@ -3588,7 +3588,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		if wr, ok := latestWrites[currentBlock]; ok {
 			//slog.Info("[READ] HOT BLOCK:", "block", wr.Block, "seqnum", wr.SeqNum)
 
-			copy(data[start:end], clone(wr.Data))
+			copy(data[start:end], bytes.Clone(wr.Data))
 			continue
 		}
 
@@ -3596,7 +3596,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		if lp, ok := latestPendingWrites[currentBlock]; ok {
 			//slog.Info("[READ] PENDING BLOCK:", "block", lp.Block, "seqnum", lp.SeqNum)
 
-			copy(data[start:end], clone(lp.Data))
+			copy(data[start:end], bytes.Clone(lp.Data))
 			continue
 		}
 
@@ -3771,7 +3771,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		if vb.Cache.Config.Size > 0 {
 			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
 				currentBlock := cb.StartBlock + i
-				vb.Cache.lru.Add(currentBlock, clone(data[start+i*uint64(vb.BlockSize):start+(i+1)*uint64(vb.BlockSize)]))
+				vb.Cache.lru.Add(currentBlock, bytes.Clone(data[start+i*uint64(vb.BlockSize):start+(i+1)*uint64(vb.BlockSize)]))
 			}
 		}
 	}
@@ -4031,12 +4031,6 @@ func (vb *VB) ChunkHeaderSize() int {
 	return len(vb.ChunkMagic) + binary.Size(vb.Version) + binary.Size(vb.BlockSize)
 }
 
-func clone(in []byte) []byte {
-	out := make([]byte, len(in))
-	copy(out, in)
-	return out
-}
-
 func GenerateVolumeID(voltype, name, bucket string, timestamp int64) string {
 	// Combine the fields
 	input := fmt.Sprintf("%-s-%s-%s-%d", voltype, name, bucket, timestamp)
@@ -4288,7 +4282,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 				currentBlock := cb.StartBlock + i
 				blockStart := start + i*uint64(vb.BlockSize)
 				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.Cache.lru.Add(currentBlock, clone(data[blockStart:blockEnd]))
+				vb.Cache.lru.Add(currentBlock, bytes.Clone(data[blockStart:blockEnd]))
 			}
 		}
 	}
@@ -4395,7 +4389,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 				currentBlock := cb.StartBlock + i
 				blockStart := start + i*uint64(vb.BlockSize)
 				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.Cache.lru.Add(currentBlock, clone(data[blockStart:blockEnd]))
+				vb.Cache.lru.Add(currentBlock, bytes.Clone(data[blockStart:blockEnd]))
 			}
 		}
 	}
