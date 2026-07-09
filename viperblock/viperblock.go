@@ -287,7 +287,8 @@ type Blocks struct {
 }
 
 type BlocksToObject struct {
-	mu sync.RWMutex
+	mu    sync.RWMutex
+	dirty atomic.Bool
 
 	BlockLookup map[uint64]BlockLookup
 }
@@ -2346,7 +2347,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset, block.SeqNum)
 		}
 	}
-
+	vb.BlocksToObject.dirty.Store(true)
 	vb.BlocksToObject.mu.Unlock()
 
 	// Flush the updated block→chunk mapping to S3 immediately after each chunk
@@ -2354,8 +2355,8 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// shrinks the window in which a crash can leave the checkpoint pointing at a
 	// stale seqNum relative to the just-uploaded chunk ciphertext (the remaining
 	// window is the gap between Backend.Write and this call, not the full 30s
-	// background-uploader interval). Non-fatal: DrainToBackend will retry at the
-	// end of the current cycle regardless.
+	// background-uploader interval). If this write fails, dirty remains set and
+	// DrainToBackend's trailing SaveLiveCheckpointCtx call will retry.
 	if cpErr := vb.SaveLiveCheckpointCtx(ctx); cpErr != nil {
 		slog.WarnContext(ctx, "createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
 	}
@@ -2554,16 +2555,40 @@ func (vb *VB) SaveLiveCheckpoint() error {
 
 // SaveLiveCheckpointCtx is SaveLiveCheckpoint with a caller-supplied context.
 func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
-	vb.BlocksToObject.mu.RLock()
-	defer vb.BlocksToObject.mu.RUnlock()
+	if !vb.BlocksToObject.dirty.Load() {
+		return nil
+	}
 
+	// Serialize the map under the read lock, then release before doing I/O so
+	// the lock is not held across network writes or retry sleeps.
+	vb.BlocksToObject.mu.RLock()
 	checkpoint := vb.BlockToObjectWALHeader()
 	for _, block := range vb.BlocksToObject.BlockLookup {
 		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
 	}
+	vb.BlocksToObject.mu.RUnlock()
 
 	headers := []byte{}
-	return vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
+	backoff := time.Second
+	var err error
+	for attempt := range 3 {
+		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
+		if err == nil {
+			vb.BlocksToObject.dirty.Store(false)
+			return nil
+		}
+		if attempt < 2 {
+			slog.WarnContext(ctx, "SaveLiveCheckpoint: write failed, retrying",
+				"attempt", attempt+1, "backoff", backoff, "err", err)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			backoff *= 2
+		}
+	}
+	return fmt.Errorf("SaveLiveCheckpoint: failed after retries: %w", err)
 }
 
 // LoadLiveCheckpoint reads the live checkpoint written by SaveLiveCheckpoint. If no
