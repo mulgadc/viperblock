@@ -704,11 +704,11 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
 
-	if os.Getenv("VIPERBLOCK_DEBUG") == "1" {
-		vb.SetDebug(true)
-	} else {
-		vb.SetDebug(false)
-	}
+	// New intentionally does not touch the process-wide slog default: a
+	// library must never mutate its caller's global logger state. Standalone
+	// entrypoints (nbdkit plugin bootstrap, viperblockd) opt in explicitly
+	// via SetDebug or telemetry.SetDefaultJSONLogger; embedders keep whatever
+	// logger they already installed.
 
 	// Create the base directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume()), 0750); err != nil {
@@ -729,18 +729,18 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	return vb, nil
 }
 
+// SetDebug installs a process-wide JSON slog default at Debug or Error
+// level, fanning out to an OTLP bridge if telemetry.Init already configured
+// one. It mutates global logger state, so only a standalone process that
+// owns its own logging should call it directly (e.g. from a CLI entrypoint);
+// an embedder must never have this called on its behalf, which is why New
+// no longer invokes it automatically.
 func (vb *VB) SetDebug(debug bool) {
-	var level slog.Level
+	level := slog.LevelError
 	if debug {
 		level = slog.LevelDebug
-	} else {
-		level = slog.LevelError
 	}
-
-	logger := slog.New(telemetry.NewSlogHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: level,
-	})))
-	slog.SetDefault(logger)
+	telemetry.SetDefaultJSONLogger("viperblock", level)
 }
 
 func (vb *VB) SetWALBaseDir(baseDir string) {
@@ -1221,7 +1221,16 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 }
 
 // Flush the main memory (writes) to the WAL
-func (vb *VB) Flush() error {
+func (vb *VB) Flush() (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
+	}()
+
 	vb.Writes.mu.Lock()
 	defer vb.Writes.mu.Unlock()
 	if vb.UseShardedWAL {
@@ -1941,8 +1950,18 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 }
 
 // WriteWALToChunkCtx is WriteWALToChunk with a caller-supplied context
-// threaded through the chunk uploads.
-func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) error {
+// threaded through the chunk uploads. Consolidates the WAL (or dispatches to
+// the sharded WAL) into a durable chunk object on the backend.
+func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordWALOp(ctx, "consolidate", vb.VolumeName, outcome, time.Since(start))
+	}()
+
 	// Dispatch to sharded implementation when enabled
 	if vb.UseShardedWAL {
 		return vb.WriteShardedWALToChunkCtx(ctx, force)
@@ -1984,7 +2003,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) error {
 	// Open the next WAL file while still holding the lock so there is no
 	// window where syncWALIfDirty or WriteWAL can see a closed DB entry.
 	nextWalNum := vb.WAL.WallNum.Add(1)
-	err := vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
+	err = vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
 	vb.WAL.mu.Unlock()
 	if err != nil {
 		return err
@@ -2710,7 +2729,16 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 // RecoverLocalWALs scans for orphaned WAL files left behind by a crash and replays
 // valid blocks into S3 chunks via createChunkFile. This must be called between
 // LoadBlockState() and OpenWAL() during boot to prevent data loss.
-func (vb *VB) RecoverLocalWALs() error {
+func (vb *VB) RecoverLocalWALs() (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordWALOp(context.Background(), "replay", vb.VolumeName, outcome, time.Since(start))
+	}()
+
 	walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
 
 	entries, err := os.ReadDir(walDir)
@@ -4092,11 +4120,13 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 
 		switch state {
 		case BlockStateHot, BlockStatePending, BlockStateCached:
-			// Data is available in memory
+			// Data is available in memory: a cache hit.
+			telemetry.RecordCacheLookup(ctx, true)
 			copy(data[start:end], blockData)
 
 		case BlockStatePersisted:
-			// Need to fetch from backend
+			// Need to fetch from backend: a cache miss.
+			telemetry.RecordCacheLookup(ctx, false)
 			entry, ok := vb.BlockStore.ReadBlock(currentBlock)
 			if !ok {
 				// Should not happen if state was Persisted

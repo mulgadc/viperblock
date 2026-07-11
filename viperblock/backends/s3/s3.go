@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
@@ -174,6 +175,14 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 
 func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	slog.DebugContext(ctx, "[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	}()
 
 	if backend.config.S3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -221,6 +230,16 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	start := time.Now()
+	bodyLen := 0
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "write", "s3", backend.config.VolumeName, outcome, bodyLen, time.Since(start))
+	}()
+
 	if backend.config.S3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
@@ -243,6 +262,7 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	} else if data != nil {
 		body = *data
 	}
+	bodyLen = len(body)
 
 	// Create a new S3 object
 	object := &s3.PutObjectInput{

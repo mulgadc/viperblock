@@ -8,6 +8,7 @@ import (
 	"libguestfs.org/nbdkit"
 )
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -23,6 +25,15 @@ import (
 )
 
 var pluginName = "viperblock"
+
+// serviceName identifies this process to OTLP (resource service.name) and
+// to the otelslog bridge, matching the metrics-apm.app.<name> data stream
+// dashboards are built against.
+const serviceName = "viperblockd"
+
+// otelShutdown flushes the OTLP exporters on Unload, if telemetry.Init
+// configured real ones. nil (a no-op) when OTLP export is not configured.
+var otelShutdown func(context.Context) error
 
 type ViperBlockPlugin struct {
 	nbdkit.Plugin
@@ -147,6 +158,23 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 		return nbdkit.PluginError{Errmsg: "host parameter is required"}
 	}
 
+	// Wire OTLP export + the slog bridge before anything else logs, so
+	// standalone (nbdkit) logs reach ES via OTLP, not only journald. Both
+	// are no-ops without OTEL_EXPORTER_OTLP_* configured. This is the only
+	// place viperblock's process-wide slog default is touched — never from
+	// viperblock.New, which would hijack an embedding process's logger.
+	shutdown, err := telemetry.Init(context.Background(), serviceName)
+	if err != nil {
+		slog.Error("otel telemetry init failed, continuing without OTLP export", "err", err)
+	} else {
+		otelShutdown = shutdown
+	}
+	level := slog.LevelInfo
+	if os.Getenv("VIPERBLOCK_DEBUG") == "1" {
+		level = slog.LevelDebug
+	}
+	telemetry.SetDefaultJSONLogger(serviceName, level)
+
 	// Resolve and load the master key once at plugin startup so per-NBD-
 	// connection Open avoids a disk read + permission check on every attach.
 	mkey, err := viperblock.LoadMasterKeyFromFlagOrEnv(encryption_key_file)
@@ -198,7 +226,8 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	// Apply nbdkit config override for sharded WAL
 	vb.UseShardedWAL = use_shardwal
 
-	//vb.SetDebug(true)
+	// Debug logging is configured once for the whole process in
+	// ConfigComplete via telemetry.SetDefaultJSONLogger, not per-connection.
 
 	// Set 20% LRU memory from host
 	//vb.SetCacheSize(0, 20)
@@ -447,6 +476,15 @@ func (c *ViperBlockConnection) Close() {
 // SIGTERM shutdown mode, which causes nbdkit to skip the per-connection close
 // callback.
 func (p *ViperBlockPlugin) Unload() {
+	defer func() {
+		if otelShutdown == nil {
+			return
+		}
+		if err := otelShutdown(context.Background()); err != nil {
+			slog.Error("Unload: otel shutdown failed", "err", err)
+		}
+	}()
+
 	if activeVB == nil {
 		return
 	}

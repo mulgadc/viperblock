@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
 )
@@ -34,12 +36,39 @@ func (backend *Backend) InitCtx(_ context.Context) error {
 	return backend.Init()
 }
 
-func (backend *Backend) ReadCtx(_ context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
-	return backend.Read(fileType, objectId, offset, length)
+func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+	start := time.Now()
+	data, err = backend.Read(fileType, objectId, offset, length)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "read", "file", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	return data, err
 }
 
-func (backend *Backend) WriteCtx(_ context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
-	return backend.Write(fileType, objectId, headers, data)
+func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	start := time.Now()
+	err := backend.Write(fileType, objectId, headers, data)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "write", "file", backend.config.VolumeName, outcome, writeLen(headers, data), time.Since(start))
+	return err
+}
+
+// writeLen returns the combined byte length of headers+data as actually
+// written by Write, without allocating a copy.
+func writeLen(headers, data *[]byte) int {
+	n := 0
+	if headers != nil {
+		n += len(*headers)
+	}
+	if data != nil {
+		n += len(*data)
+	}
+	return n
 }
 
 func (backend *Backend) ReadFromCtx(_ context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
