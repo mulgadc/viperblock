@@ -17,12 +17,12 @@ const meterName = "github.com/mulgadc/viperblock/telemetry"
 var (
 	instrumentsOnce sync.Once
 
-	backendIOCount    metric.Int64Counter
-	backendIOBytes    metric.Int64Counter
-	backendIODuration metric.Float64Histogram
+	backendIOOps         metric.Int64Counter
+	backendIOBytes       metric.Int64Counter
+	backendIODurationSum metric.Float64Counter
 
-	walOpCount    metric.Int64Counter
-	walOpDuration metric.Float64Histogram
+	walOpCount       metric.Int64Counter
+	walOpDurationSum metric.Float64Counter
 
 	cacheLookups metric.Int64Counter
 
@@ -41,7 +41,11 @@ func instruments() {
 		m := otel.Meter(meterName)
 		var err error
 
-		backendIOCount, err = m.Int64Counter("viperblock.backend.io",
+		// "io" is a namespace (ops/bytes/duration.sum siblings), not a leaf,
+		// to avoid an ES leaf-vs-object mapping collision. Durations are
+		// recorded as seconds-sum counters (not histograms) so avg latency
+		// = sum/ops is computable in ES|QL; native ES histograms aren't.
+		backendIOOps, err = m.Int64Counter("viperblock.backend.io.ops",
 			metric.WithDescription("Count of block-storage backend read/write operations."),
 			metric.WithUnit("{operation}"))
 		if err != nil {
@@ -53,8 +57,8 @@ func instruments() {
 		if err != nil {
 			otel.Handle(err)
 		}
-		backendIODuration, err = m.Float64Histogram("viperblock.backend.io.duration",
-			metric.WithDescription("Duration of block-storage backend read/write operations."),
+		backendIODurationSum, err = m.Float64Counter("viperblock.backend.io.duration.sum",
+			metric.WithDescription("Cumulative seconds spent in block-storage backend read/write operations."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -66,8 +70,8 @@ func instruments() {
 		if err != nil {
 			otel.Handle(err)
 		}
-		walOpDuration, err = m.Float64Histogram("viperblock.wal.operation.duration",
-			metric.WithDescription("Duration of WAL flush/replay/consolidate operations."),
+		walOpDurationSum, err = m.Float64Counter("viperblock.wal.operation.duration.sum",
+			metric.WithDescription("Cumulative seconds spent in WAL flush/replay/consolidate operations."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -85,10 +89,10 @@ func instruments() {
 	})
 }
 
-// RecordBackendIO records one backend chunk-object read or write: IOPS,
-// bytes transferred, and latency. op is "read"/"write", backendType is
-// "s3"/"file", outcome is "success"/"error". volume is omitted from
-// attributes when empty.
+// RecordBackendIO records one backend chunk-object read or write: op count,
+// bytes transferred, and cumulative duration (as duration.sum, added to on
+// every call). op is "read"/"write", backendType is "s3"/"file", outcome is
+// "success"/"error". volume is omitted from attributes when empty.
 func RecordBackendIO(ctx context.Context, op, backendType, volume, outcome string, bytesTransferred int, elapsed time.Duration) {
 	instruments()
 	attrs := []attribute.KeyValue{
@@ -101,18 +105,19 @@ func RecordBackendIO(ctx context.Context, op, backendType, volume, outcome strin
 	}
 	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
 
-	if backendIOCount != nil {
-		backendIOCount.Add(ctx, 1, opt)
+	if backendIOOps != nil {
+		backendIOOps.Add(ctx, 1, opt)
 	}
 	if backendIOBytes != nil && bytesTransferred > 0 {
 		backendIOBytes.Add(ctx, int64(bytesTransferred), opt)
 	}
-	if backendIODuration != nil {
-		backendIODuration.Record(ctx, elapsed.Seconds(), opt)
+	if backendIODurationSum != nil {
+		backendIODurationSum.Add(ctx, elapsed.Seconds(), opt)
 	}
 }
 
-// RecordWALOp records one WAL lifecycle operation. phase is
+// RecordWALOp records one WAL lifecycle operation: op count and cumulative
+// duration (as duration.sum, added to on every call). phase is
 // "flush"/"replay"/"consolidate", outcome is "success"/"error".
 func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed time.Duration) {
 	instruments()
@@ -128,8 +133,8 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 	if walOpCount != nil {
 		walOpCount.Add(ctx, 1, opt)
 	}
-	if walOpDuration != nil {
-		walOpDuration.Record(ctx, elapsed.Seconds(), opt)
+	if walOpDurationSum != nil {
+		walOpDurationSum.Add(ctx, elapsed.Seconds(), opt)
 	}
 }
 
