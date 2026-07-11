@@ -67,12 +67,12 @@ func TestRecordBackendIOEmitsCounterBytesAndDuration(t *testing.T) {
 	}
 	metrics := collectMetrics(t, rm)
 
-	sum, ok := metrics["viperblock.backend.io"].(metricdata.Sum[int64])
+	sum, ok := metrics["viperblock.backend.io.ops"].(metricdata.Sum[int64])
 	if !ok || len(sum.DataPoints) != 1 {
-		t.Fatalf("viperblock.backend.io = %#v, want one int64 sum point", metrics["viperblock.backend.io"])
+		t.Fatalf("viperblock.backend.io.ops = %#v, want one int64 sum point", metrics["viperblock.backend.io.ops"])
 	}
 	if sum.DataPoints[0].Value != 1 {
-		t.Errorf("io count = %d, want 1", sum.DataPoints[0].Value)
+		t.Errorf("io ops = %d, want 1", sum.DataPoints[0].Value)
 	}
 
 	bytesSum, ok := metrics["viperblock.backend.io.bytes"].(metricdata.Sum[int64])
@@ -80,9 +80,9 @@ func TestRecordBackendIOEmitsCounterBytesAndDuration(t *testing.T) {
 		t.Fatalf("viperblock.backend.io.bytes = %#v, want 4096", metrics["viperblock.backend.io.bytes"])
 	}
 
-	hist, ok := metrics["viperblock.backend.io.duration"].(metricdata.Histogram[float64])
-	if !ok || len(hist.DataPoints) != 1 || hist.DataPoints[0].Count != 1 {
-		t.Fatalf("viperblock.backend.io.duration = %#v, want one histogram point with count 1", metrics["viperblock.backend.io.duration"])
+	durSum, ok := metrics["viperblock.backend.io.duration.sum"].(metricdata.Sum[float64])
+	if !ok || len(durSum.DataPoints) != 1 || durSum.DataPoints[0].Value <= 0 {
+		t.Fatalf("viperblock.backend.io.duration.sum = %#v, want one float64 sum point > 0", metrics["viperblock.backend.io.duration.sum"])
 	}
 
 	attrs := sum.DataPoints[0].Attributes
@@ -107,9 +107,9 @@ func TestRecordBackendIOZeroBytesAndEmptyVolume(t *testing.T) {
 		t.Errorf("expected no bytes data points recorded for a zero-byte op, got %d", len(bytesSum.DataPoints))
 	}
 
-	sum, ok := metrics["viperblock.backend.io"].(metricdata.Sum[int64])
+	sum, ok := metrics["viperblock.backend.io.ops"].(metricdata.Sum[int64])
 	if !ok || len(sum.DataPoints) != 1 {
-		t.Fatalf("viperblock.backend.io = %#v, want one int64 sum point", metrics["viperblock.backend.io"])
+		t.Fatalf("viperblock.backend.io.ops = %#v, want one int64 sum point", metrics["viperblock.backend.io.ops"])
 	}
 	wantAttr(t, sum.DataPoints[0].Attributes, "outcome", "error")
 	if _, ok := sum.DataPoints[0].Attributes.Value(attribute.Key("volume.name")); ok {
@@ -135,9 +135,9 @@ func TestRecordWALOpEmitsCounterAndDuration(t *testing.T) {
 	wantAttr(t, sum.DataPoints[0].Attributes, "phase", "consolidate")
 	wantAttr(t, sum.DataPoints[0].Attributes, "volume.name", "vol-9")
 
-	hist, ok := metrics["viperblock.wal.operation.duration"].(metricdata.Histogram[float64])
-	if !ok || len(hist.DataPoints) != 1 {
-		t.Fatalf("viperblock.wal.operation.duration = %#v, want one point", metrics["viperblock.wal.operation.duration"])
+	durSum, ok := metrics["viperblock.wal.operation.duration.sum"].(metricdata.Sum[float64])
+	if !ok || len(durSum.DataPoints) != 1 || durSum.DataPoints[0].Value <= 0 {
+		t.Fatalf("viperblock.wal.operation.duration.sum = %#v, want one float64 sum point > 0", metrics["viperblock.wal.operation.duration.sum"])
 	}
 }
 
