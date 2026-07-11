@@ -3,6 +3,7 @@ package types
 import (
 	"context"
 	"fmt"
+	"log/slog"
 )
 
 type Backend interface {
@@ -21,6 +22,10 @@ type Backend interface {
 	GetBackendType() string
 	GetHost() string
 	SetConfig(config any)
+	// SetLogger installs the logger the backend uses for its own log lines.
+	// Backends never call slog.SetDefault; the logger is scoped to the
+	// instance so an embedding process's global logger is left untouched.
+	SetLogger(logger *slog.Logger)
 }
 
 // FileType represents the type of file being written to S3

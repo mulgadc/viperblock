@@ -14,25 +14,31 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// SetDefaultJSONLogger installs the process-wide slog default: JSON to
-// stdout at the given level, with trace_id/span_id stamping. If Init already
-// installed a real OTLP LoggerProvider, the default also fans out to it, so
-// repeated calls re-establish stdout-at-level without ever clobbering the
-// OTLP bridge. Callers must invoke this explicitly (standalone entrypoints
-// only) — never from a constructor an embedder might call, or it silently
-// hijacks the host process's own logger.
-func SetDefaultJSONLogger(serviceName string, level slog.Level) {
+// NewJSONLogger builds a *slog.Logger that writes JSON to stdout at the
+// given level, with trace_id/span_id stamping. If Init already installed a
+// real OTLP LoggerProvider, the logger also fans out to it. Unlike
+// SetDefaultJSONLogger this never touches slog.SetDefault, so it is safe to
+// call from library code that only wants its own scoped logger.
+func NewJSONLogger(serviceName string, level slog.Level) *slog.Logger {
 	stdout := NewSlogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: level,
 	}))
 
 	lp, ok := loggerglobal.GetLoggerProvider().(*sdklog.LoggerProvider)
 	if !ok {
-		slog.SetDefault(slog.New(stdout))
-		return
+		return slog.New(stdout)
 	}
 	bridge := otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(lp))
-	slog.SetDefault(slog.New(newFanoutHandler(stdout, bridge)))
+	return slog.New(newFanoutHandler(stdout, bridge))
+}
+
+// SetDefaultJSONLogger installs the process-wide slog default built by
+// NewJSONLogger. Repeated calls re-establish stdout-at-level without ever
+// clobbering the OTLP bridge. Callers must invoke this explicitly
+// (standalone entrypoints only) — never from a constructor an embedder might
+// call, or it silently hijacks the host process's own logger.
+func SetDefaultJSONLogger(serviceName string, level slog.Level) {
+	slog.SetDefault(NewJSONLogger(serviceName, level))
 }
 
 var _ slog.Handler = (*traceHandler)(nil)
