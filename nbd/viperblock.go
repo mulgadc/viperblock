@@ -67,6 +67,7 @@ var secret_key string
 var host string
 var base_dir string
 var cache_size int = 20
+var max_pending_bytes uint64 = 0
 var use_shardwal bool = false
 var encryption_key_file string
 
@@ -122,6 +123,13 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 	} else if key == "cache_size" {
 		var err error
 		cache_size, err = strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		return nil
+	} else if key == "max_pending_bytes" {
+		var err error
+		max_pending_bytes, err = strconv.ParseUint(value, 0, 64)
 		if err != nil {
 			return err
 		}
@@ -213,6 +221,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 				Size: cache_size,
 			},
 		},
+		MaxPendingBytes:   max_pending_bytes,
 		MasterKey:         loadedMasterKey,
 		EncryptionEnabled: loadedMasterKey != nil,
 	}

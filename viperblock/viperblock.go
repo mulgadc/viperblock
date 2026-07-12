@@ -41,6 +41,13 @@ const DefaultFlushSize uint32 = 64 * 1024 * 1024
 const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
 const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 
+// DefaultMaxPendingBytes bounds the combined size of Writes.Blocks and
+// PendingBackendWrites.Blocks — the guest-write backpressure high-watermark.
+// WriteAtCtx blocks the caller once this is crossed, draining synchronously
+// until back under MaxPendingBytes/2, so a sustained guest write self-throttles
+// to backend ingest rate instead of ballooning unbounded anonymous memory.
+const DefaultMaxPendingBytes uint64 = 256 * 1024 * 1024
+
 // seqNumReservation is the size of each SeqNum high-water reservation window.
 // reserveSeqNum hands out values lock-free via atomic.Add until the persisted
 // high-water is crossed; the slow path advances by seqNumReservation and
@@ -139,6 +146,34 @@ type VB struct {
 
 	// Pending writes to backend, when data flushed, WAL appended, and prior to backend upload completion (to avoid race conditions)
 	PendingBackendWrites Blocks
+
+	// MaxPendingBytes bounds outstanding buffered write bytes (Writes.Blocks +
+	// PendingBackendWrites.Blocks). 0 uses DefaultMaxPendingBytes. WriteAtCtx
+	// blocks once pendingBytes crosses this until a synchronous drain brings
+	// it back under MaxPendingBytes/2 — see awaitBackpressure.
+	MaxPendingBytes uint64
+
+	// pendingBytes tracks outstanding buffered write bytes across
+	// Writes.Blocks and PendingBackendWrites.Blocks. Incremented in
+	// WriteAtCtx when writes land in Writes.Blocks, decremented in
+	// createChunkFile when blocks are evicted from PendingBackendWrites
+	// after a successful chunk upload. Atomic and read without the
+	// Writes/PendingBackendWrites locks: an approximate watermark is fine,
+	// exact linearizability with the slices is not required.
+	pendingBytes atomic.Int64
+
+	// drainInFlight ensures at most one goroutine actively drives
+	// DrainToBackendCtx from inside awaitBackpressure at a time; concurrent
+	// blocked writers poll pendingBytes instead of each launching a
+	// redundant drain.
+	drainInFlight atomic.Bool
+
+	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
+	// to drain now instead of waiting for the next ChunkUploadInterval tick,
+	// once pendingBytes crosses FlushSize. Buffered 1: a pending trigger
+	// coalesces repeated sends. nil-safe to send on only after
+	// StartChunkUploader has run.
+	chunkUploadTrigger chan struct{}
 
 	// Periodically writes (Blocks) are flushed to the WAL log (default 5s, or when 64MB written, or OS flushes)
 	WAL WAL
@@ -637,6 +672,10 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.FlushSize = DefaultFlushSize
 	}
 
+	if config.MaxPendingBytes == 0 {
+		config.MaxPendingBytes = DefaultMaxPendingBytes
+	}
+
 	// WALSyncInterval: 0 means use default, negative means disabled
 	if config.WALSyncInterval == 0 {
 		config.WALSyncInterval = DefaultWALSyncInterval
@@ -684,6 +723,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		ObjBlockSize:        config.ObjBlockSize,
 		FlushInterval:       config.FlushInterval,
 		FlushSize:           config.FlushSize,
+		MaxPendingBytes:     config.MaxPendingBytes,
 		WALSyncInterval:     config.WALSyncInterval,
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		Writes:              Blocks{},
@@ -711,6 +751,8 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 		UseShardedWAL: false,
 		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
+
+		chunkUploadTrigger: make(chan struct{}, 1),
 
 		MasterKey:         config.MasterKey,
 		EncryptionEnabled: config.EncryptionEnabled,
@@ -867,6 +909,13 @@ func (vb *VB) StartChunkUploader() {
 			case <-vb.chunkUploadTicker.C:
 				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					vb.logger().Warn("chunk uploader: DrainToBackend failed", "err", err)
+				}
+			case <-vb.chunkUploadTrigger:
+				// Size-triggered drain: pendingBytes crossed FlushSize in
+				// WriteAtCtx. Bounds steady-state memory to ~FlushSize
+				// without waiting on the ChunkUploadInterval ticker.
+				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
+					vb.logger().Warn("chunk uploader: size-triggered DrainToBackend failed", "err", err)
 				}
 			case <-vb.chunkUploadStop:
 				return
@@ -1077,6 +1126,91 @@ func (vb *VB) WriteAt(offset uint64, data []byte) error {
 	return vb.WriteAtCtx(context.Background(), offset, data)
 }
 
+// PendingBytes returns the current outstanding buffered write bytes across
+// Writes.Blocks and PendingBackendWrites.Blocks — the counter the WriteAtCtx
+// backpressure gate watches.
+func (vb *VB) PendingBytes() uint64 {
+	return uint64(vb.pendingBytes.Load()) //nolint:gosec // G115: increments/decrements are matched byte counts, never negative
+}
+
+// maxPendingBytes returns the configured high-watermark, or the default if
+// unset (covers VB values assembled without going through New).
+func (vb *VB) maxPendingBytes() uint64 {
+	if vb.MaxPendingBytes == 0 {
+		return DefaultMaxPendingBytes
+	}
+	return vb.MaxPendingBytes
+}
+
+// signalSizeTrigger asks the background chunk uploader to drain now, once
+// pendingBytes crosses FlushSize, instead of waiting for the next
+// ChunkUploadInterval tick. Non-blocking: a trigger already pending
+// coalesces, and the synchronous gate in awaitBackpressure is the hard bound
+// if the uploader can't keep up.
+func (vb *VB) signalSizeTrigger() {
+	flushSize := vb.FlushSize
+	if flushSize == 0 {
+		flushSize = DefaultFlushSize
+	}
+	if vb.PendingBytes() < uint64(flushSize) {
+		return
+	}
+	select {
+	case vb.chunkUploadTrigger <- struct{}{}:
+	default:
+	}
+}
+
+// awaitBackpressure blocks the caller once pendingBytes has crossed
+// MaxPendingBytes, driving DrainToBackendCtx synchronously until pendingBytes
+// falls back under the low-watermark (MaxPendingBytes/2). This is the core
+// backpressure mechanism: a guest write that outruns the backend's ingest
+// rate self-throttles here instead of growing Writes.Blocks /
+// PendingBackendWrites.Blocks without bound.
+//
+// Called after WriteAtCtx has already released vb.Writes.mu, so the Flush()
+// invoked by DrainToBackendCtx (which takes that same lock) cannot deadlock
+// against us. drainInFlight ensures only one blocked writer actually drives
+// the drain at a time; the rest poll pendingBytes with a bounded backoff.
+func (vb *VB) awaitBackpressure(ctx context.Context) error {
+	high := vb.maxPendingBytes()
+	if vb.PendingBytes() <= high {
+		return nil
+	}
+
+	low := high / 2
+	backoff := 10 * time.Millisecond
+	const maxBackoff = 500 * time.Millisecond
+
+	for vb.PendingBytes() > low {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if vb.drainInFlight.CompareAndSwap(false, true) {
+			err := vb.DrainToBackendCtx(ctx)
+			vb.drainInFlight.Store(false)
+			if err != nil {
+				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err)
+			}
+			if vb.PendingBytes() <= low {
+				break
+			}
+		}
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+
+	return nil
+}
+
 // WriteAtCtx is WriteAt with a caller-supplied context that flows through any
 // read-modify-write backend fetches for trace propagation.
 func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error {
@@ -1180,6 +1314,17 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 		for _, block := range writes {
 			vb.BlockStore.WriteWithSeqNum(block.Block, block.Data, block.SeqNum)
 		}
+	}
+
+	vb.pendingBytes.Add(int64(len(writes)) * int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
+	vb.signalSizeTrigger()
+
+	// Backpressure gate: block this guest write until buffered bytes drop
+	// back under the low-watermark if MaxPendingBytes has been crossed. Runs
+	// after releasing vb.Writes.mu above so the drain this drives (which
+	// re-acquires that lock) cannot deadlock against us.
+	if err := vb.awaitBackpressure(ctx); err != nil {
+		return err
 	}
 
 	return nil
@@ -2343,6 +2488,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// Filter pending writes in-place using the hash map for O(n) complexity
 	// We iterate through the slice once, keeping non-matched blocks at the front
 	n := 0
+	var freedBytes int64
 	for _, block := range vb.PendingBackendWrites.Blocks {
 		if _, matched := matchedBlockMap[block.Block]; !matched {
 			// Block not in matched set, keep it in pending writes
@@ -2353,12 +2499,18 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			if vb.Cache.Config.Size > 0 {
 				vb.Cache.lru.Add(block.Block, block.Data)
 			}
+			freedBytes += int64(len(block.Data))
 		}
 	}
 	// Truncate the slice to remove processed blocks
 	vb.PendingBackendWrites.Blocks = vb.PendingBackendWrites.Blocks[:n]
 
 	vb.PendingBackendWrites.mu.Unlock()
+
+	// This chunk's bytes have left both Writes.Blocks (filtered out at flush
+	// time) and PendingBackendWrites.Blocks (just above) — release them from
+	// the backpressure counter WriteAtCtx's awaitBackpressure gate watches.
+	vb.pendingBytes.Add(-freedBytes)
 
 	headerLen := len(headers)
 
@@ -4004,6 +4156,8 @@ func (vb *VB) Reset() error {
 	vb.PendingBackendWrites.mu.Lock()
 	vb.PendingBackendWrites.Blocks = make([]Block, 0)
 	vb.PendingBackendWrites.mu.Unlock()
+
+	vb.pendingBytes.Store(0)
 
 	if vb.Cache.lru != nil {
 		vb.Cache.lru.Purge()
