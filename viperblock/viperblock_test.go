@@ -1,11 +1,13 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -404,6 +406,64 @@ func TestNew(t *testing.T) {
 			assert.NoError(t, err)
 		})
 	}
+}
+
+// TestNewAndSetDebugDoNotMutateGlobalLogger guards against viperblock (a
+// library) hijacking its embedder's process-wide slog default: New must
+// default vb.log to slog.Default() without installing anything globally, and
+// SetDebug must rebuild vb.log in place rather than calling slog.SetDefault.
+func TestNewAndSetDebugDoNotMutateGlobalLogger(t *testing.T) {
+	defaultBefore := slog.Default()
+
+	vb, err := New(&VB{VolumeName: "test-logger-default", VolumeSize: 1024 * 1024}, FileBackend, file.FileConfig{
+		BaseDir:    t.TempDir(),
+		VolumeName: "test-logger-default",
+		VolumeSize: 1024 * 1024,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, vb)
+	defer func() {
+		assert.NoError(t, vb.RemoveLocalFiles())
+	}()
+
+	assert.Same(t, defaultBefore, slog.Default(), "New must not mutate the process-wide slog default")
+	assert.Same(t, defaultBefore, vb.log, "New must default vb.log to slog.Default() when no Logger is supplied")
+
+	loggerAfterNew := vb.log
+
+	vb.SetDebug(true)
+	assert.Same(t, defaultBefore, slog.Default(), "SetDebug(true) must not mutate the process-wide slog default")
+	assert.NotSame(t, loggerAfterNew, vb.log, "SetDebug must rebuild the instance logger")
+
+	vb.SetDebug(false)
+	assert.Same(t, defaultBefore, slog.Default(), "SetDebug(false) must not mutate the process-wide slog default")
+}
+
+// TestNewHonorsInjectedLogger confirms a caller-supplied Logger is used
+// verbatim as the instance logger instead of falling back to slog.Default().
+func TestNewHonorsInjectedLogger(t *testing.T) {
+	var buf bytes.Buffer
+	injected := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	vb, err := New(&VB{
+		VolumeName: "test-logger-injected",
+		VolumeSize: 1024 * 1024,
+		Logger:     injected,
+	}, FileBackend, file.FileConfig{
+		BaseDir:    t.TempDir(),
+		VolumeName: "test-logger-injected",
+		VolumeSize: 1024 * 1024,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, vb)
+	defer func() {
+		assert.NoError(t, vb.RemoveLocalFiles())
+	}()
+
+	assert.Same(t, injected, vb.log, "New must use the caller-supplied Logger instead of slog.Default()")
+
+	vb.log.Debug("probe message")
+	assert.Contains(t, buf.String(), "probe message")
 }
 
 func TestWriteAndRead(t *testing.T) {

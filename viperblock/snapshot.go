@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"math"
 	"time"
 
@@ -64,7 +63,7 @@ type InheritedLayer struct {
 // under {snapshotID}/. No data is copied -- the snapshot references the
 // source volume's existing chunk files.
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
-	slog.Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
+	vb.logger().Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
 
 	// 1. Flush hot writes to WAL and persist to chunks.
 	// Skip if this VB doesn't own the WAL files (e.g. viperblockd snapshot VB
@@ -86,6 +85,15 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		// no need to hold the write lock — new writes go to the next WAL file)
 		if err := vb.WriteWALToChunk(true); err != nil {
 			return nil, fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
+		}
+
+		// Chunk uploads no longer refresh the live checkpoint per-chunk (that
+		// was a parallel-upload hazard, see createChunkFile). Refresh it once
+		// here so the source volume's live checkpoint reflects the chunks
+		// just uploaded, same as DrainToBackendCtx does after its own drain.
+		// Non-fatal: a stale live checkpoint self-heals on the next drain.
+		if err := vb.SaveLiveCheckpoint(); err != nil {
+			vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
 		}
 	}
 
@@ -171,7 +179,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		return nil, fmt.Errorf("failed to write snapshot config: %w", err)
 	}
 
-	slog.Info("CreateSnapshot: complete", "snapshotID", snapshotID, "sourceVolume", vb.VolumeName)
+	vb.logger().Info("CreateSnapshot: complete", "snapshotID", snapshotID, "sourceVolume", vb.VolumeName)
 	return snap, nil
 }
 
@@ -326,7 +334,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		ident.InheritedLayers = layers
 	}
 
-	slog.Debug("LoadSnapshotBlockMap: loaded",
+	vb.logger().Debug("LoadSnapshotBlockMap: loaded",
 		"snapshotID", snapshotID,
 		"sourceVolume", snap.SourceVolumeName,
 		"blocks", len(baseMap.BlockLookup),
@@ -372,7 +380,7 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 		}
 	}
 
-	slog.Debug("OpenFromSnapshot: clone ready",
+	vb.logger().Debug("OpenFromSnapshot: clone ready",
 		"volume", vb.VolumeName,
 		"snapshotID", snapshotID,
 		"sourceVolume", ident.SourceVolumeName,

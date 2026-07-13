@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
 )
@@ -20,6 +22,7 @@ type FileConfig struct {
 
 type FileBackend struct {
 	config FileConfig
+	log    *slog.Logger
 }
 
 type Backend struct {
@@ -34,12 +37,39 @@ func (backend *Backend) InitCtx(_ context.Context) error {
 	return backend.Init()
 }
 
-func (backend *Backend) ReadCtx(_ context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
-	return backend.Read(fileType, objectId, offset, length)
+func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
+	start := time.Now()
+	data, err = backend.Read(fileType, objectId, offset, length)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "read", "file", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	return data, err
 }
 
-func (backend *Backend) WriteCtx(_ context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
-	return backend.Write(fileType, objectId, headers, data)
+func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	start := time.Now()
+	err := backend.Write(fileType, objectId, headers, data)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "write", "file", backend.config.VolumeName, outcome, writeLen(headers, data), time.Since(start))
+	return err
+}
+
+// writeLen returns the combined byte length of headers+data as actually
+// written by Write, without allocating a copy.
+func writeLen(headers, data *[]byte) int {
+	n := 0
+	if headers != nil {
+		n += len(*headers)
+	}
+	if data != nil {
+		n += len(*data)
+	}
+	return n
 }
 
 func (backend *Backend) ReadFromCtx(_ context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
@@ -56,15 +86,24 @@ func New(config any) (backend *Backend) {
 	if !ok {
 		panic("file backend: expected FileConfig")
 	}
-	return &Backend{FileBackend: FileBackend{config: cfg}}
+	return &Backend{FileBackend: FileBackend{config: cfg, log: slog.Default()}}
+}
+
+// SetLogger installs the logger this backend uses for its own log lines.
+// Never calls slog.SetDefault; nil falls back to slog.Default().
+func (backend *Backend) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	backend.log = logger
 }
 
 func (backend *Backend) Init() error {
-	slog.Info("Init for file backend", "volumeName", backend.config.VolumeName)
+	backend.log.Info("Init for file backend", "volumeName", backend.config.VolumeName)
 
 	// Check if the directory exists
 	if _, err := os.Stat(backend.config.BaseDir); os.IsNotExist(err) {
-		slog.Error("Directory does not exist", "error", err)
+		backend.log.Error("Directory does not exist", "error", err)
 		return err
 	}
 
@@ -74,7 +113,7 @@ func (backend *Backend) Init() error {
 	err := os.MkdirAll(dirPath, 0750)
 
 	if err != nil {
-		slog.Error("Failed to create directory", "error", err)
+		backend.log.Error("Failed to create directory", "error", err)
 		return err
 	}
 
@@ -93,7 +132,7 @@ func (backend *Backend) Init() error {
 		// Create all parent dirs
 		err := os.MkdirAll(dirPath, 0750)
 		if err != nil {
-			slog.Error("Failed to create directory", "error", err)
+			backend.log.Error("Failed to create directory", "error", err)
 			return err
 		}
 	}
@@ -157,7 +196,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	file, err := os.Create(filename)
 
 	if err != nil {
-		slog.Error("Failed to create chunk file", "error", err)
+		backend.log.Error("Failed to create chunk file", "error", err)
 		return err
 	}
 
@@ -165,21 +204,21 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	_, err = file.Write(*headers)
 
 	if err != nil {
-		slog.Error("Failed to write headers", "error", err)
+		backend.log.Error("Failed to write headers", "error", err)
 		return err
 	}
 
 	_, err = file.Write(*data)
 
 	if err != nil {
-		slog.Error("Failed to write data", "error", err)
+		backend.log.Error("Failed to write data", "error", err)
 		return err
 	}
 
 	err = file.Close()
 
 	if err != nil {
-		slog.Error("Failed to close file", "error", err)
+		backend.log.Error("Failed to close file", "error", err)
 		return err
 	}
 
@@ -239,14 +278,14 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 
 	file, err := os.Create(filename)
 	if err != nil {
-		slog.Error("Failed to create file", "error", err)
+		backend.log.Error("Failed to create file", "error", err)
 		return err
 	}
 
 	if headers != nil && len(*headers) > 0 {
 		if _, err = file.Write(*headers); err != nil {
 			if cerr := file.Close(); cerr != nil {
-				slog.Warn("failed to close file during cleanup", "error", cerr)
+				backend.log.Warn("failed to close file during cleanup", "error", cerr)
 			}
 			return err
 		}
@@ -255,7 +294,7 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 	if data != nil {
 		if _, err = file.Write(*data); err != nil {
 			if cerr := file.Close(); cerr != nil {
-				slog.Warn("failed to close file during cleanup", "error", cerr)
+				backend.log.Warn("failed to close file during cleanup", "error", cerr)
 			}
 			return err
 		}

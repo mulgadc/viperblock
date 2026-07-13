@@ -384,10 +384,18 @@ func TestSnapshotEncrypted_CloneWriteUsesCloneIdentity(t *testing.T) {
 }
 
 // TestEncryptedChunk_LiveCheckpointSeqNumConsistency gates the ordering fix in
-// createChunkFile (mulga-be2ev): after a chunk is sealed, SaveLiveCheckpoint is
-// called immediately so the recorded BlockLookup.SeqNum matches the seal-time
-// SeqNum. A stale SeqNum causes the nonce reconstructed on ReadAt to diverge
-// from the seal nonce, making AES-GCM tag verification fail with ErrIntegrity.
+// createChunkFile (mulga-be2ev): the recorded BlockLookup.SeqNum must match
+// the seal-time SeqNum, or the nonce reconstructed on ReadAt diverges from the
+// seal nonce and AES-GCM tag verification fails with ErrIntegrity.
+//
+// Chunk uploads within a drain now run on a bounded parallel worker pool
+// (mulga-edou7 §7), so SaveLiveCheckpoint is no longer called per-chunk from
+// inside createChunkFile — N concurrent chunks would race N concurrent
+// checkpoint PUTs. It is instead coalesced to exactly one call per drain pass:
+// DrainToBackendCtx (and, like it, any direct WriteWALToChunk caller that
+// needs the checkpoint current) calls SaveLiveCheckpoint once after every
+// chunk in the pass has been persisted. This test exercises that contract
+// directly: WriteWALToChunk followed by an explicit SaveLiveCheckpoint.
 //
 // This mirrors the crash/remount scenario: a VB drains to a chunk, then a
 // "remounted" VB loads the live checkpoint and reads the same blocks back via
@@ -397,8 +405,8 @@ func TestEncryptedChunk_LiveCheckpointSeqNumConsistency(t *testing.T) {
 	dir := t.TempDir()
 	key := testKey(t, 0x77)
 
-	// Writer: seal blocks into a chunk. Our fix has createChunkFile call
-	// SaveLiveCheckpoint immediately after updating BlockLookup.
+	// Writer: seal blocks into a chunk, then refresh the live checkpoint —
+	// the same two-step contract DrainToBackendCtx/Close/CreateSnapshot use.
 	writer := openEncryptedVBInDir(t, dir, "seqnum-consistency", key)
 	defer writer.StopChunkUploader()
 
@@ -407,8 +415,8 @@ func TestEncryptedChunk_LiveCheckpointSeqNumConsistency(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writer.Write(0, data))
 	require.NoError(t, writer.Flush())
-	// WriteWALToChunk → createChunkFile → SaveLiveCheckpoint (ordering fix).
 	require.NoError(t, writer.WriteWALToChunk(true))
+	require.NoError(t, writer.SaveLiveCheckpoint())
 
 	// Remount: fresh VB over the same backend loading only from the live
 	// checkpoint — no in-memory write buffer. This is what happens on remount

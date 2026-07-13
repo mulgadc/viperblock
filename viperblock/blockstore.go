@@ -166,6 +166,48 @@ func (ubs *UnifiedBlockStore) ReadSingle(blockNum uint64) ([]byte, BlockState, e
 	return nil, BlockStateEmpty, ErrZeroBlock
 }
 
+// ReadEntry returns a full snapshot of a block's entry (state, data, and
+// persisted location) captured under a single lock acquisition. Callers that
+// need more than just the state — in particular the Persisted location — must
+// use this instead of ReadSingle followed by a separate ReadBlock call: two
+// separate lock acquisitions leave a window where a concurrent rewrite (guest
+// WriteAt racing a chunk upload) changes the entry between the two reads,
+// handing back a state from before the rewrite paired with a location/seqNum
+// from after it. The read then reconstructs the wrong AEAD nonce from that
+// torn pair and fails integrity ("cipher: message authentication failed").
+// Higher chunk-upload concurrency widens this window, so a single atomic
+// snapshot is required rather than narrowing it and hoping.
+func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
+	shard := ubs.getShard(blockNum)
+	shard.mu.RLock()
+	entry, exists := shard.entries[blockNum]
+	var snapshot BlockEntry
+	if exists {
+		snapshot = *entry
+	}
+	shard.mu.RUnlock()
+
+	ubs.stats.Reads.Add(1)
+	if !exists {
+		ubs.stats.CacheMiss.Add(1)
+		return snapshot, false
+	}
+
+	switch snapshot.State {
+	case BlockStateHot:
+		ubs.stats.HotReads.Add(1)
+	case BlockStatePending:
+		ubs.stats.PendReads.Add(1)
+	case BlockStateCached:
+		ubs.stats.CacheHits.Add(1)
+	case BlockStatePersisted:
+		ubs.stats.BackendReads.Add(1)
+	default:
+		ubs.stats.CacheMiss.Add(1)
+	}
+	return snapshot, true
+}
+
 // Write stores a block in the Hot state and returns the assigned sequence number
 // The index is updated immediately (not rebuilt on read)
 func (ubs *UnifiedBlockStore) Write(blockNum uint64, data []byte) uint64 {
