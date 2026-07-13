@@ -86,6 +86,15 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 		if err := vb.WriteWALToChunk(true); err != nil {
 			return nil, fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
 		}
+
+		// Chunk uploads no longer refresh the live checkpoint per-chunk (that
+		// was a parallel-upload hazard, see createChunkFile). Refresh it once
+		// here so the source volume's live checkpoint reflects the chunks
+		// just uploaded, same as DrainToBackendCtx does after its own drain.
+		// Non-fatal: a stale live checkpoint self-heals on the next drain.
+		if err := vb.SaveLiveCheckpoint(); err != nil {
+			vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
+		}
 	}
 
 	// 2. Serialize the current block-to-object map as the snapshot checkpoint.

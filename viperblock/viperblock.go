@@ -48,6 +48,10 @@ const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 // to backend ingest rate instead of ballooning unbounded anonymous memory.
 const DefaultMaxPendingBytes uint64 = 256 * 1024 * 1024
 
+// DefaultUploadWorkers bounds the parallel chunk-upload worker pool used by
+// WriteWALToChunkCtx / WriteShardedWALToChunkCtx. 1 means fully serial.
+const DefaultUploadWorkers int = 16
+
 // seqNumReservation is the size of each SeqNum high-water reservation window.
 // reserveSeqNum hands out values lock-free via atomic.Add until the persisted
 // high-water is crossed; the slow path advances by seqNumReservation and
@@ -114,6 +118,11 @@ type VB struct {
 
 	FlushInterval time.Duration
 	FlushSize     uint32
+
+	// UploadWorkers bounds the parallel chunk-upload worker pool used when
+	// draining WAL/ShardedWAL to backend chunks. 0 uses DefaultUploadWorkers;
+	// 1 runs uploads serially. Negative values are clamped to 1 in New().
+	UploadWorkers int
 
 	// WALSyncInterval controls periodic fsync of WAL to disk (default 200ms)
 	// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
@@ -676,6 +685,13 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.MaxPendingBytes = DefaultMaxPendingBytes
 	}
 
+	// UploadWorkers: 0 means use default, negative is clamped to 1 (serial).
+	if config.UploadWorkers == 0 {
+		config.UploadWorkers = DefaultUploadWorkers
+	} else if config.UploadWorkers < 0 {
+		config.UploadWorkers = 1
+	}
+
 	// WALSyncInterval: 0 means use default, negative means disabled
 	if config.WALSyncInterval == 0 {
 		config.WALSyncInterval = DefaultWALSyncInterval
@@ -724,6 +740,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		FlushInterval:       config.FlushInterval,
 		FlushSize:           config.FlushSize,
 		MaxPendingBytes:     config.MaxPendingBytes,
+		UploadWorkers:       config.UploadWorkers,
 		WALSyncInterval:     config.WALSyncInterval,
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		Writes:              Blocks{},
@@ -1878,6 +1895,99 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 	return block, nil
 }
 
+// chunkJob is one unit of work for the parallel chunk uploader: a filled
+// chunk buffer plus the blocks it contains, ready for createChunkFile.
+type chunkJob struct {
+	buf    []byte
+	blocks []Block
+}
+
+// parallelUploader bounds concurrent createChunkFile calls to vb.UploadWorkers
+// in-flight jobs. Combined with the existing guest-write MaxPendingBytes
+// backpressure gate, this keeps memory bounded during a drain. The first
+// worker error cancels the derived context so in-flight createChunkFile calls
+// (and the Backend.WriteCtx they drive) unwind promptly instead of continuing
+// to push chunks that will just be discarded on drain failure.
+type parallelUploader struct {
+	vb       *VB
+	walNum   uint64
+	workChan chan chunkJob
+	wg       sync.WaitGroup
+	cancel   context.CancelFunc
+	errOnce  sync.Once
+	firstErr error
+	failed   atomic.Bool
+}
+
+// newParallelUploader starts vb.UploadWorkers goroutines (1 if UploadWorkers
+// is unset/invalid) draining a bounded work channel into createChunkFile for
+// the given walNum. Returns the uploader and a context derived from ctx that
+// is canceled on the first worker error; callers do not need to use the
+// returned context themselves (submit/wait handle it), but createChunkFile
+// receives it so backend writes fail fast after a sibling chunk's error.
+func (vb *VB) newParallelUploader(ctx context.Context, walNum uint64) (*parallelUploader, context.Context) {
+	workers := vb.UploadWorkers
+	if workers <= 0 {
+		workers = DefaultUploadWorkers
+	}
+
+	jobCtx, cancel := context.WithCancel(ctx)
+
+	u := &parallelUploader{
+		vb:       vb,
+		walNum:   walNum,
+		workChan: make(chan chunkJob, workers),
+		cancel:   cancel,
+	}
+
+	u.wg.Add(workers)
+	for range workers {
+		go func() {
+			defer u.wg.Done()
+			for job := range u.workChan {
+				if err := vb.createChunkFile(jobCtx, u.walNum, &job.buf, &job.blocks); err != nil {
+					u.errOnce.Do(func() {
+						u.firstErr = err
+						u.failed.Store(true)
+						cancel()
+					})
+				}
+			}
+		}()
+	}
+
+	return u, jobCtx
+}
+
+// submit copies buf and blocks into fresh slices, then hands the copy to a
+// worker. The copy is required: the caller (WriteWALToChunkCtx /
+// WriteShardedWALToChunkCtx) resets/reuses those backing arrays for the next
+// chunk immediately after calling submit. No-op once an earlier job in this
+// drain pass has failed — the derived context is already canceled, so there
+// is nothing to gain from queuing more chunk uploads.
+func (u *parallelUploader) submit(buf []byte, blocks []Block) {
+	if u.failed.Load() {
+		return
+	}
+
+	bufCopy := make([]byte, len(buf))
+	copy(bufCopy, buf)
+	blocksCopy := make([]Block, len(blocks))
+	copy(blocksCopy, blocks)
+
+	u.workChan <- chunkJob{buf: bufCopy, blocks: blocksCopy}
+}
+
+// wait closes the work channel, waits for all in-flight uploads to finish,
+// and returns the first error encountered across all workers (nil if every
+// chunk uploaded successfully).
+func (u *parallelUploader) wait() error {
+	close(u.workChan)
+	u.wg.Wait()
+	u.cancel()
+	return u.firstErr
+}
+
 // WriteShardedWALToChunk consolidates all shard files into unified 4MB chunks.
 // It briefly locks all shards to rotate to the next generation, then reads
 // the closed shard files in parallel, deduplicates, sorts, and creates chunks.
@@ -2092,9 +2202,11 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 	}
 	sort.Slice(sortedBlocks, func(i, j int) bool { return sortedBlocks[i].Block < sortedBlocks[j].Block })
 
-	// Create 4MB chunks
+	// Create 4MB chunks, uploaded via a bounded parallel worker pool.
 	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
 	matchedBlocks := make([]Block, 0)
+
+	up, _ := vb.newParallelUploader(ctx, currentWALNum)
 
 	for _, block := range sortedBlocks {
 		chunkBuffer = append(chunkBuffer, block.Data...)
@@ -2104,21 +2216,19 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 		})
 
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
-			if err != nil {
-				return fmt.Errorf("failed to create chunk file: %w", err)
-			}
+			up.submit(chunkBuffer, matchedBlocks)
 			chunkBuffer = chunkBuffer[:0]
 			matchedBlocks = make([]Block, 0)
 		}
 	}
 
-	// Write remaining data
+	// Submit remaining data
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
-		if err != nil {
-			return fmt.Errorf("failed to create final chunk file: %w", err)
-		}
+		up.submit(chunkBuffer, matchedBlocks)
+	}
+
+	if err := up.wait(); err != nil {
+		return fmt.Errorf("failed to create chunk file: %w", err)
 	}
 
 	return nil
@@ -2316,6 +2426,8 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	var chunkBuffer = make([]byte, 0, vb.ObjBlockSize)
 	var matchedBlocks = make([]Block, 0)
 
+	up, ctx := vb.newParallelUploader(ctx, currentWALNum)
+
 	for _, block := range sortedBlocks {
 		chunkBuffer = append(chunkBuffer, block.Data...)
 		matchedBlocks = append(matchedBlocks, Block{
@@ -2323,117 +2435,27 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 			Block:  block.Block,
 		})
 
-		// If buffer is full (default 4MB), write to file
+		// If buffer is full (default 4MB), submit for upload
 		if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-			err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
-			if err != nil {
-				vb.logger().ErrorContext(ctx, "Failed to create chunk file", "error", err)
-				//vb.WAL.mu.Unlock()
+			up.submit(chunkBuffer, matchedBlocks)
 
-				return err
-			}
-
-			chunkBuffer = chunkBuffer[:0] // Reset bufferAdd commentMore actions
+			chunkBuffer = chunkBuffer[:0] // Reset buffer
 			matchedBlocks = make([]Block, 0)
 		}
 	}
 
-	// Write any remaining data as the last chunkAdd commentMore actions
+	// Submit any remaining data as the last chunk
 	if len(chunkBuffer) > 0 {
-		err := vb.createChunkFile(ctx, currentWALNum, &chunkBuffer, &matchedBlocks)
-		if err != nil {
-			vb.logger().ErrorContext(ctx, "Failed to create chunk file", "error", err)
+		up.submit(chunkBuffer, matchedBlocks)
+	}
 
-			return err
-		}
+	if err := up.wait(); err != nil {
+		vb.logger().ErrorContext(ctx, "Failed to create chunk file", "error", err)
+		return err
 	}
 
 	return nil
 }
-
-// Create work channel and result channel
-/*
-		workChan := make(chan ChunkWork, runtime.NumCPU())
-		resultChan := make(chan error, runtime.NumCPU())
-
-		// Create worker pool
-		numWorkers := runtime.NumCPU()
-		var wg sync.WaitGroup
-		wg.Add(numWorkers)
-
-		// Start workers
-		for i := 0; i < numWorkers; i++ {
-			go func() {
-				defer wg.Done()
-				for work := range workChan {
-					err := vb.createChunkFile(work.currentWALNum, vb.ObjectNum.Load(), &work.chunkBuffer, &work.matchedBlocks)
-					resultChan <- err
-				}
-			}()
-		}
-
-		// Prepare chunks and send to workers
-		chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
-		matchedBlocks := make([]Block, 0, len(sortedBlocks))
-		chunkIndex := uint64(0)
-
-		for _, block := range sortedBlocks {
-			chunkBuffer = append(chunkBuffer, block.Data...)
-			matchedBlocks = append(matchedBlocks, Block{
-				SeqNum: block.SeqNum,
-				Block:  block.Block,
-			})
-
-			if len(chunkBuffer) >= int(vb.ObjBlockSize) {
-				// Create copies for the worker
-				chunkBufferCopy := make([]byte, len(chunkBuffer))
-				copy(chunkBufferCopy, chunkBuffer)
-				matchedBlocksCopy := make([]Block, len(matchedBlocks))
-				copy(matchedBlocksCopy, matchedBlocks)
-
-				workChan <- ChunkWork{
-					currentWALNum: currentWALNum,
-					chunkBuffer:   chunkBufferCopy,
-					matchedBlocks: matchedBlocksCopy,
-				}
-
-				chunkBuffer = chunkBuffer[:0]
-				matchedBlocks = matchedBlocks[:0]
-				chunkIndex++
-			}
-		}
-
-		// Handle remaining data
-		if len(chunkBuffer) > 0 {
-			chunkBufferCopy := make([]byte, len(chunkBuffer))
-			copy(chunkBufferCopy, chunkBuffer)
-			matchedBlocksCopy := make([]Block, len(matchedBlocks))
-			copy(matchedBlocksCopy, matchedBlocks)
-
-			workChan <- ChunkWork{
-				currentWALNum: currentWALNum,
-				chunkBuffer:   chunkBufferCopy,
-				matchedBlocks: matchedBlocksCopy,
-			}
-		}
-
-		// Close work channel and wait for workers
-		close(workChan)
-		wg.Wait()
-		close(resultChan)
-
-		// Check for errors
-		for err := range resultChan {
-			if err != nil {
-				return err
-			}
-		}
-
-
-	return nil
-}
-*/
-
 func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
@@ -2554,16 +2576,14 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 	vb.BlocksToObject.mu.Unlock()
 
-	// Flush the updated block→chunk mapping to S3 immediately after each chunk
-	// upload so the live checkpoint stays consistent with what is in S3. This
-	// shrinks the window in which a crash can leave the checkpoint pointing at a
-	// stale seqNum relative to the just-uploaded chunk ciphertext (the remaining
-	// window is the gap between Backend.Write and this call, not the full 30s
-	// background-uploader interval). Non-fatal: DrainToBackend will retry at the
-	// end of the current cycle regardless.
-	if cpErr := vb.SaveLiveCheckpointCtx(ctx); cpErr != nil {
-		vb.logger().WarnContext(ctx, "createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
-	}
+	// The live checkpoint save moved out of the per-chunk path: with chunks
+	// now uploaded by a parallel worker pool, N concurrent createChunkFile
+	// calls would race N concurrent checkpoint PUTs, and a slower PUT could
+	// land after a faster one and leave the checkpoint pointing at a stale
+	// seqNum relative to the just-uploaded chunk ciphertext. DrainToBackendCtx
+	// saves exactly one checkpoint after every chunk in the drain pass has
+	// been persisted (up.wait() returns), giving one consistent snapshot per
+	// drain instead of racy per-chunk ones.
 
 	return nil
 }
@@ -3093,6 +3113,16 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 	}
 	if err := vb.SaveBlockState(); err != nil {
 		return fmt.Errorf("WAL recovery: failed to save block state: %w", err)
+	}
+
+	// Chunk uploads no longer refresh the live checkpoint per-chunk (that was
+	// a parallel-upload hazard, see createChunkFile). Refresh it once here so
+	// it reflects the just-recovered blocks: a subsequent Open always prefers
+	// the live checkpoint over the numbered one just saved above, and the
+	// recovered WAL files are removed below, so a stale live checkpoint here
+	// would silently lose this recovery's blocks on a second crash.
+	if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
+		vb.logger().Warn("WAL recovery: SaveLiveCheckpoint failed", "err", cpErr)
 	}
 
 	// Remove only successfully-read WAL files (keep failed ones for retry)
@@ -4065,6 +4095,16 @@ func (vb *VB) Close() error {
 	}
 	if walErr != nil {
 		vb.logger().Error("Could not Write WAL to Chunk during Close, proceeding to save block state", "err", walErr)
+	} else {
+		// Chunk uploads no longer refresh the live checkpoint per-chunk (that
+		// was a parallel-upload hazard, see createChunkFile). Refresh it once
+		// here so a subsequent Open's LoadLiveCheckpoint (which is always
+		// preferred over the numbered checkpoint saved below) reflects the
+		// chunks just uploaded during this Close. Non-fatal: SaveBlockState
+		// below still persists the same map to the numbered checkpoint.
+		if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
+			vb.logger().Warn("Close: SaveLiveCheckpoint failed", "err", cpErr)
+		}
 	}
 
 	path := fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, vb.GetVolume())
@@ -4303,24 +4343,27 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)
 
-		// O(1) lookup using BlockStore
-		blockData, state, err := vb.BlockStore.ReadSingle(currentBlock)
+		// O(1) lookup using BlockStore. A single atomically-captured snapshot
+		// (state + data + persisted location together) — NOT ReadSingle
+		// followed by a separate ReadBlock call, which would leave a window
+		// for a concurrent rewrite to change the entry between the two reads
+		// and hand back a torn (stale-state, fresh-location) pair. See
+		// ReadEntry's doc comment.
+		entry, exists := vb.BlockStore.ReadEntry(currentBlock)
+		state := entry.State
+		if !exists {
+			state = BlockStateEmpty
+		}
 
 		switch state {
 		case BlockStateHot, BlockStatePending, BlockStateCached:
 			// Data is available in memory: a cache hit.
 			telemetry.RecordCacheLookup(ctx, true)
-			copy(data[start:end], blockData)
+			copy(data[start:end], entry.Data)
 
 		case BlockStatePersisted:
 			// Need to fetch from backend: a cache miss.
 			telemetry.RecordCacheLookup(ctx, false)
-			entry, ok := vb.BlockStore.ReadBlock(currentBlock)
-			if !ok {
-				// Should not happen if state was Persisted
-				zeroBlockErr = ErrZeroBlock
-				continue
-			}
 
 			consecutiveBlocks = append(consecutiveBlocks, ConsecutiveBlock{
 				BlockPosition: i,
@@ -4375,9 +4418,9 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 			if ancFound {
 				continue
 			}
-			if errors.Is(err, ErrZeroBlock) {
-				zeroBlockErr = ErrZeroBlock
-			}
+			// ReadEntry's !exists / default-state paths both correspond to
+			// "no own-volume, base-map, or ancestor data for this block".
+			zeroBlockErr = ErrZeroBlock
 		}
 	}
 
