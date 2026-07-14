@@ -2577,17 +2577,14 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	vb.BlocksToObject.dirty.Store(true)
 	vb.BlocksToObject.mu.Unlock()
 
-	// Flush the updated block→chunk mapping to S3 immediately after each chunk
-	// upload so the live checkpoint stays consistent with what is in S3. This
-	// shrinks the window in which a crash can leave the checkpoint pointing at a
-	// stale seqNum relative to the just-uploaded chunk ciphertext (the remaining
-	// window is the gap between Backend.Write and this call, not the full 30s
-	// background-uploader interval). If this write fails, dirty remains set and
-	// DrainToBackend's trailing SaveLiveCheckpointCtx call will retry.
-	if cpErr := vb.SaveLiveCheckpointCtx(ctx); cpErr != nil {
-		slog.WarnContext(ctx, "createChunkFile: SaveLiveCheckpoint failed", "err", cpErr)
-	}
-
+	// Do NOT checkpoint per chunk here. createChunkFile runs under the parallel
+	// upload pool, so concurrent per-chunk SaveLiveCheckpointCtx calls can PUT
+	// out of snapshot order: a worker holding an early, partial map can land its
+	// write last and leave the live checkpoint pointing at a stale seqNum, which
+	// an encrypted reattach then decrypts as garbage (bad superblock). dirty is
+	// set above; the single serialized SaveLiveCheckpointCtx that every driver
+	// runs after up.wait() (DrainToBackendCtx, RecoverLocalWALs, Close) writes
+	// the complete coalesced map exactly once, after all chunk PUTs have landed.
 	return nil
 }
 
