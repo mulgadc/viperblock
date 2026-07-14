@@ -105,9 +105,12 @@ func TestCheckpointIdleGating(t *testing.T) {
 		"idle ticks must not PUT blocks.live.bin when no blocks changed")
 }
 
-// TestCheckpointWriteProportionality verifies that after a drain, checkpoint
-// PUTs equal chunk uploads (one per dirty chunk), and that subsequent idle
-// ticks do not add further writes.
+// TestCheckpointWriteProportionality verifies that a drain writes the live
+// checkpoint exactly once — a single coalesced PUT after all chunk uploads
+// land, regardless of chunk count — and that subsequent idle ticks add no
+// further writes. Per-chunk checkpointing was removed: concurrent per-chunk
+// PUTs from the parallel upload pool could land out of snapshot order and
+// leave a stale seqNum in the checkpoint (encrypted reattach bad superblock).
 func TestCheckpointWriteProportionality(t *testing.T) {
 	dir := t.TempDir()
 	// Slow ticker so it does not fire during the explicit drain below.
@@ -126,8 +129,8 @@ func TestCheckpointWriteProportionality(t *testing.T) {
 	chunkWrites := cb.count(types.FileTypeChunk)
 	cpWrites := cb.count(types.FileTypeBlockCheckpointLive)
 	require.Equal(t, 2, chunkWrites, "expected 2 chunk uploads")
-	assert.Equal(t, chunkWrites, cpWrites,
-		"checkpoint PUTs must equal chunk uploads, not tick count")
+	assert.Equal(t, 1, cpWrites,
+		"drain must write the live checkpoint once (coalesced), not per chunk")
 	assert.False(t, vb.BlocksToObject.dirty.Load(),
 		"dirty must be clear after successful drain")
 
