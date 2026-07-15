@@ -22,10 +22,9 @@ import (
 	"text/template"
 	"time"
 
-	awssdk "github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	predastoresvc "github.com/mulgadc/predastore/s3"
 )
@@ -352,18 +351,14 @@ func createBucket(endpoint string, opts Options) error {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test-only: self-signed cert on loopback
 		},
 	}
-	sess, err := session.NewSession(&awssdk.Config{
-		Region:           awssdk.String(opts.Region),
-		Endpoint:         awssdk.String("https://" + endpoint),
-		Credentials:      credentials.NewStaticCredentials(opts.AccessKey, opts.SecretKey, ""),
-		S3ForcePathStyle: awssdk.Bool(true),
-		HTTPClient:       httpClient,
+	client := awss3.New(awss3.Options{
+		Region:       opts.Region,
+		BaseEndpoint: awssdk.String("https://" + endpoint),
+		Credentials:  credentials.NewStaticCredentialsProvider(opts.AccessKey, opts.SecretKey, ""),
+		UsePathStyle: true,
+		HTTPClient:   httpClient,
 	})
-	if err != nil {
-		return fmt.Errorf("new aws session: %w", err)
-	}
-	client := awss3.New(sess)
-	_, err = client.CreateBucket(&awss3.CreateBucketInput{
+	_, err := client.CreateBucket(context.Background(), &awss3.CreateBucketInput{
 		Bucket: awssdk.String(opts.BucketName),
 	})
 	if err != nil {
