@@ -791,13 +791,15 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 
 	switch btype {
 	case "file":
-		// Use the same base dir as setupTestVB uses for the file backend.
-		// The VB.BaseDir is "{tmpDir}/viperblock" while the file backend's
-		// BaseDir is just tmpDir. Both must share the same storage root.
+		// Derive the backend root from the source rather than naming it, so the
+		// clone follows its source wherever that is rooted. setupTestVB roots
+		// the VB at "{tmpDir}/viperblock" and the file backend at tmpDir, so
+		// the source's parent is the storage root both must share for ReadFrom
+		// and OpenFromSnapshot to resolve the source's chunks.
 		cloneBackendConfig = file.FileConfig{
 			VolumeName: cloneName,
 			VolumeSize: source.VolumeSize,
-			BaseDir:    os.TempDir(),
+			BaseDir:    filepath.Dir(source.BaseDir),
 		}
 	case "s3":
 		// Reconstruct S3 config with the clone's volume name
@@ -826,6 +828,12 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 	clone, err := New(&vbconfig, btype, cloneBackendConfig)
 	require.NoError(t, err)
 
+	// Registered before the setup below can call FailNow, which would otherwise
+	// skip cleanup and leave the clone's VB tree behind.
+	t.Cleanup(func() {
+		assert.NoError(t, clone.RemoveLocalFiles())
+	})
+
 	err = clone.Backend.Init()
 	require.NoError(t, err)
 
@@ -843,10 +851,6 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 	// Load snapshot base map
 	err = clone.OpenFromSnapshot(snapshotID)
 	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		clone.RemoveLocalFiles()
-	})
 
 	return clone
 }
