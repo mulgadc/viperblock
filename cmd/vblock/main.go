@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 
@@ -36,39 +35,48 @@ func main() {
 	// Loop through required arguments
 
 	if *file == "" {
-		log.Fatalf("Required argument file is missing")
+		slog.Error("Required argument file is missing")
+		os.Exit(1)
 	}
 
 	if *size == 0 {
-		log.Fatalf("Required argument size is missing")
+		slog.Error("Required argument size is missing")
+		os.Exit(1)
 	}
 
 	if *volume == "" {
-		log.Fatalf("Required argument volume is missing")
+		slog.Error("Required argument volume is missing")
+		os.Exit(1)
 	}
 
 	if *bucket == "" {
-		log.Fatalf("Required argument bucket is missing")
+		slog.Error("Required argument bucket is missing")
+		os.Exit(1)
 	}
 
 	if *region == "" {
-		log.Fatalf("Required argument region is missing")
+		slog.Error("Required argument region is missing")
+		os.Exit(1)
 	}
 
 	if *access_key == "" {
-		log.Fatalf("Required argument access_key is missing")
+		slog.Error("Required argument access_key is missing")
+		os.Exit(1)
 	}
 
 	if *secret_key == "" {
-		log.Fatalf("Required argument secret_key is missing")
+		slog.Error("Required argument secret_key is missing")
+		os.Exit(1)
 	}
 
 	if *host == "" {
-		log.Fatalf("Required argument host is missing")
+		slog.Error("Required argument host is missing")
+		os.Exit(1)
 	}
 
 	if *base_dir == "" {
-		log.Fatalf("Required argument base_dir is missing")
+		slog.Error("Required argument base_dir is missing")
+		os.Exit(1)
 	}
 
 	var volumeConfig viperblock.VolumeConfig
@@ -77,20 +85,23 @@ func main() {
 		fmt.Println("Reading metadata from file", *metadata)
 		// Check file exists
 		if _, err := os.Stat(*metadata); os.IsNotExist(err) {
-			log.Fatalf("Metadata file %s does not exist", *metadata)
+			slog.Error("Metadata file does not exist", "path", *metadata)
+			os.Exit(1)
 		}
 
 		// Read the metadata file
 		metadata, err := os.ReadFile(*metadata)
 
 		if err != nil {
-			log.Fatalf("Failed to read metadata file: %v", err)
+			slog.Error("Failed to read metadata file", "error", err)
+			os.Exit(1)
 		}
 
 		// Parse the metadata
 		err = json.Unmarshal(metadata, &volumeConfig)
 		if err != nil {
-			log.Fatalf("Failed to parse metadata: %v", err)
+			slog.Error("Failed to parse metadata", "error", err)
+			os.Exit(1)
 		}
 	}
 
@@ -135,7 +146,8 @@ func main() {
 	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, *file)
 
 	if err != nil {
-		log.Fatalf("Failed to import disk image: %v", err)
+		slog.Error("Failed to import disk image", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("Successfully imported disk image to Viperblock store")

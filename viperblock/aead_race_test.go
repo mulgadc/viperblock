@@ -11,7 +11,7 @@ package viperblock
 import (
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,33 +88,33 @@ func TestConcurrentRMWWriteVsDrainAEAD(t *testing.T) {
 	// Partial-block writers: sub-block WriteAt forces the RMW read path.
 	for w := range 8 {
 		wg.Add(1)
-		go func(seed int64) {
+		go func(seed uint64) {
 			defer wg.Done()
-			rng := rand.New(rand.NewSource(seed))
+			rng := rand.New(rand.NewPCG(seed, seed))
 			payload := make([]byte, 256)
 			for !stop.Load() {
-				blk := uint64(rng.Intn(numBlocks))
+				blk := uint64(rng.IntN(numBlocks))
 				for i := range payload {
-					payload[i] = byte(rng.Intn(256))
+					payload[i] = byte(rng.IntN(256))
 				}
 				rec("write", vb.WriteAt(blk*blockSize+128, payload))
 			}
-		}(int64(w) + 1)
+		}(uint64(w) + 1)
 	}
 
 	// Readers: coalesced multi-block reads across the range.
 	for r := range 8 {
 		wg.Add(1)
-		go func(seed int64) {
+		go func(seed uint64) {
 			defer wg.Done()
-			rng := rand.New(rand.NewSource(seed))
+			rng := rand.New(rand.NewPCG(seed, seed))
 			for !stop.Load() {
-				blk := uint64(rng.Intn(numBlocks - 16))
-				span := uint64(1 + rng.Intn(16))
+				blk := uint64(rng.IntN(numBlocks - 16))
+				span := uint64(1 + rng.IntN(16))
 				_, err := vb.ReadAt(blk*blockSize, span*blockSize)
 				rec("read", err)
 			}
-		}(int64(r) + 101)
+		}(uint64(r) + 101)
 	}
 
 	// Concurrent drainers: mimic the uploader ticker + flush + snapshot drains

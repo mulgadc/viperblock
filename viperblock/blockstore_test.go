@@ -3,7 +3,7 @@ package viperblock
 import (
 	"bytes"
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -570,11 +570,12 @@ func BenchmarkBlockStore_RandomReadWrite(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		localData := make([]byte, 4096)
-		rng := rand.New(rand.NewSource(int64(counter.Add(1))))
+		seed := counter.Add(1)
+		rng := rand.New(rand.NewPCG(seed, seed))
 
 		for pb.Next() {
-			blockNum := uint64(rng.Intn(10000))
-			if rng.Intn(10) < 3 { // 30% writes
+			blockNum := uint64(rng.IntN(10000))
+			if rng.IntN(10) < 3 { // 30% writes
 				bs.Write(blockNum, localData)
 			} else {
 				bs.ReadSingle(blockNum)
