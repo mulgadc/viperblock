@@ -63,6 +63,18 @@ type InheritedLayer struct {
 // under {snapshotID}/. No data is copied -- the snapshot references the
 // source volume's existing chunk files.
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
+	// Latch chunk GC off permanently for this instance the moment a
+	// snapshot is created, regardless of outcome below. ensureGCSnapshotSafe
+	// only catches snapshots that existed (or were created by this same
+	// process) before it last scanned; a snapshot created by a call that
+	// races a sweep already in flight would otherwise be invisible to that
+	// cached result until the next scan, which may never happen once
+	// gcSnapshotChecked is cached true. This latch closes that specific gap
+	// unconditionally rather than depending on scan timing.
+	if vb.GCEnabled && vb.gcLatchedOff.CompareAndSwap(false, true) {
+		vb.logger().Warn("chunk GC: disabled permanently, CreateSnapshot called on this volume", "volume", vb.VolumeName, "snapshotID", snapshotID)
+	}
+
 	vb.logger().Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
 
 	// 1. Flush hot writes to WAL and persist to chunks.

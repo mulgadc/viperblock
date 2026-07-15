@@ -18,6 +18,27 @@ type Backend interface {
 	ReadFromCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
 	WriteTo(volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	WriteToCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
+	// Delete removes an object from this backend's own volume. There is
+	// deliberately no DeleteTo/DeleteFrom cross-volume form: every deleter
+	// in this codebase (chunk GC) only ever deletes objects it minted
+	// itself, and adding a cross-volume delete verb would make it too easy
+	// for a future caller to reach across a volume boundary and remove
+	// something another volume still depends on.
+	Delete(fileType FileType, objectId uint64) (err error)
+	DeleteCtx(ctx context.Context, fileType FileType, objectId uint64) (err error)
+	// ListPrefixes returns the top-level names under prefix, one level deep
+	// (delimiter "/"), scoped to the whole backend rather than to any one
+	// volume — callers that need a single volume's own contents already
+	// know its name and do not need to list for it.
+	ListPrefixes(prefix string) (names []string, err error)
+	ListPrefixesCtx(ctx context.Context, prefix string) (names []string, err error)
+	// ListObjects returns every object's full key under prefix, recursively
+	// (no delimiter) — unlike ListPrefixes, which groups by the next path
+	// segment, this returns leaf keys directly. Used to reconcile a
+	// volume's own chunks/ directory against its in-memory state; callers
+	// needing directory-like grouping want ListPrefixes instead.
+	ListObjects(prefix string) (keys []string, err error)
+	ListObjectsCtx(ctx context.Context, prefix string) (keys []string, err error)
 	Sync()
 	GetBackendType() string
 	GetHost() string
