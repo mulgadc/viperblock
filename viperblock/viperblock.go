@@ -746,7 +746,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
-		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: [4]byte{'V', 'B', 'W', 'B'}},
+		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: blockToObjectWALMagic},
 		Cache: Cache{
 			lru: lruCache,
 			Config: CacheConfig{
@@ -1863,6 +1863,19 @@ func (vb *VB) WriteBlockWAL(blocks *[]BlockLookup) (err error) {
 // metadata because the checkpoint stays plaintext (not AEAD-sealed).
 const blockWalChunkSize = 34
 
+// blockToObjectWALMagic identifies a block-to-object checkpoint stream.
+//
+// Unlike the chunk and single-file-WAL magics, this one is NOT switched by
+// EncryptionEnabled: the block map is metadata and stays plaintext on both
+// encrypted and unencrypted volumes, so both write the same magic. That is
+// what lets a checkpoint be decoded from its bytes alone, with no volume
+// identity and no master key.
+var blockToObjectWALMagic = [4]byte{'V', 'B', 'W', 'B'}
+
+// blockCheckpointHeaderSize is the size of the header preceding the
+// blockWalChunkSize-sized records: magic(4) + Version(2) + Timestamp(8).
+const blockCheckpointHeaderSize = 14
+
 func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
 	data = make([]byte, blockWalChunkSize)
 
@@ -1878,7 +1891,15 @@ func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
 	return data
 }
 
-func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
+// decodeBlockWalChunk decodes one blockWalChunkSize-sized record and verifies
+// its CRC32. data must be exactly blockWalChunkSize bytes; callers slice it.
+// Receiver-free so the checkpoint format can be decoded without a VB — see
+// ParseBlockCheckpointBytes.
+func decodeBlockWalChunk(data []byte) (block BlockLookup, err error) {
+	if len(data) != blockWalChunkSize {
+		return block, fmt.Errorf("block record is %d bytes, want %d", len(data), blockWalChunkSize)
+	}
+
 	block.StartBlock = binary.BigEndian.Uint64(data[:8])
 	block.NumBlocks = binary.BigEndian.Uint16(data[8:10])
 	block.ObjectID = binary.BigEndian.Uint64(data[10:18])
@@ -1889,10 +1910,18 @@ func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
 
 	checksumValidated := crc32.ChecksumIEEE(data[:30])
 	if checksumValidated != checksum {
-		vb.logger().Error("Checksum mismatch", "checksum", checksum, "checksum_validated", checksumValidated)
-		return block, fmt.Errorf("checksum mismatch")
+		return block, fmt.Errorf("checksum mismatch: got %d, want %d", checksumValidated, checksum)
 	}
 
+	return block, nil
+}
+
+func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
+	block, err = decodeBlockWalChunk(data)
+	if err != nil {
+		vb.logger().Error("Block record decode failed", "error", err)
+		return block, err
+	}
 	return block, nil
 }
 
@@ -2674,6 +2703,68 @@ func (vb *VB) SaveBlockStateCtx(ctx context.Context) (err error) {
 	return err
 }
 
+// walkBlockCheckpoint validates a serialized block checkpoint's header
+// (magic + version) and calls fn once per decoded record, in on-disk order.
+//
+// Receiver-free and the single place the checkpoint wire format is parsed, so
+// every caller — in-process load, and out-of-process readers that have only
+// the bytes — decodes identically. Two copies of this loop drifting apart
+// would make one caller silently wrong with no test noticing.
+func walkBlockCheckpoint(raw []byte, version uint16, walMagic [4]byte, fn func(BlockLookup)) error {
+	if len(raw) < blockCheckpointHeaderSize {
+		return fmt.Errorf("checkpoint is %d bytes, shorter than the %d-byte header", len(raw), blockCheckpointHeaderSize)
+	}
+
+	if !bytes.Equal(raw[:4], walMagic[:]) {
+		return fmt.Errorf("magic mismatch: got %q, want %q", raw[:4], walMagic[:])
+	}
+
+	if got := binary.BigEndian.Uint16(raw[4:6]); got != version {
+		return fmt.Errorf("version mismatch: got %d, want %d", got, version)
+	}
+
+	// Reject a partial trailing record rather than reading up to it and
+	// returning a short map: the records are fixed-width, so a remainder
+	// means the bytes are truncated or not a checkpoint at all, and a
+	// silently-short referenced set is worse than a hard error.
+	dataSize := len(raw) - blockCheckpointHeaderSize
+	if dataSize%blockWalChunkSize != 0 {
+		return fmt.Errorf("checkpoint has %d trailing bytes (data section %d bytes is not a multiple of %d-byte records)",
+			dataSize%blockWalChunkSize, dataSize, blockWalChunkSize)
+	}
+
+	for offset := blockCheckpointHeaderSize; offset+blockWalChunkSize <= len(raw); offset += blockWalChunkSize {
+		block, err := decodeBlockWalChunk(raw[offset : offset+blockWalChunkSize])
+		if err != nil {
+			return fmt.Errorf("record at offset %d: %w", offset, err)
+		}
+		fn(block)
+	}
+
+	return nil
+}
+
+// ParseBlockCheckpointBytes decodes a block-to-object checkpoint into its
+// block map, keyed by StartBlock, from the raw bytes alone.
+//
+// This is the read-only, no-side-effect way to inspect a volume's referenced
+// chunk set. Constructing a VB to reach the same map is not equivalent: New()
+// creates directories and starts the WAL syncer and chunk uploader, and the
+// uploader writes to the backend — attaching a second writer to the volume
+// being inspected. This function touches nothing.
+//
+// No master key is required: the block map is metadata and is written
+// plaintext on encrypted volumes too (see blockToObjectWALMagic).
+func ParseBlockCheckpointBytes(raw []byte, version uint16) (map[uint64]BlockLookup, error) {
+	blocks := make(map[uint64]BlockLookup)
+	if err := walkBlockCheckpoint(raw, version, blockToObjectWALMagic, func(block BlockLookup) {
+		blocks[block.StartBlock] = block
+	}); err != nil {
+		return nil, err
+	}
+	return blocks, nil
+}
+
 // parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
 // Caller must hold BlocksToObject.mu (write).
 func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
@@ -2681,28 +2772,12 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 
 	vb.logger().Debug("Loaded checkpoint", "checkpoint", checkpoint)
 
-	headers := checkpoint[:vb.BlockToObjectWALHeaderSize()]
-
-	if !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]) {
-		return fmt.Errorf("magic mismatch")
-	}
-
-	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
-		return fmt.Errorf("version mismatch")
-	}
-
 	// Track the highest chunk ObjectID the map references so ObjectNum can be
 	// reconciled to max+1 below, mirroring SeqNum -> maxSeqNum in RecoverLocalWALs.
 	var maxObjectID uint64
 	haveObject := false
 
-	offset := vb.BlockToObjectWALHeaderSize()
-	for offset < len(checkpoint) {
-		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
-		if err != nil {
-			vb.logger().Error("Error reading block", "error", err)
-			return err
-		}
+	err := walkBlockCheckpoint(checkpoint, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
 		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
 		if !haveObject || block.ObjectID > maxObjectID {
 			maxObjectID = block.ObjectID
@@ -2711,7 +2786,10 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 		if vb.UseBlockStore && vb.BlockStore != nil {
 			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
 		}
-		offset += blockWalChunkSize
+	})
+	if err != nil {
+		vb.logger().Error("Error reading checkpoint", "error", err)
+		return err
 	}
 
 	// Runtime drains persist chunks but not config.json ObjectNum, so a re-Open can
@@ -4296,7 +4374,7 @@ func (vb *VB) BlockToObjectWALHeader() []byte {
 
 func (vb *VB) BlockToObjectWALHeaderSize() int {
 	// Magic bytes (4) + Version (2) + Timestamp (8)
-	return len(vb.BlockToObjectWAL.WALMagic) + binary.Size(vb.Version) + binary.Size(time.Now().Unix())
+	return blockCheckpointHeaderSize
 }
 
 func (vb *VB) ChunkHeader() []byte {
