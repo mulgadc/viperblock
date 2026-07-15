@@ -12,7 +12,6 @@ package viperblock
 import (
 	"bytes"
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -446,7 +445,7 @@ func TestEncryptedChunk_PreEncryptionMagicRejected(t *testing.T) {
 		"chunk magic mismatch must surface as ErrPreEncryptionFormat, not a generic ErrIntegrity")
 	// Should NOT be ErrIntegrity — the whole point of the preflight is
 	// to avoid the AEAD-open path on pre-encryption data.
-	assert.False(t, errors.Is(err, ErrIntegrity),
+	assert.NotErrorIs(t, err, ErrIntegrity,
 		"preflight must reject before AEAD open; got integrity error instead")
 }
 

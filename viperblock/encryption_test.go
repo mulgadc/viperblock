@@ -7,7 +7,6 @@ package viperblock
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,7 +123,7 @@ func TestWriteFileAtomic_RoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, updated, got)
 	_, err = os.Stat(path + ".tmp")
-	assert.True(t, errors.Is(err, os.ErrNotExist), "tmp file should not remain after rename")
+	assert.ErrorIs(t, err, os.ErrNotExist, "tmp file should not remain after rename")
 }
 
 // A remount on a node that never held the volume locally has no per-volume

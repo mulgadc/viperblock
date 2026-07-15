@@ -1,7 +1,6 @@
 package s3
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -124,10 +123,10 @@ func TestWrapNotFound(t *testing.T) {
 			}
 			assert.Error(t, got)
 			if tc.wantNotFound {
-				assert.True(t, errors.Is(got, os.ErrNotExist),
+				assert.ErrorIs(t, got, os.ErrNotExist,
 					"want os.ErrNotExist for %v, got %v", tc.in, got)
 			} else {
-				assert.False(t, errors.Is(got, os.ErrNotExist),
+				assert.NotErrorIs(t, got, os.ErrNotExist,
 					"unexpected os.ErrNotExist for %v", tc.in)
 			}
 		})

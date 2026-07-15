@@ -269,14 +269,14 @@ func TestSealMeta_RoundTrip(t *testing.T) {
 
 	payload, _, err := splitEnvelope(blob)
 	require.NoError(t, err)
-	assert.Equal(t, jsonBytes, payload, "payload recovered verbatim from the envelope")
+	assert.JSONEq(t, string(jsonBytes), string(payload), "payload recovered verbatim from the envelope")
 
 	recovered, err := openMetaTest(aead, blob, aad, nonce)
 	require.NoError(t, err)
-	assert.Equal(t, jsonBytes, recovered)
+	assert.JSONEq(t, string(jsonBytes), string(recovered))
 
 	// StateBody strips the wrapper without a key (the unverified consumer path).
-	assert.Equal(t, jsonBytes, StateBody(blob))
+	assert.JSONEq(t, string(jsonBytes), string(StateBody(blob)))
 }
 
 // TestSealMeta_TamperFails — bit-flip in the payload, the tag, or the

@@ -47,7 +47,7 @@ func TestCreateSnapshot(t *testing.T) {
 		baseMap, ident, err := vb.LoadSnapshotBlockMap(snapshotID)
 		require.NoError(t, err)
 		assert.Equal(t, vb.VolumeName, ident.SourceVolumeName)
-		assert.Equal(t, len(vb.BlocksToObject.BlockLookup), len(baseMap.BlockLookup))
+		assert.Len(t, baseMap.BlockLookup, len(vb.BlocksToObject.BlockLookup))
 
 		// Verify each block mapping matches
 		for block, lookup := range vb.BlocksToObject.BlockLookup {
@@ -552,7 +552,7 @@ func TestLiveCheckpointFallback(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		assert.Equal(t, len(vb.BlocksToObject.BlockLookup), len(reader.BlocksToObject.BlockLookup),
+		assert.Len(t, reader.BlocksToObject.BlockLookup, len(vb.BlocksToObject.BlockLookup),
 			"fallback must restore the full block map")
 
 		for blockNum, want := range vb.BlocksToObject.BlockLookup {
@@ -612,7 +612,7 @@ func TestLiveCheckpointRoundtrip(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		assert.Equal(t, len(vb.BlocksToObject.BlockLookup), len(reader.BlocksToObject.BlockLookup),
+		assert.Len(t, reader.BlocksToObject.BlockLookup, len(vb.BlocksToObject.BlockLookup),
 			"live checkpoint must contain all written blocks")
 
 		for blockNum, want := range vb.BlocksToObject.BlockLookup {
@@ -658,7 +658,7 @@ func TestObjectNumReconcileOnLoad(t *testing.T) {
 			}
 		}
 		vb.BlocksToObject.mu.RUnlock()
-		require.Greater(t, maxObjectID, uint64(0), "expected multiple chunks")
+		require.Positive(t, maxObjectID, "expected multiple chunks")
 
 		newReader := func() *VB {
 			return &VB{

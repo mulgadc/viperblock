@@ -131,7 +131,7 @@ func TestMiscBackendMethods(t *testing.T) {
 	backend := newTestBackend(t)
 
 	assert.Equal(t, "file", backend.GetBackendType())
-	assert.Equal(t, "", backend.GetHost())
+	assert.Empty(t, backend.GetHost())
 	assert.NoError(t, backend.Open("ignored"))
 	backend.Sync() // no-op, just must not panic
 

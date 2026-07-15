@@ -296,7 +296,7 @@ func TestShardedWAL_FlushDispatch(t *testing.T) {
 
 	// Verify blocks were written to shards (at least some should be dirty)
 	// After flush, all writes should have been drained
-	assert.Equal(t, 0, len(vb.Writes.Blocks))
+	assert.Empty(t, vb.Writes.Blocks)
 }
 
 func TestShardedWAL_SyncDirtyOnly(t *testing.T) {

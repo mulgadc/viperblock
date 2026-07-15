@@ -69,15 +69,15 @@ func TestFormatVolume(t *testing.T) {
 	// Allocate some blocks
 	blocks, err := sfs.AllocateBlocks(5)
 	assert.NoError(t, err)
-	assert.Equal(t, 5, len(blocks))
+	assert.Len(t, blocks, 5)
 
 	// Test FormatVolume
 	err = sfs.FormatVolume()
 	assert.NoError(t, err)
 
 	// Verify all blocks are free
-	assert.Equal(t, 10, len(sfs.Volume.Free))
-	assert.Equal(t, 0, len(sfs.Volume.Used))
+	assert.Len(t, sfs.Volume.Free, 10)
+	assert.Empty(t, sfs.Volume.Used)
 }
 
 func TestAllocateAndFreeBlocks(t *testing.T) {
@@ -91,7 +91,7 @@ func TestAllocateAndFreeBlocks(t *testing.T) {
 		// Test allocating blocks
 		blocks, err := sfs.AllocateBlocks(5)
 		assert.NoError(t, err)
-		assert.Equal(t, 5, len(blocks))
+		assert.Len(t, blocks, 5)
 
 		// Verify blocks are marked as used
 		for _, block := range blocks {
@@ -130,14 +130,14 @@ func TestFileOperations(t *testing.T) {
 		// Test creating a file
 		blocks, err := sfs.CreateFile("test.txt", uint64(viperblock.DefaultBlockSize)*2) // 2 blocks
 		assert.NoError(t, err)
-		assert.Equal(t, 2, len(blocks))
+		assert.Len(t, blocks, 2)
 
 		// Verify file exists in blocks map
 		block, exists := sfs.Blocks["test.txt"]
 		assert.True(t, exists)
 		assert.Equal(t, "test.txt", block.Filename)
 		assert.Equal(t, uint64(viperblock.DefaultBlockSize)*2, block.Size)
-		assert.Equal(t, 2, len(block.Blocks))
+		assert.Len(t, block.Blocks, 2)
 	})
 
 	t.Run("Delete File", func(t *testing.T) {
@@ -185,6 +185,6 @@ func TestStateOperations(t *testing.T) {
 
 		// Verify state was loaded correctly
 		assert.Equal(t, sfs.Volume.Name, newSFS.Volume.Name)
-		assert.Equal(t, len(sfs.Blocks), len(newSFS.Blocks))
+		assert.Len(t, newSFS.Blocks, len(sfs.Blocks))
 	})
 }

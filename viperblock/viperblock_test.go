@@ -648,7 +648,7 @@ func TestWriteAndRead(t *testing.T) {
 
 				// Confirm inflight cache has the correct number of blocks
 				expectedInflight := len(tc.data) / int(vb.BlockSize)
-				assert.Equal(t, expectedInflight, len(vb.PendingBackendWrites.Blocks))
+				assert.Len(t, vb.PendingBackendWrites.Blocks, expectedInflight)
 
 				// Write a new request while inflight, should be stored in our HOT cache
 				inflightWrite := make([]byte, DefaultBlockSize)
@@ -670,14 +670,14 @@ func TestWriteAndRead(t *testing.T) {
 				assert.NoError(t, err)
 
 				// Confirm HOT cache has the one write after the flush
-				assert.Equal(t, 1, len(vb.Writes.Blocks))
+				assert.Len(t, vb.Writes.Blocks, 1)
 
 				// Flush again, so not to interfere with the next test
 				err = vb.Flush()
 				assert.NoError(t, err)
 
 				// Confirm single inflight write exists
-				assert.Equal(t, 1, len(vb.PendingBackendWrites.Blocks))
+				assert.Len(t, vb.PendingBackendWrites.Blocks, 1)
 
 				// Next, upload chunk to the backend
 				err = vb.WriteWALToChunk(true)
@@ -888,7 +888,7 @@ func TestWriteWALTruncatesOnShortWrite(t *testing.T) {
 		st, err := os.Stat(walPath)
 		require.NoError(t, err)
 		boundarySize := st.Size()
-		require.Greater(t, boundarySize, int64(0))
+		require.Positive(t, boundarySize)
 
 		// Close the active WAL handle to deterministically trigger an error
 		// on the next Write. WriteWAL must surface that error and must NOT
@@ -1250,7 +1250,7 @@ func TestBlockLookup(t *testing.T) {
 			for _, block := range []uint64{0, 1, 2} {
 				objectID, objectOffset, _, err := vb.LookupBlockToObject(block)
 				assert.NoError(t, err)
-				assert.Equal(t, objectID, uint64(0))
+				assert.Equal(t, uint64(0), objectID)
 				offset := vb.BlockSize*uint32(block) + uint32(headersLen)
 				assert.Equal(t, offset, objectOffset)
 				//t.Log("offset", offset, "objectOffset", objectOffset)
@@ -1569,7 +1569,7 @@ func TestCacheConfiguration(t *testing.T) {
 			assert.NoError(t, err)
 			assert.True(t, vb.Cache.Config.UseSystemMemory)
 			assert.Equal(t, 50, vb.Cache.Config.SystemMemoryPercent)
-			assert.Greater(t, vb.Cache.Config.Size, 0)
+			assert.Positive(t, vb.Cache.Config.Size)
 
 			// Test invalid percentages
 			err = vb.SetCacheSystemMemory(0)
@@ -2163,7 +2163,7 @@ func TestRecoverLocalWALsSeqNumAdvancement(t *testing.T) {
 
 			// Record the SeqNum before crash
 			precrashSeqNum := vb.SeqNum.Load()
-			require.Greater(t, precrashSeqNum, uint64(0), "SeqNum should be non-zero after writes")
+			require.Positive(t, precrashSeqNum, "SeqNum should be non-zero after writes")
 
 			// Simulate crash: reset in-memory state
 			vb.BlocksToObject.mu.Lock()
@@ -2348,7 +2348,7 @@ func TestRecoverLocalWALsBlockStoreSync(t *testing.T) {
 				if exists {
 					assert.Equal(t, BlockStatePersisted, entry.State,
 						"Block %d should be in Persisted state", i)
-					assert.Greater(t, entry.SeqNum, uint64(0),
+					assert.Positive(t, entry.SeqNum,
 						"Block %d should have non-zero SeqNum in BlockStore", i)
 				}
 			}
@@ -2435,7 +2435,7 @@ func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
 			// Corrupt files should NOT be deleted (kept for retry)
 			entries, err = os.ReadDir(walDir)
 			require.NoError(t, err)
-			assert.Equal(t, 2, len(entries), "Corrupt WAL files should be kept for retry")
+			assert.Len(t, entries, 2, "Corrupt WAL files should be kept for retry")
 		})
 	})
 }
