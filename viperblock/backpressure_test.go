@@ -3,7 +3,6 @@ package viperblock
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,7 +39,7 @@ func (s *slowBackend) WriteCtx(ctx context.Context, fileType types.FileType, obj
 func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time.Duration) *VB {
 	t.Helper()
 
-	tmpDir := os.TempDir()
+	tmpDir := t.TempDir()
 	testVol := fmt.Sprintf("test_backpressure_%d", time.Now().UnixNano())
 
 	backendConfig := file.FileConfig{
@@ -68,6 +67,12 @@ func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time
 	require.NoError(t, err)
 	require.NotNil(t, vb)
 
+	// Registered before the setup below can call FailNow, which would otherwise
+	// skip cleanup and leave the VB tree behind.
+	t.Cleanup(func() {
+		assert.NoError(t, vb.RemoveLocalFiles())
+	})
+
 	vb.UseShardedWAL = false
 	vb.ShardedWAL = nil
 
@@ -76,10 +81,6 @@ func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time
 
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
-
-	t.Cleanup(func() {
-		_ = vb.RemoveLocalFiles()
-	})
 
 	return vb
 }

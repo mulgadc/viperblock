@@ -164,9 +164,13 @@ func loadTestCredentials() (accessKey, secretKey string) {
 
 // setupTestVB creates a new VB instance for testing with the specified backend
 func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
-	// Create a temporary directory for test data
-	//tmpDir, err := os.MkdirTemp("", "viperblock_test_*")
-	tmpDir := os.TempDir()
+	// Per-test storage root shared by both trees: the file backend is rooted at
+	// tmpDir and creates "{tmpDir}/{volume}", while the VB is rooted at
+	// "{tmpDir}/viperblock". RemoveLocalFiles() only owns the VB tree, so the
+	// root must be a t.TempDir() for the backend tree to be cleaned up too.
+	// createCloneVB re-derives this root from source.BaseDir, so a clone and its
+	// source resolve each other's chunks only while this layout holds.
+	tmpDir := t.TempDir()
 	testVol := fmt.Sprintf("test_volume_%d", time.Now().UnixNano())
 
 	t.Cleanup(func() {
@@ -176,8 +180,6 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 			err = vb.RemoveLocalFiles()
 
 			assert.NoError(t, err)
-
-			//os.RemoveAll(fmt.Sprintf("%s/%s", tmpDir, testVol))
 		}
 	})
 
@@ -359,11 +361,16 @@ func runWithBackends(t *testing.T, testName string, testFunc func(t *testing.T, 
 }
 
 func TestNew(t *testing.T) {
+	// New() creates "{BaseDir}/{volume}" itself, so both roots are explicit
+	// here: an unset VB.BaseDir would default to the shared /tmp/viperblock,
+	// and a relative backend BaseDir would resolve inside the repo.
+	tmpDir := t.TempDir()
+
 	testCases := []TestVB{
 		{
 			name: "file",
 			config: file.FileConfig{
-				BaseDir:    "test_data",
+				BaseDir:    filepath.Join(tmpDir, "test_data"),
 				VolumeName: "test_s3",
 				VolumeSize: volumeSize,
 			},
@@ -388,7 +395,7 @@ func TestNew(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			vb, err := New(&VB{VolumeName: "test", VolumeSize: 1024 * 1024}, tc.name, tc.config)
+			vb, err := New(&VB{VolumeName: "test", VolumeSize: 1024 * 1024, BaseDir: filepath.Join(tmpDir, "viperblock")}, tc.name, tc.config)
 			assert.NoError(t, err)
 			assert.NotNil(t, vb)
 			assert.Equal(t, tc.blockSize, vb.BlockSize)
@@ -908,7 +915,7 @@ func TestWriteWALTruncatesOnShortWrite(t *testing.T) {
 // registered with t.Cleanup.
 func setupWALTruncateTestVB(t *testing.T, tag string) (*VB, string) {
 	t.Helper()
-	tmpDir := os.TempDir()
+	tmpDir := t.TempDir()
 	testVol := fmt.Sprintf("test_wal_truncate_%s_%d", tag, time.Now().UnixNano())
 
 	backendConfig := file.FileConfig{
@@ -932,7 +939,6 @@ func setupWALTruncateTestVB(t *testing.T, tag string) (*VB, string) {
 
 	t.Cleanup(func() {
 		vb.StopWALSyncer()
-		os.RemoveAll(filepath.Join(vb.BaseDir, testVol))
 	})
 
 	require.NoError(t, vb.Backend.Init())
@@ -947,7 +953,7 @@ func setupWALTruncateTestVB(t *testing.T, tag string) (*VB, string) {
 // TestWALPeriodicSync tests the periodic WAL fsync functionality
 // following patterns from PostgreSQL (wal_writer_delay), BadgerDB, and MongoDB
 func TestWALPeriodicSync(t *testing.T) {
-	tmpDir := os.TempDir()
+	tmpDir := t.TempDir()
 
 	testCases := []struct {
 		name            string
@@ -994,7 +1000,6 @@ func TestWALPeriodicSync(t *testing.T) {
 
 			t.Cleanup(func() {
 				vb.StopWALSyncer()
-				os.RemoveAll(filepath.Join(vb.BaseDir, testVol))
 			})
 
 			// Verify syncer state matches expectation
@@ -1085,7 +1090,7 @@ func TestWALPeriodicSync(t *testing.T) {
 
 // TestWALSyncerConcurrency tests that the syncer handles concurrent writes correctly
 func TestWALSyncerConcurrency(t *testing.T) {
-	tmpDir := os.TempDir()
+	tmpDir := t.TempDir()
 	testVol := fmt.Sprintf("test_wal_sync_concurrent_%d", time.Now().UnixNano())
 
 	backendConfig := file.FileConfig{
@@ -1106,7 +1111,6 @@ func TestWALSyncerConcurrency(t *testing.T) {
 
 	t.Cleanup(func() {
 		vb.StopWALSyncer()
-		os.RemoveAll(filepath.Join(vb.BaseDir, testVol))
 	})
 
 	err = vb.Backend.Init()
