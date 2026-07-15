@@ -28,7 +28,7 @@ type Backend interface {
 	SetLogger(logger *slog.Logger)
 }
 
-// FileType represents the type of file being written to S3
+// FileType represents the type of file being written to S3.
 type FileType int
 
 const (
@@ -42,7 +42,7 @@ const (
 	FileTypeBlockCheckpointLive
 )
 
-// getFilePath returns the appropriate S3 path based on file type and objectId
+// getFilePath returns the appropriate S3 path based on file type and objectId.
 func GetFilePath(fileType FileType, objectId uint64, volumeName string) string {
 	switch fileType {
 	case FileTypeConfig:

@@ -24,22 +24,22 @@ type Arena struct {
 	totalBytes  atomic.Uint64
 }
 
-// ArenaSlab is a contiguous memory region for block allocations
+// ArenaSlab is a contiguous memory region for block allocations.
 type ArenaSlab struct {
 	data   []byte
 	offset uint32
 	refs   atomic.Int32 // Reference count for blocks in this slab
 }
 
-// DefaultSlabSize is 4MB - matches ObjBlockSize for efficiency
+// DefaultSlabSize is 4MB - matches ObjBlockSize for efficiency.
 const DefaultSlabSize = 4 * 1024 * 1024
 
-// NewArena creates a new arena allocator
+// NewArena creates a new arena allocator.
 func NewArena(blockSize uint32) *Arena {
 	return NewArenaWithSlabSize(blockSize, DefaultSlabSize)
 }
 
-// NewArenaWithSlabSize creates an arena with a custom slab size
+// NewArenaWithSlabSize creates an arena with a custom slab size.
 func NewArenaWithSlabSize(blockSize, slabSize uint32) *Arena {
 	a := &Arena{
 		slabSize:  slabSize,
@@ -50,7 +50,7 @@ func NewArenaWithSlabSize(blockSize, slabSize uint32) *Arena {
 	return a
 }
 
-// newSlab allocates a new memory slab
+// newSlab allocates a new memory slab.
 func (a *Arena) newSlab() *ArenaSlab {
 	slab := &ArenaSlab{
 		data:   make([]byte, a.slabSize),
@@ -82,14 +82,14 @@ func (a *Arena) Alloc() []byte {
 	return a.active.data[start : start+a.blockSize]
 }
 
-// AllocCopy allocates a block and copies data into it
+// AllocCopy allocates a block and copies data into it.
 func (a *Arena) AllocCopy(data []byte) []byte {
 	buf := a.Alloc()
 	copy(buf, data)
 	return buf
 }
 
-// AllocN allocates n consecutive blocks from the arena
+// AllocN allocates n consecutive blocks from the arena.
 func (a *Arena) AllocN(n int) []byte {
 	size := utils.SafeIntToUint32(n) * a.blockSize
 
@@ -126,7 +126,7 @@ func (a *Arena) AllocN(n int) []byte {
 
 // Release decrements the reference count for a slab
 // When ref count reaches zero, the slab can be reused
-// Note: The caller must track which slab a buffer belongs to
+// Note: The caller must track which slab a buffer belongs to.
 func (a *Arena) Release(slab *ArenaSlab) {
 	if slab == nil {
 		return
@@ -135,7 +135,7 @@ func (a *Arena) Release(slab *ArenaSlab) {
 }
 
 // Reset clears all slabs and starts fresh
-// Only safe to call when no allocations are in use
+// Only safe to call when no allocations are in use.
 func (a *Arena) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -146,7 +146,7 @@ func (a *Arena) Reset() {
 }
 
 // Compact removes empty slabs (ref count <= 1)
-// The active slab is never removed
+// The active slab is never removed.
 func (a *Arena) Compact() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -167,7 +167,7 @@ func (a *Arena) Compact() int {
 	return removed
 }
 
-// Stats returns allocation statistics
+// Stats returns allocation statistics.
 func (a *Arena) Stats() (numSlabs int, totalAllocs, totalBytes uint64) {
 	a.mu.Lock()
 	numSlabs = len(a.slabs)
@@ -176,14 +176,14 @@ func (a *Arena) Stats() (numSlabs int, totalAllocs, totalBytes uint64) {
 	return numSlabs, a.totalAllocs.Load(), a.totalBytes.Load()
 }
 
-// SlabCount returns the current number of slabs
+// SlabCount returns the current number of slabs.
 func (a *Arena) SlabCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.slabs)
 }
 
-// ActiveSlabUsage returns how much of the active slab is used
+// ActiveSlabUsage returns how much of the active slab is used.
 func (a *Arena) ActiveSlabUsage() (used, total uint32) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -194,14 +194,14 @@ func (a *Arena) ActiveSlabUsage() (used, total uint32) {
 }
 
 // PooledArena wraps Arena with a sync.Pool for temporary allocations
-// that are frequently allocated and released
+// that are frequently allocated and released.
 type PooledArena struct {
 	arena     *Arena
 	blockSize uint32
 	pool      sync.Pool
 }
 
-// NewPooledArena creates an arena with pooling for frequently reused blocks
+// NewPooledArena creates an arena with pooling for frequently reused blocks.
 func NewPooledArena(blockSize uint32) *PooledArena {
 	pa := &PooledArena{
 		arena:     NewArena(blockSize),
@@ -213,7 +213,7 @@ func NewPooledArena(blockSize uint32) *PooledArena {
 	return pa
 }
 
-// Get returns a block from the pool
+// Get returns a block from the pool.
 func (pa *PooledArena) Get() []byte {
 	b, ok := pa.pool.Get().([]byte)
 	if !ok {
@@ -222,19 +222,19 @@ func (pa *PooledArena) Get() []byte {
 	return b
 }
 
-// Put returns a block to the pool
+// Put returns a block to the pool.
 func (pa *PooledArena) Put(b []byte) {
 	// Clear the buffer before returning to pool
 	clear(b)
 	pa.pool.Put(b)
 }
 
-// AllocPermanent allocates from the arena (not pooled)
+// AllocPermanent allocates from the arena (not pooled).
 func (pa *PooledArena) AllocPermanent() []byte {
 	return pa.arena.Alloc()
 }
 
-// AllocCopyPermanent allocates and copies to arena (not pooled)
+// AllocCopyPermanent allocates and copies to arena (not pooled).
 func (pa *PooledArena) AllocCopyPermanent(data []byte) []byte {
 	return pa.arena.AllocCopy(data)
 }

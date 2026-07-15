@@ -15,7 +15,7 @@ import (
 	"github.com/pterm/pterm"
 )
 
-// Helper function to import disk image to S3 backend
+// Helper function to import disk image to S3 backend.
 func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename string) error {
 	// Confirm filename can be opened
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0)

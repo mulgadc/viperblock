@@ -633,7 +633,7 @@ func BenchmarkMakeSlice(b *testing.B) {
 	}
 }
 
-// Comparison benchmark: Old map rebuild vs new O(1) lookup
+// Comparison benchmark: Old map rebuild vs new O(1) lookup.
 func BenchmarkOldVsNew_MapRebuild(b *testing.B) {
 	// Simulate the old approach: rebuilding map on each read
 	blocks := make([]Block, 1000)

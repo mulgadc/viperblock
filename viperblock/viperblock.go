@@ -298,7 +298,7 @@ type VB struct {
 	saveStateMu sync.Mutex
 }
 
-// CacheConfig holds configuration for the LRU cache
+// CacheConfig holds configuration for the LRU cache.
 type CacheConfig struct {
 	// Size in number of blocks
 	Size int
@@ -443,7 +443,7 @@ type VolumeModification struct {
 	EndTime            time.Time `json:"EndTime,omitzero"`
 }
 
-// Meta-data
+// Meta-data.
 type VolumeMetadata struct {
 	VolumeID            string            `json:"VolumeID"`   // e.g. "vol-0abcd1234ef567890"
 	VolumeName          string            `json:"VolumeName"` // Optional name for UI or tagging
@@ -546,7 +546,7 @@ func classifyStateLoad(localErr, backendErr error) error {
 	return fmt.Errorf("%w: state present but BlockSize=0", ErrStateNotFound)
 }
 
-// getSystemMemory returns the total system memory in bytes
+// getSystemMemory returns the total system memory in bytes.
 func getSystemMemory() uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
@@ -554,7 +554,7 @@ func getSystemMemory() uint64 {
 }
 
 // calculateCacheSize calculates the number of blocks that can fit in the cache
-// based on the system memory and block size
+// based on the system memory and block size.
 func calculateCacheSize(blockSize uint32, percent int) int {
 	if percent <= 0 || percent > 100 {
 		percent = 30 // default to 30%
@@ -566,7 +566,7 @@ func calculateCacheSize(blockSize uint32, percent int) int {
 	return utils.SafeUint64ToInt(cacheMemory / uint64(blockSize))
 }
 
-// SetCacheSize sets the size of the LRU cache in number of blocks
+// SetCacheSize sets the size of the LRU cache in number of blocks.
 func (vb *VB) SetCacheSize(size int, percentage int) error {
 	if size < 0 {
 		return fmt.Errorf("cache size must be greater than 0")
@@ -604,7 +604,7 @@ func (vb *VB) SetCacheSize(size int, percentage int) error {
 	return nil
 }
 
-// SetCacheSystemMemory sets the cache size based on a percentage of system memory
+// SetCacheSystemMemory sets the cache size based on a percentage of system memory.
 func (vb *VB) SetCacheSystemMemory(percent int) error {
 	if percent <= 0 || percent > 100 {
 		return fmt.Errorf("system memory percentage must be between 1 and 100")
@@ -1020,7 +1020,7 @@ func (vb *VB) syncShardedWALIfDirty() {
 	}
 }
 
-// WAL functions
+// WAL functions.
 func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 	// Lock operations on the WAL
 	wal.mu.Lock()
@@ -1417,7 +1417,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 	return nil
 }
 
-// Flush the main memory (writes) to the WAL
+// Flush the main memory (writes) to the WAL.
 func (vb *VB) Flush() (err error) {
 	start := time.Now()
 	defer func() {
@@ -2733,7 +2733,7 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	return nil
 }
 
-// Load the previous blockstate from disk
+// Load the previous blockstate from disk.
 func (vb *VB) LoadBlockState() (err error) {
 	return vb.LoadBlockStateCtx(context.Background())
 }
@@ -3492,7 +3492,7 @@ func fsyncDir(dir string) error {
 	return d.Close()
 }
 
-// Load the block tracking state from disk
+// Load the block tracking state from disk.
 func (vb *VB) LoadState() error {
 	return vb.LoadStateCtx(context.Background())
 }
@@ -3729,7 +3729,7 @@ func (vb *VB) bumpSeqNumHighWater(ctx context.Context) error {
 	return nil
 }
 
-// Query the local state from file or the backend
+// Query the local state from file or the backend.
 func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 	return vb.LoadStateRequestCtx(context.Background(), filename)
 }
@@ -3800,7 +3800,7 @@ func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state V
 	return state, err
 }
 
-// Private function to read a block from the storage backend, use ReadAt for public access
+// Private function to read a block from the storage backend, use ReadAt for public access.
 func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []byte, err error) {
 	// Use optimized BlockStore path if enabled
 	if vb.UseBlockStore {
@@ -4278,7 +4278,7 @@ func (vb *VB) WALHeader() []byte {
 	return header
 }
 
-// WALHeaderSize returns the size of the WAL header in bytes
+// WALHeaderSize returns the size of the WAL header in bytes.
 func (vb *VB) WALHeaderSize() int {
 	// Magic bytes (4) + Version (2) + BlockSize (4) + Timestamp (8)
 	return len(vb.WAL.WALMagic) + binary.Size(vb.Version) + binary.Size(vb.BlockSize) + binary.Size(time.Now().Unix())
@@ -4324,7 +4324,7 @@ func GenerateVolumeID(voltype, name, bucket string, timestamp int64) string {
 	return fmt.Sprintf("%s-%s", voltype, shortHash)
 }
 
-// FindFreePort allocates a free TCP port from the OS
+// FindFreePort allocates a free TCP port from the OS.
 func FindFreePort() (string, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -4334,20 +4334,20 @@ func FindFreePort() (string, error) {
 	return l.Addr().String(), nil
 }
 
-// EnableBlockStore enables the unified block store for O(1) lookups
+// EnableBlockStore enables the unified block store for O(1) lookups.
 func (vb *VB) EnableBlockStore() {
 	vb.UseBlockStore = true
 	vb.logger().Info("BlockStore enabled")
 }
 
-// DisableBlockStore disables the unified block store and uses legacy data structures
+// DisableBlockStore disables the unified block store and uses legacy data structures.
 func (vb *VB) DisableBlockStore() {
 	vb.UseBlockStore = false
 	vb.logger().Info("BlockStore disabled")
 }
 
 // readBlockStore is the optimized read path using UnifiedBlockStore
-// Provides O(1) lookups instead of O(n) map rebuilding per read
+// Provides O(1) lookups instead of O(n) map rebuilding per read.
 func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64) (data []byte, err error) {
 	// Check blockLen is a multiple of blocksize
 	if blockLen%uint64(vb.BlockSize) != 0 {
@@ -4478,7 +4478,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 }
 
 // fetchConsecutiveBlocksFromBackend fetches blocks from backend storage
-// Used by both legacy and BlockStore read paths
+// Used by both legacy and BlockStore read paths.
 func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
@@ -4682,7 +4682,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 	return nil
 }
 
-// WriteBlockStore writes a block using the unified block store
+// WriteBlockStore writes a block using the unified block store.
 func (vb *VB) WriteBlockStore(block uint64, data []byte) (err error) {
 	blockLen := uint64(len(data))
 
@@ -4734,7 +4734,7 @@ func (vb *VB) WriteBlockStore(block uint64, data []byte) (err error) {
 	return nil
 }
 
-// FlushBlockStore flushes hot blocks using the BlockStore path
+// FlushBlockStore flushes hot blocks using the BlockStore path.
 func (vb *VB) FlushBlockStore() error {
 	// Get all hot blocks from BlockStore
 	hotBlocks := vb.BlockStore.GetHotBlocks()
@@ -4784,7 +4784,7 @@ func (vb *VB) FlushBlockStore() error {
 }
 
 // SyncBlockStoreFromLegacy synchronizes BlockStore state from legacy data structures
-// Used during migration or recovery
+// Used during migration or recovery.
 func (vb *VB) SyncBlockStoreFromLegacy() {
 	// Sync from Writes
 	vb.Writes.mu.RLock()
@@ -4815,7 +4815,7 @@ func (vb *VB) SyncBlockStoreFromLegacy() {
 		"blocks", vb.BlockStore.Count())
 }
 
-// GetBlockStoreStats returns statistics from the BlockStore
+// GetBlockStoreStats returns statistics from the BlockStore.
 func (vb *VB) GetBlockStoreStats() (reads, writes, cacheHits, cacheMiss uint64) {
 	if vb.BlockStore == nil {
 		return 0, 0, 0, 0

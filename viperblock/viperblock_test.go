@@ -25,14 +25,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestVB is a helper struct to hold test cases
+// TestVB is a helper struct to hold test cases.
 type TestVB struct {
 	name      string
 	config    any
 	blockSize uint32
 }
 
-// BackendType represents the type of backend to use in tests
+// BackendType represents the type of backend to use in tests.
 type BackendTest struct {
 	Name          string
 	BackendType   string
@@ -45,14 +45,14 @@ const (
 	FileBackend string = "file"
 	S3Backend   string = "s3"
 
-	// Default test credentials for local predastore test server (matches tests/config/server.toml)
+	// Default test credentials for local predastore test server (matches tests/config/server.toml).
 	DefaultTestAccessKey string = "AKIAIOSFODNN7EXAMPLE"
 	DefaultTestSecretKey string = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 	volumeSize uint64 = 8 * 1024 * 1024
 )
 
-// Test credentials - defaults for local predastore server, can be overridden via ENV vars
+// Test credentials - defaults for local predastore server, can be overridden via ENV vars.
 var (
 	AccessKey string
 	SecretKey string
@@ -162,7 +162,7 @@ func loadTestCredentials() (accessKey, secretKey string) {
 	return accessKey, secretKey
 }
 
-// setupTestVB creates a new VB instance for testing with the specified backend
+// setupTestVB creates a new VB instance for testing with the specified backend.
 func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB, baseURL string, shutdown func(volName string), err error) {
 	// Per-test storage root shared by both trees: the file backend is rooted at
 	// tmpDir and creates "{tmpDir}/{volume}", while the VB is rooted at
@@ -951,7 +951,7 @@ func setupWALTruncateTestVB(t *testing.T, tag string) (*VB, string) {
 }
 
 // TestWALPeriodicSync tests the periodic WAL fsync functionality
-// following patterns from PostgreSQL (wal_writer_delay), BadgerDB, and MongoDB
+// following patterns from PostgreSQL (wal_writer_delay), BadgerDB, and MongoDB.
 func TestWALPeriodicSync(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -1088,7 +1088,7 @@ func TestWALPeriodicSync(t *testing.T) {
 	}
 }
 
-// TestWALSyncerConcurrency tests that the syncer handles concurrent writes correctly
+// TestWALSyncerConcurrency tests that the syncer handles concurrent writes correctly.
 func TestWALSyncerConcurrency(t *testing.T) {
 	tmpDir := t.TempDir()
 	testVol := fmt.Sprintf("test_wal_sync_concurrent_%d", time.Now().UnixNano())
@@ -1507,7 +1507,7 @@ func TestInvalidS3Auth(t *testing.T) {
 	})
 }
 
-// Test image import from local disk file
+// Test image import from local disk file.
 func TestImportDiskImage(t *testing.T) {
 	runWithBackends(t, "s3_import_disk_image", func(t *testing.T, vb *VB) {
 		// Skip if file backend

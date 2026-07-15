@@ -13,7 +13,7 @@ import (
 	"github.com/mulgadc/viperblock/utils"
 )
 
-// 2. Define config structs
+// 2. Define config structs.
 type FileConfig struct {
 	VolumeName string
 	VolumeSize uint64
@@ -80,7 +80,7 @@ func (backend *Backend) WriteToCtx(_ context.Context, volumeName string, fileTyp
 	return backend.WriteTo(volumeName, fileType, objectId, headers, data)
 }
 
-// 3. Implement WithConfig for each backend
+// 3. Implement WithConfig for each backend.
 func New(config any) (backend *Backend) {
 	cfg, ok := config.(FileConfig)
 	if !ok {

@@ -8,13 +8,13 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestSimpleFS is a helper struct to hold test cases
+// TestSimpleFS is a helper struct to hold test cases.
 type TestSimpleFS struct {
 	name       string
 	volumeSize uint64
 }
 
-// setupTestSimpleFS creates a new SimpleFS instance for testing
+// setupTestSimpleFS creates a new SimpleFS instance for testing.
 func setupTestSimpleFS(t *testing.T, testCase TestSimpleFS) *SimpleFS {
 	// Create a temporary directory for test data
 	_ = t.TempDir()

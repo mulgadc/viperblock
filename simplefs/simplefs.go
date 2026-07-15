@@ -60,7 +60,7 @@ func (sfs *SimpleFS) CreateVolume(name string, size uint64) error {
 	return nil
 }
 
-// Format a selected volume with all free blocks
+// Format a selected volume with all free blocks.
 func (sfs *SimpleFS) FormatVolume() error {
 	sfs.mu.Lock()
 	defer sfs.mu.Unlock()
@@ -103,7 +103,7 @@ func (sfs *SimpleFS) AllocateBlocks(size uint64) (blocks []uint64, err error) {
 	return blocks, nil
 }
 
-// Free blocks
+// Free blocks.
 func (sfs *SimpleFS) FreeBlocks(blocks []uint64) error {
 	sfs.mu.Lock()
 	defer sfs.mu.Unlock()
@@ -149,7 +149,7 @@ func (sfs *SimpleFS) CreateFile(pathname string, dataLen uint64) (blocks []uint6
 	return blocks, nil
 }
 
-// Delete a file
+// Delete a file.
 func (sfs *SimpleFS) DeleteFile(pathname string) error {
 	if _, ok := sfs.Blocks[pathname]; !ok {
 		return fmt.Errorf("file not found")
@@ -166,7 +166,7 @@ func (sfs *SimpleFS) DeleteFile(pathname string) error {
 	return nil
 }
 
-// Save the block tracking state to disk
+// Save the block tracking state to disk.
 func (sfs *SimpleFS) SaveState(filename string) error {
 	sfs.mu.Lock()
 	defer sfs.mu.Unlock()
@@ -186,7 +186,7 @@ func (sfs *SimpleFS) SaveState(filename string) error {
 	return nil
 }
 
-// Load the block tracking state from disk
+// Load the block tracking state from disk.
 func (sfs *SimpleFS) LoadState(filename string) error {
 	sfs.mu.Lock()
 	defer sfs.mu.Unlock()

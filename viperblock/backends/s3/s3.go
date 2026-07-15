@@ -61,7 +61,7 @@ func wrapNotFound(err error) error {
 	return err
 }
 
-// 2. Define config structs
+// 2. Define config structs.
 type S3Config struct {
 	VolumeName string
 	VolumeSize uint64
