@@ -2743,7 +2743,7 @@ func (vb *VB) LoadBlockState() (err error) {
 func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 	var checkpoint []byte
 
-	// Step 1. Validate the local persistant disk contains the state
+	// Step 1. Validate the local persistent disk contains the state
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))
 
 	_, err = os.Stat(filename)
