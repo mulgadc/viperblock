@@ -12,6 +12,46 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestNormalizeEndpoint pins Host's accepted input space. Callers pass a bare
+// host:port (spinifex's admin.DialTarget yields one) as well as a full URL, and
+// the SDK rejects a schemeless endpoint outright, so both shapes must resolve.
+func TestNormalizeEndpoint(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			// The shape admin.DialTarget and Predastore.Host produce.
+			name: "bare_host_port_gets_https",
+			in:   "192.168.1.29:8443",
+			want: "https://192.168.1.29:8443",
+		},
+		{
+			name: "https_url_unchanged",
+			in:   "https://127.0.0.1:8443",
+			want: "https://127.0.0.1:8443",
+		},
+		{
+			// An explicit http endpoint must not be silently upgraded.
+			name: "http_url_unchanged",
+			in:   "http://127.0.0.1:8443",
+			want: "http://127.0.0.1:8443",
+		},
+		{
+			name: "bare_hostname_gets_https",
+			in:   "predastore.internal",
+			want: "https://predastore.internal",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, normalizeEndpoint(tc.in))
+		})
+	}
+}
+
 // TestWrapNotFound pins the AWS-error → os.ErrNotExist mapping that callers
 // (e.g. viperblock.LoadState) rely on to tell "object missing" apart from
 // "backend unreachable". Required by the medium-term fix.

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -21,6 +22,20 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// schemeRE matches a leading URI scheme.
+var schemeRE = regexp.MustCompile("^[^:]+://")
+
+// normalizeEndpoint returns host with an https scheme when it carries none.
+// Callers pass Host as a bare "host:port" as often as a full URL, and the SDK
+// requires the endpoint to be a valid URI — it fails endpoint resolution
+// outright on a schemeless value rather than assuming one.
+func normalizeEndpoint(host string) string {
+	if schemeRE.MatchString(host) {
+		return host
+	}
+	return "https://" + host
+}
 
 // wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error
 // indicates the requested object is genuinely absent (NoSuchKey, 404 NotFound,
@@ -153,7 +168,7 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 	// surfaces as an AccessDenied 403 that is not retried. -1 skips the header
 	// entirely; it's a no-op under HTTP/2 anyway.
 	backend.config.s3Client = s3.New(s3.Options{
-		BaseEndpoint:                 aws.String(backend.config.Host),
+		BaseEndpoint:                 aws.String(normalizeEndpoint(backend.config.Host)),
 		UsePathStyle:                 true,
 		ContinueHeaderThresholdBytes: -1,
 		Region:                       backend.config.Region,
