@@ -586,7 +586,7 @@ func (vb *VB) SetCacheSize(size int, percentage int) error {
 	// Create new LRU cache with specified size
 	newCache, err := lru.New[uint64, []byte](size)
 	if err != nil {
-		return fmt.Errorf("failed to create new LRU cache: %v", err)
+		return fmt.Errorf("failed to create new LRU cache: %w", err)
 	}
 
 	// Replace old cache with new one
@@ -2271,7 +2271,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		fstat, err := pendingWAL.Stat()
 		if err != nil {
 			vb.WAL.mu.Unlock()
-			return fmt.Errorf("could not validate WAL size: %v", err)
+			return fmt.Errorf("could not validate WAL size: %w", err)
 		}
 		if fstat.Size() < int64(vb.ObjBlockSize) {
 			vb.WAL.mu.Unlock()
@@ -2310,7 +2310,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	// Read and validate WAL header (magic, version, timestamp)
 	headers := make([]byte, vb.WALHeaderSize())
 	if _, err := pendingWAL2.Read(headers); err != nil {
-		return fmt.Errorf("error reading WAL headers: %v", err)
+		return fmt.Errorf("error reading WAL headers: %w", err)
 	}
 
 	if !bytes.Equal(headers[:4], vb.WAL.WALMagic[:]) {
@@ -2347,7 +2347,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 				if err == io.EOF {
 					break
 				}
-				return fmt.Errorf("error reading encrypted WAL data: %v", err)
+				return fmt.Errorf("error reading encrypted WAL data: %w", err)
 			}
 
 			seqNum := binary.BigEndian.Uint64(record[0:8])
@@ -2378,7 +2378,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 				if err == io.EOF {
 					break
 				}
-				return fmt.Errorf("error reading WAL data: %v", err)
+				return fmt.Errorf("error reading WAL data: %w", err)
 			}
 
 			// Validate checksum
@@ -2391,7 +2391,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 			if checksumValidated != checksum {
 				pos, err := pendingWAL2.Seek(0, io.SeekCurrent)
 				if err != nil {
-					return fmt.Errorf("error seeking in WriteWALToChunk: %v", err)
+					return fmt.Errorf("error seeking in WriteWALToChunk: %w", err)
 				}
 
 				vb.logger().Error("checksum mismatch in WriteWALToChunk", "filename", filename, "pos", pos, "checksum", checksum, "checksumValidated", checksumValidated)
@@ -2906,7 +2906,7 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 				// tear. Surface as ErrIntegrity so RecoverLocalWALs
 				// keeps the file (no silent truncation of recovery).
 				vb.logger().Error("WAL recovery: aead.Open failed", "file", filename, "block", blockNum, "seqNum", seqNum, "valid_records_so_far", len(blocks))
-				return nil, 0, fmt.Errorf("readWALFileForRecovery: %w: WAL record block %d seqNum %d in %s: %v", ErrIntegrity, blockNum, seqNum, filename, err)
+				return nil, 0, fmt.Errorf("readWALFileForRecovery: %w: WAL record block %d seqNum %d in %s: %w", ErrIntegrity, blockNum, seqNum, filename, err)
 			}
 
 			blocks = append(blocks, Block{
@@ -4091,7 +4091,7 @@ func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]by
 	// Read entire range of needed blocks
 	fullData, err := vb.read(ctx, firstBlock, blockCount*blockSize)
 
-	if err != nil && err != ErrZeroBlock {
+	if err != nil && !errors.Is(err, ErrZeroBlock) {
 		return nil, err
 	}
 

@@ -2,6 +2,7 @@ package viperblock
 
 import (
 	"bytes"
+	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -60,7 +61,7 @@ func TestBlockStore_ReadNonExistent(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 
 	_, state, err := bs.ReadSingle(999)
-	if err != ErrZeroBlock {
+	if !errors.Is(err, ErrZeroBlock) {
 		t.Errorf("expected ErrZeroBlock, got %v", err)
 	}
 	if state != BlockStateEmpty {

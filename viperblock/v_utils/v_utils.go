@@ -20,14 +20,14 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	// Confirm filename can be opened
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open disk file: %v", err)
+		return fmt.Errorf("failed to open disk file: %w", err)
 	}
 	defer f.Close()
 
 	// Get file stats
 	fileInfo, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("failed to stat disk file: %v", err)
+		return fmt.Errorf("failed to stat disk file: %w", err)
 	}
 
 	var volumeName string
@@ -98,7 +98,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 	vb, err := viperblock.New(vbConfig, "s3", *s3Config)
 	if err != nil {
-		return fmt.Errorf("failed to connect to Viperblock store: %v", err)
+		return fmt.Errorf("failed to connect to Viperblock store: %w", err)
 	}
 
 	//vb.SetDebug(true)
@@ -106,7 +106,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	// Initialize the backend
 	err = vb.Backend.Init()
 	if err != nil {
-		return fmt.Errorf("failed to initialize backend: %v", err)
+		return fmt.Errorf("failed to initialize backend: %w", err)
 	}
 
 	//var walNum uint64
@@ -123,21 +123,21 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	err = vb.LoadBlockState()
 
 	if err != nil {
-		return fmt.Errorf("failed to load block state: %v", err)
+		return fmt.Errorf("failed to load block state: %w", err)
 	}
 
 	// Open the chunk WAL
 	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
 
 	if err != nil {
-		return fmt.Errorf("failed to load WAL: %v", err)
+		return fmt.Errorf("failed to load WAL: %w", err)
 	}
 
 	// Open the block to object WAL
 	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
 
 	if err != nil {
-		return fmt.Errorf("failed to load block WAL: %v", err)
+		return fmt.Errorf("failed to load block WAL: %w", err)
 	}
 
 	// Encrypted volumes derive the AES-GCM nonce from VolumeUUID, which
@@ -194,7 +194,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 				break
 			}
 			_, _ = bar.Stop()
-			return fmt.Errorf("failed to read disk file: %v", err)
+			return fmt.Errorf("failed to read disk file: %w", err)
 		}
 
 		if err := vb.WriteAt(block*uint64(vb.BlockSize), buf[:n]); err != nil {
@@ -230,14 +230,14 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		snapshotID := fmt.Sprintf("snap-%s", vb.VolumeName)
 		_, err := vb.CreateSnapshot(snapshotID)
 		if err != nil {
-			return fmt.Errorf("failed to create AMI snapshot: %v", err)
+			return fmt.Errorf("failed to create AMI snapshot: %w", err)
 		}
 		vb.VolumeConfig.AMIMetadata.SnapshotID = snapshotID
 	}
 
 	err = vb.Close()
 	if err != nil {
-		return fmt.Errorf("failed to close Viperblock store: %v", err)
+		return fmt.Errorf("failed to close Viperblock store: %w", err)
 	}
 
 	return nil
