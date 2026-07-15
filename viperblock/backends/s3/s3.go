@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
@@ -32,16 +31,11 @@ func wrapNotFound(err error) error {
 		return nil
 	}
 
-	var noKey *s3types.NoSuchKey
-	var noBucket *s3types.NoSuchBucket
-	var notFound *s3types.NotFound
-	if errors.As(err, &noKey) || errors.As(err, &noBucket) || errors.As(err, &notFound) {
-		return fmt.Errorf("%w: %w", os.ErrNotExist, err)
-	}
-
-	// The typed errors above cover the common cases; the code switch also
-	// catches NoSuchVersion and whatever an S3-compatible backend returns for a
-	// bodyless HEAD, neither of which has a dedicated type.
+	// Match on the wire code rather than the modeled types. GetObject models
+	// only NoSuchKey, so a missing bucket arrives as a generic API error, and
+	// NoSuchVersion and a bodyless 404 have no modeled type at all. The modeled
+	// types report these same codes via ErrorCode(), so matching the code
+	// covers both shapes.
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {

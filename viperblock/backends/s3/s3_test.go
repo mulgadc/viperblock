@@ -41,13 +41,19 @@ func TestWrapNotFound(t *testing.T) {
 			wantNotFound: true,
 		},
 		{
+			// Modeled errors report their code through ErrorCode() like any
+			// other API error, so they match the same switch. Pins that, and
+			// guards the day the SDK starts modeling NoSuchBucket on GetObject.
 			name:         "no_such_bucket_typed_wraps_not_exist",
 			in:           &s3types.NoSuchBucket{Message: aws.String("bucket missing")},
 			wantNotFound: true,
 		},
 		{
-			name:         "head_object_404_wraps_not_exist",
-			in:           &s3types.NotFound{Message: aws.String("404")},
+			// A 404 whose body yields no code deserializes to the status text
+			// as the code. Viperblock never calls HeadObject, so this — not the
+			// modeled NotFound type — is how a bodyless 404 reaches ReadCtx.
+			name:         "bodyless_404_wraps_not_exist",
+			in:           &smithy.GenericAPIError{Code: "NotFound", Message: "404"},
 			wantNotFound: true,
 		},
 		{
