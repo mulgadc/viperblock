@@ -6,8 +6,9 @@ import (
 	"os"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -27,22 +28,38 @@ func TestWrapNotFound(t *testing.T) {
 		},
 		{
 			name:         "no_such_key_wraps_not_exist",
-			in:           awserr.New(awss3.ErrCodeNoSuchKey, "key missing", nil),
+			in:           &s3types.NoSuchKey{Message: aws.String("key missing")},
 			wantNotFound: true,
 		},
 		{
+			// GetObject models only NoSuchKey and InvalidObjectState, so a read
+			// against a missing bucket arrives unmodeled, carrying just the code.
+			// This is the shape ReadCtx actually sees, and viperblock.LoadState
+			// depends on it meaning "not exist".
 			name:         "no_such_bucket_wraps_not_exist",
-			in:           awserr.New(awss3.ErrCodeNoSuchBucket, "bucket missing", nil),
+			in:           &smithy.GenericAPIError{Code: "NoSuchBucket", Message: "bucket missing"},
+			wantNotFound: true,
+		},
+		{
+			name:         "no_such_bucket_typed_wraps_not_exist",
+			in:           &s3types.NoSuchBucket{Message: aws.String("bucket missing")},
 			wantNotFound: true,
 		},
 		{
 			name:         "head_object_404_wraps_not_exist",
-			in:           awserr.New("NotFound", "404", nil),
+			in:           &s3types.NotFound{Message: aws.String("404")},
+			wantNotFound: true,
+		},
+		{
+			// No typed error exists for NoSuchVersion, so it can only match via
+			// the API error code switch.
+			name:         "no_such_version_wraps_not_exist",
+			in:           &smithy.GenericAPIError{Code: "NoSuchVersion", Message: "version missing"},
 			wantNotFound: true,
 		},
 		{
 			name:         "internal_error_stays_transient",
-			in:           awserr.New("InternalError", "5xx", nil),
+			in:           &smithy.GenericAPIError{Code: "InternalError", Message: "5xx"},
 			wantNotFound: false,
 		},
 		{

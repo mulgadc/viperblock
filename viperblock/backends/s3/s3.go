@@ -12,18 +12,18 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 )
 
-// wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error code
+// wrapNotFound returns err wrapped with os.ErrNotExist when the AWS error
 // indicates the requested object is genuinely absent (NoSuchKey, 404 NotFound,
 // NoSuchBucket). Callers can detect "missing" vs "transient" via
 // errors.Is(err, os.ErrNotExist) without taking an AWS SDK dependency.
@@ -31,10 +31,21 @@ func wrapNotFound(err error) error {
 	if err == nil {
 		return nil
 	}
-	var aerr awserr.Error
-	if errors.As(err, &aerr) {
-		switch aerr.Code() {
-		case s3.ErrCodeNoSuchKey, s3.ErrCodeNoSuchBucket, "NotFound", "NoSuchVersion":
+
+	var noKey *s3types.NoSuchKey
+	var noBucket *s3types.NoSuchBucket
+	var notFound *s3types.NotFound
+	if errors.As(err, &noKey) || errors.As(err, &noBucket) || errors.As(err, &notFound) {
+		return fmt.Errorf("%w: %w", os.ErrNotExist, err)
+	}
+
+	// The typed errors above cover the common cases; the code switch also
+	// catches NoSuchVersion and whatever an S3-compatible backend returns for a
+	// bodyless HEAD, neither of which has a dedicated type.
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NoSuchBucket", "NotFound", "NoSuchVersion":
 			return fmt.Errorf("%w: %w", os.ErrNotExist, err)
 		}
 	}
@@ -53,7 +64,9 @@ type S3Config struct {
 
 	Host string
 
-	S3Client   *s3.S3
+	// s3Client is set by InitCtx and read by this backend's own methods. It is
+	// unexported to keep the SDK type out of viperblock's public API.
+	s3Client   *s3.Client
 	HTTPClient *http.Client // Optional: override the default HTTP client (e.g. for tests)
 }
 
@@ -136,34 +149,25 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 
 	// Use the AWS SDK to initialize the S3 backend.
 	//
-	// S3Disable100Continue: aws-sdk-go v1 auto-adds "Expect: 100-continue" for
-	// PUTs >= 2 MiB (service/s3/platform_handlers_go1.6.go). Chunk writes are
-	// 4 MiB so every chunk PUT qualifies. Under HTTP/2, Go's server strips the
-	// Expect header before handlers see it (x/net/http2 server behavior). On
-	// the first send the signer runs before add100Continue so "expect" is NOT
-	// in SignedHeaders and sigs match. On retry, copyHTTPRequest preserves the
-	// Expect header, the signer now sees it and includes "expect" in
-	// SignedHeaders signed with value "100-continue" — but the server still
-	// strips it and canonicalizes "expect:" as empty, producing a signature
-	// mismatch (AccessDenied, 403, not retried). Disabling 100-continue skips
-	// the header entirely; it's a no-op under HTTP/2 anyway.
-	sess, err := session.NewSession(&aws.Config{
-		Endpoint:             aws.String(backend.config.Host),
-		S3ForcePathStyle:     aws.Bool(true),
-		S3Disable100Continue: aws.Bool(true),
-		Region:               aws.String(backend.config.Region),
-		HTTPClient:           client,
-		Credentials:          credentials.NewStaticCredentials(backend.config.AccessKey, backend.config.SecretKey, ""),
+	// ContinueHeaderThresholdBytes: the SDK adds "Expect: 100-continue" to PUTs
+	// at or above this threshold, defaulting to 2 MiB when left zero
+	// (service/internal/s3shared/s3100continue.go). Chunk writes are 4 MiB, so
+	// every chunk PUT would qualify. Under HTTP/2 Go's server strips the Expect
+	// header before handlers see it (x/net/http2 server behavior) and
+	// canonicalizes "expect:" as empty, while the signer includes "expect" in
+	// SignedHeaders signed with value "100-continue" — a signature mismatch that
+	// surfaces as an AccessDenied 403 that is not retried. -1 skips the header
+	// entirely; it's a no-op under HTTP/2 anyway.
+	backend.config.s3Client = s3.New(s3.Options{
+		BaseEndpoint:                 aws.String(backend.config.Host),
+		UsePathStyle:                 true,
+		ContinueHeaderThresholdBytes: -1,
+		Region:                       backend.config.Region,
+		HTTPClient:                   client,
+		Credentials:                  credentials.NewStaticCredentialsProvider(backend.config.AccessKey, backend.config.SecretKey, ""),
 	})
 
-	if err != nil {
-		backend.log.ErrorContext(ctx, "Error creating session", "error", err)
-		return err
-	}
-
-	backend.config.S3Client = s3.New(sess)
-
-	_, err = backend.config.S3Client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
+	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket: aws.String(backend.config.Bucket),
 	})
 
@@ -194,7 +198,7 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
 	}()
 
-	if backend.config.S3Client == nil {
+	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
 
@@ -217,7 +221,7 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 	}
 
 	// TODO: Add retry from S3 timeout/500/etc
-	textResult, err := backend.config.S3Client.GetObjectWithContext(ctx, requestObject)
+	textResult, err := backend.config.s3Client.GetObject(ctx, requestObject)
 
 	if err != nil {
 		return nil, wrapNotFound(err)
@@ -250,7 +254,7 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 		telemetry.RecordBackendIO(ctx, "write", "s3", backend.config.VolumeName, outcome, bodyLen, time.Since(start))
 	}()
 
-	if backend.config.S3Client == nil {
+	if backend.config.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
 
@@ -281,7 +285,7 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 		Body:   bytes.NewReader(body),
 	}
 
-	_, err = backend.config.S3Client.PutObjectWithContext(ctx, object)
+	_, err = backend.config.s3Client.PutObject(ctx, object)
 
 	if err != nil {
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
@@ -298,7 +302,7 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READFROM] Reading object", "volumeName", volumeName, "objectId", objectId, "offset", offset, "length", length)
 
-	if backend.config.S3Client == nil {
+	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
 
@@ -313,7 +317,7 @@ func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, file
 		requestObject.Range = aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
 	}
 
-	textResult, err := backend.config.S3Client.GetObjectWithContext(ctx, requestObject)
+	textResult, err := backend.config.s3Client.GetObject(ctx, requestObject)
 	if err != nil {
 		return nil, wrapNotFound(err)
 	}
@@ -332,7 +336,7 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 }
 
 func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
-	if backend.config.S3Client == nil {
+	if backend.config.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
 
@@ -359,7 +363,7 @@ func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileT
 		Body:   bytes.NewReader(body),
 	}
 
-	_, err = backend.config.S3Client.PutObjectWithContext(ctx, object)
+	_, err = backend.config.s3Client.PutObject(ctx, object)
 	if err != nil {
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
