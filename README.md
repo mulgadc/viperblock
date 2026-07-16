@@ -165,4 +165,4 @@ The following papers informed the design of Viperblock:
 
 ## License
 
-Viperblock is open source under the [GNU Affero General Public License v3.0](LICENSE). You're free to use, modify, and deploy it anywhere you need reliable infrastructure without depending on centralized cloud platforms.
+Viperblock is licensed under the GNU Affero General Public License v3.0 (AGPLv3). See [LICENSE](LICENSE) for the full text.
