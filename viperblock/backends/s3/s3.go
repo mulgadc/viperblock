@@ -114,7 +114,15 @@ func (backend *Backend) Init() error {
 }
 
 func (backend *Backend) InitCtx(ctx context.Context) error {
-	backend.log.InfoContext(ctx, "Initializing S3 backend", "config", backend.config)
+	// Log only the fields that identify the backend. S3Config carries the
+	// static credentials, so logging the struct wholesale would write the
+	// secret key in plaintext to wherever the embedder's logger points.
+	backend.log.InfoContext(ctx, "Initializing S3 backend",
+		"volumeName", backend.config.VolumeName,
+		"bucket", backend.config.Bucket,
+		"region", backend.config.Region,
+		"host", backend.config.Host,
+	)
 
 	client := backend.config.HTTPClient
 	if client == nil {
