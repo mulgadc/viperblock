@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mulgadc/viperblock/telemetry"
@@ -301,6 +302,91 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 	}
 
 	return file.Close()
+}
+
+// Delete removes the object identified by fileType/objectId from this
+// backend's own volume. Returns an error satisfying errors.Is(err,
+// os.ErrNotExist) if the object is already gone — os.Remove already
+// produces that, so no wrapping is needed (unlike the s3 backend, whose
+// SDK error types must be translated).
+func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err error) {
+	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+	return os.Remove(filename)
+}
+
+func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
+	start := time.Now()
+	err = backend.Delete(fileType, objectId)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "delete", "file", backend.config.VolumeName, outcome, 0, time.Since(start))
+	return err
+}
+
+// ListPrefixes returns the directory entries under BaseDir whose name has
+// prefix, one level deep. BaseDir is the backend's root (analogous to an S3
+// bucket root), not this backend's own VolumeName directory, so this can
+// see sibling volumes/snapshots the way ListObjectsV2 with a delimiter
+// would on the s3 backend.
+func (backend *Backend) ListPrefixes(prefix string) (names []string, err error) {
+	entries, err := os.ReadDir(backend.config.BaseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), prefix) {
+			names = append(names, entry.Name())
+		}
+	}
+	return names, nil
+}
+
+func (backend *Backend) ListPrefixesCtx(_ context.Context, prefix string) (names []string, err error) {
+	return backend.ListPrefixes(prefix)
+}
+
+// ListObjects returns every regular file's key (path relative to BaseDir)
+// under prefix, walked recursively -- the file-backend counterpart of a
+// non-delimited S3 ListObjectsV2. Missing directories are not an error
+// (nothing to list yet), matching ListPrefixes.
+func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
+	root := filepath.Join(backend.config.BaseDir, prefix)
+
+	walkErr := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(backend.config.BaseDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		keys = append(keys, filepath.ToSlash(rel))
+		return nil
+	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		return nil, walkErr
+	}
+
+	return keys, nil
+}
+
+func (backend *Backend) ListObjectsCtx(_ context.Context, prefix string) (keys []string, err error) {
+	return backend.ListObjects(prefix)
 }
 
 func (backend *Backend) GetHost() string {

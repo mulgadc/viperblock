@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -387,6 +388,121 @@ func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileT
 	}
 
 	return nil
+}
+
+func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err error) {
+	return backend.DeleteCtx(context.Background(), fileType, objectId)
+}
+
+// DeleteCtx removes the object identified by fileType/objectId from this
+// backend's own volume. predastore (unlike real S3) errors on deleting an
+// already-missing key rather than treating it as an idempotent success, so
+// wrapNotFound is load-bearing here: callers use errors.Is(err,
+// os.ErrNotExist) to treat "already gone" as success.
+func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "delete", "s3", backend.config.VolumeName, outcome, 0, time.Since(start))
+	}()
+
+	if backend.config.s3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+
+	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
+
+	_, err = backend.config.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(filename),
+	})
+	if err != nil {
+		return wrapNotFound(err)
+	}
+	return nil
+}
+
+func (backend *Backend) ListPrefixes(prefix string) (names []string, err error) {
+	return backend.ListPrefixesCtx(context.Background(), prefix)
+}
+
+// ListPrefixesCtx returns the top-level "directory" names under prefix
+// (delimiter "/"), paginating through every page of results. This is
+// bucket-wide, not scoped to this backend's own VolumeName — the bucket is
+// shared by the whole deployment and other volumes/snapshots live at
+// sibling top-level prefixes.
+func (backend *Backend) ListPrefixesCtx(ctx context.Context, prefix string) (names []string, err error) {
+	if backend.config.s3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+
+	var continuationToken *string
+	for {
+		out, listErr := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(backend.config.Bucket),
+			Prefix:            aws.String(prefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: continuationToken,
+		})
+		if listErr != nil {
+			return nil, listErr
+		}
+
+		for _, cp := range out.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			names = append(names, strings.TrimSuffix(*cp.Prefix, "/"))
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+
+	return names, nil
+}
+
+func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
+	return backend.ListObjectsCtx(context.Background(), prefix)
+}
+
+// ListObjectsCtx returns every object's full key under prefix, recursively
+// (no Delimiter), paginating through every page of results.
+func (backend *Backend) ListObjectsCtx(ctx context.Context, prefix string) (keys []string, err error) {
+	if backend.config.s3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+
+	var continuationToken *string
+	for {
+		out, listErr := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(backend.config.Bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if listErr != nil {
+			return nil, listErr
+		}
+
+		for _, obj := range out.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			keys = append(keys, *obj.Key)
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+
+	return keys, nil
 }
 
 func (backend *Backend) Sync() {
