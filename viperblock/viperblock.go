@@ -547,6 +547,16 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 // contiguous byte offsets (stride apart) — the same criteria createChunkFile
 // uses to build a run, so a checkpoint save/load round trip reproduces the
 // exact same extent boundaries the writer produced.
+//
+// Every flat record is treated as covering exactly ONE physical block: the
+// map is keyed by block number and both the legacy pre-coalesce writer and
+// the new expandBlockLookup path emit one record per 4KiB block. The on-disk
+// NumBlocks field is deliberately IGNORED for merge math -- the legacy writer
+// stored a per-run countdown there (10, 9, ... 1) rather than a run length,
+// so trusting it would collapse a whole run onto its first record's SeqNum
+// and corrupt per-block AEAD nonces on reload. Runs are rebuilt purely from
+// real geometry (contiguous block numbers + same ObjectID + contiguous byte
+// offsets), and each record contributes its own SeqNum to the merged run.
 func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]BlockLookup {
 	out := make(map[uint64]BlockLookup, len(flat))
 	if len(flat) == 0 {
@@ -562,32 +572,27 @@ func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]
 	i := 0
 	for i < len(keys) {
 		first := flat[keys[i]]
-		run := []BlockLookup{first}
+		seqNums := []uint64{first.SeqNum}
+		prev := first
 		j := i + 1
 		for j < len(keys) {
-			prev := run[len(run)-1]
 			cand := flat[keys[j]]
-			if cand.StartBlock == prev.end() &&
+			// prev covers a single block, so the next block number is
+			// prev.StartBlock+1 and its object offset is one stride further in.
+			if cand.StartBlock == prev.StartBlock+1 &&
 				cand.ObjectID == first.ObjectID &&
-				cand.ObjectOffset == prev.offsetAt(int(prev.NumBlocks), stride) {
-				run = append(run, cand)
+				cand.ObjectOffset == prev.ObjectOffset+stride {
+				seqNums = append(seqNums, cand.SeqNum)
+				prev = cand
 				j++
 				continue
 			}
 			break
 		}
 
-		numBlocks := 0
-		seqNums := make([]uint64, 0, len(run))
-		for _, r := range run {
-			for p := 0; p < int(r.NumBlocks); p++ {
-				seqNums = append(seqNums, r.seqNumAt(p))
-			}
-			numBlocks += int(r.NumBlocks)
-		}
 		merged := BlockLookup{
 			StartBlock:   first.StartBlock,
-			NumBlocks:    utils.SafeIntToUint16(numBlocks),
+			NumBlocks:    utils.SafeIntToUint16(len(seqNums)),
 			ObjectID:     first.ObjectID,
 			ObjectOffset: first.ObjectOffset,
 			SeqNum:       first.SeqNum,
@@ -3451,17 +3456,26 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		}
 	}
 
-	// Sync BlockStore from BlocksToObject since createChunkFile's MarkPersisted
-	// won't work during recovery (blocks aren't in Pending state in BlockStore)
+	// Sync BlockStore from BlocksToObject since createChunkFile's
+	// MarkPersistedRange won't work during recovery (blocks aren't in Pending
+	// state in BlockStore). createChunkFile already coalesced BlocksToObject
+	// above, so install each run as one persistedExtent via SetPersistedRange
+	// -- keeping the index O(extents) rather than reverting recovered blocks to
+	// one BlockStore entry per block. Each block keeps its own AEAD SeqNum via
+	// the entry's per-position SeqNums. Idempotent for runs already installed
+	// by a prior checkpoint load, and Hot/Pending shard entries from newer
+	// writes still take precedence in ReadEntry.
 	if vb.UseBlockStore && vb.BlockStore != nil {
 		vb.BlocksToObject.mu.RLock()
 		stride := vb.blockStride()
-		for _, block := range sortedBlocks {
-			// Point lookup on BlockLookup's map key misses any block that
-			// isn't the start of its coalesced run; resolve by range instead.
-			if lookup, pos, ok := vb.BlocksToObject.resolveBlockLookup(block.Block); ok {
-				vb.BlockStore.SetPersisted(block.Block, lookup.ObjectID, lookup.offsetAt(pos, stride), block.SeqNum)
+		for _, lookup := range vb.BlocksToObject.BlockLookup {
+			blocks := make([]uint64, lookup.NumBlocks)
+			seqNums := make([]uint64, lookup.NumBlocks)
+			for i := range blocks {
+				blocks[i] = lookup.StartBlock + uint64(i)
+				seqNums[i] = lookup.seqNumAt(i)
 			}
+			vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
 		}
 		vb.BlocksToObject.mu.RUnlock()
 	}

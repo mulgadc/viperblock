@@ -687,6 +687,87 @@ func TestBlockStore_MarkPersistedRange_StaleWriteSkipped(t *testing.T) {
 	}
 }
 
+// TestBlockStore_MarkPersistedRange_ConcurrentRewrite exercises the TOCTOU
+// window with a genuinely concurrent guest rewrite, under -race. While a chunk
+// upload persists a run via MarkPersistedRange, other goroutines keep
+// rewriting blocks in that run (Write + MarkPending, bumping their SeqNum) and
+// reading them back. Two invariants must hold throughout: the race detector
+// must stay silent (all persistedExtents / shard access is correctly locked),
+// and no reader may ever observe a block as "never written" (BlockStateEmpty)
+// mid-transition -- the 3-pass insert-before-delete ordering guarantees every
+// block is resolvable at every instant.
+func TestBlockStore_MarkPersistedRange_ConcurrentRewrite(t *testing.T) {
+	const stride = uint32(4096)
+	const startBlock = 900
+	const numBlocks = 64
+
+	for range 50 {
+		bs := NewUnifiedBlockStore(4096)
+		blocks, seqNums := pendingRun(bs, startBlock, numBlocks)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		stop := make(chan struct{})
+
+		// Persister: transition the whole run to Persisted.
+		wg.Go(func() {
+			<-start
+			bs.MarkPersistedRange(blocks, 3, 0, stride, seqNums)
+		})
+
+		// Rewriters: keep superseding random blocks in the run with newer
+		// writes, racing the persist's read-select-delete passes.
+		data := make([]byte, bs.blockSize)
+		for range 4 {
+			wg.Go(func() {
+				<-start
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					b := startBlock + uint64(rand.IntN(numBlocks))
+					bs.Write(b, data)
+					bs.MarkPending(b)
+				}
+			})
+		}
+
+		// Readers: every block must always resolve to *some* non-empty state.
+		var sawEmpty atomic.Bool
+		for range 4 {
+			wg.Go(func() {
+				<-start
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					b := startBlock + uint64(rand.IntN(numBlocks))
+					entry, ok := bs.ReadEntry(b)
+					if !ok || entry.State == BlockStateEmpty {
+						sawEmpty.Store(true)
+					}
+				}
+			})
+		}
+
+		close(start)
+		// Let the rewriters/readers run alongside the persist, then stop them.
+		for i := range 2000 {
+			bs.ReadEntry(startBlock + uint64(i%numBlocks))
+		}
+		close(stop)
+		wg.Wait()
+
+		if sawEmpty.Load() {
+			t.Fatal("a reader observed a block as never-written mid-transition: insert-before-delete ordering violated")
+		}
+	}
+}
+
 // Benchmarks
 
 func BenchmarkBlockStore_SingleRead(b *testing.B) {
