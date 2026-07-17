@@ -8,8 +8,10 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
@@ -850,4 +852,169 @@ func TestChunkGC_LiveReferencedChunkNeverDeletedAmongGarbage(t *testing.T) {
 	readPinned, err := vb.ReadAt(0, uint64(len(pinned)))
 	require.NoError(t, err)
 	assert.Equal(t, pinned, readPinned)
+}
+
+// Test 14 (over-collection blocker): a stale drain that installs a block-map
+// entry backwards must never clobber a newer chunk's pointer, and must never
+// drive that live chunk's refcount to zero. Two concurrent drains rotate to
+// different sequential WAL segments and run createChunkFile in parallel; if
+// the OLDER segment's map write lands last, an unconditional overwrite would
+// repoint the block at the stale chunk and (via gcTrackBlock) drop the newer,
+// still-referenced chunk to refcount zero -- which the next sweep would then
+// physically delete. That is the exact silent-data-loss catastrophe this
+// feature must never cause.
+//
+// This drives the boundary deterministically by calling createChunkFile
+// directly with the NEWER write (higher SeqNum) first and the STALE write
+// (lower SeqNum) for the SAME block second, standing in for the newer of two
+// racing drains winning the map-write ordering. WITHOUT the monotonic guard
+// in createChunkFile the final assertions fail loudly: the live chunk is
+// deleted and the read returns stale data. WITH it, the live chunk survives,
+// the orphaned stale chunk is reclaimed, and the read is correct.
+func TestChunkGC_StaleDrainNeverClobbersNewerChunk(t *testing.T) {
+	root := t.TempDir()
+	vb := newGCTestVB(t, root, "vol-stale-clobber", true)
+	ctx := context.Background()
+	bs := int(vb.BlockSize)
+
+	// This test drives createChunkFile directly to force the exact
+	// out-of-order boundary, bypassing WriteAtCtx -- which is also the only
+	// path that populates the BlockStore. Route reads through the
+	// BlocksToObject map (where the monotonic guard under test lives) so the
+	// read reflects the map pointer, not an unpopulated BlockStore.
+	vb.UseBlockStore = false
+
+	// Newer write (higher SeqNum) lands FIRST.
+	newerData := make([]byte, bs)
+	_, err := rand.Read(newerData)
+	require.NoError(t, err)
+	newerBuf := newerData
+	newerMatched := []Block{{Block: 0, SeqNum: 20, Len: uint64(bs)}}
+	require.NoError(t, vb.createChunkFile(ctx, 0, &newerBuf, &newerMatched))
+	newerChunkID := vb.ObjectNum.Load() - 1
+
+	// Stale write (lower SeqNum) for the SAME block lands SECOND.
+	staleData := make([]byte, bs)
+	_, err = rand.Read(staleData)
+	require.NoError(t, err)
+	staleBuf := staleData
+	staleMatched := []Block{{Block: 0, SeqNum: 10, Len: uint64(bs)}}
+	require.NoError(t, vb.createChunkFile(ctx, 0, &staleBuf, &staleMatched))
+	staleChunkID := vb.ObjectNum.Load() - 1
+	require.NotEqual(t, newerChunkID, staleChunkID)
+
+	// The block must still point at the NEWER chunk, and refcounts must be
+	// exactly: live chunk 1, orphaned stale chunk tracked at 0.
+	vb.BlocksToObject.mu.RLock()
+	lookup, mapOK := vb.BlocksToObject.BlockLookup[0]
+	newerRefs := vb.gcRefcount[newerChunkID]
+	staleRefs, staleTracked := vb.gcRefcount[staleChunkID]
+	vb.BlocksToObject.mu.RUnlock()
+
+	require.True(t, mapOK, "block 0 lost its map entry entirely")
+	assert.Equalf(t, newerChunkID, lookup.ObjectID, "stale drain clobbered the live block pointer (map points at %d, want newer chunk %d)", lookup.ObjectID, newerChunkID)
+	assert.Equal(t, uint64(20), lookup.SeqNum, "block pointer must carry the newer SeqNum")
+	assert.Equalf(t, uint64(1), newerRefs, "live chunk %d refcount must stay 1; a stale drain must never decrement it", newerChunkID)
+	assert.True(t, staleTracked, "orphaned stale chunk should be tracked for prompt reclaim, not leaked")
+	assert.Zero(t, staleRefs, "orphaned stale chunk must be at refcount 0")
+
+	// A sweep reclaims the stale/orphan chunk and NEVER the live one.
+	vb.sweepChunks(ctx)
+	assertClosure(t, vb)
+	assertChunkPresent(t, vb.Backend, vb.VolumeName, newerChunkID)
+	assertChunkGone(t, vb.Backend, vb.VolumeName, staleChunkID)
+
+	// The read must return the NEWER data -- proof the live chunk was neither
+	// repointed away nor deleted.
+	got, err := vb.ReadAt(0, uint64(bs))
+	require.NoError(t, err)
+	assert.Equal(t, newerData, got, "read returned stale data -- the live chunk pointer was corrupted")
+}
+
+// Test 15 (concurrency, race-mode): drive real awaitBackpressure-triggered
+// drains from several concurrent writers WHILE a sweeper goroutine hammers
+// runGCSweep (which itself drains). This is the multi-trigger drain
+// concurrency drainMu must serialize. The invariant proven: after the storm
+// settles, closure holds (no live chunk was ever deleted -- a deleted live
+// chunk would make a referenced ObjectID unreadable) and every block reads
+// back its last-written value (proof each block's pointer resolves to its
+// highest-SeqNum chunk, not a stale or reclaimed one). Run under -race to
+// catch data races on BlockLookup / gcRefcount as well.
+func TestChunkGC_ConcurrentDrainAndSweepPreserveLiveChunks(t *testing.T) {
+	root := t.TempDir()
+	vb := newGCTestVB(t, root, "vol-concurrent-drain", true)
+	// Force backpressure so each concurrent WriteAtCtx drives its own
+	// synchronous DrainToBackendCtx, overlapping the sweeper's drains.
+	vb.MaxPendingBytes = 16 * uint64(vb.BlockSize)
+
+	ctx := context.Background()
+	bs := uint64(vb.BlockSize)
+
+	const writers = 4
+	const blocksPerWriter = 4
+	const rounds = 30
+
+	// Each writer owns an exclusive block range so its final value is known
+	// unambiguously; supersession within its own repeated rewrites still
+	// churns chunks, and the drains still overlap across writers + sweeper.
+	lastWritten := make([][]byte, writers)
+	writeErrs := make([]error, writers)
+
+	var writersWG sync.WaitGroup
+	var sweeperWG sync.WaitGroup
+	stop := make(chan struct{})
+
+	sweeperWG.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				vb.runGCSweep(ctx)
+				time.Sleep(time.Millisecond)
+			}
+		}
+	})
+
+	for w := range writers {
+		writersWG.Add(1)
+		go func(w int) {
+			defer writersWG.Done()
+			base := uint64(w*blocksPerWriter) * bs
+			var last []byte
+			for range rounds {
+				data := make([]byte, blocksPerWriter*int(bs))
+				if _, err := rand.Read(data); err != nil {
+					writeErrs[w] = err
+					return
+				}
+				if err := vb.WriteAtCtx(ctx, base, data); err != nil {
+					writeErrs[w] = err
+					return
+				}
+				last = data
+			}
+			lastWritten[w] = last
+		}(w)
+	}
+
+	writersWG.Wait()
+	close(stop)
+	sweeperWG.Wait()
+
+	for w, err := range writeErrs {
+		require.NoErrorf(t, err, "writer %d failed", w)
+	}
+
+	// Final quiescent drain + sweep, then verify nothing live was lost.
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+	vb.sweepChunks(ctx)
+	assertClosure(t, vb)
+
+	for w := range writers {
+		base := uint64(w*blocksPerWriter) * bs
+		got, err := vb.ReadAt(base, uint64(blocksPerWriter)*bs)
+		require.NoErrorf(t, err, "reading writer %d range", w)
+		assert.Equalf(t, lastWritten[w], got, "writer %d: block range did not read back its last write -- a live chunk was superseded incorrectly or deleted", w)
+	}
 }

@@ -183,8 +183,23 @@ type VB struct {
 	// drainInFlight ensures at most one goroutine actively drives
 	// DrainToBackendCtx from inside awaitBackpressure at a time; concurrent
 	// blocked writers poll pendingBytes instead of each launching a
-	// redundant drain.
+	// redundant drain. It is only an optimization for the backpressure path;
+	// drainMu below is the actual mutual-exclusion guarantee across every
+	// drain trigger.
 	drainInFlight atomic.Bool
+
+	// drainMu serializes DrainToBackendCtx across ALL its triggers
+	// (backpressure, ChunkUploadInterval ticker, size trigger, and the GC
+	// sweep). Two concurrent drains each rotate to a different sequential WAL
+	// segment and run WriteWALToChunk in parallel; because createChunkFile
+	// installs BlockLookup entries by block number, an older segment's write
+	// completing last would clobber a newer chunk's live pointer and (via
+	// gcTrackBlock) drop that chunk's refcount to zero, letting GC delete a
+	// still-referenced chunk. Holding this for the whole drain body keeps at
+	// most one WriteWALToChunk in flight, so no two createChunkFile calls ever
+	// contend for the same block. createChunkFile's own per-entry SeqNum guard
+	// is the belt to this mutex's braces.
+	drainMu sync.Mutex
 
 	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
 	// to drain now instead of waiting for the next ChunkUploadInterval tick,
@@ -1563,6 +1578,12 @@ func (vb *VB) DrainToBackend() error {
 // DrainToBackendCtx is DrainToBackend with a caller-supplied context threaded
 // through the chunk-upload and checkpoint S3 writes.
 func (vb *VB) DrainToBackendCtx(ctx context.Context) error {
+	// Serialize every drain trigger. See drainMu's doc comment: overlapping
+	// drains race in createChunkFile and can strand a live chunk at refcount
+	// zero, which GC would then physically delete.
+	vb.drainMu.Lock()
+	defer vb.drainMu.Unlock()
+
 	if err := vb.Flush(); err != nil {
 		return fmt.Errorf("drain flush: %w", err)
 	}
@@ -2712,6 +2733,36 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 		// TODO: Optimise for number of consecutive blocks to reduce the memory size
 		oldBlock, hadOld := vb.BlocksToObject.BlockLookup[block.Block]
+
+		// Reject a stale drain that would repoint this block backwards. Two
+		// concurrent drains can process sequential WAL segments in parallel
+		// (drainMu now prevents that, but a direct WriteWALToChunk caller or a
+		// future scheduling change could reintroduce overlap); if the OLDER
+		// segment's createChunkFile reached this write last, an unconditional
+		// overwrite would install its stale chunk AND make gcTrackBlock
+		// decrement the newer, live chunk's refcount -- potentially to zero,
+		// letting the next sweep delete a still-referenced chunk. Only advance
+		// on a strictly newer SeqNum, mirroring BlockStore.MarkPersisted. The
+		// stale chunk this call already uploaded is simply left unreferenced,
+		// so it becomes an ordinary GC candidate instead of corrupting the map.
+		// gcTrackBlock is skipped on rejection so the live chunk
+		// (oldBlock.ObjectID) keeps its reference and is never decremented.
+		// The stale chunk we already uploaded (newBlock.ObjectID) is instead
+		// recorded at refcount zero -- but only materialized if absent, so a
+		// sibling block in this same batch that legitimately installs this
+		// chunk still increments it to a positive count. That makes a wholly
+		// orphaned stale chunk a prompt sweep candidate instead of leaking it
+		// until the once-per-lifetime reconcile, while never fabricating a
+		// reference that would pin a live chunk.
+		if hadOld && oldBlock.SeqNum >= newBlock.SeqNum {
+			if vb.GCEnabled {
+				if _, tracked := vb.gcRefcount[newBlock.ObjectID]; !tracked {
+					vb.gcRefcount[newBlock.ObjectID] = 0
+				}
+			}
+			continue
+		}
+
 		vb.BlocksToObject.BlockLookup[block.Block] = newBlock
 		vb.gcTrackBlock(oldBlock.ObjectID, hadOld, newBlock.ObjectID)
 
