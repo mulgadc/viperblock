@@ -101,10 +101,18 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// For COW clones (vb.BaseBlockMap != nil), also write a flat inherited-blocks
 	// section so the snapshot is self-contained with no ancestry chain to walk.
 	vb.BlocksToObject.mu.RLock()
-	blockCount := uint64(len(vb.BlocksToObject.BlockLookup))
+	// BlockCount must be the physical block count (LoadSnapshotBlockMap
+	// validates it against a flat, un-coalesced loaded map's len()), not the
+	// number of coalesced map entries — sum each entry's NumBlocks rather
+	// than taking len() of the map.
+	var blockCount uint64
 	checkpoint := vb.BlockToObjectWALHeader()
+	stride := vb.blockStride()
 	for _, block := range vb.BlocksToObject.BlockLookup {
-		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
+		blockCount += uint64(block.NumBlocks)
+		for _, single := range expandBlockLookup(block, stride) {
+			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
+		}
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
@@ -427,11 +435,17 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 	}
 
 	// Build a seen-set from own blocks so inherited entries only include blocks
-	// not already covered by the volume's own delta.
+	// not already covered by the volume's own delta. Own entries may be
+	// coalesced runs (NumBlocks > 1), so expand each entry's full block
+	// range into the seen-set rather than just its map key (StartBlock) —
+	// otherwise every non-start block of an own run would be wrongly
+	// re-included from the base/ancestor maps below.
 	seen := make(map[uint64]struct{}, len(vb.BlocksToObject.BlockLookup))
 	vb.BlocksToObject.mu.RLock()
-	for k := range vb.BlocksToObject.BlockLookup {
-		seen[k] = struct{}{}
+	for _, bl := range vb.BlocksToObject.BlockLookup {
+		for i := uint16(0); i < bl.NumBlocks; i++ {
+			seen[bl.StartBlock+uint64(i)] = struct{}{}
+		}
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
