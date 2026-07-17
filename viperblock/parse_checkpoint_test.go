@@ -144,11 +144,24 @@ func TestParseBlockCheckpointBytesMatchesVBLoad(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		require.Len(t, got, len(vb.BlocksToObject.BlockLookup))
-		for blockNum, want := range vb.BlocksToObject.BlockLookup {
-			have, ok := got[blockNum]
-			require.True(t, ok, "block %d missing from parsed map", blockNum)
-			assert.Equal(t, want, have, "block %d mismatch", blockNum)
+		// vb's map may be coalesced into extents while ParseBlockCheckpointBytes
+		// stays flat (it has no volume config to reconstruct chunk stride
+		// from), so compare by physical block coverage rather than map
+		// shape: every block vb's coalesced map resolves must decode to the
+		// same location and SeqNum in the flat parsed map.
+		stride := vb.blockStride()
+		wantTotal := 0
+		for _, entry := range vb.BlocksToObject.BlockLookup {
+			wantTotal += int(entry.NumBlocks)
+			for i := range int(entry.NumBlocks) {
+				blockNum := entry.StartBlock + uint64(i)
+				have, ok := got[blockNum]
+				require.True(t, ok, "block %d missing from parsed map", blockNum)
+				assert.Equal(t, entry.ObjectID, have.ObjectID, "block %d ObjectID mismatch", blockNum)
+				assert.Equal(t, entry.offsetAt(i, stride), have.ObjectOffset, "block %d ObjectOffset mismatch", blockNum)
+				assert.Equal(t, entry.seqNumAt(i), have.SeqNum, "block %d SeqNum mismatch", blockNum)
+			}
 		}
+		require.Len(t, got, wantTotal, "parsed map block count should match vb's physical block count")
 	})
 }

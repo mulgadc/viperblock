@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -358,7 +359,78 @@ type BlockLookup struct {
 	// SeqNum here is the only source. Always populated from BlockEntry.SeqNum
 	// in createChunkFile (zero for blocks written by pre-encryption code paths
 	// — those volumes are unreadable post-cutover by design).
+	//
+	// For NumBlocks == 1 this is the block's own SeqNum. For NumBlocks > 1
+	// it is StartBlock's SeqNum, kept for on-disk wire-format compatibility;
+	// SeqNums below carries every block's own value since consecutive
+	// blocks in a run are not guaranteed to share a SeqNum (blocks are
+	// sorted by number, not write order, before coalescing).
 	SeqNum uint64
+
+	// SeqNums holds one SeqNum per block in this entry's [StartBlock,
+	// StartBlock+NumBlocks) run, in order. Populated whenever an entry
+	// covers more than one block (createChunkFile, coalesceBlockLookup);
+	// nil for single-block entries, where SeqNum alone is authoritative.
+	// Never serialized directly — the on-disk WAL/checkpoint format stays
+	// one 34-byte record per physical block (see expandBlockLookup).
+	SeqNums []uint64
+}
+
+// end returns the exclusive upper bound of the block range this entry
+// covers.
+func (bl BlockLookup) end() uint64 {
+	return bl.StartBlock + uint64(bl.NumBlocks)
+}
+
+// seqNumAt returns the SeqNum for the block at zero-based position i within
+// this entry's run, falling back to SeqNum when SeqNums wasn't populated
+// (always correct for the common NumBlocks == 1 case).
+func (bl BlockLookup) seqNumAt(i int) uint64 {
+	if i >= 0 && i < len(bl.SeqNums) {
+		return bl.SeqNums[i]
+	}
+	return bl.SeqNum
+}
+
+// offsetAt returns the on-disk object offset for the block at zero-based
+// position i within this entry's run, given the chunk's per-block byte
+// stride (BlockSize, or BlockSize+16 on encrypted volumes).
+func (bl BlockLookup) offsetAt(i int, stride uint32) uint32 {
+	return bl.ObjectOffset + utils.SafeIntToUint32(i)*stride
+}
+
+// sliceSeqNums returns the SeqNums for block positions [from, to) within
+// bl's run, suitable for building a fractured head/tail entry. Falls back
+// to a single-element slice derived from seqNumAt when bl.SeqNums wasn't
+// populated, so a fractured single-block (NumBlocks == 1) entry never loses
+// its SeqNum.
+func (bl BlockLookup) sliceSeqNums(from, to int) []uint64 {
+	if from >= to {
+		return nil
+	}
+	out := make([]uint64, to-from)
+	for i := from; i < to; i++ {
+		out[i-from] = bl.seqNumAt(i)
+	}
+	return out
+}
+
+// expandBlockLookup returns bl as a slice of single-block (NumBlocks == 1)
+// entries, one per block in its run. Used to preserve the on-disk
+// WAL/checkpoint wire format (one fixed 34-byte record per physical block)
+// exactly as before extent coalescing was introduced.
+func expandBlockLookup(bl BlockLookup, stride uint32) []BlockLookup {
+	out := make([]BlockLookup, bl.NumBlocks)
+	for i := range out {
+		out[i] = BlockLookup{
+			StartBlock:   bl.StartBlock + uint64(i),
+			NumBlocks:    1,
+			ObjectID:     bl.ObjectID,
+			ObjectOffset: bl.offsetAt(i, stride),
+			SeqNum:       bl.seqNumAt(i),
+		}
+	}
+	return out
 }
 
 type ConsecutiveBlock struct {
@@ -380,6 +452,157 @@ type ConsecutiveBlock struct {
 }
 
 type ConsecutiveBlocks []ConsecutiveBlock
+
+// resolveBlockLookup finds the coalesced entry covering block, if any,
+// returning it together with block's zero-based position within that
+// entry's run (0 for a direct StartBlock hit). Callers must hold
+// BlocksToObject.mu for at least reading.
+func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, bool) {
+	if bl, ok := b.BlockLookup[block]; ok {
+		return bl, 0, true
+	}
+	// Fall back to an O(n) containment scan: coalescing keys the map by
+	// StartBlock only, so a block inside a multi-block run has no entry of
+	// its own. n is bounded by the number of extents, not the number of
+	// blocks, so this stays cheap post-coalescing.
+	for _, bl := range b.BlockLookup {
+		if block > bl.StartBlock && block < bl.end() {
+			return bl, utils.SafeUint64ToInt(block - bl.StartBlock), true
+		}
+	}
+	return BlockLookup{}, 0, false
+}
+
+// insertCoalescedLocked inserts newEntry into BlockLookup, fracturing any
+// existing entries whose block range overlaps newEntry's range into their
+// surviving head/tail. This is the map-storage counterpart of
+// UnifiedBlockStore's persistedExtent fracturing: an overwrite landing
+// inside a previously-persisted extent must not leave the old extent's
+// entry shadowing (or being shadowed inconsistently by) the new one.
+// stride is the volume's current per-block on-disk byte stride, used to
+// recompute the surviving tail's ObjectOffset. Caller must hold
+// BlocksToObject.mu (write lock).
+func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32) {
+	newStart := newEntry.StartBlock
+	newEnd := newEntry.end()
+
+	// Snapshot keys first: Go forbids inserting new keys into a map while
+	// ranging over it, and fracturing does delete+reinsert below.
+	keys := make([]uint64, 0, len(b.BlockLookup))
+	for k := range b.BlockLookup {
+		keys = append(keys, k)
+	}
+
+	for _, k := range keys {
+		existing, ok := b.BlockLookup[k]
+		if !ok {
+			continue // already replaced by an earlier iteration
+		}
+		exStart := existing.StartBlock
+		exEnd := existing.end()
+		if exEnd <= newStart || exStart >= newEnd {
+			continue // no overlap
+		}
+
+		delete(b.BlockLookup, k)
+
+		// Surviving head: [exStart, newStart)
+		if exStart < newStart {
+			headLen := utils.SafeUint64ToInt(newStart - exStart)
+			head := BlockLookup{
+				StartBlock:   exStart,
+				NumBlocks:    utils.SafeIntToUint16(headLen),
+				ObjectID:     existing.ObjectID,
+				ObjectOffset: existing.ObjectOffset,
+				SeqNum:       existing.seqNumAt(0),
+				SeqNums:      existing.sliceSeqNums(0, headLen),
+			}
+			b.BlockLookup[head.StartBlock] = head
+		}
+
+		// Surviving tail: [newEnd, exEnd)
+		if exEnd > newEnd {
+			tailStart := newEnd
+			tailOffset := utils.SafeUint64ToInt(tailStart - exStart)
+			tailLen := utils.SafeUint64ToInt(exEnd - tailStart)
+			tail := BlockLookup{
+				StartBlock:   tailStart,
+				NumBlocks:    utils.SafeIntToUint16(tailLen),
+				ObjectID:     existing.ObjectID,
+				ObjectOffset: existing.offsetAt(tailOffset, stride),
+				SeqNum:       existing.seqNumAt(tailOffset),
+				SeqNums:      existing.sliceSeqNums(tailOffset, tailOffset+tailLen),
+			}
+			b.BlockLookup[tail.StartBlock] = tail
+		}
+	}
+
+	b.BlockLookup[newEntry.StartBlock] = newEntry
+}
+
+// coalesceBlockLookup merges a flat, one-entry-per-physical-block map (as
+// decoded from on-disk WAL/checkpoint records) into maximal coalesced runs,
+// keyed by StartBlock. Two consecutive-by-block-number records are only
+// merged when they also belong to the same backend chunk (ObjectID) at
+// contiguous byte offsets (stride apart) — the same criteria createChunkFile
+// uses to build a run, so a checkpoint save/load round trip reproduces the
+// exact same extent boundaries the writer produced.
+//
+// Every flat record is treated as covering exactly ONE physical block: the
+// map is keyed by block number and both the legacy pre-coalesce writer and
+// the new expandBlockLookup path emit one record per 4KiB block. The on-disk
+// NumBlocks field is deliberately IGNORED for merge math -- the legacy writer
+// stored a per-run countdown there (10, 9, ... 1) rather than a run length,
+// so trusting it would collapse a whole run onto its first record's SeqNum
+// and corrupt per-block AEAD nonces on reload. Runs are rebuilt purely from
+// real geometry (contiguous block numbers + same ObjectID + contiguous byte
+// offsets), and each record contributes its own SeqNum to the merged run.
+func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]BlockLookup {
+	out := make(map[uint64]BlockLookup, len(flat))
+	if len(flat) == 0 {
+		return out
+	}
+
+	keys := make([]uint64, 0, len(flat))
+	for k := range flat {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	i := 0
+	for i < len(keys) {
+		first := flat[keys[i]]
+		seqNums := []uint64{first.SeqNum}
+		prev := first
+		j := i + 1
+		for j < len(keys) {
+			cand := flat[keys[j]]
+			// prev covers a single block, so the next block number is
+			// prev.StartBlock+1 and its object offset is one stride further in.
+			if cand.StartBlock == prev.StartBlock+1 &&
+				cand.ObjectID == first.ObjectID &&
+				cand.ObjectOffset == prev.ObjectOffset+stride {
+				seqNums = append(seqNums, cand.SeqNum)
+				prev = cand
+				j++
+				continue
+			}
+			break
+		}
+
+		merged := BlockLookup{
+			StartBlock:   first.StartBlock,
+			NumBlocks:    utils.SafeIntToUint16(len(seqNums)),
+			ObjectID:     first.ObjectID,
+			ObjectOffset: first.ObjectOffset,
+			SeqNum:       first.SeqNum,
+			SeqNums:      seqNums,
+		}
+		out[merged.StartBlock] = merged
+		i = j
+	}
+	return out
+}
 
 type BlocksMap map[uint64]Block
 
@@ -2486,6 +2709,18 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 
 	return nil
 }
+
+// blockStride returns the per-block on-disk byte distance within a chunk:
+// BlockSize normally, or BlockSize+16 on encrypted volumes to account for
+// the GCM tag appended after each sealed block.
+func (vb *VB) blockStride() uint32 {
+	stride := vb.BlockSize
+	if vb.EncryptionEnabled {
+		stride += 16
+	}
+	return stride
+}
+
 func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
@@ -2566,42 +2801,57 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 	headerLen := len(headers)
 
-	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
-	// each ciphertext block; unencrypted chunks stay at BlockSize.
-	stride := int(vb.BlockSize)
-	if vb.EncryptionEnabled {
-		stride += 16
-	}
+	strideU32 := vb.blockStride()
+	stride := int(strideU32)
 
 	vb.BlocksToObject.mu.Lock()
-	for k, block := range *matchedBlocks {
-		// Find out how many consecutive blocks there are
-		numBlocks := 1
-		for j := k + 1; j < len(*matchedBlocks); j++ {
-			if (*matchedBlocks)[j].Block == (*matchedBlocks)[j-1].Block+1 {
-				numBlocks++
-			} else {
-				break
-			}
+	// matchedBlocks is sorted by Block ascending (see caller). Coalesce each
+	// maximal consecutive run into a single BlockLookup entry instead of one
+	// entry per block: an uncoalesced map grows unboundedly with total bytes
+	// ever written, not with live data, which is what drove nbdkit RSS up on
+	// long-running volumes.
+	runStart := 0
+	for runStart < len(*matchedBlocks) {
+		runEnd := runStart + 1
+		for runEnd < len(*matchedBlocks) && (*matchedBlocks)[runEnd].Block == (*matchedBlocks)[runEnd-1].Block+1 {
+			runEnd++
+		}
+		numBlocks := runEnd - runStart
+		first := (*matchedBlocks)[runStart]
+
+		seqNums := make([]uint64, numBlocks)
+		for i := runStart; i < runEnd; i++ {
+			seqNums[i-runStart] = (*matchedBlocks)[i].SeqNum
 		}
 
 		newBlock := BlockLookup{
-			StartBlock:   block.Block,
+			StartBlock:   first.Block,
 			NumBlocks:    utils.SafeIntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
-			ObjectOffset: utils.SafeIntToUint32(headerLen + (k * stride)),
-			SeqNum:       block.SeqNum,
+			ObjectOffset: utils.SafeIntToUint32(headerLen + (runStart * stride)),
+			SeqNum:       first.SeqNum,
+			SeqNums:      seqNums,
 		}
 
-		// TODO: Optimise for number of consecutive blocks to reduce the memory size
-		vb.BlocksToObject.BlockLookup[block.Block] = newBlock
+		// Fracture any existing entry this run overwrites (e.g. a prior
+		// persisted extent partially rewritten) into its surviving
+		// head/tail before inserting the new run.
+		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32)
 
-		// Update BlockStore: transition from Pending to Persisted. Pass the
-		// sealed SeqNum so the location and seqNum stay bound as a unit; a
-		// stale drain whose block was since re-written is rejected here.
+		// Update BlockStore: transition from Pending to Persisted, one
+		// range op per run instead of one call per block. Per-block SeqNums
+		// keep the location/seqNum binding atomic per block; a stale block
+		// whose data was since re-written is rejected per-block inside
+		// MarkPersistedRange, same as the single-block MarkPersisted guard.
 		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset, block.SeqNum)
+			blocks := make([]uint64, numBlocks)
+			for i := range blocks {
+				blocks[i] = first.Block + uint64(i)
+			}
+			vb.BlockStore.MarkPersistedRange(blocks, chunkIndex, newBlock.ObjectOffset, strideU32, seqNums)
 		}
+
+		runStart = runEnd
 	}
 	vb.BlocksToObject.dirty.Store(true)
 	vb.BlocksToObject.mu.Unlock()
@@ -2666,12 +2916,13 @@ func (vb *VB) SaveBlockStateCtx(ctx context.Context) (err error) {
 
 	//file.Write(header)
 
+	// Expand each coalesced entry back into one 34-byte record per physical
+	// block: the on-disk wire format stays unchanged even though the
+	// in-memory map is coalesced into extents.
+	stride := vb.blockStride()
 	for _, block := range vb.BlocksToObject.BlockLookup {
-		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
-
-		if err != nil {
-			vb.logger().Error("ERROR WRITING BLOCK TO BLOCK WAL:", "error", err)
-			return err
+		for _, single := range expandBlockLookup(block, stride) {
+			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
 		}
 	}
 
@@ -2768,9 +3019,14 @@ func ParseBlockCheckpointBytes(raw []byte, version uint16) (map[uint64]BlockLook
 // parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
 // Caller must hold BlocksToObject.mu (write).
 func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
-
 	vb.logger().Debug("Loaded checkpoint", "checkpoint", checkpoint)
+
+	// The on-disk wire format is unchanged: one fixed record per physical
+	// block. Decode into a flat map first, then recoalesce into maximal
+	// same-chunk consecutive runs -- otherwise every (re)open of a large
+	// volume would revert BlocksToObject and BlockStore straight back to
+	// one entry per block, regressing the coalescing this map is built for.
+	flat := make(map[uint64]BlockLookup)
 
 	// Track the highest chunk ObjectID the map references so ObjectNum can be
 	// reconciled to max+1 below, mirroring SeqNum -> maxSeqNum in RecoverLocalWALs.
@@ -2778,18 +3034,29 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	haveObject := false
 
 	err := walkBlockCheckpoint(checkpoint, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
-		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
+		flat[block.StartBlock] = block
 		if !haveObject || block.ObjectID > maxObjectID {
 			maxObjectID = block.ObjectID
 			haveObject = true
-		}
-		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
 		}
 	})
 	if err != nil {
 		vb.logger().Error("Error reading checkpoint", "error", err)
 		return err
+	}
+
+	vb.BlocksToObject.BlockLookup = coalesceBlockLookup(flat, vb.blockStride())
+
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		for _, entry := range vb.BlocksToObject.BlockLookup {
+			blocks := make([]uint64, entry.NumBlocks)
+			seqNums := make([]uint64, entry.NumBlocks)
+			for i := range blocks {
+				blocks[i] = entry.StartBlock + uint64(i)
+				seqNums[i] = entry.seqNumAt(i)
+			}
+			vb.BlockStore.SetPersistedRange(blocks, entry.ObjectID, entry.ObjectOffset, vb.blockStride(), seqNums)
+		}
 	}
 
 	// Runtime drains persist chunks but not config.json ObjectNum, so a re-Open can
@@ -2865,8 +3132,11 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	// the lock is not held across network writes or retry sleeps.
 	vb.BlocksToObject.mu.RLock()
 	checkpoint := vb.BlockToObjectWALHeader()
+	stride := vb.blockStride()
 	for _, block := range vb.BlocksToObject.BlockLookup {
-		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
+		for _, single := range expandBlockLookup(block, stride) {
+			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
+		}
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
@@ -3186,14 +3456,26 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		}
 	}
 
-	// Sync BlockStore from BlocksToObject since createChunkFile's MarkPersisted
-	// won't work during recovery (blocks aren't in Pending state in BlockStore)
+	// Sync BlockStore from BlocksToObject since createChunkFile's
+	// MarkPersistedRange won't work during recovery (blocks aren't in Pending
+	// state in BlockStore). createChunkFile already coalesced BlocksToObject
+	// above, so install each run as one persistedExtent via SetPersistedRange
+	// -- keeping the index O(extents) rather than reverting recovered blocks to
+	// one BlockStore entry per block. Each block keeps its own AEAD SeqNum via
+	// the entry's per-position SeqNums. Idempotent for runs already installed
+	// by a prior checkpoint load, and Hot/Pending shard entries from newer
+	// writes still take precedence in ReadEntry.
 	if vb.UseBlockStore && vb.BlockStore != nil {
 		vb.BlocksToObject.mu.RLock()
-		for _, block := range sortedBlocks {
-			if lookup, ok := vb.BlocksToObject.BlockLookup[block.Block]; ok {
-				vb.BlockStore.SetPersisted(block.Block, lookup.ObjectID, lookup.ObjectOffset, block.SeqNum)
+		stride := vb.blockStride()
+		for _, lookup := range vb.BlocksToObject.BlockLookup {
+			blocks := make([]uint64, lookup.NumBlocks)
+			seqNums := make([]uint64, lookup.NumBlocks)
+			for i := range blocks {
+				blocks[i] = lookup.StartBlock + uint64(i)
+				seqNums[i] = lookup.seqNumAt(i)
 			}
+			vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
 		}
 		vb.BlocksToObject.mu.RUnlock()
 	}
@@ -3330,15 +3612,14 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	vb.logger().Debug("LookupBlockToObject", "block", block)
 
 	vb.BlocksToObject.mu.RLock()
-
-	blockLookup, ok := vb.BlocksToObject.BlockLookup[block]
-
+	blockLookup, pos, ok := vb.BlocksToObject.resolveBlockLookup(block)
+	stride := vb.blockStride()
 	vb.BlocksToObject.mu.RUnlock()
 
 	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
 
 	if ok {
-		return blockLookup.ObjectID, blockLookup.ObjectOffset, blockLookup.SeqNum, nil
+		return blockLookup.ObjectID, blockLookup.offsetAt(pos, stride), blockLookup.seqNumAt(pos), nil
 	} else {
 		return 0, 0, 0, ErrZeroBlock
 	}
@@ -4879,10 +5160,20 @@ func (vb *VB) SyncBlockStoreFromLegacy() {
 	}
 	vb.PendingBackendWrites.mu.RUnlock()
 
-	// Sync from BlocksToObject
+	// Sync from BlocksToObject. Each entry may cover a coalesced run of
+	// several blocks; SetPersistedRange installs the whole run as one
+	// extent instead of reverting it to one BlockStore entry per block.
+	// seqNum 0 for every block is a pre-existing quirk of this legacy sync
+	// path, kept as-is here.
 	vb.BlocksToObject.mu.RLock()
-	for blockNum, lookup := range vb.BlocksToObject.BlockLookup {
-		vb.BlockStore.SetPersisted(blockNum, lookup.ObjectID, lookup.ObjectOffset, 0)
+	stride := vb.blockStride()
+	for _, lookup := range vb.BlocksToObject.BlockLookup {
+		blocks := make([]uint64, lookup.NumBlocks)
+		seqNums := make([]uint64, lookup.NumBlocks)
+		for i := range blocks {
+			blocks[i] = lookup.StartBlock + uint64(i)
+		}
+		vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
