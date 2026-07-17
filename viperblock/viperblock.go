@@ -3226,8 +3226,32 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	}
 	vb.BlocksToObject.mu.Unlock()
 
-	swept := 0
-	for _, id := range candidates {
+	swept := vb.deleteChunkObjects(ctx, candidates)
+
+	if swept > 0 {
+		vb.logger().Info("chunk GC: sweep complete", "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
+	} else {
+		vb.logger().Debug("chunk GC: sweep found nothing to reclaim", "floor", floor, "watermark", watermark)
+	}
+}
+
+// deleteChunkObjects issues a DeleteObject call for each chunk ObjectID in
+// ids and returns how many were actually reclaimed (deleted, or already
+// gone). This is the sole call site chunk GC uses to remove backend
+// objects, deliberately isolated from sweepChunks's candidate-selection
+// logic: predastore has no batch DeleteObjects route today (POST
+// ?delete= returns 405 -- see the s3 backend's Delete doc comment), so
+// this issues one DeleteCtx per key, but a future batched backend call can
+// replace this loop's body without sweepChunks or its safety predicate
+// (floor/watermark/refcount) changing at all. Not a hot path: a sweep runs
+// at most every few minutes over at most tens of candidate keys.
+//
+// A delete that fails with anything other than "already gone"
+// (errors.Is(err, os.ErrNotExist)) is left both in gcRefcount and out of
+// the swept count, so the next sweep retries it -- silent under-collection
+// (a leaked chunk) is always preferred over losing track of a candidate.
+func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) {
+	for _, id := range ids {
 		if err := vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id); err != nil && !errors.Is(err, os.ErrNotExist) {
 			vb.logger().Warn("chunk GC: delete failed, will retry next sweep", "objectID", id, "err", err)
 			continue
@@ -3237,12 +3261,7 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		vb.BlocksToObject.mu.Unlock()
 		swept++
 	}
-
-	if swept > 0 {
-		vb.logger().Info("chunk GC: sweep complete", "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
-	} else {
-		vb.logger().Debug("chunk GC: sweep found nothing to reclaim", "floor", floor, "watermark", watermark)
-	}
+	return swept
 }
 
 // runGCSweep drains this VB to the backend -- persisting a live checkpoint

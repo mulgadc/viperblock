@@ -755,3 +755,99 @@ func TestChunkGC_CrashConsistency(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, original, readBack)
 }
+
+// countChunkObjects returns the number of chunk objects currently on the
+// backend under volumeName's own chunks/ prefix -- the acceptance-level
+// signal for "did GC actually bound backend growth", independent of
+// gcRefcount's in-memory bookkeeping.
+func countChunkObjects(t *testing.T, backend types.Backend, volumeName string) int {
+	t.Helper()
+	keys, err := backend.ListObjects(volumeName + "/chunks/")
+	require.NoError(t, err)
+	return len(keys)
+}
+
+// Test 12 (acceptance headline): rewriting the same logical blocks N times
+// yields a BOUNDED chunk object count, not one that grows with N. Every
+// pass fully supersedes the previous pass's single chunk (randomBlocks(4) is
+// far under ObjBlockSize, so writeAndChunk mints exactly one chunk per
+// call -- see its doc comment), so an unbounded/leaking implementation would
+// show live chunk count == pass count; a correct one holds flat at 1 after
+// each sweep. This is the plan doc's pre-registered prediction
+// ("slope_per_footprint drops from ~4.603 to ~0") reproduced as a unit
+// assertion instead of a live sweep.
+func TestChunkGC_BoundedGrowthUnderSustainedOverwrite(t *testing.T) {
+	root := t.TempDir()
+	vb := newGCTestVB(t, root, "vol-bounded", true)
+	ctx := context.Background()
+
+	const passes = 10
+	counts := make([]int, 0, passes)
+
+	for i := range passes {
+		writeAndChunk(t, vb, 0, randomBlocks(4))
+		vb.runGCSweep(ctx)
+		assertClosure(t, vb)
+
+		count := countChunkObjects(t, vb.Backend, vb.VolumeName)
+		counts = append(counts, count)
+		// Every pass fully supersedes the prior pass's one chunk, so after
+		// its sweep exactly one chunk (this pass's own) must remain live --
+		// never a growing tail of superseded ones.
+		assert.Equalf(t, 1, count, "pass %d: expected exactly 1 live chunk after sweep, got %d (counts so far: %v)", i, count, counts)
+	}
+
+	// Belt-and-braces on the acceptance claim itself: the final count must
+	// not scale with passes. A naive no-op GC would show counts[passes-1] ==
+	// passes (10); bounded GC holds it at 1 regardless of N.
+	require.Less(t, counts[len(counts)-1], passes,
+		"chunk object count grew with pass count (got %v) -- GC did not bound backend growth", counts)
+
+	// Data correctness survives the whole sustained-overwrite + GC cycle.
+	final, err := vb.ReadAt(0, 4*uint64(DefaultBlockSize))
+	require.NoError(t, err)
+	require.Len(t, final, 4*int(DefaultBlockSize))
+}
+
+// Test 13: negative/safety belt-and-braces -- a chunk still referenced by
+// ANY live block-map entry is never a GC candidate, even sitting alongside
+// many wholly-unreferenced siblings in the same sweep. Loudly asserts the
+// refcounted chunk is untouched across a sweep that reclaims everything
+// else.
+func TestChunkGC_LiveReferencedChunkNeverDeletedAmongGarbage(t *testing.T) {
+	root := t.TempDir()
+	vb := newGCTestVB(t, root, "vol-live-safety", true)
+	ctx := context.Background()
+
+	// Block range [0,4) stays live for the whole test -- never overwritten.
+	pinned := randomBlocks(4)
+	writeAndChunk(t, vb, 0, pinned)
+	pinnedChunkID := vb.ObjectNum.Load() - 1
+
+	// Block range [4,8) gets rewritten repeatedly, minting and orphaning a
+	// chunk each time -- garbage the sweep should reclaim, interleaved with
+	// the pinned chunk's ID range so a floor/watermark-only bug (rather than
+	// true per-chunk refcounting) would be exposed.
+	var garbageChunkIDs []uint64
+	for range 5 {
+		writeAndChunk(t, vb, 4, randomBlocks(4))
+		garbageChunkIDs = append(garbageChunkIDs, vb.ObjectNum.Load()-1)
+	}
+
+	vb.runGCSweep(ctx)
+	assertClosure(t, vb)
+
+	// The pinned chunk must survive every sweep, loudly.
+	assertChunkPresent(t, vb.Backend, vb.VolumeName, pinnedChunkID)
+
+	// Every garbage chunk except the last (still live) must be gone.
+	for _, id := range garbageChunkIDs[:len(garbageChunkIDs)-1] {
+		assertChunkGone(t, vb.Backend, vb.VolumeName, id)
+	}
+	assertChunkPresent(t, vb.Backend, vb.VolumeName, garbageChunkIDs[len(garbageChunkIDs)-1])
+
+	// Both live ranges still read back correctly.
+	readPinned, err := vb.ReadAt(0, uint64(len(pinned)))
+	require.NoError(t, err)
+	assert.Equal(t, pinned, readPinned)
+}
