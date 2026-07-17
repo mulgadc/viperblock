@@ -194,9 +194,10 @@ type VB struct {
 	// sweep). Two concurrent drains each rotate to a different sequential WAL
 	// segment and run WriteWALToChunk in parallel; because createChunkFile
 	// installs BlockLookup entries by block number, an older segment's write
-	// completing last would clobber a newer chunk's live pointer and (via
-	// gcTrackBlock) drop that chunk's refcount to zero, letting GC delete a
-	// still-referenced chunk. Holding this for the whole drain body keeps at
+	// completing last would clobber a newer chunk's live pointer and drop
+	// that chunk's refcount to zero (see insertCoalescedLocked's gcRefcount
+	// accounting), letting GC delete a still-referenced chunk. Holding this
+	// for the whole drain body keeps at
 	// most one WriteWALToChunk in flight, so no two createChunkFile calls ever
 	// contend for the same block. createChunkFile's own per-entry SeqNum guard
 	// is the belt to this mutex's braces.
@@ -345,7 +346,7 @@ type VB struct {
 	// reason about. A zero count marks the chunk a GC candidate; the entry
 	// is left in the map (not deleted) at zero so sweepChunks can find it,
 	// and is removed only once the chunk is actually deleted from the
-	// backend. Only maintained when GCEnabled — see gcTrackBlock.
+	// backend. Only maintained when GCEnabled — see insertCoalescedLocked.
 	//
 	// gcRefcount alone cannot see a chunk that became unreferenced and was
 	// never swept before this process last closed: parseBlockCheckpoint
@@ -581,7 +582,17 @@ func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, boo
 // stride is the volume's current per-block on-disk byte stride, used to
 // recompute the surviving tail's ObjectOffset. Caller must hold
 // BlocksToObject.mu (write lock).
-func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32) {
+//
+// gcRefcount, if non-nil, is kept in exact lockstep with every entry this
+// call removes or adds: a fracture can turn one existing entry into zero,
+// one, or two survivors of the SAME ObjectID (a partial overwrite of a
+// coalesced run splits it into a surviving head and/or tail), so the net
+// refcount delta for that ObjectID is not always -1/+1. Tracking per entry
+// removed/added here -- rather than a single old/new pair at the call site
+// -- is what keeps gcRefcount an exact live-entry count instead of a
+// per-chunk approximation that could hit zero (and trigger a delete) while
+// a surviving fragment still points at the chunk.
+func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32, gcRefcount map[uint64]uint64) {
 	newStart := newEntry.StartBlock
 	newEnd := newEntry.end()
 
@@ -604,6 +615,11 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 		}
 
 		delete(b.BlockLookup, k)
+		if gcRefcount != nil {
+			if n := gcRefcount[existing.ObjectID]; n > 0 {
+				gcRefcount[existing.ObjectID] = n - 1
+			}
+		}
 
 		// Surviving head: [exStart, newStart)
 		if exStart < newStart {
@@ -617,6 +633,9 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 				SeqNums:      existing.sliceSeqNums(0, headLen),
 			}
 			b.BlockLookup[head.StartBlock] = head
+			if gcRefcount != nil {
+				gcRefcount[head.ObjectID]++
+			}
 		}
 
 		// Surviving tail: [newEnd, exEnd)
@@ -633,10 +652,16 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 				SeqNums:      existing.sliceSeqNums(tailOffset, tailOffset+tailLen),
 			}
 			b.BlockLookup[tail.StartBlock] = tail
+			if gcRefcount != nil {
+				gcRefcount[tail.ObjectID]++
+			}
 		}
 	}
 
 	b.BlockLookup[newEntry.StartBlock] = newEntry
+	if gcRefcount != nil {
+		gcRefcount[newEntry.ObjectID]++
+	}
 }
 
 // coalesceBlockLookup merges a flat, one-entry-per-physical-block map (as
@@ -2976,21 +3001,22 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		// (drainMu now prevents that, but a direct WriteWALToChunk caller or a
 		// future scheduling change could reintroduce overlap); if the OLDER
 		// segment's createChunkFile reached this write last, an unconditional
-		// overwrite would install its stale chunk AND make gcTrackBlock
-		// decrement the newer, live chunk's refcount -- potentially to zero,
-		// letting the next sweep delete a still-referenced chunk. Only advance
-		// on a strictly newer SeqNum, mirroring BlockStore.MarkPersisted. The
-		// stale chunk this call already uploaded is simply left unreferenced,
-		// so it becomes an ordinary GC candidate instead of corrupting the map.
-		// gcTrackBlock is skipped on rejection so the live chunk
-		// (oldBlock.ObjectID) keeps its reference and is never decremented.
-		// The stale chunk we already uploaded (newBlock.ObjectID) is instead
-		// recorded at refcount zero -- but only materialized if absent, so a
-		// sibling block in this same batch that legitimately installs this
-		// chunk still increments it to a positive count. That makes a wholly
-		// orphaned stale chunk a prompt sweep candidate instead of leaking it
-		// until the once-per-lifetime reconcile, while never fabricating a
-		// reference that would pin a live chunk.
+		// overwrite would install its stale chunk AND drop the newer, live
+		// chunk's refcount -- potentially to zero, letting the next sweep
+		// delete a still-referenced chunk. Only advance on a strictly newer
+		// SeqNum, mirroring BlockStore.MarkPersisted. The stale chunk this
+		// call already uploaded is simply left unreferenced, so it becomes
+		// an ordinary GC candidate instead of corrupting the map.
+		// insertCoalescedLocked's refcount accounting is skipped entirely on
+		// rejection so the live chunk (oldBlock.ObjectID) keeps its
+		// reference and is never decremented. The stale chunk we already
+		// uploaded (newBlock.ObjectID) is instead recorded at refcount zero
+		// -- but only materialized if absent, so a sibling block in this
+		// same batch that legitimately installs this chunk still increments
+		// it to a positive count. That makes a wholly orphaned stale chunk a
+		// prompt sweep candidate instead of leaking it until the
+		// once-per-lifetime reconcile, while never fabricating a reference
+		// that would pin a live chunk.
 		//
 		// resolveBlockLookup (not a raw map index) finds the covering entry
 		// even when this run's start block sits inside an existing coalesced
@@ -3009,9 +3035,17 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 		// Fracture any existing entry this run overwrites (e.g. a prior
 		// persisted extent partially rewritten) into its surviving
-		// head/tail before inserting the new run.
-		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32)
-		vb.gcTrackBlock(oldBlock.ObjectID, hadOld, newBlock.ObjectID)
+		// head/tail before inserting the new run. Pass gcRefcount straight
+		// through so a partial overwrite's surviving fragments keep their
+		// share of the old chunk's refcount -- a single old/new decrement
+		// here would instead always drop it by exactly one, undercounting
+		// (and risking an early, incorrect sweep of) a chunk that a
+		// fracture left with surviving references.
+		var gcRefcount map[uint64]uint64
+		if vb.GCEnabled {
+			gcRefcount = vb.gcRefcount
+		}
+		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32, gcRefcount)
 
 		// Update BlockStore: transition from Pending to Persisted, one
 		// range op per run instead of one call per block. Per-block SeqNums
@@ -3046,24 +3080,6 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// it has actually landed on the backend. GC only ever sweeps from the
 	// single serialized point right after that checkpoint write succeeds.
 	return nil
-}
-
-// gcTrackBlock updates the in-memory chunk refcount for one BlockLookup
-// mutation. Call under BlocksToObject.mu (the same lock that guards
-// BlockLookup itself — see gcRefcount's doc comment on VB). oldObjectID/
-// hadOld describe the block's previous occupant, if any; newObjectID is the
-// chunk it now belongs to. A no-op when GCEnabled is false so the refcount
-// map is never allocated or touched for the common, GC-disabled case.
-func (vb *VB) gcTrackBlock(oldObjectID uint64, hadOld bool, newObjectID uint64) {
-	if !vb.GCEnabled {
-		return
-	}
-	if hadOld && oldObjectID != newObjectID {
-		if n := vb.gcRefcount[oldObjectID]; n > 0 {
-			vb.gcRefcount[oldObjectID] = n - 1
-		}
-	}
-	vb.gcRefcount[newObjectID]++
 }
 
 func (vb *VB) SaveHotState(filename string) (err error) {
