@@ -72,6 +72,12 @@ var upload_workers int = 16
 var use_shardwal bool = false
 var encryption_key_file string
 
+// gc_enabled mirrors viperblock.VB.GCEnabled: chunk GC (mark-and-sweep,
+// snapshot-ancestry gated) is off unless the spawning process explicitly
+// passes gc_enabled=true. Defaults false so every existing deployment keeps
+// today's behavior until the enable is flipped deliberately.
+var gc_enabled bool = false
+
 var disk []byte
 
 // loadedMasterKey is populated once in ConfigComplete from
@@ -144,6 +150,9 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "shardwal" {
 		use_shardwal = value == "true" || value == "1"
+		return nil
+	} else if key == "gc_enabled" {
+		gc_enabled = value == "true" || value == "1"
 		return nil
 	} else if key == "encryption_key_file" {
 		encryption_key_file = value
@@ -233,6 +242,10 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		UploadWorkers:     upload_workers,
 		MasterKey:         loadedMasterKey,
 		EncryptionEnabled: loadedMasterKey != nil,
+		// GCEnabled must be set here (not applied post-construction like
+		// UseShardedWAL below) because viperblock.New copies it once into
+		// vb.GCEnabled at construction time.
+		GCEnabled: gc_enabled,
 	}
 
 	slog.Info("Creating Viperblock backend with btype, config", cfg)

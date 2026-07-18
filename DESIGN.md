@@ -601,6 +601,7 @@ The plugin implements the full nbdkit interface:
 | `base_dir` | Local storage directory |
 | `cache_size` | LRU cache size (percentage of system memory) |
 | `shardwal` | Enable sharded WAL (`true`/`false`) |
+| `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `false`) |
 
 ---
 
