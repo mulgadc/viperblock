@@ -9,11 +9,13 @@ import (
 )
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/telemetry"
@@ -391,6 +393,20 @@ func stopSnapshotListener() {
 	snapshotListenerDone = nil
 }
 
+// backendErrToPluginError turns a viperblock write-path error into an
+// nbdkit.PluginError, mapping viperblock.ErrNoSpace onto a real ENOSPC so
+// the guest kernel sees "no space left on device" instead of a generic I/O
+// error. PluginError.Errno propagates to nbdkit's set_error via the C
+// bridge in implError; every other error leaves Errno at its zero value (no
+// errno override, nbdkit defaults to EIO).
+func backendErrToPluginError(msgPrefix string, err error) nbdkit.PluginError {
+	perr := nbdkit.PluginError{Errmsg: fmt.Sprintf("%s: %v", msgPrefix, err)}
+	if errors.Is(err, viperblock.ErrNoSpace) {
+		perr.Errno = syscall.ENOSPC
+	}
+	return perr
+}
+
 func (c *ViperBlockConnection) GetSize() (uint64, error) {
 	return c.vb.GetVolumeSize(), nil
 
@@ -431,7 +447,7 @@ func (c *ViperBlockConnection) PWrite(buf []byte, offset uint64,
 	err := c.vb.WriteAt(offset, data)
 
 	if err != nil {
-		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write data: %v", err)}
+		return backendErrToPluginError("Could not write data", err)
 	}
 
 	return nil
@@ -454,7 +470,7 @@ func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) e
 	err := c.vb.WriteAt(offset, data)
 
 	if err != nil {
-		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not write zero data: %v", err)}
+		return backendErrToPluginError("Could not write zero data", err)
 	}
 
 	return nil
@@ -479,7 +495,7 @@ func (c *ViperBlockConnection) CanFlush() (bool, error) {
 
 func (c *ViperBlockConnection) Flush(flags uint32) error {
 	if err := c.vb.Flush(); err != nil {
-		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Flush failed: %v", err)}
+		return backendErrToPluginError("Flush failed", err)
 	}
 	return nil
 }

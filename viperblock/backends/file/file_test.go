@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/mulgadc/viperblock/types"
@@ -258,4 +259,106 @@ func TestListObjectsMissingPrefixIsEmptyNotError(t *testing.T) {
 	keys, err := backend.ListObjects("no-such-volume/chunks/")
 	require.NoError(t, err)
 	assert.Empty(t, keys)
+}
+
+// TestClassifyWriteErr pins the disk-full detection viperblock's drain path
+// relies on: a full local disk surfaces syscall.ENOSPC, wrapped at any depth
+// (a bare os.PathError from the os package, or further wrapped by a caller),
+// and classifyWriteErr must turn that into types.ErrNoSpace so it latches
+// backendFull the same way a predastore 507 does. Any other error —
+// including a different, unrelated syscall.Errno — must pass through
+// unclassified.
+func TestClassifyWriteErr(t *testing.T) {
+	cases := []struct {
+		name        string
+		in          error
+		wantNoSpace bool
+	}{
+		{
+			name:        "nil_passes_through",
+			in:          nil,
+			wantNoSpace: false,
+		},
+		{
+			name:        "bare_enospc_maps_to_no_space",
+			in:          syscall.ENOSPC,
+			wantNoSpace: true,
+		},
+		{
+			name: "path_error_wrapped_enospc_maps_to_no_space",
+			in: &os.PathError{
+				Op:   "write",
+				Path: "/tmp/some/chunk.bin",
+				Err:  syscall.ENOSPC,
+			},
+			wantNoSpace: true,
+		},
+		{
+			name:        "unrelated_errno_stays_unclassified",
+			in:          syscall.EACCES,
+			wantNoSpace: false,
+		},
+		{
+			name:        "unrelated_error_stays_unclassified",
+			in:          os.ErrPermission,
+			wantNoSpace: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyWriteErr(tc.in)
+			if tc.in == nil {
+				assert.NoError(t, got)
+				return
+			}
+			assert.Error(t, got)
+			if tc.wantNoSpace {
+				assert.ErrorIs(t, got, types.ErrNoSpace,
+					"want types.ErrNoSpace for %v, got %v", tc.in, got)
+			} else {
+				assert.NotErrorIs(t, got, types.ErrNoSpace,
+					"unexpected types.ErrNoSpace for %v", tc.in)
+			}
+		})
+	}
+}
+
+// TestWriteRealDiskFullMapsToNoSpace exercises Write's actual error path (not
+// just the classifyWriteErr helper) by pointing BaseDir at a size-capped
+// tmpfs mount and writing until the filesystem genuinely reports ENOSPC.
+// Requires CAP_SYS_ADMIN to mount tmpfs; skips (rather than failing) when
+// that is unavailable so the suite still runs in unprivileged environments.
+func TestWriteRealDiskFullMapsToNoSpace(t *testing.T) {
+	mountPoint := t.TempDir()
+
+	if err := syscall.Mount("tmpfs", mountPoint, "tmpfs", 0, "size=65536"); err != nil {
+		t.Skipf("cannot mount a size-capped tmpfs (need CAP_SYS_ADMIN): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Unmount(mountPoint, 0)
+	})
+
+	backend := New(FileConfig{
+		VolumeName: "enospc-vol",
+		VolumeSize: 1024 * 1024 * 1024,
+		BaseDir:    mountPoint,
+	})
+	require.NoError(t, backend.Init())
+
+	headers := []byte("hdr")
+	data := make([]byte, 8192)
+
+	var writeErr error
+	for i := range uint64(64) {
+		if writeErr = backend.Write(types.FileTypeChunk, i, &headers, &data); writeErr != nil {
+			break
+		}
+	}
+
+	require.Error(t, writeErr, "writes should eventually exhaust the 64KiB tmpfs")
+	assert.ErrorIs(t, writeErr, types.ErrNoSpace,
+		"a real disk-full write error must classify as types.ErrNoSpace, got: %v", writeErr)
+	assert.ErrorIs(t, writeErr, syscall.ENOSPC,
+		"classification must preserve the underlying syscall.ENOSPC")
 }

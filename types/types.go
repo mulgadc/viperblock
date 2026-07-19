@@ -2,9 +2,25 @@ package types
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 )
+
+// ErrNoSpace is returned by a Backend's Write/WriteCtx/WriteTo/WriteToCtx
+// when the backend has rejected the write because its underlying storage is
+// full: predastore's S3 API returns HTTP 507 (Insufficient Storage) or 503
+// when its filesystem is nearly full, and the local file backend surfaces a
+// real syscall.ENOSPC on a full disk. Backends classify both shapes into
+// this single sentinel so callers can react to "out of space" uniformly via
+// errors.Is, regardless of which backend is in use.
+//
+// This lives in the types package (rather than the viperblock package,
+// which is where callers consume it as viperblock.ErrNoSpace) because the
+// backends/file and backends/s3 packages, which must return it, are
+// imported BY the viperblock package — defining it there would create an
+// import cycle.
+var ErrNoSpace = errors.New("viperblock: backend out of space")
 
 type Backend interface {
 	Init() error

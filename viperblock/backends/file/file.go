@@ -2,11 +2,13 @@ package file
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mulgadc/viperblock/telemetry"
@@ -57,6 +59,19 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 		outcome = "error"
 	}
 	telemetry.RecordBackendIO(ctx, "write", "file", backend.config.VolumeName, outcome, writeLen(headers, data), time.Since(start))
+	return err
+}
+
+// classifyWriteErr maps a local write failure into types.ErrNoSpace when the
+// underlying syscall reports ENOSPC (disk full). Any other error passes
+// through unchanged.
+func classifyWriteErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
+	}
 	return err
 }
 
@@ -197,6 +212,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	file, err := os.Create(filename)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create chunk file", "error", err)
 		return err
 	}
@@ -205,6 +221,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	_, err = file.Write(*headers)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write headers", "error", err)
 		return err
 	}
@@ -212,6 +229,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	_, err = file.Write(*data)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write data", "error", err)
 		return err
 	}
@@ -219,6 +237,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	err = file.Close()
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to close file", "error", err)
 		return err
 	}
@@ -279,6 +298,7 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 
 	file, err := os.Create(filename)
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create file", "error", err)
 		return err
 	}
@@ -288,7 +308,7 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 			if cerr := file.Close(); cerr != nil {
 				backend.log.Warn("failed to close file during cleanup", "error", cerr)
 			}
-			return err
+			return classifyWriteErr(err)
 		}
 	}
 
@@ -297,11 +317,11 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 			if cerr := file.Close(); cerr != nil {
 				backend.log.Warn("failed to close file during cleanup", "error", cerr)
 			}
-			return err
+			return classifyWriteErr(err)
 		}
 	}
 
-	return file.Close()
+	return classifyWriteErr(file.Close())
 }
 
 // Delete removes the object identified by fileType/objectId from this

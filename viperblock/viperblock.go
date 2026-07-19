@@ -189,6 +189,20 @@ type VB struct {
 	// drain trigger.
 	drainInFlight atomic.Bool
 
+	// backendFull latches "the storage backend rejected a write as
+	// out-of-space" (predastore HTTP 507/503, or a local file backend
+	// syscall.ENOSPC). A guest write is acknowledged before its chunk is
+	// actually PUT to the backend (write -> RAM buffer -> async drain), so a
+	// backend-full error surfaces on a drain that is decoupled from the
+	// write that triggered it. Rather than try to map that error back onto
+	// an already-acked write, WriteAtCtx checks this latch up-front and
+	// fails fast with ErrNoSpace while it is set, so the disk stops growing
+	// and the guest gets a prompt, real error instead of the backend being
+	// hammered with doomed retries. Cleared on the next drain that succeeds.
+	// atomic.Bool: read on every WriteAtCtx (hot path, lock-free) and
+	// written from the drain paths, which run concurrently with writers.
+	backendFull atomic.Bool
+
 	// drainMu serializes DrainToBackendCtx across ALL its triggers
 	// (backpressure, ChunkUploadInterval ticker, size trigger, and the GC
 	// sweep). Two concurrent drains each rotate to a different sequential WAL
@@ -835,6 +849,16 @@ var ErrRequestOutOfRange = errors.New("request out of range")
 var ErrRequestBlockSize = errors.New("request must be a multiple of block size")
 var ErrRequestBufferEmpty = errors.New("request requires a buffer > 0")
 
+// ErrNoSpace is returned by WriteAtCtx once the backendFull latch is set: a
+// prior drain observed the storage backend reject a write as out-of-space
+// (predastore 507/503, or a local-disk syscall.ENOSPC). It re-exports
+// types.ErrNoSpace — the same sentinel value the backends/file and
+// backends/s3 packages return — so callers can use errors.Is(err,
+// viperblock.ErrNoSpace) without reaching into the types package. See the
+// backendFull field doc on VB for why this is a latch rather than a
+// per-write error.
+var ErrNoSpace = types.ErrNoSpace
+
 // ErrStateNotFound is returned by LoadState when both the local file and the
 // backend object are genuinely absent (NoSuchKey/os.ErrNotExist). The volume
 // has no persisted state — caller decides whether that is expected (newly
@@ -1302,6 +1326,10 @@ func (vb *VB) StartChunkUploader() {
 		for {
 			select {
 			case <-vb.chunkUploadTicker.C:
+				// DrainToBackendCtx itself latches/clears backendFull on
+				// ErrNoSpace/success, so a dropped error here is not
+				// silently lost — WriteAtCtx's up-front gate will start
+				// failing fast until a later drain clears the latch.
 				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					vb.logger().Warn("chunk uploader: DrainToBackend failed", "err", err)
 				}
@@ -1570,6 +1598,14 @@ func (vb *VB) signalSizeTrigger() {
 // invoked by DrainToBackendCtx (which takes that same lock) cannot deadlock
 // against us. drainInFlight ensures only one blocked writer actually drives
 // the drain at a time; the rest poll pendingBytes with a bounded backoff.
+//
+// A drain that fails with ErrNoSpace stops the retry loop immediately
+// instead of backing off and trying again: the backend has told us it is
+// out of space, so pendingBytes will never fall back under the
+// low-watermark on its own, and looping here would just hammer an already
+// full backend. DrainToBackendCtx has already latched backendFull by the
+// time the error reaches us; returning it here surfaces ErrNoSpace to the
+// guest write that triggered this backpressure wait.
 func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
 	if vb.PendingBytes() <= high {
@@ -1580,6 +1616,15 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	backoff := 10 * time.Millisecond
 	const maxBackoff = 500 * time.Millisecond
 
+	// A drain that keeps failing with an error we do NOT recognize as
+	// ErrNoSpace (e.g. a backend rejection that never surfaced as a clean
+	// out-of-space status) must not spin here forever — that hangs the guest
+	// write indefinitely. Bound the consecutive failures and surface the error
+	// so the guest gets a prompt failure instead. A single successful drain
+	// resets the count, so transient backend slowness does not trip it.
+	const maxDrainFailures = 10
+	drainFailures := 0
+
 	for vb.PendingBytes() > low {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1589,7 +1634,16 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			err := vb.DrainToBackendCtx(ctx)
 			vb.drainInFlight.Store(false)
 			if err != nil {
-				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err)
+				if errors.Is(err, ErrNoSpace) {
+					return err
+				}
+				drainFailures++
+				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err, "consecutiveFailures", drainFailures)
+				if drainFailures >= maxDrainFailures {
+					return fmt.Errorf("write backpressure: %d consecutive drains failed, aborting: %w", drainFailures, err)
+				}
+			} else {
+				drainFailures = 0
 			}
 			if vb.PendingBytes() <= low {
 				break
@@ -1609,9 +1663,52 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	return nil
 }
 
+// backendNearFuller is implemented by backends that can report a
+// pre-full backpressure signal observed out-of-band from write errors — the
+// s3 backend's PutObject response carries this via the
+// X-Predastore-Pool-Pressure header (see s3.Backend.NearFull). The core
+// type-asserts vb.Backend against this interface rather than adding NearFull
+// to the exported types.Backend interface, so a backend with no such concept
+// (backends/file) is entirely unaffected: isBackendNearFull simply returns
+// false for it.
+type backendNearFuller interface {
+	NearFull() bool
+}
+
+var _ backendNearFuller = (*s3.Backend)(nil)
+
+// isBackendNearFull reports whether vb.Backend currently implements
+// backendNearFuller and observed its last write land in the nearfull
+// pressure band. Lock-free and cheap to call from the WriteAtCtx hot path
+// even when the backend doesn't implement the interface.
+func (vb *VB) isBackendNearFull() bool {
+	nf, ok := vb.Backend.(backendNearFuller)
+	return ok && nf.NearFull()
+}
+
 // WriteAtCtx is WriteAt with a caller-supplied context that flows through any
 // read-modify-write backend fetches for trace propagation.
 func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error {
+	// Fail fast while the backend is known to be out of space, before
+	// buffering anything into Writes.Blocks or incrementing pendingBytes. A
+	// guest write is acknowledged well before its chunk is actually PUT to
+	// the backend, so without this up-front gate a full backend would just
+	// keep accepting writes into memory (or spin forever in
+	// awaitBackpressure) instead of surfacing a prompt, real error. The
+	// backendFull latch clears itself once a later drain succeeds.
+	//
+	// isBackendNearFull engages the SAME fast-fail earlier, at the backend's
+	// nearfull band (still accepting writes) rather than waiting for FULL:
+	// at FULL the backend rejects every PUT including viperblock's own
+	// drains, so already-acked dirty pages could never flush and the guest
+	// filesystem would remount read-only. Refusing new writes here, while
+	// leaving DrainToBackendCtx ungated, lets buffered drains keep flushing
+	// into the backend's remaining headroom, so the guest fs gets a clean
+	// ENOSPC on a new write instead of dying wedged mid-flush.
+	if vb.backendFull.Load() || vb.isBackendNearFull() {
+		return ErrNoSpace
+	}
+
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
 		return ErrRequestTooLarge
@@ -1825,17 +1922,31 @@ func (vb *VB) DrainToBackend() error {
 
 // DrainToBackendCtx is DrainToBackend with a caller-supplied context threaded
 // through the chunk-upload and checkpoint S3 writes.
-func (vb *VB) DrainToBackendCtx(ctx context.Context) error {
+func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	// Serialize every drain trigger. See drainMu's doc comment: overlapping
 	// drains race in createChunkFile and can strand a live chunk at refcount
 	// zero, which GC would then physically delete.
 	vb.drainMu.Lock()
 	defer vb.drainMu.Unlock()
 
-	if err := vb.Flush(); err != nil {
+	// Every drain path (ticker, size-triggered, backpressure-driven) funnels
+	// through here, so this is the single choke point for the backendFull
+	// latch: a backend-out-of-space error anywhere in the drain sets it, and
+	// a drain that completes cleanly clears it — the backend has accepted
+	// writes again, so buffered writers should stop failing fast.
+	defer func() {
+		if err != nil {
+			if errors.Is(err, ErrNoSpace) {
+				vb.backendFull.Store(true)
+			}
+			return
+		}
+		vb.backendFull.Store(false)
+	}()
+
+	if err = vb.Flush(); err != nil {
 		return fmt.Errorf("drain flush: %w", err)
 	}
-	var err error
 	if vb.UseShardedWAL {
 		err = vb.WriteShardedWALToChunkCtx(ctx, true)
 	} else {
@@ -1844,7 +1955,7 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("drain chunk upload: %w", err)
 	}
-	if err := vb.SaveLiveCheckpointCtx(ctx); err != nil {
+	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
 	return nil

@@ -12,17 +12,38 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// poolPressureHeader is the response header predastore sets on a SUCCESSFUL
+// (2xx) S3 PutObject response when its storage pool has crossed into the
+// nearfull pressure band (still accepting writes, but approaching FULL).
+// Absence of the header means the pool is not in that band. This is a fixed
+// wire contract with predastore; FULL is unaffected and continues to be
+// signalled by an HTTP 507/503 status (see classifyWriteErr).
+const poolPressureHeader = "X-Predastore-Pool-Pressure"
+
+// poolPressureNearFull is the only header value this backend acts on.
+const poolPressureNearFull = "nearfull"
+
+// putObjectOperationName is the AWS SDK operation name reported via
+// awsmiddleware.GetOperationName for PutObject calls, used to scope the
+// pool-pressure observer to PUTs only so GET/List responses cannot clobber
+// the flag.
+const putObjectOperationName = "PutObject"
 
 // schemeRE matches a leading URI scheme.
 var schemeRE = regexp.MustCompile("^[^:]+://")
@@ -62,6 +83,32 @@ func wrapNotFound(err error) error {
 	return err
 }
 
+// classifyWriteErr maps a PutObject error into types.ErrNoSpace when the
+// HTTP response indicates the backend has rejected the write for lack of
+// space. predastore returns 507 Insufficient Storage when its filesystem is
+// nearly full, and can surface 503 Service Unavailable under the same
+// condition. errors.As unwraps through the SDK's retry/middleware error
+// chain to the smithy transport error that carries the HTTP status code —
+// smithyhttp.ResponseError is the concrete type the SDK wraps every
+// non-2xx response in, regardless of whether the body parsed into a
+// modeled or generic API error. Any other error (including a modeled
+// APIError with no HTTP response attached) passes through unchanged.
+func classifyWriteErr(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) {
+		switch respErr.HTTPStatusCode() {
+		case http.StatusInsufficientStorage, http.StatusServiceUnavailable:
+			return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
+		}
+	}
+
+	return err
+}
+
 // 2. Define config structs.
 type S3Config struct {
 	VolumeName string
@@ -83,6 +130,17 @@ type S3Config struct {
 type S3Backend struct {
 	config S3Config
 	log    *slog.Logger
+
+	// backendNearFull mirrors the most recently observed
+	// X-Predastore-Pool-Pressure response header from a PutObject call:
+	// true when the header equals "nearfull", false otherwise (including
+	// when the header is absent, or the last PutObject failed before a
+	// response with the header could be read). Written by the deserialize
+	// middleware registered in InitCtx on every PutObject response — drains
+	// keep issuing PutObjects during backpressure, so this self-refreshes
+	// and self-clears without a separate polling path. Read via NearFull()
+	// from viperblock's WriteAtCtx gate (hot path, lock-free).
+	backendNearFull atomic.Bool
 }
 
 type Backend struct {
@@ -108,6 +166,49 @@ func (backend *Backend) SetLogger(logger *slog.Logger) {
 		logger = slog.Default()
 	}
 	backend.log = logger
+}
+
+// NearFull reports whether the most recently observed PutObject response
+// carried X-Predastore-Pool-Pressure: nearfull. viperblock's WriteAtCtx gate
+// consults this (via the backendNearFuller interface it type-asserts
+// vb.Backend against) to refuse new guest writes before the backend reaches
+// its FULL watermark, so buffered drains still have headroom to flush into.
+// Always false until InitCtx has registered the observer middleware and at
+// least one PutObject response has been seen.
+func (backend *Backend) NearFull() bool {
+	return backend.backendNearFull.Load()
+}
+
+// newPoolPressureMiddleware returns a deserialize-step middleware that, on
+// every PutObject response, records whether X-Predastore-Pool-Pressure
+// equals "nearfull" into backend.backendNearFull. Split out from InitCtx's
+// registration call so it can be exercised directly in tests without
+// standing up a real S3 client.
+func (backend *Backend) newPoolPressureMiddleware() middleware.DeserializeMiddleware {
+	return middleware.DeserializeMiddlewareFunc("PoolPressureObserver",
+		func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (
+			middleware.DeserializeOutput, middleware.Metadata, error,
+		) {
+			out, metadata, err := next.HandleDeserialize(ctx, in)
+
+			// Scope to PutObject only: GET/List responses carry no pool-pressure
+			// semantics and must not clobber the flag a concurrent PutObject set.
+			if awsmiddleware.GetOperationName(ctx) != putObjectOperationName {
+				return out, metadata, err
+			}
+
+			// The header is only ever set on a successful (2xx) response; a
+			// failed PutObject (including the 507/503 FULL path, which carries
+			// no such header) or a request that never got an HTTP response at
+			// all both correctly resolve to "not nearfull" here.
+			nearFull := false
+			if resp, ok := out.RawResponse.(*smithyhttp.Response); ok && resp != nil {
+				nearFull = resp.Header.Get(poolPressureHeader) == poolPressureNearFull
+			}
+			backend.backendNearFull.Store(nearFull)
+
+			return out, metadata, err
+		})
 }
 
 func (backend *Backend) Init() error {
@@ -183,6 +284,17 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 		Region:                       backend.config.Region,
 		HTTPClient:                   client,
 		Credentials:                  credentials.NewStaticCredentialsProvider(backend.config.AccessKey, backend.config.SecretKey, ""),
+		// Registers the pool-pressure observer on the deserialize step so
+		// every PutObject response (success or failure) refreshes
+		// backend.backendNearFull, feeding viperblock's early backpressure
+		// gate. middleware.After places it after the SDK's own deserialize
+		// middleware has already parsed the response, so RawResponse is
+		// populated and the HTTP status/error handling above is untouched.
+		APIOptions: []func(*middleware.Stack) error{
+			func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(backend.newPoolPressureMiddleware(), middleware.After)
+			},
+		},
 	})
 
 	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -306,6 +418,7 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	_, err = backend.config.s3Client.PutObject(ctx, object)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
 	}
@@ -383,6 +496,7 @@ func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileT
 
 	_, err = backend.config.s3Client.PutObject(ctx, object)
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
 	}
