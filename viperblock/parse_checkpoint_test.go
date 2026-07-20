@@ -144,11 +144,8 @@ func TestParseBlockCheckpointBytesMatchesVBLoad(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		// vb's map may be coalesced into extents while ParseBlockCheckpointBytes
-		// stays flat (it has no volume config to reconstruct chunk stride
-		// from), so compare by physical block coverage rather than map
-		// shape: every block vb's coalesced map resolves must decode to the
-		// same location and SeqNum in the flat parsed map.
+		// vb's map may be coalesced into extents while the parsed map stays
+		// flat, so compare by physical block coverage rather than map shape.
 		stride := vb.blockStride()
 		wantTotal := 0
 		for _, entry := range vb.BlocksToObject.BlockLookup {

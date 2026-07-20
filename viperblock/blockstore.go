@@ -67,16 +67,12 @@ const (
 // (Writes, PendingBackendWrites, Cache, BlocksToObject) with a single
 // unified index that is updated incrementally on writes.
 //
-// Persisted blocks are the exception to per-block sharding: once a block
-// reaches the backend it lives forever (until rewritten), so tracking it
-// with one *BlockEntry per block in the sharded index would grow that index
-// linearly with total volume data written -- exactly the memory blowup this
-// type exists to avoid. Instead, MarkPersistedRange removes the per-block
-// shard entries for a whole consecutive run uploaded in one chunk and
-// records a single coalesced persistedExtent covering it. Hot/Pending/Cached
-// blocks are unaffected -- they stay in the sharded index, which is fine
-// since those states are inherently transient and already bounded (WriteAtCtx
-// backpressure, LRU cache size), not O(volume data written).
+// Persisted blocks are the exception to per-block sharding: to avoid growing
+// the sharded index linearly with total volume data written, MarkPersistedRange
+// removes the per-block shard entries for a run uploaded in one chunk and
+// records a single coalesced persistedExtent covering it instead. Hot/Pending/
+// Cached blocks stay in the sharded index, since those states are already
+// bounded (WriteAtCtx backpressure, LRU cache size).
 type UnifiedBlockStore struct {
 	shards    [NumShards]*IndexShard
 	blockSize uint32
@@ -96,12 +92,10 @@ type UnifiedBlockStore struct {
 // coalesced index of Persisted-state blocks: one entry per consecutive run
 // uploaded together in a chunk, instead of one BlockEntry per block. stride
 // is the on-disk byte distance between two consecutive blocks in the run's
-// chunk (BlockSize, or BlockSize+16 for encrypted volumes), used to recompute
-// the ObjectOffset of any block within the run. seqNums carries each block's
-// own write-generation SeqNum (index 0 == startBlock): blocks that end up
-// numerically consecutive are not necessarily written in the same guest
-// write and so do not share a SeqNum, and the exact per-block value is
-// required to reconstruct the correct AEAD nonce on read.
+// chunk (BlockSize, or BlockSize+16 for encrypted volumes). seqNums carries
+// each block's own write-generation SeqNum (index 0 == startBlock), since
+// numerically consecutive blocks are not necessarily from the same guest
+// write and the exact per-block value is needed to reconstruct the AEAD nonce.
 type persistedExtent struct {
 	startBlock   uint64
 	numBlocks    uint16
@@ -167,10 +161,8 @@ func (ubs *UnifiedBlockStore) getShard(blockNum uint64) *IndexShard {
 
 // findPersistedExtentLocked returns the persistedExtent covering blockNum, if
 // any. Callers must hold persistedMu (read or write). Checks the fast path
-// first (blockNum is itself an extent's startBlock -- the common case, since
-// most reads walk forward from a run's start) before falling back to a scan:
-// the index is O(extents) in size, not O(blocks), so a linear scan here is
-// cheap relative to the memory it replaces.
+// first (blockNum is itself an extent's startBlock) before falling back to a
+// scan, which is cheap since the index is O(extents), not O(blocks).
 func (ubs *UnifiedBlockStore) findPersistedExtentLocked(blockNum uint64) (persistedExtent, bool) {
 	if pe, ok := ubs.persistedExtents[blockNum]; ok {
 		return pe, true
@@ -204,11 +196,10 @@ func (ubs *UnifiedBlockStore) readPersisted(blockNum uint64) (BlockEntry, bool) 
 
 // fractureOverlapsLocked removes or splits existing persisted extents that
 // overlap [newStart, newStart+newNum), since the caller is about to insert a
-// fresher extent covering that exact range. An overwrite can land anywhere
-// inside a previously-coalesced extent, so a map-key collision alone cannot
-// detect staleness -- every existing extent must be checked for range
-// overlap, and any surviving head/tail re-inserted under its own startBlock
-// key. Callers must hold persistedMu (write).
+// fresher extent covering that range. An overwrite can land anywhere inside a
+// previously-coalesced extent, so every existing extent must be checked for
+// range overlap and any surviving head/tail re-inserted under its own
+// startBlock key. Callers must hold persistedMu (write).
 func (ubs *UnifiedBlockStore) fractureOverlapsLocked(newStart uint64, newNum uint16) {
 	newEnd := newStart + uint64(newNum)
 
@@ -349,11 +340,9 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 
 	ubs.stats.Reads.Add(1)
 	if !exists {
-		// Not in the sharded index -- it may have been coalesced into the
+		// Not in the sharded index -- may have been coalesced into the
 		// persisted-extent index after upload. Resolve by range instead of
-		// treating a miss here as "never written". readPersisted captures
-		// (state, location, seqNum) as one snapshot under persistedMu, the
-		// same atomicity guarantee the sharded path gives via shard.mu.
+		// treating a miss as "never written".
 		if pe, ok := ubs.readPersisted(blockNum); ok {
 			ubs.stats.BackendReads.Add(1)
 			return pe, true
@@ -486,34 +475,18 @@ func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset ui
 	return false
 }
 
-// MarkPersistedRange transitions a whole consecutive run of blocks from
-// Pending to Persisted state in one call, coalescing eligible sub-runs into
-// single persistedExtent entries instead of leaving one BlockEntry per block
-// in the sharded index forever. Mirrors what a loop of per-block
-// MarkPersisted calls would do, but the index stays O(extents), not
-// O(blocks written).
-//
-// blocks and seqNums must be the same length and describe the run in
-// ascending, block-number-consecutive order (seqNums[i] is the SeqNum this
-// chunk sealed blocks[i] under -- tracked per block, not per run, since
-// blocks that end up numerically consecutive are not necessarily part of the
-// same guest write and so do not share a SeqNum). objectOffset is the
-// ObjectOffset of blocks[0]; stride is the on-disk byte distance between two
-// consecutive blocks in the chunk. Returns the number of blocks transitioned.
-//
-// A block is only transitioned if its shard entry is still Pending with a
-// matching SeqNum at the moment it is removed -- the same staleness check
-// MarkPersisted makes -- so a block superseded by a newer write is left
-// untouched (still Hot) rather than incorrectly persisted under a stale
-// location.
-//
-// Ordering matters for readers: the persisted-extent entries for eligible
-// sub-runs are inserted (pass 2) before any shard entry is removed (pass 3).
-// Between those passes a block is resolvable via whichever structure still
-// holds it -- ReadEntry checks the shard first and falls back to the extent
-// index -- so no reader ever observes a block as "never written" during the
-// transition, preserving the same no-torn-read guarantee ReadEntry's single
-// atomic snapshot gives on the single-block path.
+// MarkPersistedRange transitions a consecutive run of blocks from Pending to
+// Persisted in one call, coalescing eligible sub-runs into persistedExtent
+// entries instead of leaving one BlockEntry per block, so the index stays
+// O(extents) rather than O(blocks written). blocks and seqNums must be the
+// same length, in ascending block-number order; seqNums[i] is the SeqNum
+// blocks[i] was sealed under. objectOffset is the ObjectOffset of blocks[0];
+// stride is the on-disk byte distance between consecutive blocks in the
+// chunk. A block is only transitioned if still Pending with a matching
+// SeqNum, so one superseded by a newer write is left untouched. Extent
+// entries are inserted (pass 2) before shard entries are removed (pass 3),
+// so no reader ever observes a block as unwritten mid-transition. Returns
+// the number of blocks transitioned.
 func (ubs *UnifiedBlockStore) MarkPersistedRange(blocks []uint64, objectID uint64, objectOffset uint32, stride uint32, seqNums []uint64) int {
 	if len(blocks) == 0 || len(blocks) != len(seqNums) {
 		return 0
@@ -567,11 +540,10 @@ func (ubs *UnifiedBlockStore) MarkPersistedRange(blocks []uint64, objectID uint6
 	ubs.persistedMu.Unlock()
 
 	// Pass 3: finalize by removing the per-block shard entries, re-checking
-	// eligibility under lock since a concurrent rewrite may have superseded
-	// a block after pass 1 sampled it. A block that raced is left in the
-	// sharded index as-is (the newer write wins); the extent entry from pass
-	// 2 becomes a harmless staleness for that one block, corrected the next
-	// time it is persisted (fractureOverlapsLocked splits it away then).
+	// eligibility under lock since a concurrent rewrite may have superseded a
+	// block after pass 1 sampled it. A raced block is left in the sharded
+	// index as-is (newer write wins); its stale pass-2 extent entry is
+	// corrected next time it is persisted.
 	transitioned := 0
 	for i, b := range blocks {
 		if !eligible[i] {
@@ -614,19 +586,13 @@ func (ubs *UnifiedBlockStore) SetPersisted(blockNum, objectID uint64, offset uin
 	}
 }
 
-// SetPersistedRange is SetPersisted's bulk, extent-coalescing counterpart:
-// it installs an entire consecutive run of blocks as Persisted in one call,
-// as a single persistedExtent, instead of leaving one shard entry per block.
-//
-// Used exclusively to reconstruct BlockStore state from an on-disk
-// checkpoint at load time (parseBlockCheckpoint / RecoverLocalWALs). Unlike
-// MarkPersistedRange, there is no prior shard state to validate against
-// here -- the checkpoint is the authoritative source of truth for a volume
-// being (re)opened, so this unconditionally installs the run, fracturing
-// away any overlapping extent exactly like MarkPersistedRange's pass 2. This
-// mirrors what a loop of per-block SetPersisted calls would do, but keeps
-// the index O(extents) across a restart instead of reverting to O(blocks)
-// the moment a large volume is reopened.
+// SetPersistedRange is SetPersisted's bulk, extent-coalescing counterpart: it
+// installs a consecutive run of blocks as Persisted as a single
+// persistedExtent, instead of one shard entry per block. Used to reconstruct
+// BlockStore state from an on-disk checkpoint at load time. Unlike
+// MarkPersistedRange, there is no prior shard state to validate — the
+// checkpoint is authoritative, so this unconditionally installs the run,
+// fracturing away any overlapping extent.
 func (ubs *UnifiedBlockStore) SetPersistedRange(blocks []uint64, objectID uint64, objectOffset uint32, stride uint32, seqNums []uint64) {
 	if len(blocks) == 0 || len(blocks) != len(seqNums) {
 		return

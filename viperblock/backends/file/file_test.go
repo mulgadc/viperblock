@@ -184,10 +184,8 @@ func TestDeleteAndDeleteCtx(t *testing.T) {
 func TestDeleteAlreadyMissingReturnsErrNotExist(t *testing.T) {
 	backend := newTestBackend(t)
 
-	// Deleting an object that was never written must surface ErrNotExist
-	// (not some other OS error), matching the s3 backend's wrapNotFound
-	// contract that chunk GC's sweep relies on to treat "already gone" as
-	// a successful, idempotent outcome.
+	// Matches the s3 backend's wrapNotFound contract that chunk GC's sweep
+	// relies on to treat "already gone" as success.
 	err := backend.Delete(types.FileTypeChunk, 42)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, os.ErrNotExist)
@@ -201,8 +199,7 @@ func TestListPrefixesAndListPrefixesCtx(t *testing.T) {
 	backend := newTestBackend(t)
 
 	// ListPrefixes lists directories under BaseDir, not under the backend's
-	// own VolumeName — write chunk objects for two sibling "volumes"
-	// (snapshot-shaped top-level prefixes) directly under BaseDir.
+	// own VolumeName, so write two sibling "volumes" directly under BaseDir.
 	headers := []byte{}
 	data := []byte("x")
 	require.NoError(t, backend.WriteTo("snap-alpha", types.FileTypeConfig, 0, &headers, &data))
@@ -261,13 +258,8 @@ func TestListObjectsMissingPrefixIsEmptyNotError(t *testing.T) {
 	assert.Empty(t, keys)
 }
 
-// TestClassifyWriteErr pins the disk-full detection viperblock's drain path
-// relies on: a full local disk surfaces syscall.ENOSPC, wrapped at any depth
-// (a bare os.PathError from the os package, or further wrapped by a caller),
-// and classifyWriteErr must turn that into types.ErrNoSpace so it latches
-// backendFull the same way a predastore 507 does. Any other error —
-// including a different, unrelated syscall.Errno — must pass through
-// unclassified.
+// TestClassifyWriteErr pins ENOSPC detection at any wrap depth, and that an
+// unrelated syscall.Errno passes through unclassified.
 func TestClassifyWriteErr(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -324,11 +316,9 @@ func TestClassifyWriteErr(t *testing.T) {
 	}
 }
 
-// TestWriteRealDiskFullMapsToNoSpace exercises Write's actual error path (not
-// just the classifyWriteErr helper) by pointing BaseDir at a size-capped
-// tmpfs mount and writing until the filesystem genuinely reports ENOSPC.
-// Requires CAP_SYS_ADMIN to mount tmpfs; skips (rather than failing) when
-// that is unavailable so the suite still runs in unprivileged environments.
+// TestWriteRealDiskFullMapsToNoSpace exercises Write's real error path against
+// a size-capped tmpfs. Requires CAP_SYS_ADMIN to mount tmpfs; skips rather than
+// failing when unavailable.
 func TestWriteRealDiskFullMapsToNoSpace(t *testing.T) {
 	mountPoint := t.TempDir()
 

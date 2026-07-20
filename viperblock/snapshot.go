@@ -63,14 +63,10 @@ type InheritedLayer struct {
 // under {snapshotID}/. No data is copied -- the snapshot references the
 // source volume's existing chunk files.
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
-	// Latch chunk GC off permanently for this instance the moment a
-	// snapshot is created, regardless of outcome below. ensureGCSnapshotSafe
-	// only catches snapshots that existed (or were created by this same
-	// process) before it last scanned; a snapshot created by a call that
-	// races a sweep already in flight would otherwise be invisible to that
-	// cached result until the next scan, which may never happen once
-	// gcSnapshotChecked is cached true. This latch closes that specific gap
-	// unconditionally rather than depending on scan timing.
+	// Latch chunk GC off permanently the moment a snapshot is created,
+	// regardless of outcome below. This closes a race ensureGCSnapshotSafe
+	// can't: a snapshot created while a sweep is already in flight would
+	// otherwise stay invisible to that sweep's cached result.
 	if vb.GCEnabled && vb.gcLatchedOff.CompareAndSwap(false, true) {
 		vb.logger().Warn("chunk GC: disabled permanently, CreateSnapshot called on this volume", "volume", vb.VolumeName, "snapshotID", snapshotID)
 	}
@@ -113,10 +109,8 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// For COW clones (vb.BaseBlockMap != nil), also write a flat inherited-blocks
 	// section so the snapshot is self-contained with no ancestry chain to walk.
 	vb.BlocksToObject.mu.RLock()
-	// BlockCount must be the physical block count (LoadSnapshotBlockMap
-	// validates it against a flat, un-coalesced loaded map's len()), not the
-	// number of coalesced map entries — sum each entry's NumBlocks rather
-	// than taking len() of the map.
+	// BlockCount must be the physical block count, not the number of
+	// coalesced map entries — sum each entry's NumBlocks rather than len().
 	var blockCount uint64
 	checkpoint := vb.BlockToObjectWALHeader()
 	stride := vb.blockStride()
@@ -448,10 +442,8 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 
 	// Build a seen-set from own blocks so inherited entries only include blocks
 	// not already covered by the volume's own delta. Own entries may be
-	// coalesced runs (NumBlocks > 1), so expand each entry's full block
-	// range into the seen-set rather than just its map key (StartBlock) —
-	// otherwise every non-start block of an own run would be wrongly
-	// re-included from the base/ancestor maps below.
+	// coalesced runs (NumBlocks > 1), so expand each entry's full range into
+	// the seen-set rather than just its map key (StartBlock).
 	seen := make(map[uint64]struct{}, len(vb.BlocksToObject.BlockLookup))
 	vb.BlocksToObject.mu.RLock()
 	for _, bl := range vb.BlocksToObject.BlockLookup {

@@ -19,22 +19,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file exercises chunk GC exclusively against the file backend, per
-// the design doc's own testing scope ("file backend, no cluster"). That is
-// sufficient to validate the refcount/watermark/ancestry-guard LOGIC in
-// isolation, but it says nothing about whether a DeleteObject against
-// predastore actually reclaims physical bytes -- predastore's own
-// tombstone/compaction behavior is a separate, live-verified question.
-// Nothing in this file should be read as evidence about predastore.
+// This file exercises chunk GC against the file backend only, validating
+// the refcount/watermark/ancestry-guard logic in isolation. It says nothing
+// about whether a DeleteObject against predastore reclaims physical bytes.
 
 // newGCTestVB creates a fresh, file-backend-only VB rooted at root, with the
-// periodic GC/WAL-sync tickers disabled (GCInterval: -1, WALSyncInterval:
-// -1) so every test drives sweeps explicitly via runGCSweep/sweepChunks
-// instead of racing a background goroutine. root is shared by both the VB
-// tree ("{root}/viperblock") and the backend tree ("{root}/{volumeName}"),
-// matching setupTestVB's layout, so ancestry tests can point multiple VBs
-// (source + clones) at the same root and have them resolve each other's
-// chunks.
+// periodic GC/WAL-sync tickers disabled so every test drives sweeps
+// explicitly via runGCSweep/sweepChunks instead of racing a background
+// goroutine. root is shared by the VB tree and the backend tree so ancestry
+// tests can point multiple VBs (source + clones) at the same root.
 func newGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 	t.Helper()
 
@@ -71,10 +64,9 @@ func newGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 }
 
 // reopenGCTestVB simulates a fresh process opening an existing volume: a
-// brand-new VB struct (empty gcRefcount, gcLatchedOff false, gcReconciled
-// false) that loads persisted state from the backend rather than a New()
-// VB's zero state. Mirrors the LoadState -> LoadLiveCheckpoint -> OpenWAL
-// ordering RecoverLocalWALs's doc comment describes for boot.
+// brand-new VB struct that loads persisted state from the backend rather
+// than a New() VB's zero state. Mirrors the LoadState -> LoadLiveCheckpoint
+// -> OpenWAL boot ordering.
 func reopenGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 	t.Helper()
 
@@ -106,13 +98,10 @@ func reopenGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 	require.NoError(t, vb.Backend.Init())
 	require.NoError(t, vb.LoadState())
 	require.NoError(t, vb.LoadLiveCheckpoint())
-	// Must run between LoadLiveCheckpoint and OpenWAL (see RecoverLocalWALs's
-	// doc comment): a "crashed" instance in these tests never called Close,
-	// so it may have left an empty, freshly rotated local WAL segment at the
-	// same WallNum this reopen is about to (re-)create. OpenWAL always
-	// appends rather than truncates, so opening straight over a leftover
-	// header-only segment would double-header it; RecoverLocalWALs replays
-	// (here, zero) records and removes the file first.
+	// Must run between LoadLiveCheckpoint and OpenWAL: a "crashed" instance
+	// may have left an empty, freshly rotated local WAL segment at the same
+	// WallNum this reopen is about to (re-)create, and OpenWAL appends
+	// rather than truncates, so RecoverLocalWALs must clear it first.
 	require.NoError(t, vb.RecoverLocalWALs())
 
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
@@ -121,11 +110,10 @@ func reopenGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 	return vb
 }
 
-// cloneGCTestVB opens a COW clone of snapshotID sharing source's file-backend
-// root, the same shape as snapshot_test.go's createCloneVB, but with an
-// explicit clone volume name and GC enablement so ancestry tests can chain
-// clones of clones (createCloneVB's fixed "clone-{source}-{snapshotID}"
-// naming would collide across chain levels) and control GC per level.
+// cloneGCTestVB opens a COW clone of snapshotID sharing source's
+// file-backend root, like snapshot_test.go's createCloneVB but with an
+// explicit clone volume name and GC enablement, so ancestry tests can chain
+// clones of clones and control GC per level.
 func cloneGCTestVB(t *testing.T, source *VB, snapshotID, cloneVolumeName string, gcEnabled bool) *VB {
 	t.Helper()
 
@@ -183,12 +171,9 @@ func randomBlockData(n uint64) []byte {
 }
 
 // assertClosure asserts the CLOSURE invariant for vb: every ObjectID
-// referenced anywhere in vb's own block map, its frozen BaseBlockMap (COW
-// parent), and every flattened ancestor layer resolves to a readable chunk
-// file under the volume name that layer's map is keyed against. A CLOSURE
-// failure means a dangling reference -- data loss -- and this must hold
-// after every sweep in every test in this file, regardless of what else the
-// test is checking.
+// referenced anywhere in vb's own block map, its frozen BaseBlockMap, and
+// every ancestor layer resolves to a readable chunk. A failure means a
+// dangling reference -- data loss.
 func assertClosure(t *testing.T, vb *VB) {
 	t.Helper()
 
@@ -300,13 +285,10 @@ func TestChunkGC_PartiallyReferencedChunkSurvives(t *testing.T) {
 }
 
 // Test 3: Refcount rebuild across restart. A chunk that becomes wholly
-// unreferenced but is never swept before the process exits (simulating a
-// crash before a graceful Close) must still be reclaimable by the next
-// process's first sweep. This is the scenario that requires
-// reconcileChunksOnce: parseBlockCheckpoint's rebuild sees only the loaded
-// live map, and a zero-reference chunk is by definition absent from it, so
-// without a chunks/-prefix reconcile the new process's gcRefcount would
-// never even learn firstChunkID exists.
+// unreferenced but is never swept before the process exits must still be
+// reclaimable by the next process's first sweep, via reconcileChunksOnce --
+// parseBlockCheckpoint's rebuild only sees the loaded live map, which by
+// definition omits a zero-reference chunk.
 func TestChunkGC_RefcountRebuildAcrossRestart(t *testing.T) {
 	root := t.TempDir()
 	volumeName := "vol-restart"
@@ -321,28 +303,15 @@ func TestChunkGC_RefcountRebuildAcrossRestart(t *testing.T) {
 	overwrite := randomBlockData(4)
 	writeAndChunk(t, vb, 0, overwrite)
 
-	// Persist the live checkpoint (now referencing only the overwrite chunk)
-	// and config.json, but deliberately never call Close() or
-	// SaveBlockState() -- simulates a crash before the graceful shutdown
-	// sweep, and before any numbered checkpoint is ever written for this
-	// volume (SaveBlockState is the only thing that writes one). No
-	// numbered checkpoint means ensureGCFloor finds nothing to protect
-	// (floor 0), so this restart is not entangled with the separate
-	// numbered-checkpoint-floor behavior exercised elsewhere.
+	// Persist the live checkpoint but never call Close() or SaveBlockState(),
+	// simulating a crash before graceful shutdown and before any numbered
+	// checkpoint exists for this volume.
 	require.NoError(t, vb.DrainToBackendCtx(ctx))
 	require.NoError(t, vb.SaveState())
 
-	// Simulate reattaching on a different host (or losing local disk): wipe
-	// the local WAL tree so reopenGCTestVB's RecoverLocalWALs has nothing to
-	// replay. Without this, both consolidated WAL segments from this test's
-	// two writeAndChunk calls are still sitting on local disk (viperblock
-	// only ever deletes a consolidated WAL file via RecoverLocalWALs replay
-	// or a full Close) and get replayed into a brand-new chunk on reopen --
-	// which would reclaim firstChunkID on its own, via WAL replay, and this
-	// test would pass whether or not reconcileChunksOnce works at all. This
-	// isolates the test to what reconcileChunksOnce is actually for: a
-	// chunk that only the backend-durable checkpoint plus a chunks/-prefix
-	// listing can account for.
+	// Wipe local WAL state so RecoverLocalWALs on reopen has nothing to
+	// replay -- otherwise WAL replay alone would reclaim firstChunkID and
+	// the test would pass regardless of whether reconcileChunksOnce works.
 	require.NoError(t, vb.RemoveLocalFiles())
 
 	reopened := reopenGCTestVB(t, root, volumeName, true)
@@ -392,11 +361,10 @@ func TestChunkGC_ReadsSurviveFullGCCycle(t *testing.T) {
 	assert.Equal(t, shadow, readBack)
 }
 
-// Test 5: Snapshot pins superseded chunks. The sweep runs on a freshly
-// reopened VB instance (not the one that called CreateSnapshot) so the
-// assertion exercises scanForOwnSnapshots's bucket-wide ancestry scan, not
-// just the simpler CreateSnapshot-sets-gcLatchedOff shortcut a same-instance
-// test would trivially satisfy without proving the scan works at all.
+// Test 5: Snapshot pins superseded chunks. Runs on a freshly reopened VB
+// (not the one that called CreateSnapshot) so this exercises
+// scanForOwnSnapshots's ancestry scan, not just the same-instance
+// gcLatchedOff shortcut.
 func TestChunkGC_SnapshotPinsSupersededChunks(t *testing.T) {
 	root := t.TempDir()
 	volumeName := "vol-snap-pin"
@@ -575,10 +543,9 @@ func TestChunkGC_MultiLevelChain(t *testing.T) {
 	require.NoError(t, err)
 	chunkA1 := cloneA.ObjectNum.Load() - 1
 
-	// Same window one level down: overwrite the blocks A's own snapshot
-	// depends on. chunkA1 becomes unreferenced in A's live map but snap2
-	// (and cloneB, cloned from it below) still needs it. Sweep must be a
-	// no-op -- CreateSnapshot above latched A off too.
+	// Same window one level down: overwriting these blocks makes chunkA1
+	// unreferenced in A's live map, but snap2 (and cloneB below) still
+	// needs it. Sweep must be a no-op -- CreateSnapshot latched A off too.
 	dataA2 := randomBlockData(4)
 	writeAndChunk(t, cloneA, 4, dataA2) // overwrite blocks 4-7 again
 	cloneA.runGCSweep(ctx)
@@ -619,15 +586,11 @@ func TestChunkGC_MultiLevelChain(t *testing.T) {
 	assertClosure(t, cloneB)
 }
 
-// Test 9: Chunk minted after mark is not swept. sweepChunks has no reachable
-// seam to inject a real concurrent write mid-sweep without adding test-only
-// instrumentation to production code, so this test manufactures the exact
-// boundary condition instead: a gcRefcount entry for an ObjectID at or above
-// the current ObjectNum counter, standing in for "a chunk minted after the
-// mark." If the watermark clamp is missing or wrong, sweepChunks will
-// attempt to delete it (and, since no such chunk file exists, silently
-// forget it was ever tracked -- see the DeleteCtx/os.ErrNotExist handling in
-// sweepChunks). If the clamp holds, the entry is left untouched.
+// Test 9: Chunk minted after mark is not swept. There's no seam to inject a
+// real concurrent write mid-sweep, so this manufactures the boundary
+// directly: a gcRefcount entry for an ObjectID at or above the current
+// ObjectNum, standing in for "minted after the mark." A missing/wrong
+// watermark clamp would attempt to delete it.
 func TestChunkGC_WatermarkExcludesChunksMintedAfterMark(t *testing.T) {
 	root := t.TempDir()
 	vb := newGCTestVB(t, root, "vol-watermark", true)
@@ -706,13 +669,10 @@ func TestChunkGC_NoDeleteBeforeCheckpointDurability(t *testing.T) {
 }
 
 // Test 11: Crash-consistency. Simulates a crash between a chunk's durable
-// upload and the checkpoint save that would have made it (and its
-// supersession of the prior chunk) durable: the new chunk lands on the
-// backend via WriteWALToChunk, but SaveLiveCheckpointCtx never runs. On
-// recovery, the durable checkpoint is unchanged (still points at the old
-// chunk), so the new, never-checkpointed chunk is legitimately orphaned --
-// correctly reclaimable, not a dangling reference -- while the old chunk
-// the durable checkpoint still names is never touched.
+// upload and the checkpoint save that would have made it durable: the new
+// chunk lands via WriteWALToChunk, but SaveLiveCheckpointCtx never runs. On
+// recovery the durable checkpoint still points at the old chunk, so the new,
+// never-checkpointed chunk is legitimately orphaned and reclaimable.
 func TestChunkGC_CrashConsistency(t *testing.T) {
 	root := t.TempDir()
 	volumeName := "vol-crash"
@@ -727,32 +687,23 @@ func TestChunkGC_CrashConsistency(t *testing.T) {
 	require.NoError(t, vb.DrainToBackendCtx(ctx)) // durable checkpoint: block0 -> survivingChunkID
 	require.NoError(t, vb.SaveState())
 
-	// "Crash": the chunk upload completes and durably lands...
+	// "Crash": a new chunk lands durably, but the checkpoint that would
+	// supersede survivingChunkID never gets saved.
 	uncommitted := randomBlockData(1)
 	writeAndChunk(t, vb, 0, uncommitted)
-	require.NoError(t, vb.SaveState()) // metadata (ObjectNum/WALNum) advances...
-	// ...but the checkpoint that would supersede survivingChunkID never
-	// gets saved: no DrainToBackendCtx/SaveLiveCheckpoint call follows.
+	require.NoError(t, vb.SaveState())
 
-	// Wipe local disk so recovery can only see backend-durable state --
-	// otherwise RecoverLocalWALs would find the still-on-disk, already-
-	// consolidated WAL segments (viperblock never deletes a segment except
-	// via WAL replay or a full Close) and replay the "uncommitted" write
-	// right back in, which is a different, legitimate recovery path (real
-	// same-host crash recovery) but would defeat this test's specific
-	// point: an orphaned, never-checkpointed chunk is safe to reclaim.
+	// Wipe local disk so recovery only sees backend-durable state --
+	// otherwise WAL replay would restore the "uncommitted" write, which is a
+	// different (legitimate) recovery path than the one under test here.
 	require.NoError(t, vb.RemoveLocalFiles())
 
 	recovered := reopenGCTestVB(t, root, volumeName, true)
 	recovered.runGCSweep(ctx)
 	assertClosure(t, recovered)
 
-	// The durable checkpoint's own reference must never be touched.
 	assertChunkPresent(t, recovered.Backend, volumeName, survivingChunkID)
 
-	// Recovery reflects the last durable checkpoint, not the crashed write:
-	// local WAL replay was deliberately taken out of the picture above, so
-	// only chunk GC's own safety is being exercised here.
 	readBack, err := recovered.ReadAt(0, uint64(len(original)))
 	require.NoError(t, err)
 	assert.Equal(t, original, readBack)
@@ -770,14 +721,10 @@ func countChunkObjects(t *testing.T, backend types.Backend, volumeName string) i
 }
 
 // Test 12 (acceptance headline): rewriting the same logical blocks N times
-// yields a BOUNDED chunk object count, not one that grows with N. Every
-// pass fully supersedes the previous pass's single chunk (randomBlockData(4) is
-// far under ObjBlockSize, so writeAndChunk mints exactly one chunk per
-// call -- see its doc comment), so an unbounded/leaking implementation would
-// show live chunk count == pass count; a correct one holds flat at 1 after
-// each sweep. This is the plan doc's pre-registered prediction
-// ("slope_per_footprint drops from ~4.603 to ~0") reproduced as a unit
-// assertion instead of a live sweep.
+// yields a BOUNDED chunk object count, not one that grows with N. Every pass
+// fully supersedes the previous pass's single chunk, so an unbounded/leaking
+// implementation would show live chunk count == pass count; a correct one
+// holds flat at 1 after each sweep.
 func TestChunkGC_BoundedGrowthUnderSustainedOverwrite(t *testing.T) {
 	root := t.TempDir()
 	vb := newGCTestVB(t, root, "vol-bounded", true)
@@ -793,15 +740,11 @@ func TestChunkGC_BoundedGrowthUnderSustainedOverwrite(t *testing.T) {
 
 		count := countChunkObjects(t, vb.Backend, vb.VolumeName)
 		counts = append(counts, count)
-		// Every pass fully supersedes the prior pass's one chunk, so after
-		// its sweep exactly one chunk (this pass's own) must remain live --
-		// never a growing tail of superseded ones.
 		assert.Equalf(t, 1, count, "pass %d: expected exactly 1 live chunk after sweep, got %d (counts so far: %v)", i, count, counts)
 	}
 
-	// Belt-and-braces on the acceptance claim itself: the final count must
-	// not scale with passes. A naive no-op GC would show counts[passes-1] ==
-	// passes (10); bounded GC holds it at 1 regardless of N.
+	// The final count must not scale with passes: a naive no-op GC would
+	// show counts[passes-1] == passes.
 	require.Less(t, counts[len(counts)-1], passes,
 		"chunk object count grew with pass count (got %v) -- GC did not bound backend growth", counts)
 
@@ -811,11 +754,9 @@ func TestChunkGC_BoundedGrowthUnderSustainedOverwrite(t *testing.T) {
 	require.Len(t, final, 4*int(DefaultBlockSize))
 }
 
-// Test 13: negative/safety belt-and-braces -- a chunk still referenced by
-// ANY live block-map entry is never a GC candidate, even sitting alongside
-// many wholly-unreferenced siblings in the same sweep. Loudly asserts the
-// refcounted chunk is untouched across a sweep that reclaims everything
-// else.
+// Test 13: a chunk still referenced by ANY live block-map entry is never a
+// GC candidate, even alongside many wholly-unreferenced siblings in the
+// same sweep.
 func TestChunkGC_LiveReferencedChunkNeverDeletedAmongGarbage(t *testing.T) {
 	root := t.TempDir()
 	vb := newGCTestVB(t, root, "vol-live-safety", true)
@@ -827,9 +768,8 @@ func TestChunkGC_LiveReferencedChunkNeverDeletedAmongGarbage(t *testing.T) {
 	pinnedChunkID := vb.ObjectNum.Load() - 1
 
 	// Block range [4,8) gets rewritten repeatedly, minting and orphaning a
-	// chunk each time -- garbage the sweep should reclaim, interleaved with
-	// the pinned chunk's ID range so a floor/watermark-only bug (rather than
-	// true per-chunk refcounting) would be exposed.
+	// chunk each time, interleaved with the pinned chunk's ID range so a
+	// floor/watermark-only bug (not true per-chunk refcounting) would show.
 	var garbageChunkIDs []uint64
 	for range 5 {
 		writeAndChunk(t, vb, 4, randomBlockData(4))
@@ -854,34 +794,21 @@ func TestChunkGC_LiveReferencedChunkNeverDeletedAmongGarbage(t *testing.T) {
 	assert.Equal(t, pinned, readPinned)
 }
 
-// Test 14 (over-collection blocker): a stale drain that installs a block-map
-// entry backwards must never clobber a newer chunk's pointer, and must never
-// drive that live chunk's refcount to zero. Two concurrent drains rotate to
-// different sequential WAL segments and run createChunkFile in parallel; if
-// the OLDER segment's map write lands last, an unconditional overwrite would
-// repoint the block at the stale chunk and (via gcTrackBlock) drop the newer,
-// still-referenced chunk to refcount zero -- which the next sweep would then
-// physically delete. That is the exact silent-data-loss catastrophe this
-// feature must never cause.
-//
-// This drives the boundary deterministically by calling createChunkFile
-// directly with the NEWER write (higher SeqNum) first and the STALE write
-// (lower SeqNum) for the SAME block second, standing in for the newer of two
-// racing drains winning the map-write ordering. WITHOUT the monotonic guard
-// in createChunkFile the final assertions fail loudly: the live chunk is
-// deleted and the read returns stale data. WITH it, the live chunk survives,
-// the orphaned stale chunk is reclaimed, and the read is correct.
+// Test 14 (over-collection blocker): a stale drain that installs a
+// block-map entry backwards must never clobber a newer chunk's pointer or
+// drive its refcount to zero. Drives the boundary deterministically by
+// calling createChunkFile directly with the NEWER write (higher SeqNum)
+// first and the STALE write (lower SeqNum) for the SAME block second,
+// standing in for the newer of two racing drains winning the map-write
+// ordering.
 func TestChunkGC_StaleDrainNeverClobbersNewerChunk(t *testing.T) {
 	root := t.TempDir()
 	vb := newGCTestVB(t, root, "vol-stale-clobber", true)
 	ctx := context.Background()
 	bs := int(vb.BlockSize)
 
-	// This test drives createChunkFile directly to force the exact
-	// out-of-order boundary, bypassing WriteAtCtx -- which is also the only
-	// path that populates the BlockStore. Route reads through the
-	// BlocksToObject map (where the monotonic guard under test lives) so the
-	// read reflects the map pointer, not an unpopulated BlockStore.
+	// Bypass WriteAtCtx (the only path that populates BlockStore) so reads
+	// go through the BlocksToObject map, where the monotonic guard lives.
 	vb.UseBlockStore = false
 
 	// Newer write (higher SeqNum) lands FIRST.
@@ -924,22 +851,17 @@ func TestChunkGC_StaleDrainNeverClobbersNewerChunk(t *testing.T) {
 	assertChunkPresent(t, vb.Backend, vb.VolumeName, newerChunkID)
 	assertChunkGone(t, vb.Backend, vb.VolumeName, staleChunkID)
 
-	// The read must return the NEWER data -- proof the live chunk was neither
-	// repointed away nor deleted.
+	// The read must return the NEWER data.
 	got, err := vb.ReadAt(0, uint64(bs))
 	require.NoError(t, err)
 	assert.Equal(t, newerData, got, "read returned stale data -- the live chunk pointer was corrupted")
 }
 
-// Test 15 (concurrency, race-mode): drive real awaitBackpressure-triggered
-// drains from several concurrent writers WHILE a sweeper goroutine hammers
-// runGCSweep (which itself drains). This is the multi-trigger drain
-// concurrency drainMu must serialize. The invariant proven: after the storm
-// settles, closure holds (no live chunk was ever deleted -- a deleted live
-// chunk would make a referenced ObjectID unreadable) and every block reads
-// back its last-written value (proof each block's pointer resolves to its
-// highest-SeqNum chunk, not a stale or reclaimed one). Run under -race to
-// catch data races on BlockLookup / gcRefcount as well.
+// Test 15 (concurrency, race-mode): drives real backpressure-triggered
+// drains from several concurrent writers while a sweeper goroutine hammers
+// runGCSweep, exercising the multi-trigger drain concurrency drainMu must
+// serialize. After the storm settles, closure must hold and every block
+// must read back its last-written value. Run under -race.
 func TestChunkGC_ConcurrentDrainAndSweepPreserveLiveChunks(t *testing.T) {
 	root := t.TempDir()
 	vb := newGCTestVB(t, root, "vol-concurrent-drain", true)
@@ -955,8 +877,7 @@ func TestChunkGC_ConcurrentDrainAndSweepPreserveLiveChunks(t *testing.T) {
 	const rounds = 30
 
 	// Each writer owns an exclusive block range so its final value is known
-	// unambiguously; supersession within its own repeated rewrites still
-	// churns chunks, and the drains still overlap across writers + sweeper.
+	// unambiguously, while its repeated rewrites still churn chunks.
 	lastWritten := make([][]byte, writers)
 	writeErrs := make([]error, writers)
 

@@ -8,18 +8,10 @@ import (
 )
 
 // ErrNoSpace is returned by a Backend's Write/WriteCtx/WriteTo/WriteToCtx
-// when the backend has rejected the write because its underlying storage is
-// full: predastore's S3 API returns HTTP 507 (Insufficient Storage) or 503
-// when its filesystem is nearly full, and the local file backend surfaces a
-// real syscall.ENOSPC on a full disk. Backends classify both shapes into
-// this single sentinel so callers can react to "out of space" uniformly via
-// errors.Is, regardless of which backend is in use.
-//
-// This lives in the types package (rather than the viperblock package,
-// which is where callers consume it as viperblock.ErrNoSpace) because the
-// backends/file and backends/s3 packages, which must return it, are
-// imported BY the viperblock package — defining it there would create an
-// import cycle.
+// when the underlying storage is full, so callers can check for it uniformly
+// via errors.Is regardless of backend. Lives here rather than in the
+// viperblock package to avoid an import cycle (backends are imported by
+// viperblock, so can't import it back).
 var ErrNoSpace = errors.New("viperblock: backend out of space")
 
 type Backend interface {
@@ -35,24 +27,18 @@ type Backend interface {
 	WriteTo(volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	WriteToCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	// Delete removes an object from this backend's own volume. There is
-	// deliberately no DeleteTo/DeleteFrom cross-volume form: every deleter
-	// in this codebase (chunk GC) only ever deletes objects it minted
-	// itself, and adding a cross-volume delete verb would make it too easy
-	// for a future caller to reach across a volume boundary and remove
-	// something another volume still depends on.
+	// deliberately no cross-volume DeleteTo/DeleteFrom: deleters (chunk GC)
+	// only ever remove objects they minted themselves.
 	Delete(fileType FileType, objectId uint64) (err error)
 	DeleteCtx(ctx context.Context, fileType FileType, objectId uint64) (err error)
 	// ListPrefixes returns the top-level names under prefix, one level deep
-	// (delimiter "/"), scoped to the whole backend rather than to any one
-	// volume — callers that need a single volume's own contents already
-	// know its name and do not need to list for it.
+	// (delimiter "/"), scoped to the whole backend rather than one volume.
 	ListPrefixes(prefix string) (names []string, err error)
 	ListPrefixesCtx(ctx context.Context, prefix string) (names []string, err error)
 	// ListObjects returns every object's full key under prefix, recursively
-	// (no delimiter) — unlike ListPrefixes, which groups by the next path
-	// segment, this returns leaf keys directly. Used to reconcile a
-	// volume's own chunks/ directory against its in-memory state; callers
-	// needing directory-like grouping want ListPrefixes instead.
+	// (no delimiter) — unlike ListPrefixes, these are leaf keys, not grouped
+	// path segments. Used to reconcile a volume's chunks/ directory against
+	// its in-memory state.
 	ListObjects(prefix string) (keys []string, err error)
 	ListObjectsCtx(ctx context.Context, prefix string) (keys []string, err error)
 	Sync()

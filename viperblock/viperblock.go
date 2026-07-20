@@ -44,11 +44,9 @@ const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
 const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 
 // DefaultGCInterval is how often the background chunk uploader also runs a
-// chunk GC sweep when GCEnabled is true and GCInterval is left at its zero
-// value. Deliberately much longer than DefaultChunkUploadInterval — a sweep
-// is a bucket-wide-scan-adjacent operation the first time it runs per VB
-// lifetime (see ensureGCSnapshotSafe) and superseded chunks are not urgent
-// to reclaim the moment they go stale.
+// chunk GC sweep, when GCEnabled and GCInterval is left at zero. Longer than
+// DefaultChunkUploadInterval: a sweep's first run per VB lifetime does a
+// bucket-wide scan (see ensureGCSnapshotSafe), and reclaiming is not urgent.
 const DefaultGCInterval time.Duration = 5 * time.Minute
 
 // DefaultMaxPendingBytes bounds the combined size of Writes.Blocks and
@@ -184,37 +182,22 @@ type VB struct {
 	// drainInFlight ensures at most one goroutine actively drives
 	// DrainToBackendCtx from inside awaitBackpressure at a time; concurrent
 	// blocked writers poll pendingBytes instead of each launching a
-	// redundant drain. It is only an optimization for the backpressure path;
-	// drainMu below is the actual mutual-exclusion guarantee across every
-	// drain trigger.
+	// redundant drain. Only an optimization for the backpressure path —
+	// drainMu below is the actual cross-trigger exclusion guarantee.
 	drainInFlight atomic.Bool
 
-	// backendFull latches "the storage backend rejected a write as
-	// out-of-space" (predastore HTTP 507/503, or a local file backend
-	// syscall.ENOSPC). A guest write is acknowledged before its chunk is
-	// actually PUT to the backend (write -> RAM buffer -> async drain), so a
-	// backend-full error surfaces on a drain that is decoupled from the
-	// write that triggered it. Rather than try to map that error back onto
-	// an already-acked write, WriteAtCtx checks this latch up-front and
-	// fails fast with ErrNoSpace while it is set, so the disk stops growing
-	// and the guest gets a prompt, real error instead of the backend being
-	// hammered with doomed retries. Cleared on the next drain that succeeds.
-	// atomic.Bool: read on every WriteAtCtx (hot path, lock-free) and
-	// written from the drain paths, which run concurrently with writers.
+	// backendFull latches an out-of-space error from the backend (predastore
+	// 507/503, or local ENOSPC). Writes are acked before their chunk is PUT,
+	// so the error surfaces on a later drain; WriteAtCtx checks this latch
+	// up front and fails fast with ErrNoSpace while set. Cleared on the next
+	// successful drain.
 	backendFull atomic.Bool
 
-	// drainMu serializes DrainToBackendCtx across ALL its triggers
-	// (backpressure, ChunkUploadInterval ticker, size trigger, and the GC
-	// sweep). Two concurrent drains each rotate to a different sequential WAL
-	// segment and run WriteWALToChunk in parallel; because createChunkFile
-	// installs BlockLookup entries by block number, an older segment's write
-	// completing last would clobber a newer chunk's live pointer and drop
-	// that chunk's refcount to zero (see insertCoalescedLocked's gcRefcount
-	// accounting), letting GC delete a still-referenced chunk. Holding this
-	// for the whole drain body keeps at
-	// most one WriteWALToChunk in flight, so no two createChunkFile calls ever
-	// contend for the same block. createChunkFile's own per-entry SeqNum guard
-	// is the belt to this mutex's braces.
+	// drainMu serializes DrainToBackendCtx across all its triggers. Two
+	// concurrent drains would rotate to different WAL segments and race in
+	// createChunkFile, where an older segment landing last can clobber a
+	// newer chunk's live pointer and let GC delete a still-referenced chunk.
+	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
 	drainMu sync.Mutex
 
 	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
@@ -337,37 +320,25 @@ type VB struct {
 	// stay uncontended.
 	saveStateMu sync.Mutex
 
-	// GCEnabled turns on chunk garbage collection: deleting superseded
-	// chunk objects that no live block references. Default false — GC is
-	// opt-in until the cross-process "another process snapshots this
-	// volume mid-run" window (see ensureGCSnapshotSafe) has a durable
-	// answer, not just the in-process latch CreateSnapshot sets below.
+	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
+	// objects no live block references. Default false — opt-in until the
+	// cross-process "another process snapshots this volume mid-run" window
+	// (see ensureGCSnapshotSafe) has a durable answer.
 	GCEnabled bool
 
-	// GCInterval controls how often the background chunk uploader goroutine
-	// also runs a GC sweep (default DefaultGCInterval). <= 0 disables the
-	// periodic sweep even when GCEnabled is true, but Close/DrainToBackend
-	// still run one on the way out. Ignored entirely when GCEnabled is false.
+	// GCInterval controls how often the background chunk uploader also runs
+	// a GC sweep (default DefaultGCInterval). <= 0 disables the periodic
+	// sweep, but Close/DrainToBackend still run one on the way out. Ignored
+	// when GCEnabled is false.
 	GCInterval time.Duration
 
 	gcTicker *time.Ticker
 
-	// gcRefcount counts, per chunk ObjectID, how many entries in
-	// BlocksToObject.BlockLookup currently point at it. Protected by
-	// BlocksToObject.mu — every mutation site already holds that lock to
-	// touch BlockLookup, so reusing it keeps refcount and map updates
-	// atomic with each other instead of needing a second lock ordering to
-	// reason about. A zero count marks the chunk a GC candidate; the entry
-	// is left in the map (not deleted) at zero so sweepChunks can find it,
-	// and is removed only once the chunk is actually deleted from the
-	// backend. Only maintained when GCEnabled — see insertCoalescedLocked.
-	//
-	// gcRefcount alone cannot see a chunk that became unreferenced and was
-	// never swept before this process last closed: parseBlockCheckpoint
-	// rebuilds gcRefcount purely from the current live map, and a
-	// zero-reference chunk is by definition absent from that map — it
-	// looks identical to a chunk that was never minted. reconcileChunksOnce
-	// (gcReconciled below) closes that gap once per VB lifetime.
+	// gcRefcount counts, per chunk ObjectID, how many live BlockLookup
+	// entries reference it (protected by BlocksToObject.mu). Zero marks a GC
+	// candidate; entries persist until actually deleted so sweepChunks can
+	// find them. Only maintained when GCEnabled — rebuilt from the live map
+	// alone at load, so reconcileChunksOnce must close the "swept" gap once.
 	gcRefcount map[uint64]uint64
 
 	// gcReconciled marks whether reconcileChunksOnce has already run for
@@ -375,41 +346,26 @@ type VB struct {
 	gcReconciled atomic.Bool
 
 	// gcFloor and gcFloorReady cache the lowest chunk ObjectID chunk GC may
-	// ever consider (see ensureGCFloor): everything below it may still be
-	// referenced by the current numbered checkpoint
-	// (checkpoints/blocks.%08d.bin), which is read as a fallback if the
-	// live checkpoint is unreadable. Computed lazily and cached for the
-	// life of the process — numbered checkpoints are only rewritten at
-	// Close/RecoverLocalWALs, at which point the process is tearing down or
-	// re-deriving state from scratch anyway.
+	// ever consider (see ensureGCFloor): below it, a chunk may still be
+	// referenced by the current numbered checkpoint, read as a fallback if
+	// the live checkpoint is unreadable. Cached for the process lifetime —
+	// numbered checkpoints are only rewritten at Close/RecoverLocalWALs.
 	gcFloor      atomic.Uint64
 	gcFloorReady atomic.Bool
 
-	// gcSnapshotSafe and gcSnapshotChecked cache the outcome of
-	// ensureGCSnapshotSafe's bucket-wide ancestry scan: whether any
-	// existing snapshot already references this volume. Once a scan
-	// completes (safe or not), the result is cached for the process
-	// lifetime — see ensureGCSnapshotSafe's doc comment for why a positive
-	// result is not re-validated. A scan that errors leaves gcSnapshotChecked
-	// false so the next sweep attempt retries rather than caching a
-	// transient failure as "unsafe forever".
+	// gcSnapshotSafe/gcSnapshotChecked cache ensureGCSnapshotSafe's result:
+	// whether any snapshot already references this volume. Cached for the
+	// process lifetime once checked; an error leaves gcSnapshotChecked false
+	// so the next sweep retries instead of caching a transient failure.
 	gcSnapshotSafe    atomic.Bool
 	gcSnapshotChecked atomic.Bool
 
 	// gcLatchedOff is set permanently, never cleared, the moment this VB
-	// instance does anything that invalidates chunk GC's invariants, and is
-	// checked by ensureGCSnapshotSafe (and so, transitively, sweepChunks).
-	// Two callers set it:
-	//   - CreateSnapshot: closes the in-process half of the snapshot-
-	//     ancestry hazard. A snapshot created after ensureGCSnapshotSafe
-	//     last scanned would otherwise be invisible to a cached "safe"
-	//     result. The cross-process half (another process snapshotting
-	//     this volume while this instance keeps GC running) is NOT covered
-	//     by this latch and has no fix in this phase — it is the reason
-	//     GCEnabled defaults to false.
-	//   - Reset: Reset re-issues ObjectID 0, violating the "chunk IDs are
-	//     never reused" invariant GC's refcount/watermark/floor reasoning
-	//     depends on entirely.
+	// instance does something that invalidates GC's invariants:
+	// CreateSnapshot (closes the in-process snapshot-ancestry hazard) or
+	// Reset (re-issues ObjectID 0, violating the "chunk IDs are never
+	// reused" invariant GC's refcount/floor reasoning relies on). Checked
+	// by ensureGCSnapshotSafe.
 	gcLatchedOff atomic.Bool
 }
 
@@ -475,18 +431,15 @@ type BlockLookup struct {
 	// — those volumes are unreadable post-cutover by design).
 	//
 	// For NumBlocks == 1 this is the block's own SeqNum. For NumBlocks > 1
-	// it is StartBlock's SeqNum, kept for on-disk wire-format compatibility;
-	// SeqNums below carries every block's own value since consecutive
-	// blocks in a run are not guaranteed to share a SeqNum (blocks are
-	// sorted by number, not write order, before coalescing).
+	// it is StartBlock's SeqNum only, kept for wire-format compatibility;
+	// SeqNums below carries every block's own value, since blocks in a run
+	// are not guaranteed to share one.
 	SeqNum uint64
 
 	// SeqNums holds one SeqNum per block in this entry's [StartBlock,
-	// StartBlock+NumBlocks) run, in order. Populated whenever an entry
-	// covers more than one block (createChunkFile, coalesceBlockLookup);
-	// nil for single-block entries, where SeqNum alone is authoritative.
-	// Never serialized directly — the on-disk WAL/checkpoint format stays
-	// one 34-byte record per physical block (see expandBlockLookup).
+	// StartBlock+NumBlocks) run, in order. Nil for single-block entries,
+	// where SeqNum alone is authoritative. Never serialized directly — the
+	// on-disk format stays one record per physical block (expandBlockLookup).
 	SeqNums []uint64
 }
 
@@ -588,24 +541,12 @@ func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, boo
 }
 
 // insertCoalescedLocked inserts newEntry into BlockLookup, fracturing any
-// existing entries whose block range overlaps newEntry's range into their
-// surviving head/tail. This is the map-storage counterpart of
-// UnifiedBlockStore's persistedExtent fracturing: an overwrite landing
-// inside a previously-persisted extent must not leave the old extent's
-// entry shadowing (or being shadowed inconsistently by) the new one.
-// stride is the volume's current per-block on-disk byte stride, used to
-// recompute the surviving tail's ObjectOffset. Caller must hold
-// BlocksToObject.mu (write lock).
+// overlapping existing entries into their surviving head/tail; stride
+// recomputes the tail's ObjectOffset. Caller must hold BlocksToObject.mu.
 //
-// gcRefcount, if non-nil, is kept in exact lockstep with every entry this
-// call removes or adds: a fracture can turn one existing entry into zero,
-// one, or two survivors of the SAME ObjectID (a partial overwrite of a
-// coalesced run splits it into a surviving head and/or tail), so the net
-// refcount delta for that ObjectID is not always -1/+1. Tracking per entry
-// removed/added here -- rather than a single old/new pair at the call site
-// -- is what keeps gcRefcount an exact live-entry count instead of a
-// per-chunk approximation that could hit zero (and trigger a delete) while
-// a surviving fragment still points at the chunk.
+// gcRefcount, if non-nil, is updated per removed/added entry rather than a
+// single delta, since a fracture can split one entry into zero, one, or two
+// survivors of the same ObjectID — the net change isn't always ±1.
 func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32, gcRefcount map[uint64]uint64) {
 	newStart := newEntry.StartBlock
 	newEnd := newEntry.end()
@@ -678,23 +619,14 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 	}
 }
 
-// coalesceBlockLookup merges a flat, one-entry-per-physical-block map (as
-// decoded from on-disk WAL/checkpoint records) into maximal coalesced runs,
-// keyed by StartBlock. Two consecutive-by-block-number records are only
-// merged when they also belong to the same backend chunk (ObjectID) at
-// contiguous byte offsets (stride apart) — the same criteria createChunkFile
-// uses to build a run, so a checkpoint save/load round trip reproduces the
-// exact same extent boundaries the writer produced.
+// coalesceBlockLookup merges a flat, one-entry-per-block map (as decoded
+// from on-disk WAL/checkpoint records) into maximal coalesced runs keyed by
+// StartBlock, using the same adjacency criteria as createChunkFile so a
+// checkpoint round trip reproduces the same extents.
 //
-// Every flat record is treated as covering exactly ONE physical block: the
-// map is keyed by block number and both the legacy pre-coalesce writer and
-// the new expandBlockLookup path emit one record per 4KiB block. The on-disk
-// NumBlocks field is deliberately IGNORED for merge math -- the legacy writer
-// stored a per-run countdown there (10, 9, ... 1) rather than a run length,
-// so trusting it would collapse a whole run onto its first record's SeqNum
-// and corrupt per-block AEAD nonces on reload. Runs are rebuilt purely from
-// real geometry (contiguous block numbers + same ObjectID + contiguous byte
-// offsets), and each record contributes its own SeqNum to the merged run.
+// The on-disk NumBlocks field is ignored for merge math — it's a legacy
+// per-run countdown, not a run length, and trusting it would corrupt
+// per-block AEAD nonces on reload. Runs are rebuilt from geometry alone.
 func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]BlockLookup {
 	out := make(map[uint64]BlockLookup, len(flat))
 	if len(flat) == 0 {
@@ -849,14 +781,10 @@ var ErrRequestOutOfRange = errors.New("request out of range")
 var ErrRequestBlockSize = errors.New("request must be a multiple of block size")
 var ErrRequestBufferEmpty = errors.New("request requires a buffer > 0")
 
-// ErrNoSpace is returned by WriteAtCtx once the backendFull latch is set: a
-// prior drain observed the storage backend reject a write as out-of-space
-// (predastore 507/503, or a local-disk syscall.ENOSPC). It re-exports
-// types.ErrNoSpace — the same sentinel value the backends/file and
-// backends/s3 packages return — so callers can use errors.Is(err,
-// viperblock.ErrNoSpace) without reaching into the types package. See the
-// backendFull field doc on VB for why this is a latch rather than a
-// per-write error.
+// ErrNoSpace is returned by WriteAtCtx once the backendFull latch is set (see
+// the VB.backendFull field doc). Re-exports types.ErrNoSpace, the sentinel
+// the backends/file and backends/s3 packages return, so callers can use
+// errors.Is(err, viperblock.ErrNoSpace) without importing types.
 var ErrNoSpace = types.ErrNoSpace
 
 // ErrStateNotFound is returned by LoadState when both the local file and the
@@ -1074,8 +1002,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	}
 	// GCInterval: 0 means use default, negative means disabled (periodic
 	// sweep only; Close/DrainToBackend still run one on the way out).
-	// Applied regardless of GCEnabled so a later flip has a sane value, but
-	// StartChunkUploader itself gates all GC behavior on GCEnabled.
+	// Applied regardless of GCEnabled, which StartChunkUploader gates on.
 	if config.GCInterval == 0 {
 		config.GCInterval = DefaultGCInterval
 	}
@@ -1301,13 +1228,10 @@ func (vb *VB) StartChunkUploader() {
 	vb.chunkUploadDone = make(chan struct{})
 	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
 
-	// Chunk GC runs on its own cadence, decoupled from ChunkUploadInterval:
-	// a short upload interval (tuned for snapshot freshness) should not
-	// force GC's one-time-per-lifetime bucket-wide ancestry scan (see
-	// ensureGCSnapshotSafe) to be considered far more often than necessary.
-	// gcTickerC stays nil (permanently non-firing in the select below) when
-	// GC is off or GCInterval <= 0, so this goroutine's only extra cost in
-	// the common, GC-disabled case is one always-false receive case.
+	// Chunk GC runs on its own cadence, decoupled from ChunkUploadInterval,
+	// so a short upload interval doesn't force GC's ancestry scan (see
+	// ensureGCSnapshotSafe) to run more often than necessary. gcTickerC
+	// stays nil (never fires below) when GC is off or GCInterval <= 0.
 	var gcTickerC <-chan time.Time
 	if vb.GCEnabled && vb.GCInterval > 0 {
 		vb.gcTicker = time.NewTicker(vb.GCInterval)
@@ -1600,12 +1524,10 @@ func (vb *VB) signalSizeTrigger() {
 // the drain at a time; the rest poll pendingBytes with a bounded backoff.
 //
 // A drain that fails with ErrNoSpace stops the retry loop immediately
-// instead of backing off and trying again: the backend has told us it is
-// out of space, so pendingBytes will never fall back under the
-// low-watermark on its own, and looping here would just hammer an already
-// full backend. DrainToBackendCtx has already latched backendFull by the
-// time the error reaches us; returning it here surfaces ErrNoSpace to the
-// guest write that triggered this backpressure wait.
+// instead of backing off: pendingBytes will never fall under the
+// low-watermark on its own once the backend is out of space, so retrying
+// here would just hammer it. The error surfaces to the guest write that
+// triggered this wait.
 func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
 	if vb.PendingBytes() <= high {
@@ -1616,12 +1538,9 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	backoff := 10 * time.Millisecond
 	const maxBackoff = 500 * time.Millisecond
 
-	// A drain that keeps failing with an error we do NOT recognize as
-	// ErrNoSpace (e.g. a backend rejection that never surfaced as a clean
-	// out-of-space status) must not spin here forever — that hangs the guest
-	// write indefinitely. Bound the consecutive failures and surface the error
-	// so the guest gets a prompt failure instead. A single successful drain
-	// resets the count, so transient backend slowness does not trip it.
+	// Bound consecutive non-ErrNoSpace drain failures so a persistently
+	// failing drain doesn't spin here forever; a single success resets the
+	// count so transient backend slowness doesn't trip it.
 	const maxDrainFailures = 10
 	drainFailures := 0
 
@@ -1663,14 +1582,10 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	return nil
 }
 
-// backendNearFuller is implemented by backends that can report a
-// pre-full backpressure signal observed out-of-band from write errors — the
-// s3 backend's PutObject response carries this via the
-// X-Predastore-Pool-Pressure header (see s3.Backend.NearFull). The core
-// type-asserts vb.Backend against this interface rather than adding NearFull
-// to the exported types.Backend interface, so a backend with no such concept
-// (backends/file) is entirely unaffected: isBackendNearFull simply returns
-// false for it.
+// backendNearFuller lets a backend report pre-full backpressure out-of-band
+// from write errors (the s3 backend via X-Predastore-Pool-Pressure). Kept as
+// an internal type-assertion rather than added to types.Backend, so backends
+// with no such concept (backends/file) are unaffected.
 type backendNearFuller interface {
 	NearFull() bool
 }
@@ -1689,22 +1604,14 @@ func (vb *VB) isBackendNearFull() bool {
 // WriteAtCtx is WriteAt with a caller-supplied context that flows through any
 // read-modify-write backend fetches for trace propagation.
 func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error {
-	// Fail fast while the backend is known to be out of space, before
-	// buffering anything into Writes.Blocks or incrementing pendingBytes. A
-	// guest write is acknowledged well before its chunk is actually PUT to
-	// the backend, so without this up-front gate a full backend would just
-	// keep accepting writes into memory (or spin forever in
-	// awaitBackpressure) instead of surfacing a prompt, real error. The
-	// backendFull latch clears itself once a later drain succeeds.
+	// Fail fast while the backend is out of space, before buffering into
+	// Writes.Blocks — a write is acked before its chunk is PUT, so without
+	// this gate a full backend would keep accepting writes into memory.
 	//
-	// isBackendNearFull engages the SAME fast-fail earlier, at the backend's
-	// nearfull band (still accepting writes) rather than waiting for FULL:
-	// at FULL the backend rejects every PUT including viperblock's own
-	// drains, so already-acked dirty pages could never flush and the guest
-	// filesystem would remount read-only. Refusing new writes here, while
-	// leaving DrainToBackendCtx ungated, lets buffered drains keep flushing
-	// into the backend's remaining headroom, so the guest fs gets a clean
-	// ENOSPC on a new write instead of dying wedged mid-flush.
+	// isBackendNearFull extends the fail-fast to the nearfull band: at FULL
+	// the backend also rejects drain PUTs, so already-acked dirty pages
+	// could never flush. DrainToBackendCtx stays ungated so buffered drains
+	// keep flushing into the remaining headroom.
 	if vb.backendFull.Load() || vb.isBackendNearFull() {
 		return ErrNoSpace
 	}
@@ -1923,17 +1830,14 @@ func (vb *VB) DrainToBackend() error {
 // DrainToBackendCtx is DrainToBackend with a caller-supplied context threaded
 // through the chunk-upload and checkpoint S3 writes.
 func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
-	// Serialize every drain trigger. See drainMu's doc comment: overlapping
-	// drains race in createChunkFile and can strand a live chunk at refcount
-	// zero, which GC would then physically delete.
+	// Serialize every drain trigger — see drainMu's doc comment for why
+	// overlapping drains are unsafe.
 	vb.drainMu.Lock()
 	defer vb.drainMu.Unlock()
 
-	// Every drain path (ticker, size-triggered, backpressure-driven) funnels
-	// through here, so this is the single choke point for the backendFull
-	// latch: a backend-out-of-space error anywhere in the drain sets it, and
-	// a drain that completes cleanly clears it — the backend has accepted
-	// writes again, so buffered writers should stop failing fast.
+	// Every drain path funnels through here, so this is the single choke
+	// point for the backendFull latch: an out-of-space error anywhere in
+	// the drain sets it, and a clean completion clears it.
 	defer func() {
 		if err != nil {
 			if errors.Is(err, ErrNoSpace) {
@@ -3107,33 +3011,16 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			SeqNums:      seqNums,
 		}
 
-		// Reject a stale drain that would repoint this block backwards. Two
-		// concurrent drains can process sequential WAL segments in parallel
-		// (drainMu now prevents that, but a direct WriteWALToChunk caller or a
-		// future scheduling change could reintroduce overlap); if the OLDER
-		// segment's createChunkFile reached this write last, an unconditional
-		// overwrite would install its stale chunk AND drop the newer, live
-		// chunk's refcount -- potentially to zero, letting the next sweep
-		// delete a still-referenced chunk. Only advance on a strictly newer
-		// SeqNum, mirroring BlockStore.MarkPersisted. The stale chunk this
-		// call already uploaded is simply left unreferenced, so it becomes
-		// an ordinary GC candidate instead of corrupting the map.
-		// insertCoalescedLocked's refcount accounting is skipped entirely on
-		// rejection so the live chunk (oldBlock.ObjectID) keeps its
-		// reference and is never decremented. The stale chunk we already
-		// uploaded (newBlock.ObjectID) is instead recorded at refcount zero
-		// -- but only materialized if absent, so a sibling block in this
-		// same batch that legitimately installs this chunk still increments
-		// it to a positive count. That makes a wholly orphaned stale chunk a
-		// prompt sweep candidate instead of leaking it until the
-		// once-per-lifetime reconcile, while never fabricating a reference
-		// that would pin a live chunk.
-		//
-		// resolveBlockLookup (not a raw map index) finds the covering entry
-		// even when this run's start block sits inside an existing coalesced
-		// extent rather than exactly on one's StartBlock key, so the guard
-		// still sees the right "old" occupant for the fracturing insert below.
+		// resolveBlockLookup finds the covering entry even when this run
+		// starts inside an existing coalesced extent, not just an exact key.
 		oldBlock, _, hadOld := vb.BlocksToObject.resolveBlockLookup(first.Block)
+
+		// Reject a stale drain: an older WAL segment landing here last would
+		// otherwise overwrite the newer, live chunk and drop its refcount to
+		// zero, letting the next sweep delete a still-referenced chunk. Only
+		// advance on a strictly newer SeqNum. The stale chunk we already
+		// uploaded is recorded at refcount zero (if not already tracked) so
+		// it becomes a GC candidate instead of leaking silently.
 		if hadOld && oldBlock.SeqNum >= newBlock.SeqNum {
 			if vb.GCEnabled {
 				if _, tracked := vb.gcRefcount[newBlock.ObjectID]; !tracked {
@@ -3146,22 +3033,18 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 		// Fracture any existing entry this run overwrites (e.g. a prior
 		// persisted extent partially rewritten) into its surviving
-		// head/tail before inserting the new run. Pass gcRefcount straight
-		// through so a partial overwrite's surviving fragments keep their
-		// share of the old chunk's refcount -- a single old/new decrement
-		// here would instead always drop it by exactly one, undercounting
-		// (and risking an early, incorrect sweep of) a chunk that a
-		// fracture left with surviving references.
+		// head/tail before inserting the new run. gcRefcount is passed
+		// through so surviving fragments keep their share of the old
+		// chunk's refcount, rather than always dropping it by exactly one.
 		var gcRefcount map[uint64]uint64
 		if vb.GCEnabled {
 			gcRefcount = vb.gcRefcount
 		}
 		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32, gcRefcount)
 
-		// Update BlockStore: transition from Pending to Persisted, one
-		// range op per run instead of one call per block. Per-block SeqNums
-		// keep the location/seqNum binding atomic per block; a stale block
-		// whose data was since re-written is rejected per-block inside
+		// Transition from Pending to Persisted, one range op per run.
+		// Per-block SeqNums keep the location/seqNum binding atomic per
+		// block; a stale block is rejected per-block inside
 		// MarkPersistedRange, same as the single-block MarkPersisted guard.
 		if vb.UseBlockStore && vb.BlockStore != nil {
 			blocks := make([]uint64, numBlocks)
@@ -3186,10 +3069,9 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// the complete coalesced map exactly once, after all chunk PUTs have landed.
 	//
 	// The same reasoning rules out sweeping GC candidates from here too: a
-	// chunk this call just dereferenced (oldBlock above) is not safely
-	// deletable until the coalesced live checkpoint that stops referencing
-	// it has actually landed on the backend. GC only ever sweeps from the
-	// single serialized point right after that checkpoint write succeeds.
+	// chunk this call just dereferenced (oldBlock above) isn't safely
+	// deletable until the checkpoint that stops referencing it has landed;
+	// GC only sweeps from the serialized point right after that succeeds.
 	return nil
 }
 
@@ -3345,25 +3227,20 @@ func ParseBlockCheckpointBytes(raw []byte, version uint16) (map[uint64]BlockLook
 // parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
 // Caller must hold BlocksToObject.mu (write).
 func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
-	// Rebuild refcounts from scratch alongside the map: any zero-refcount
-	// GC candidates tracked before this load (from a prior process
-	// lifetime) are not derivable from the loaded map — a chunk with no
-	// live references looks identical to one that was never referenced —
-	// so they are lost here. That only makes GC miss reclaiming already-
-	// known garbage across a restart; it never causes deleting something
-	// still live, since every count below is derived from exactly the map
-	// that just became this process's live view.
+	// Rebuild refcounts from scratch alongside the map: zero-refcount GC
+	// candidates from a prior process lifetime aren't derivable from the
+	// loaded map (indistinguishable from a chunk never referenced), so
+	// they're lost here. That only makes GC miss already-known garbage
+	// across a restart; it never risks deleting something still live.
 	if vb.GCEnabled {
 		vb.gcRefcount = make(map[uint64]uint64)
 	}
 
 	vb.logger().Debug("Loaded checkpoint", "checkpoint", checkpoint)
 
-	// The on-disk wire format is unchanged: one fixed record per physical
-	// block. Decode into a flat map first, then recoalesce into maximal
-	// same-chunk consecutive runs -- otherwise every (re)open of a large
-	// volume would revert BlocksToObject and BlockStore straight back to
-	// one entry per block, regressing the coalescing this map is built for.
+	// The on-disk format stays one record per physical block. Decode into a
+	// flat map first, then recoalesce into runs -- otherwise every (re)open
+	// of a large volume would revert straight back to one entry per block.
 	flat := make(map[uint64]BlockLookup)
 
 	// Track the highest chunk ObjectID the map references so ObjectNum can be
@@ -3427,10 +3304,9 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 }
 
 // numberedCheckpointHighWater reads the current WallNum's numbered
-// checkpoint (checkpoints/blocks.%08d.bin -- the only one ever read as a
-// fallback, see LoadBlockStateCtx) and returns the highest chunk ObjectID
-// it references. ok is false when no numbered checkpoint has been written
-// yet for this volume (nothing to protect).
+// checkpoint (the fallback read by LoadBlockStateCtx) and returns the
+// highest chunk ObjectID it references. ok is false when no numbered
+// checkpoint has been written yet for this volume.
 func (vb *VB) numberedCheckpointHighWater(ctx context.Context) (highWater uint64, ok bool, err error) {
 	data, err := vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), 0, 0)
 	if err != nil {
@@ -3455,11 +3331,9 @@ func (vb *VB) numberedCheckpointHighWater(ctx context.Context) (highWater uint64
 
 // ensureGCFloor lazily computes and caches the GC floor: one past the
 // highest chunk ObjectID referenced by the current numbered checkpoint, so
-// chunk GC never deletes an object that checkpoint depends on (it is read
-// as a fallback whenever the live checkpoint is unreadable -- see
-// LoadLiveCheckpointCtx). Computed once per VB lifetime: numbered
-// checkpoints are only rewritten at Close/RecoverLocalWALs, both of which
-// end the process lifetime this cached value is valid for.
+// GC never deletes an object that checkpoint depends on if the live
+// checkpoint becomes unreadable. Cached for the VB lifetime — numbered
+// checkpoints are only rewritten at Close/RecoverLocalWALs.
 func (vb *VB) ensureGCFloor(ctx context.Context) uint64 {
 	if vb.gcFloorReady.Load() {
 		return vb.gcFloor.Load()
@@ -3468,10 +3342,9 @@ func (vb *VB) ensureGCFloor(ctx context.Context) uint64 {
 	high, ok, err := vb.numberedCheckpointHighWater(ctx)
 	if err != nil {
 		vb.logger().Warn("chunk GC: failed to compute numbered-checkpoint floor, sweep skipped this round", "err", err)
-		// Not cached: gcFloorReady stays false so the next sweep retries
-		// instead of treating a transient read failure as "nothing to
-		// protect".  ^uint64(0) (all bits set) makes every candidate fail
-		// the "id >= floor" check this round.
+		// Not cached, so the next sweep retries. ^uint64(0) fails every
+		// "id >= floor" check this round instead of treating a transient
+		// read failure as "nothing to protect".
 		return ^uint64(0)
 	}
 
@@ -3485,27 +3358,17 @@ func (vb *VB) ensureGCFloor(ctx context.Context) uint64 {
 }
 
 // snapPrefix is the top-level key prefix every CreateSnapshot writes a
-// snapshot's checkpoint and config.json under (see CreateSnapshot's
-// WriteTo(snapshotID, ...) calls) and the same prefix spinifex's
-// DescribeSnapshots scans with a bucket-wide ListObjectsV2.
+// snapshot's checkpoint and config.json under, and the same prefix
+// spinifex's DescribeSnapshots scans with a bucket-wide ListObjectsV2.
 const snapPrefix = "snap-"
 
-// ensureGCSnapshotSafe reports whether it is safe for chunk GC to run at
-// all against this volume: no existing snapshot may reference it. This is
-// the binary ancestry guard chunk GC relies on instead of computing a
-// GCFloor from snapshot state -- see scanForOwnSnapshots's doc comment for
-// why. The result is cached for the process lifetime once a scan completes,
-// whether the outcome is "safe" or "unsafe": once a snapshot of this volume
-// exists it always will (this phase does not lower the guard on snapshot
-// deletion, matching the conservative default). A scan that errors is not
-// cached, so the next sweep attempt retries rather than treating a
-// transient failure as permanently unsafe -- or worse, permanently safe.
+// ensureGCSnapshotSafe reports whether chunk GC may run against this volume:
+// safe only if no existing snapshot references it (scanForOwnSnapshots).
+// Cached for the process lifetime once a scan completes, safe or not — the
+// guard never loosens once a snapshot exists. A scan error is not cached.
 //
-// This only covers snapshots that exist at scan time, plus any this same
-// process creates afterward (see the gcLatchedOff CreateSnapshot sets
-// below). A different process creating a snapshot of this volume after this
-// scan last ran is not detected here -- that cross-process window is the
-// reason GCEnabled defaults to false; it is not solved by this guard.
+// Misses a snapshot created by another process after the scan; that
+// cross-process gap is why GCEnabled defaults to false.
 func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
 	if vb.gcLatchedOff.Load() {
 		return false
@@ -3529,26 +3392,11 @@ func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
 }
 
 // scanForOwnSnapshots answers "does any existing snapshot reference this
-// volume" the only way it can be answered without spinifex-side plumbing:
-// snapshots are NOT stored under this volume's own key prefix. CreateSnapshot
-// writes to {snapshotID}/, a top-level prefix sibling to {volumeName}/, keyed
-// by an independently generated snapshot ID with no derivable relationship
-// to the source volume name (confirmed against types.GetFilePath's layout
-// and spinifex's own bucket-wide ListObjectsV2(Prefix:"snap-") in
-// DescribeSnapshots). So this cannot be a bounded, per-volume prefix listing:
-// it lists every top-level "snap-" prefix in the backend and reads each
-// candidate's config.json to compare SourceVolumeName.
-//
-// Reading config.json needs no decryption key: the metadata envelope
-// authenticates the JSON, it does not encrypt it (see StateBody's doc
-// comment), so this works identically for encrypted and unencrypted
-// volumes.
-//
-// Cost: O(total snapshots in the whole deployment), not O(this volume's own
-// snapshots). Run at most once per VB lifetime (see ensureGCSnapshotSafe's
-// caching) and only when GCEnabled, never on a request path -- but it is a
-// real, deployment-wide-scaling cost that a volume-scoped snapshot index
-// would avoid. Out of scope for this phase.
+// volume" by listing every "snap-" prefix in the backend and comparing each
+// candidate's config.json SourceVolumeName — snapshot IDs carry no derivable
+// relationship to the source volume name, so this can't be a bounded
+// per-volume listing. Cost is O(total snapshots in the deployment); run at
+// most once per VB lifetime, only when GCEnabled.
 func (vb *VB) scanForOwnSnapshots(ctx context.Context) (safe bool, err error) {
 	names, err := vb.Backend.ListPrefixesCtx(ctx, snapPrefix)
 	if err != nil {
@@ -3607,23 +3455,14 @@ func parseChunkObjectID(key string) (id uint64, ok bool) {
 }
 
 // reconcileChunksOnce lists this volume's own chunks/ prefix once per VB
-// lifetime and adds any chunk object not already tracked in gcRefcount as a
-// zero-refcount GC candidate. Without this, a chunk that became
-// unreferenced and was never swept before this process last closed can
-// never be reclaimed by a later VB instance: parseBlockCheckpoint's rebuild
-// only sees the current live map, and a zero-reference chunk is by
-// definition absent from it -- indistinguishable from a chunk that was
-// never minted at all. This is the "bounded, opt-in enumeration reconcile"
-// this design relies on to stay correct across a restart; unlike
-// ensureGCSnapshotSafe's bucket-wide scan, it is scoped to this volume's
-// own chunks/ prefix only, proportional to this volume's own chunk count.
+// lifetime and adds any untracked chunk object to gcRefcount at zero — a
+// chunk unreferenced since before the last close is otherwise
+// indistinguishable from one never minted, since parseBlockCheckpoint only
+// rebuilds gcRefcount from the live map. Scoped to this volume's own
+// prefix, unlike ensureGCSnapshotSafe's bucket-wide scan.
 //
-// Assumes parseBlockCheckpoint (and so gcRefcount's initial population)
-// runs at most once per VB lifetime, before the first sweep -- true today
-// (only LoadLiveCheckpointCtx/LoadBlockStateCtx call it, both Open-time
-// paths) but would need revisiting if that ever changes, since a later
-// rebuild would wipe the zero-entries this adds without re-adding them
-// (gcReconciled would already be true).
+// Assumes gcRefcount's initial population runs once, before the first
+// sweep; a later rebuild would wipe the zero-entries this adds.
 func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 	if vb.gcReconciled.Load() {
 		return
@@ -3650,14 +3489,10 @@ func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 	vb.gcReconciled.Store(true)
 }
 
-// sweepChunks deletes superseded chunk objects: those below the GC
-// watermark captured here, at or above the numbered-checkpoint floor (see
-// ensureGCFloor), whose in-memory refcount has dropped to zero. Call only
-// after a successful SaveLiveCheckpointCtx (runGCSweep and Close both
-// arrange this) -- the durable live checkpoint has already stopped
-// referencing anything this sweep is about to delete, so a crash between
-// checkpoint save and sweep leaves garbage on disk (safe, just not yet
-// reclaimed), never a dangling reference (unsafe).
+// sweepChunks deletes superseded chunk objects: below the watermark captured
+// here, at or above the numbered-checkpoint floor, with zero refcount. Call
+// only after a successful SaveLiveCheckpointCtx — a crash between checkpoint
+// save and sweep leaves garbage on disk (safe), never a dangling reference.
 func (vb *VB) sweepChunks(ctx context.Context) {
 	if !vb.GCEnabled {
 		return
@@ -3669,10 +3504,9 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	vb.reconcileChunksOnce(ctx)
 
 	floor := vb.ensureGCFloor(ctx)
-	// Watermark is captured once, here, and never revisited for this sweep:
-	// any chunk minted after this point is structurally excluded by the
-	// "id < watermark" check below, without needing to hold
-	// BlocksToObject.mu across the delete calls that follow.
+	// Captured once: any chunk minted after this point is excluded by the
+	// "id < watermark" check below, so BlocksToObject.mu need not be held
+	// across the delete calls that follow.
 	watermark := vb.ObjectNum.Load()
 
 	vb.BlocksToObject.mu.Lock()
@@ -3693,21 +3527,11 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	}
 }
 
-// deleteChunkObjects issues a DeleteObject call for each chunk ObjectID in
-// ids and returns how many were actually reclaimed (deleted, or already
-// gone). This is the sole call site chunk GC uses to remove backend
-// objects, deliberately isolated from sweepChunks's candidate-selection
-// logic: predastore has no batch DeleteObjects route today (POST
-// ?delete= returns 405 -- see the s3 backend's Delete doc comment), so
-// this issues one DeleteCtx per key, but a future batched backend call can
-// replace this loop's body without sweepChunks or its safety predicate
-// (floor/watermark/refcount) changing at all. Not a hot path: a sweep runs
-// at most every few minutes over at most tens of candidate keys.
-//
-// A delete that fails with anything other than "already gone"
-// (errors.Is(err, os.ErrNotExist)) is left both in gcRefcount and out of
-// the swept count, so the next sweep retries it -- silent under-collection
-// (a leaked chunk) is always preferred over losing track of a candidate.
+// deleteChunkObjects issues a DeleteObject call per chunk ObjectID and
+// returns how many were reclaimed (deleted or already gone). A delete that
+// fails otherwise is left in gcRefcount and out of the swept count, so the
+// next sweep retries it — under-collection (a leaked chunk) is preferred
+// over losing track of a candidate.
 func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) {
 	for _, id := range ids {
 		if err := vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -4113,15 +3937,11 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		}
 	}
 
-	// Sync BlockStore from BlocksToObject since createChunkFile's
-	// MarkPersistedRange won't work during recovery (blocks aren't in Pending
-	// state in BlockStore). createChunkFile already coalesced BlocksToObject
-	// above, so install each run as one persistedExtent via SetPersistedRange
-	// -- keeping the index O(extents) rather than reverting recovered blocks to
-	// one BlockStore entry per block. Each block keeps its own AEAD SeqNum via
-	// the entry's per-position SeqNums. Idempotent for runs already installed
-	// by a prior checkpoint load, and Hot/Pending shard entries from newer
-	// writes still take precedence in ReadEntry.
+	// Sync BlockStore from BlocksToObject: createChunkFile's
+	// MarkPersistedRange doesn't apply during recovery (blocks aren't in
+	// Pending state), so install each coalesced run directly via
+	// SetPersistedRange. Idempotent; newer Hot/Pending entries still take
+	// precedence in ReadEntry.
 	if vb.UseBlockStore && vb.BlockStore != nil {
 		vb.BlocksToObject.mu.RLock()
 		stride := vb.blockStride()
@@ -5145,11 +4965,10 @@ func (vb *VB) Close() error {
 		if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
 			vb.logger().Warn("Close: SaveLiveCheckpoint failed", "err", cpErr)
 		} else {
-			// One last sweep on the way out, now that the live checkpoint
-			// durably excludes every zero-refcount chunk below. Run before
-			// SaveBlockState/SaveState so ensureGCFloor still sees the
-			// numbered checkpoint from before this Close, not the one
-			// SaveBlockState is about to write under a bumped WallNum.
+			// One last sweep, now that the live checkpoint durably excludes
+			// every zero-refcount chunk. Run before SaveBlockState so
+			// ensureGCFloor still sees the checkpoint from before this
+			// Close, not the one SaveBlockState is about to write.
 			vb.sweepChunks(context.Background())
 		}
 	}
@@ -5232,14 +5051,10 @@ func (vb *VB) ownsWAL() bool {
 }
 
 func (vb *VB) Reset() error {
-	// Reset re-issues ObjectID 0 below (vb.ObjectNum.Store(0)), which
-	// violates the "chunk IDs are never reused" invariant chunk GC's
-	// refcount/watermark/floor reasoning all depend on -- a reused ID could
-	// alias a chunk GC already deleted under the pre-reset generation.
-	// Latch GC off permanently for this instance rather than trying to
-	// reconcile gcRefcount/gcFloor/gcSnapshotSafe across the reset; nothing
-	// in this codebase calls Reset in production today, so this is
-	// defense-in-depth for whatever eventually does.
+	// Reset re-issues ObjectID 0 below, violating the "chunk IDs are never
+	// reused" invariant GC's refcount/floor reasoning depends on — a reused
+	// ID could alias a chunk GC already deleted. Latch GC off permanently
+	// rather than trying to reconcile GC state across the reset.
 	if vb.GCEnabled {
 		vb.gcLatchedOff.Store(true)
 	}

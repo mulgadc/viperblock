@@ -488,12 +488,9 @@ func pendingRun(bs *UnifiedBlockStore, startBlock uint64, numBlocks int) (blocks
 	return blocks, seqNums
 }
 
-// TestBlockStore_MarkPersistedRange_Coalesces pins the coalescing behaviour
-// mulga-ig6wa fixes: persisting a consecutive run must produce exactly one
-// persistedExtent entry, not one BlockEntry per block, and every block in
-// the run must still resolve to byte-identical location/seqnum data via
-// ReadEntry -- including blocks in the middle of the run, which cannot be
-// found via a raw map key lookup once coalesced.
+// TestBlockStore_MarkPersistedRange_Coalesces pins that persisting a
+// consecutive run produces one persistedExtent, not one BlockEntry per
+// block, while every block still resolves correctly via ReadEntry.
 func TestBlockStore_MarkPersistedRange_Coalesces(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 	const numBlocks = 1000
@@ -524,8 +521,7 @@ func TestBlockStore_MarkPersistedRange_Coalesces(t *testing.T) {
 		}
 	}
 
-	// Every block, including ones in the middle of the run, must still
-	// resolve to its own correct location and SeqNum.
+	// Every block, including ones mid-run, must resolve to its own location/SeqNum.
 	for i, b := range blocks {
 		entry, ok := bs.ReadEntry(b)
 		if !ok {
@@ -546,8 +542,7 @@ func TestBlockStore_MarkPersistedRange_Coalesces(t *testing.T) {
 		}
 	}
 
-	// GetPersistedInfo and ReadBlock must agree with ReadEntry for a
-	// non-start block in the run.
+	// GetPersistedInfo and ReadBlock must agree with ReadEntry for a non-start block.
 	mid := blocks[numBlocks/2]
 	objID, off, ok := bs.GetPersistedInfo(mid)
 	if !ok || objID != 7 || off != objectOffset+uint32(numBlocks/2)*stride {
@@ -557,8 +552,7 @@ func TestBlockStore_MarkPersistedRange_Coalesces(t *testing.T) {
 		t.Fatalf("ReadBlock(%d): not found after coalescing", mid)
 	}
 
-	// Total block count must still reflect every physical block even though
-	// the extent index itself has one entry.
+	// Total block count must still reflect every physical block.
 	if bs.Count() != numBlocks {
 		t.Fatalf("Count() = %d, want %d", bs.Count(), numBlocks)
 	}
@@ -567,10 +561,9 @@ func TestBlockStore_MarkPersistedRange_Coalesces(t *testing.T) {
 	}
 }
 
-// TestBlockStore_MarkPersistedRange_Fracture pins the partial-range
-// invalidation constraint from mulga-ig6wa: an overwrite that lands inside an
-// existing coalesced extent must split the old extent into its surviving
-// head/tail, not leave the old extent's stale entry shadowing the new data.
+// TestBlockStore_MarkPersistedRange_Fracture pins that an overwrite landing
+// inside an existing coalesced extent splits it into a surviving head/tail
+// rather than leaving a stale entry shadowing the new data.
 func TestBlockStore_MarkPersistedRange_Fracture(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 	const stride = uint32(4096)
@@ -584,8 +577,7 @@ func TestBlockStore_MarkPersistedRange_Fracture(t *testing.T) {
 		t.Fatalf("PersistedExtentCount() = %d, want 1 after first persist", n)
 	}
 
-	// Now overwrite the middle: blocks [103, 106) get rewritten and
-	// persisted into a new chunk 2. This must fracture the [100,110) extent
+	// Overwrite the middle [103,106) into chunk 2; must fracture [100,110)
 	// into a surviving head [100,103) and tail [106,110).
 	blocks2, seq2 := pendingRun(bs, 103, 3)
 	if got := bs.MarkPersistedRange(blocks2, 2, 500, stride, seq2); got != 3 {
@@ -613,9 +605,8 @@ func TestBlockStore_MarkPersistedRange_Fracture(t *testing.T) {
 		}
 	}
 
-	// Tail blocks [106,110) still resolve to chunk 1, at their ORIGINAL
-	// offsets within that chunk (offset math must be relative to the
-	// original extent's start, not the fracture point).
+	// Tail blocks [106,110) still resolve to chunk 1, at offsets relative to
+	// the original extent's start, not the fracture point.
 	for i, b := range []uint64{106, 107, 108, 109} {
 		origIdx := i + 6 // position within the original [100,110) run
 		entry, ok := bs.ReadEntry(b)
@@ -625,21 +616,18 @@ func TestBlockStore_MarkPersistedRange_Fracture(t *testing.T) {
 	}
 }
 
-// TestBlockStore_MarkPersistedRange_StaleWriteSkipped pins the TOCTOU
-// defence from mulga-ig6wa: a block that gets rewritten (superseded by a
-// newer guest write) after being selected into a chunk, but before that
-// chunk's upload completes, must NOT be persisted under the stale chunk's
-// location -- it must be left as Hot with the newer data, exactly like the
-// single-block MarkPersisted's existing seqnum-match guard.
+// TestBlockStore_MarkPersistedRange_StaleWriteSkipped pins that a block
+// rewritten after being selected into a chunk, but before upload completes,
+// is left as Hot with the newer data rather than persisted under the stale
+// chunk's location.
 func TestBlockStore_MarkPersistedRange_StaleWriteSkipped(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 	const stride = uint32(4096)
 
 	blocks, seqNums := pendingRun(bs, 200, 5)
 
-	// Simulate a concurrent rewrite of the middle block (202) racing the
-	// chunk upload: a fresh Write() bumps it back to Hot with a new SeqNum
-	// before MarkPersistedRange runs.
+	// Rewrite the middle block (202) before MarkPersistedRange runs, racing
+	// the chunk upload.
 	newData := []byte{0xAA, 0xBB, 0xCC, 0xDD}
 	newSeq := bs.Write(202, newData)
 	if newSeq <= seqNums[2] {
@@ -666,8 +654,7 @@ func TestBlockStore_MarkPersistedRange_StaleWriteSkipped(t *testing.T) {
 		t.Fatal("block 202 data was clobbered by the stale persist")
 	}
 
-	// The other four blocks persisted correctly, split around the gap left
-	// by the raced block: [200,202) and [203,205).
+	// The other four blocks persisted correctly, split around the raced block.
 	for i, b := range []uint64{200, 201} {
 		e, ok := bs.ReadEntry(b)
 		if !ok || e.State != BlockStatePersisted || e.ObjectID != 9 || e.ObjectOffset != uint32(i)*stride {
@@ -687,15 +674,10 @@ func TestBlockStore_MarkPersistedRange_StaleWriteSkipped(t *testing.T) {
 	}
 }
 
-// TestBlockStore_MarkPersistedRange_ConcurrentRewrite exercises the TOCTOU
-// window with a genuinely concurrent guest rewrite, under -race. While a chunk
-// upload persists a run via MarkPersistedRange, other goroutines keep
-// rewriting blocks in that run (Write + MarkPending, bumping their SeqNum) and
-// reading them back. Two invariants must hold throughout: the race detector
-// must stay silent (all persistedExtents / shard access is correctly locked),
-// and no reader may ever observe a block as "never written" (BlockStateEmpty)
-// mid-transition -- the 3-pass insert-before-delete ordering guarantees every
-// block is resolvable at every instant.
+// TestBlockStore_MarkPersistedRange_ConcurrentRewrite exercises MarkPersistedRange
+// under -race against concurrent rewriters and readers: the race detector
+// must stay silent, and no reader may observe a block as never-written
+// mid-transition.
 func TestBlockStore_MarkPersistedRange_ConcurrentRewrite(t *testing.T) {
 	const stride = uint32(4096)
 	const startBlock = 900
@@ -715,8 +697,7 @@ func TestBlockStore_MarkPersistedRange_ConcurrentRewrite(t *testing.T) {
 			bs.MarkPersistedRange(blocks, 3, 0, stride, seqNums)
 		})
 
-		// Rewriters: keep superseding random blocks in the run with newer
-		// writes, racing the persist's read-select-delete passes.
+		// Rewriters: keep superseding random blocks, racing the persist.
 		data := make([]byte, bs.blockSize)
 		for range 4 {
 			wg.Go(func() {

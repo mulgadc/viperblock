@@ -74,10 +74,8 @@ var upload_workers int = 16
 var use_shardwal bool = false
 var encryption_key_file string
 
-// gc_enabled mirrors viperblock.VB.GCEnabled: chunk GC (mark-and-sweep,
-// snapshot-ancestry gated) is off unless the spawning process explicitly
-// passes gc_enabled=true. Defaults false so every existing deployment keeps
-// today's behavior until the enable is flipped deliberately.
+// gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
+// stays off until the spawning process explicitly opts in.
 var gc_enabled bool = false
 
 var disk []byte
@@ -244,9 +242,8 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		UploadWorkers:     upload_workers,
 		MasterKey:         loadedMasterKey,
 		EncryptionEnabled: loadedMasterKey != nil,
-		// GCEnabled must be set here (not applied post-construction like
-		// UseShardedWAL below) because viperblock.New copies it once into
-		// vb.GCEnabled at construction time.
+		// Set here, not post-construction like UseShardedWAL below: New
+		// copies GCEnabled once at construction time.
 		GCEnabled: gc_enabled,
 	}
 
@@ -393,12 +390,9 @@ func stopSnapshotListener() {
 	snapshotListenerDone = nil
 }
 
-// backendErrToPluginError turns a viperblock write-path error into an
-// nbdkit.PluginError, mapping viperblock.ErrNoSpace onto a real ENOSPC so
-// the guest kernel sees "no space left on device" instead of a generic I/O
-// error. PluginError.Errno propagates to nbdkit's set_error via the C
-// bridge in implError; every other error leaves Errno at its zero value (no
-// errno override, nbdkit defaults to EIO).
+// backendErrToPluginError wraps a viperblock write-path error as an
+// nbdkit.PluginError, mapping viperblock.ErrNoSpace onto ENOSPC so the guest
+// kernel reports "no space left on device" instead of a generic I/O error.
 func backendErrToPluginError(msgPrefix string, err error) nbdkit.PluginError {
 	perr := nbdkit.PluginError{Errmsg: fmt.Sprintf("%s: %v", msgPrefix, err)}
 	if errors.Is(err, viperblock.ErrNoSpace) {

@@ -16,14 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This file exercises the s3 backend's Delete/List surface (added for
-// viperblock chunk GC) against a real predastore instance rather than a
-// hand-rolled mock. That matters specifically for Delete/DeleteCtx:
-// predastore, unlike real S3, errors on deleting an already-missing key
-// instead of treating it as an idempotent success (see wrapNotFound's doc
-// comment) -- a synthetic mock could easily get that quirk wrong and hide
-// exactly the bug that would make chunk GC's "already gone == success"
-// contract silently false.
+// This file exercises the s3 backend's Delete/List surface against a real
+// predastore instance rather than a mock, since predastore's delete-of-missing
+// behavior (see wrapNotFound) is exactly what a synthetic mock could get wrong.
 
 // sharedTestServer holds the predastore cluster started once for this
 // package's tests in TestMain.
@@ -42,13 +37,9 @@ func TestMain(m *testing.M) {
 		repoRoot := filepath.Join(dir, "..", "..", "..")
 		certPath := filepath.Join(repoRoot, "config", "server.pem")
 
-		// predastore's internal s3db + QUIC clients (and the raft transport
-		// between nodes) verify TLS strictly against the OS trust store, not
-		// just the S3-facing HTTP client this test's own requests use. Point
-		// SystemCertPool at the self-signed test cert so node-to-node and
-		// s3db verification succeeds without installing the cert
-		// system-wide. Must be set before any TLS handshake in this
-		// process — mirrors the viperblock package's own TestMain.
+		// predastore's internal node-to-node TLS (raft, s3db) verifies against
+		// the OS trust store, so point it at the self-signed test cert before
+		// any handshake happens.
 		if err := os.Setenv("SSL_CERT_FILE", certPath); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to set SSL_CERT_FILE: %v\n", err)
 			return 1
@@ -147,12 +138,9 @@ func TestS3DeleteAndDeleteCtx(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
-// TestS3DeleteAlreadyMissingReturnsErrNotExist pins the specific predastore
-// quirk wrapNotFound exists to paper over: deleting an already-absent key
-// errors instead of succeeding idempotently the way real S3 does. Chunk
-// GC's sweep depends on errors.Is(err, os.ErrNotExist) here to treat a
-// re-swept or already-reclaimed chunk as success, not a retry-worthy
-// failure.
+// TestS3DeleteAlreadyMissingReturnsErrNotExist pins the predastore quirk
+// wrapNotFound papers over: deleting an already-absent key errors instead of
+// succeeding idempotently the way real S3 does.
 func TestS3DeleteAlreadyMissingReturnsErrNotExist(t *testing.T) {
 	backend := newGCTestBackend(t, uniqueVolumeName(t))
 
@@ -230,10 +218,9 @@ func TestS3ListObjectsMissingPrefixIsEmptyNotError(t *testing.T) {
 	assert.Empty(t, keys)
 }
 
-// TestS3DeleteAndListRequireInitializedClient pins the guard-clause
-// behavior when a backend's Init/InitCtx was never called: every new
-// Delete/List method must fail closed with a clear error rather than a nil
-// pointer panic.
+// TestS3DeleteAndListRequireInitializedClient pins that every new Delete/List
+// method fails closed with a clear error when Init/InitCtx was never called,
+// rather than a nil pointer panic.
 func TestS3DeleteAndListRequireInitializedClient(t *testing.T) {
 	backend := New(S3Config{VolumeName: "uninitialized", Bucket: "predastore"})
 

@@ -48,10 +48,8 @@ func TestCreateSnapshot(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, vb.VolumeName, ident.SourceVolumeName)
 
-		// vb.BlocksToObject.BlockLookup may be coalesced into extents while
-		// the loaded snapshot map stays flat (one entry per physical
-		// block), so compare by physical block coverage rather than map
-		// shape.
+		// vb's map may be coalesced into extents while the loaded snapshot
+		// map stays flat, so compare by physical block coverage.
 		stride := vb.blockStride()
 		wantBlocks := 0
 		for _, lookup := range vb.BlocksToObject.BlockLookup {
@@ -505,10 +503,8 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		// vb.BlocksToObject.BlockLookup may be coalesced into extents while
-		// the decoded flat section stays flat (one entry per physical
-		// block), so compare by physical block coverage rather than map
-		// shape.
+		// vb's map may be coalesced into extents while the decoded flat
+		// section stays flat, so compare by physical block coverage.
 		stride := vb.blockStride()
 		wantBlocks := 0
 		for _, want := range vb.BlocksToObject.BlockLookup {

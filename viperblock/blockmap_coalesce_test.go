@@ -1,17 +1,7 @@
 // Pinning tests for extent-based block-map coalescing: createChunkFile must
 // emit one BlockLookup entry per consecutive run of blocks instead of one
 // entry per physical block, and BlockStore's Persisted state must mirror
-// that in persistedExtents. These tests pin the correctness properties that
-// make coalescing safe:
-//   - sequential writes produce O(extents) map entries, not O(blocks)
-//   - an overwrite landing inside an existing extent fractures it into its
-//     surviving head/tail rather than corrupting or losing data
-//   - reads resolve any block in a coalesced run -- including blocks that
-//     are not the run's StartBlock map key -- to byte-identical data
-//   - per-block SeqNum fidelity survives coalescing, so AEAD nonce/AAD
-//     reconstruction on encrypted volumes stays correct after coalescing
-//   - chunk boundaries (ObjBlockSize) produce one extent per chunk, since
-//     cross-chunk coalescing is architecturally impossible
+// that in persistedExtents.
 
 package viperblock
 
@@ -28,10 +18,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newCoalesceTestVB stands up a file-backed VB with WAL files already open
-// and a caller-chosen ObjBlockSize, so tests can control exactly how many
-// blocks land in one chunk (and therefore one coalesced extent). key == nil
-// gives an unencrypted volume.
+// newCoalesceTestVB creates a file-backed VB with a caller-chosen
+// ObjBlockSize so tests can control how many blocks land in one chunk (and
+// therefore one coalesced extent). key == nil gives an unencrypted volume.
 func newCoalesceTestVB(t *testing.T, volume string, objBlockSizeBlocks int, key *masterkey.Key) *VB {
 	t.Helper()
 	dir := t.TempDir()
@@ -68,11 +57,9 @@ func randomBlocks(t *testing.T, vb *VB, n int) []byte {
 	return buf
 }
 
-// TestBlockMapCoalesce_SequentialWrite pins the core fix: a single
-// consecutive write that fits in one chunk must produce exactly one
-// BlockLookup entry and one BlockStore persisted extent, not one entry per
-// block -- and every block must still read back byte-identical, including
-// blocks that are not the extent's StartBlock map key.
+// TestBlockMapCoalesce_SequentialWrite pins that a single consecutive write
+// fitting in one chunk produces exactly one BlockLookup entry, and every
+// block reads back correctly, including ones that aren't the StartBlock key.
 func TestBlockMapCoalesce_SequentialWrite(t *testing.T) {
 	const numBlocks = 50
 	vb := newCoalesceTestVB(t, "vol-seq-write", 4096 /* huge, single chunk */, nil)
@@ -90,14 +77,12 @@ func TestBlockMapCoalesce_SequentialWrite(t *testing.T) {
 
 	require.Equal(t, 1, vb.BlockStore.PersistedExtentCount(), "one consecutive run must coalesce into one persistedExtent")
 
-	// Read back every block, not just the run's StartBlock, to prove range
-	// resolution (not just the map-key hit) works.
 	got, err := vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(data, got), "sequential write readback must be byte-identical")
 
-	// Single-block reads from the middle and end of the run must also
-	// resolve correctly via the range lookup, not just a whole-range read.
+	// Read individual blocks too, to prove range resolution (not just the
+	// map-key hit) works for non-StartBlock blocks.
 	for _, block := range []uint64{0, 1, numBlocks / 2, numBlocks - 1} {
 		want := data[block*uint64(vb.BlockSize) : (block+1)*uint64(vb.BlockSize)]
 		got, err := vb.ReadAt(block*uint64(vb.BlockSize), uint64(vb.BlockSize))
@@ -106,11 +91,9 @@ func TestBlockMapCoalesce_SequentialWrite(t *testing.T) {
 	}
 }
 
-// TestBlockMapCoalesce_OverwriteFracturesExtent pins the partial-range
-// invalidation constraint: an overwrite landing inside an existing
-// coalesced extent must fracture it into its surviving head/tail, and every
-// block -- head, overwritten middle, and tail -- must read back correctly
-// afterwards.
+// TestBlockMapCoalesce_OverwriteFracturesExtent pins that an overwrite
+// landing inside an existing coalesced extent fractures it into its
+// surviving head/tail, with every block reading back correctly afterwards.
 func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	const numBlocks = 20
 	vb := newCoalesceTestVB(t, "vol-overwrite-fracture", 4096, nil)
@@ -124,7 +107,7 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.Len(t, vb.BlocksToObject.BlockLookup, 1)
 	vb.BlocksToObject.mu.RUnlock()
 
-	// Overwrite blocks [8, 12) -- strictly inside the [0, 20) extent, with
+	// Overwrite [8, 12) -- strictly inside the [0, 20) extent, leaving
 	// surviving blocks on both sides.
 	overwrite := randomBlocks(t, vb, 4)
 	require.NoError(t, vb.WriteAt(8*uint64(vb.BlockSize), overwrite))
@@ -146,7 +129,6 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.Equal(t, uint64(1), mid.ObjectID, "overwritten range must point at the new chunk")
 	require.Equal(t, uint64(0), tail.ObjectID, "tail must still point at the original chunk")
 
-	// Build the expected composite buffer: original head + overwrite + original tail.
 	want := make([]byte, 0, numBlocks*int(vb.BlockSize))
 	want = append(want, original[:8*vb.BlockSize]...)
 	want = append(want, overwrite...)
@@ -156,19 +138,17 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(want, got), "readback after fracture must reflect head/overwrite/tail exactly")
 
-	// Explicitly check the tail's first block (block 12): this is the block
-	// most likely to break if the fractured tail's ObjectOffset isn't
-	// recomputed relative to the original extent's start.
+	// Block 12 (the tail's first block) is what breaks if the fractured
+	// tail's ObjectOffset isn't recomputed relative to the original extent.
 	wantTailBlock := original[12*vb.BlockSize : 13*vb.BlockSize]
 	gotTailBlock, err := vb.ReadAt(12*uint64(vb.BlockSize), uint64(vb.BlockSize))
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(wantTailBlock, gotTailBlock), "tail block 12 readback mismatch")
 }
 
-// TestBlockMapCoalesce_MultiChunkBoundary pins that coalescing respects
-// chunk boundaries: cross-chunk coalescing is architecturally impossible
-// (different chunks are different backend objects), so a sequential write
-// spanning multiple chunks must produce exactly one extent per chunk.
+// TestBlockMapCoalesce_MultiChunkBoundary pins that a sequential write
+// spanning multiple chunks produces exactly one extent per chunk, since
+// cross-chunk coalescing is architecturally impossible.
 func TestBlockMapCoalesce_MultiChunkBoundary(t *testing.T) {
 	const blocksPerChunk = 8
 	const numBlocks = 20 // spans 3 chunks: 8 + 8 + 4
@@ -200,11 +180,10 @@ func TestBlockMapCoalesce_MultiChunkBoundary(t *testing.T) {
 	require.True(t, bytes.Equal(data, got), "readback across chunk boundaries must be byte-identical")
 }
 
-// TestBlockMapCoalesce_EncryptedReadback pins per-block SeqNum fidelity
-// through coalescing on an encrypted volume: blocks in a coalesced run are
-// not guaranteed to share a SeqNum (blocks are sorted by number, not write
-// order, before coalescing), and AEAD nonce/AAD reconstruction on read
-// depends on each block's own SeqNum surviving the coalesce.
+// TestBlockMapCoalesce_EncryptedReadback pins that per-block SeqNum
+// fidelity survives coalescing on an encrypted volume: blocks in a
+// coalesced run aren't guaranteed to share a SeqNum, and AEAD nonce
+// reconstruction on read depends on each block keeping its own.
 func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	var raw [masterkey.MasterKeySize]byte
 	for i := range raw {
@@ -231,9 +210,8 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(data, got), "encrypted sequential readback must be byte-identical")
 
-	// Now overwrite a range straddling a chunk boundary (blocks [6, 10)),
-	// which spans the first two chunks and forces per-block SeqNum tracking
-	// across a fracture on an encrypted volume.
+	// Overwrite a range straddling a chunk boundary, forcing per-block
+	// SeqNum tracking across a fracture on an encrypted volume.
 	overwrite := randomBlocks(t, vb, 4)
 	require.NoError(t, vb.WriteAt(6*uint64(vb.BlockSize), overwrite))
 	require.NoError(t, vb.Flush())
@@ -248,10 +226,8 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(want, got), "encrypted readback after cross-chunk-boundary overwrite must be byte-identical")
 
-	// Force a cold reload of the block map from a saved checkpoint --
-	// exercising parseBlockCheckpoint's recoalescing (coalesceBlockLookup)
-	// and BlockStore's SetPersistedRange restore path -- then confirm the
-	// reloaded, recoalesced map still decrypts every block correctly.
+	// Cold-reload the block map from a saved checkpoint, exercising
+	// parseBlockCheckpoint's recoalescing and BlockStore's restore path.
 	require.NoError(t, vb.SaveLiveCheckpoint())
 	vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
 	require.NoError(t, vb.LoadLiveCheckpoint())
@@ -261,11 +237,8 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	require.True(t, bytes.Equal(want, got), "cold encrypted readback after reload must still be byte-identical")
 }
 
-// TestBlockMapCoalesce_EntryCountIsExtentsNotBlocks is the bead's headline
-// acceptance criterion: a large sequential write must grow the block map by
-// O(extents), not O(blocks). Before this fix, createChunkFile wrote one
-// BlockLookup entry per physical block, so nbdkit RSS scaled linearly with
-// total bytes ever written.
+// TestBlockMapCoalesce_EntryCountIsExtentsNotBlocks pins that a large
+// sequential write grows the block map by O(extents), not O(blocks).
 func TestBlockMapCoalesce_EntryCountIsExtentsNotBlocks(t *testing.T) {
 	const blocksPerChunk = 1024 // matches the production default (4MB / 4KB)
 	const numBlocks = 5000      // spans ceil(5000/1024) = 5 chunks
@@ -287,20 +260,12 @@ func TestBlockMapCoalesce_EntryCountIsExtentsNotBlocks(t *testing.T) {
 	require.Less(t, entryCount, numBlocks/10, "sanity: coalesced entry count must be far smaller than the block count")
 }
 
-// TestCoalesceBlockLookup_LegacyCountdownNumBlocks is the deterministic
-// regression guard for the legacy-checkpoint corruption: the pre-coalesce
-// (origin/dev) writer stored a per-run COUNTDOWN in each record's NumBlocks
-// (10, 9, ... 1) while still writing one record per physical block, so the
-// on-disk NumBlocks is vestigial and does NOT mean run length. coalesceBlockLookup
-// must ignore it and rebuild the run from real geometry (contiguous block
-// numbers + same ObjectID + contiguous byte offsets), preserving each block's
-// own SeqNum. Trusting the countdown instead collapses the whole run onto its
-// first record's SeqNum, which corrupts per-block AEAD nonces on reload.
-//
-// This fails deterministically without the fix: the old merge math breaks the
-// run at the first record (cand.StartBlock != first.StartBlock+first.NumBlocks
-// because first.NumBlocks is the inflated countdown), leaving one entry per
-// record instead of a single coalesced extent.
+// TestCoalesceBlockLookup_LegacyCountdownNumBlocks pins that
+// coalesceBlockLookup ignores the legacy writer's per-run countdown
+// (NumBlocks stored as 10, 9, ... 1 for one record per physical block) and
+// rebuilds runs from real geometry instead, preserving each block's own
+// SeqNum. Trusting the countdown would collapse a run onto its first
+// record's SeqNum and corrupt per-block AEAD nonces on reload.
 func TestCoalesceBlockLookup_LegacyCountdownNumBlocks(t *testing.T) {
 	const numBlocks = 10
 	const stride uint32 = DefaultBlockSize
@@ -328,13 +293,10 @@ func TestCoalesceBlockLookup_LegacyCountdownNumBlocks(t *testing.T) {
 }
 
 // TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback is the end-to-end
-// counterpart: it forges an actual on-disk checkpoint in the LEGACY layout
-// (one record per block, correct per-block SeqNum/offset, but NumBlocks written
-// as a per-run countdown) for a real encrypted volume, loads it through the
-// production path (parseBlockCheckpoint -> coalesceBlockLookup -> SetPersistedRange),
-// and asserts every block's AEAD SeqNum survives into the BlockStore extent
-// index AND that the ciphertext still decrypts. A wrong SeqNum here yields a
-// wrong nonce and a loud AEAD authentication failure on read.
+// counterpart to TestCoalesceBlockLookup_LegacyCountdownNumBlocks: it forges
+// an on-disk checkpoint in the legacy layout for a real encrypted volume,
+// loads it through the production path, and asserts every block's AEAD
+// SeqNum survives into the BlockStore extent index and still decrypts.
 func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 	var raw [masterkey.MasterKeySize]byte
 	for i := range raw {
@@ -353,7 +315,6 @@ func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 	require.NoError(t, vb.Flush())
 	require.NoError(t, vb.WriteWALToChunk(true))
 
-	// Baseline: coalesced and decrypts correctly before we touch anything.
 	got, err := vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(data, got), "baseline encrypted readback must be byte-identical")
@@ -399,10 +360,8 @@ func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 	vb.BlocksToObject.mu.Unlock()
 	require.NoError(t, err)
 
-	// The BlockStore extent index (which readBlockStore consults for the AEAD
-	// SeqNum) must carry each block's ORIGINAL SeqNum. Trusting the countdown
-	// smears block 0's SeqNum across the run, so most blocks would resolve to
-	// the wrong SeqNum.
+	// The BlockStore extent index must carry each block's ORIGINAL SeqNum,
+	// not one smeared from trusting the countdown.
 	for i := range numBlocks {
 		be, ok := vb.BlockStore.ReadEntry(uint64(i))
 		require.True(t, ok, "block %d must resolve in the reloaded BlockStore", i)
@@ -410,8 +369,6 @@ func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 			"block %d SeqNum must survive legacy-checkpoint load; a wrong SeqNum corrupts its AEAD nonce", i)
 	}
 
-	// And the ciphertext must still decrypt end to end: a wrong SeqNum fails
-	// loudly with an AEAD authentication error rather than returning garbage.
 	got, err = vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
 	require.NoError(t, err, "legacy-checkpoint reload must not corrupt AEAD nonces")
 	require.True(t, bytes.Equal(data, got), "encrypted readback after legacy-checkpoint reload must be byte-identical")

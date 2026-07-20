@@ -325,10 +325,8 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 }
 
 // Delete removes the object identified by fileType/objectId from this
-// backend's own volume. Returns an error satisfying errors.Is(err,
-// os.ErrNotExist) if the object is already gone — os.Remove already
-// produces that, so no wrapping is needed (unlike the s3 backend, whose
-// SDK error types must be translated).
+// backend's own volume. os.Remove already reports errors.Is(err,
+// os.ErrNotExist) for a missing object, so no wrapping is needed here.
 func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err error) {
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
 	return os.Remove(filename)
@@ -346,10 +344,8 @@ func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, 
 }
 
 // ListPrefixes returns the directory entries under BaseDir whose name has
-// prefix, one level deep. BaseDir is the backend's root (analogous to an S3
-// bucket root), not this backend's own VolumeName directory, so this can
-// see sibling volumes/snapshots the way ListObjectsV2 with a delimiter
-// would on the s3 backend.
+// prefix, one level deep. BaseDir is the backend's root, not this backend's
+// own VolumeName directory, so sibling volumes/snapshots are visible too.
 func (backend *Backend) ListPrefixes(prefix string) (names []string, err error) {
 	entries, err := os.ReadDir(backend.config.BaseDir)
 	if err != nil {
@@ -375,9 +371,8 @@ func (backend *Backend) ListPrefixesCtx(_ context.Context, prefix string) (names
 }
 
 // ListObjects returns every regular file's key (path relative to BaseDir)
-// under prefix, walked recursively -- the file-backend counterpart of a
-// non-delimited S3 ListObjectsV2. Missing directories are not an error
-// (nothing to list yet), matching ListPrefixes.
+// under prefix, walked recursively. Missing directories are not an error,
+// matching ListPrefixes.
 func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
 	root := filepath.Join(backend.config.BaseDir, prefix)
 

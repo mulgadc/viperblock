@@ -11,14 +11,9 @@ import (
 	"libguestfs.org/nbdkit"
 )
 
-// TestBackendErrToPluginErrorMapsErrNoSpaceToENOSPC pins the guest-visible
-// contract this plugin promises: a write-path error that classifies as
-// viperblock.ErrNoSpace (a full predastore backend, or a full local disk)
-// must reach nbdkit as a real ENOSPC, not a generic I/O error, so the guest
-// kernel sees "no space left on device" instead of a bare EIO. PluginError's
-// Errno field is what implError (the C bridge) passes to nbdkit's
-// set_error, so this is the whole contract, verified without needing a live
-// nbdkit process or guest.
+// TestBackendErrToPluginErrorMapsErrNoSpaceToENOSPC pins that a
+// viperblock.ErrNoSpace write error reaches nbdkit as ENOSPC, not a generic
+// I/O error.
 func TestBackendErrToPluginErrorMapsErrNoSpaceToENOSPC(t *testing.T) {
 	err := fmt.Errorf("drain chunk upload: %w", viperblock.ErrNoSpace)
 
@@ -31,10 +26,8 @@ func TestBackendErrToPluginErrorMapsErrNoSpaceToENOSPC(t *testing.T) {
 }
 
 // TestBackendErrToPluginErrorLeavesOtherErrorsAlone guards against
-// over-matching: an unrelated write failure (e.g. a transient network error)
-// must not be given an ENOSPC errno it did not earn — that would misinform
-// the guest that the volume is out of space when it may simply need to
-// retry.
+// over-matching: an unrelated write failure must not be given an ENOSPC
+// errno it did not earn.
 func TestBackendErrToPluginErrorLeavesOtherErrorsAlone(t *testing.T) {
 	err := fmt.Errorf("connection reset by peer")
 
@@ -45,11 +38,8 @@ func TestBackendErrToPluginErrorLeavesOtherErrorsAlone(t *testing.T) {
 	assert.Contains(t, perr.Errmsg, "Could not write data")
 }
 
-// TestPluginErrorErrnoPropagatesAsError is a narrow guard on the
-// nbdkit.PluginError contract itself: it must satisfy the error interface
-// (implError type-asserts err.(PluginError)) so PWrite/Zero/Flush returning
-// it are actually routed through the Errno-aware path instead of falling
-// back to Error(err.Error()).
+// TestPluginErrorErrnoPropagatesAsError pins that the returned value
+// satisfies error via nbdkit.PluginError, since implError type-asserts on it.
 func TestPluginErrorErrnoPropagatesAsError(t *testing.T) {
 	var err error = backendErrToPluginError("boom", fmt.Errorf("%w", viperblock.ErrNoSpace))
 

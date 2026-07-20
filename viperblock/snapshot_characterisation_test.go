@@ -1,22 +1,13 @@
 package viperblock
 
-// Characterisation tests for snapshot/clone correctness (mulga-wnhkp).
+// Characterisation tests for snapshot/clone correctness: CreateSnapshot,
+// the base-block clone read path, snapshotAncestor, and
+// buildFlatSection/parseFlatSection, exercised through their real code
+// paths rather than inspection.
 //
-// These tests establish ground truth for CreateSnapshot (snapshot.go),
-// the base-block clone read path (fetchBaseBlocksFromBackend /
-// Backend.ReadFromCtx, viperblock.go ~4644), snapshotAncestor (viperblock.go
-// ~105), and buildFlatSection/parseFlatSection (snapshot.go ~421/~498) by
-// exercising the real code paths rather than inspecting them. Several of
-// these are reused, unmodified in intent, by chunk GC (mulga-hsnld): the
-// ancestry-safety primitives it needs (snapshot pins superseded chunks,
-// clone never touches its parent's prefix, sibling isolation, multi-level
-// chain resolution) are exactly what a naive live-map-only GC would violate.
-//
-// One test in this file (TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad)
-// documents a BUG rather than proving correct behaviour: it is marked
-// explicitly and states the expected-correct behaviour in its doc comment.
-// Everything else here passes and characterises behaviour that GC (and
-// DeleteVolume) may rely on.
+// One test (TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad)
+// documents a BUG rather than proving correct behaviour; it is marked
+// explicitly. Everything else here passes.
 
 import (
 	"crypto/rand"
@@ -35,11 +26,9 @@ import (
 // --- (a)/(b): does CreateSnapshot flush before freezing on both sides of
 // ownsWAL(), and is SnapshotState.ObjectNum the correct high-water? ---
 
-// TestCreateSnapshot_OwningPath_FlushesPendingWritesBeforeFreeze proves the
-// positive case of question (a): on the owning (vb.ownsWAL()==true) path,
-// CreateSnapshot's step 1 actually drains Writes -> WAL -> chunk before it
-// freezes the block map in step 2. A write that was never explicitly
-// flushed by the caller must still be visible through the snapshot.
+// TestCreateSnapshot_OwningPath_FlushesPendingWritesBeforeFreeze pins that on
+// the owning path, CreateSnapshot drains pending writes before freezing the
+// block map, so an unflushed write is still visible through the snapshot.
 func TestCreateSnapshot_OwningPath_FlushesPendingWritesBeforeFreeze(t *testing.T) {
 	runWithBackends(t, "owning_path_flush_before_freeze", func(t *testing.T, vb *VB) {
 		data := make([]byte, DefaultBlockSize*2)
@@ -60,24 +49,15 @@ func TestCreateSnapshot_OwningPath_FlushesPendingWritesBeforeFreeze(t *testing.T
 	})
 }
 
-// TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad demonstrates
-// a BUG. CreateSnapshot's flush/drain/SaveLiveCheckpoint (step 1) is gated on
-// vb.ownsWAL() (snapshot.go:71). A VB that never opened its own WAL files --
-// the shape of spinifex's snapshotRunningVolume flow, which constructs a
-// second VB instance sharing the live volume's backend purely to
-// LoadState/LoadLiveCheckpoint then CreateSnapshot -- skips step 1 entirely
-// and freezes whatever map it already has in memory from that one load.
+// TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad documents a
+// BUG: on the non-owning path (a VB that never opened its own WAL, e.g.
+// spinifex's snapshotRunningVolume flow), CreateSnapshot skips its
+// flush/drain step and freezes whatever map it already loaded, so writes the
+// real owner drains afterward are silently missing.
 //
-// If the REAL owning process (a different VB instance, in a different
-// process) durably drains further writes between this reader's load and its
-// CreateSnapshot call, those writes are invisible to the frozen snapshot.
-// Silently: CreateSnapshot returns no error, and the resulting SnapshotState
-// looks exactly like a valid, current snapshot.
-//
-// EXPECTED-CORRECT BEHAVIOUR: a snapshot should observe every write that was
-// durable at the moment CreateSnapshot was invoked, regardless of which VB
-// instance/process performed it. This test proves that is FALSE today on
-// the non-owning path -- it characterises the bug, it does not fix it.
+// EXPECTED-CORRECT: a snapshot should observe every write durable at the
+// moment CreateSnapshot was invoked, regardless of which VB instance
+// performed it.
 func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T) {
 	backend := BackendTest{
 		Name:          "file_nonowning",
@@ -98,11 +78,9 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 	require.NoError(t, owner.WriteShardedWALToChunk(true))
 	require.NoError(t, owner.SaveLiveCheckpoint())
 
-	// Construct a non-owning reader VB the way spinifex's snapshotRunningVolume
-	// does: shares the backend, never opens WAL files, loads the checkpoint
-	// once. This mirrors TestLiveCheckpointRoundtrip's reader shape, and the
-	// comment there already notes it "mirrors the snapshotRunningVolume path
-	// in spinifex".
+	// Construct a non-owning reader VB the way spinifex's
+	// snapshotRunningVolume does: shares the backend, never opens WAL files,
+	// loads the checkpoint once.
 	reader := &VB{
 		VolumeName:   owner.VolumeName,
 		VolumeSize:   owner.VolumeSize,
@@ -123,9 +101,8 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 
 	objectNumAtLoad := reader.ObjectNum.Load()
 
-	// The real owning process keeps serving guest writes: block 1 is written
-	// and durably drained to a NEW chunk between the reader's load and the
-	// snapshot call below.
+	// The real owning process keeps serving writes: block 1 is drained to a
+	// new chunk between the reader's load and the snapshot call below.
 	blockBData := make([]byte, DefaultBlockSize)
 	rand.Read(blockBData)
 	require.NoError(t, owner.Write(1, blockBData))
@@ -140,10 +117,8 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, snap)
 
-	// BUG: ObjectNum is stale-low -- it reflects the reader's load-time
-	// counter, not the true high-water at the moment CreateSnapshot actually
-	// ran. This matters directly for chunk GC's GCFloor, which is defined as
-	// max(SnapshotState.ObjectNum) over existing snapshots.
+	// BUG: ObjectNum is stale-low, reflecting the reader's load-time
+	// counter rather than the true high-water at snapshot time.
 	assert.Less(t, snap.ObjectNum, owner.ObjectNum.Load(),
 		"BUG: non-owning CreateSnapshot's ObjectNum lags the true high-water at snapshot time")
 
@@ -154,21 +129,17 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 	require.NoError(t, err)
 	assert.Equal(t, blockAData, got, "pre-load durable write must be visible")
 
-	// BUG: block 1 was durable on the backend (the owner drained it) before
-	// CreateSnapshot ran, but the reader's frozen map never saw it because
-	// the reader never reloaded or flushed. The clone silently reads it as
-	// never-written instead of returning the durable data.
+	// BUG: block 1 was durable before CreateSnapshot ran, but the reader's
+	// frozen map never saw it, so the clone reads it as never-written.
 	got, err = clone.ReadAt(uint64(DefaultBlockSize), uint64(DefaultBlockSize))
 	assert.ErrorIs(t, err, ErrZeroBlock,
 		"BUG: a write durable before CreateSnapshot was called is silently missing from the snapshot on the non-owning path")
 	assert.Equal(t, make([]byte, DefaultBlockSize), got)
 }
 
-// TestCreateSnapshot_OwningPath_ObjectNumAtLeastReferencedChunks answers
-// question (b) for the owning path: SnapshotState.ObjectNum must be a safe
-// high-water -- every chunk the frozen map actually references must have
-// ObjectID strictly less than ObjectNum. Chunk GC's GCFloor derivation
-// depends on this holding exactly.
+// TestCreateSnapshot_OwningPath_ObjectNumAtLeastReferencedChunks pins that
+// SnapshotState.ObjectNum is a safe high-water: every chunk the frozen map
+// references has ObjectID strictly less than ObjectNum.
 func TestCreateSnapshot_OwningPath_ObjectNumAtLeastReferencedChunks(t *testing.T) {
 	runWithBackends(t, "owning_objectnum_highwater", func(t *testing.T, vb *VB) {
 		blocksPerChunk := uint64(vb.ObjBlockSize / vb.BlockSize)
@@ -197,17 +168,10 @@ func TestCreateSnapshot_OwningPath_ObjectNumAtLeastReferencedChunks(t *testing.T
 	})
 }
 
-// --- (c)/(f): does a snapshot's frozen map only reference chunks live at
-// snapshot time, and does it keep pinning them once the source supersedes
-// them? This is the "down payment" chunk GC (mulga-hsnld) needs. ---
-
-// TestCreateSnapshot_PinsSupersededChunk is the single most important test
-// in this file for chunk GC. It reproduces exactly the hazard the GC plan doc
-// (docs/development/bugs/viperblock-chunk-gc.md) calls catastrophic: after a
-// snapshot is taken, the SOURCE volume overwrites the same blocks, which
-// makes the original chunk unreferenced by the source's OWN live map. A
-// naive live-map-only GC would consider that chunk garbage and delete it.
-// The snapshot -- and any clone descended from it -- must still resolve it.
+// TestCreateSnapshot_PinsSupersededChunk pins that after a snapshot is
+// taken, if the source volume overwrites the same blocks (making the
+// original chunk unreferenced by the source's own live map), the snapshot
+// and any clone descended from it must still resolve that chunk.
 func TestCreateSnapshot_PinsSupersededChunk(t *testing.T) {
 	runWithBackends(t, "snapshot_pins_superseded", func(t *testing.T, vb *VB) {
 		original := make([]byte, DefaultBlockSize*4)
@@ -234,24 +198,16 @@ func TestCreateSnapshot_PinsSupersededChunk(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, overwrite, got)
 
-		// ...but the snapshot's clone must still resolve the ORIGINAL chunk,
-		// which vb's live map no longer references at all.
+		// ...but the snapshot's clone must still resolve the ORIGINAL chunk.
 		got, err = clone.ReadAt(0, uint64(len(original)))
 		require.NoError(t, err)
 		assert.Equal(t, original, got, "clone must still resolve the chunk vb's own live map has since superseded")
 	})
 }
 
-// --- (f): clone never touches its parent's prefix (structural GC safety),
-// and sibling clones stay isolated from each other. File backend only, so
-// the on-disk key set under each volume's prefix can be enumerated directly. ---
-
-// TestClone_WritesNeverTouchParentPrefix proves the structural half of chunk
-// GC's "own-prefix only" rule (rule 1 in the GC plan doc): every backend key
-// a clone creates lands under the CLONE's own volume prefix, never the
-// parent's. Nothing the clone does can perturb the parent's chunk set, which
-// is exactly what makes "a clone can never GC its parent" true by
-// construction rather than by care at each call site.
+// TestClone_WritesNeverTouchParentPrefix pins that every backend key a clone
+// creates lands under the clone's own volume prefix, never the parent's.
+// File backend only, so the on-disk key set can be enumerated directly.
 func TestClone_WritesNeverTouchParentPrefix(t *testing.T) {
 	backend := BackendTest{
 		Name:          "file_prefix_isolation",
@@ -279,17 +235,15 @@ func TestClone_WritesNeverTouchParentPrefix(t *testing.T) {
 
 	clone := createCloneVB(t, parent, snapshotID)
 
-	// Writes on the clone spanning a full chunk, sized to stay within the
-	// test volume's 8 MiB bound alongside the block-10 starting offset.
+	// Write a full chunk on the clone, sized to stay within the test
+	// volume's 8 MiB bound alongside the block-10 starting offset.
 	blocksPerChunk := uint64(clone.ObjBlockSize / clone.BlockSize)
 	cloneData := make([]byte, blocksPerChunk*uint64(clone.BlockSize))
 	rand.Read(cloneData)
 	require.NoError(t, clone.Write(10, cloneData))
 	require.NoError(t, clone.Flush())
-	// createCloneVB always opens a clone on the legacy (non-sharded) WAL
-	// regardless of the parent's mode -- see its OpenWAL/OpenShardedWAL
-	// branch, which follows clone.UseShardedWAL, itself left at New()'s
-	// default (false) since createCloneVB's vbconfig never sets it.
+	// createCloneVB always opens a clone on the legacy (non-sharded) WAL,
+	// regardless of the parent's mode.
 	require.NoError(t, clone.WriteWALToChunk(true))
 
 	cloneKeys := listChunkKeys(t, storageRoot, clone.VolumeName)
@@ -299,8 +253,7 @@ func TestClone_WritesNeverTouchParentPrefix(t *testing.T) {
 	assert.ElementsMatch(t, parentKeysBefore, parentKeysAfter,
 		"a clone's writes must never create/modify/delete keys under the parent volume's own prefix")
 
-	// Confirm isolation didn't also break correctness: the clone still reads
-	// both its own write and the inherited parent data.
+	// Confirm isolation didn't break correctness.
 	got, err := clone.ReadAt(10*uint64(clone.BlockSize), uint64(len(cloneData)))
 	require.NoError(t, err)
 	assert.Equal(t, cloneData, got)
@@ -310,10 +263,9 @@ func TestClone_WritesNeverTouchParentPrefix(t *testing.T) {
 	assert.Equal(t, data, got, "clone must still read inherited parent blocks after its own writes")
 }
 
-// TestSiblingClonesAreIsolated answers the sibling-isolation half of
-// question (f): two clones of the same snapshot must not observe each
-// other's writes, must not share a chunk key namespace, and a third fresh
-// clone off the same snapshot must still see the original, unperturbed data.
+// TestSiblingClonesAreIsolated pins that two clones of the same snapshot
+// don't observe each other's writes or share a chunk key namespace, and a
+// third fresh clone still sees the original, unperturbed data.
 func TestSiblingClonesAreIsolated(t *testing.T) {
 	backend := BackendTest{
 		Name:          "file_sibling_isolation",
@@ -335,12 +287,10 @@ func TestSiblingClonesAreIsolated(t *testing.T) {
 	_, err = parent.CreateSnapshot(snapshotID)
 	require.NoError(t, err)
 
-	// createCloneVB names a clone deterministically from (source, snapshotID)
-	// with no disambiguator, so two siblings off the SAME snapshot would
-	// collide on one backend prefix. Use createNamedCloneVB with distinct
-	// suffixes to give each sibling its own namespace, as CreateVolume (the
-	// real caller of the equivalent path) does via a fresh generated volume
-	// ID per clone.
+	// createCloneVB names a clone deterministically from (source,
+	// snapshotID), so two siblings off the same snapshot would collide on
+	// one backend prefix. Use createNamedCloneVB with distinct suffixes to
+	// give each its own namespace.
 	cloneX := createNamedCloneVB(t, parent, snapshotID, "x")
 	cloneY := createNamedCloneVB(t, parent, snapshotID, "y")
 
@@ -348,8 +298,7 @@ func TestSiblingClonesAreIsolated(t *testing.T) {
 	rand.Read(xData)
 	require.NoError(t, cloneX.Write(0, xData))
 	require.NoError(t, cloneX.Flush())
-	// See the comment in TestClone_WritesNeverTouchParentPrefix -- clones
-	// always run legacy (non-sharded) WAL regardless of the parent's mode.
+	// Clones always run legacy (non-sharded) WAL regardless of the parent's mode.
 	require.NoError(t, cloneX.WriteWALToChunk(true))
 
 	yData := make([]byte, DefaultBlockSize)
@@ -366,19 +315,16 @@ func TestSiblingClonesAreIsolated(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, yData, gotY, "cloneY must read back its own overwrite, not cloneX's")
 
-	// A third, fresh clone off the same snapshot must see the original data,
-	// unaffected by either sibling's writes.
+	// A third, fresh clone off the same snapshot must see the original data.
 	freshSibling := createCloneVB(t, parent, snapshotID)
 	gotBase, err := freshSibling.ReadAt(0, uint64(DefaultBlockSize))
 	require.NoError(t, err)
 	assert.Equal(t, base, gotBase, "shared ancestor snapshot must be untouched by sibling writes")
 
-	// Chunk file names (chunk.%08d.bin) restart at 0 within EVERY volume
-	// directory, so bare file names always "collide" between any two
-	// volumes -- that's not a namespace clash, it's normal per-volume
-	// numbering. The property that actually matters is that the two
-	// clones resolve to disjoint on-disk PATHS (storageRoot/volumeName/...),
-	// so qualify each key with its owning volume name before comparing.
+	// Chunk file names restart at 0 within every volume directory, so bare
+	// names always "collide" between volumes; what matters is that the two
+	// clones resolve to disjoint on-disk paths, so qualify each key with
+	// its owning volume name before comparing.
 	storageRoot := filepath.Dir(parent.BaseDir)
 	xKeys := listChunkKeys(t, storageRoot, cloneX.VolumeName)
 	yKeys := listChunkKeys(t, storageRoot, cloneY.VolumeName)
@@ -400,8 +346,7 @@ func TestSiblingClonesAreIsolated(t *testing.T) {
 }
 
 // listChunkKeys returns the sorted set of chunk file names under
-// {storageRoot}/{volumeName}/chunks/, the file backend's on-disk layout for
-// types.FileTypeChunk (types.GetFilePath). A missing directory is a valid
+// {storageRoot}/{volumeName}/chunks/. A missing directory is a valid
 // "no chunks yet" state, not an error.
 func listChunkKeys(t *testing.T, storageRoot, volumeName string) []string {
 	t.Helper()
@@ -423,14 +368,9 @@ func listChunkKeys(t *testing.T, storageRoot, volumeName string) []string {
 	return names
 }
 
-// createNamedCloneVB is createCloneVB (snapshot_test.go) with an extra
-// suffix folded into the clone's volume name. createCloneVB derives the
-// clone name deterministically from (source.VolumeName, snapshotID) alone,
-// so two clones created from the SAME snapshot collide on one backend
-// prefix and corrupt each other's WAL/chunks. Production never hits this --
-// CreateVolume mints a fresh unique volume ID per clone regardless of a
-// shared snapshot source -- but the test helper needs an explicit
-// disambiguator to construct that scenario.
+// createNamedCloneVB is createCloneVB with an extra suffix folded into the
+// clone's volume name, so two clones from the same snapshot don't collide
+// on one backend prefix.
 func createNamedCloneVB(t *testing.T, source *VB, snapshotID, suffix string) *VB {
 	t.Helper()
 
@@ -495,13 +435,9 @@ func createNamedCloneVB(t *testing.T, source *VB, snapshotID, suffix string) *VB
 	return clone
 }
 
-// --- (d): clone reads correctly after the parent keeps writing, and after
-// the parent is closed. ---
-
-// TestClone_FrozenAtSnapshotTime_ParentContinuesWriting answers (d)'s first
-// half: a clone is a point-in-time COW view. Writes the parent makes AFTER
-// CreateSnapshot ran -- including overwriting a block the snapshot already
-// froze -- must never become visible through the clone.
+// TestClone_FrozenAtSnapshotTime_ParentContinuesWriting pins that a clone is
+// a point-in-time COW view: writes the parent makes after CreateSnapshot
+// ran must never become visible through the clone.
 func TestClone_FrozenAtSnapshotTime_ParentContinuesWriting(t *testing.T) {
 	runWithBackends(t, "clone_frozen_parent_continues", func(t *testing.T, parent *VB) {
 		frozen := make([]byte, DefaultBlockSize)
@@ -516,8 +452,8 @@ func TestClone_FrozenAtSnapshotTime_ParentContinuesWriting(t *testing.T) {
 
 		clone := createCloneVB(t, parent, snapshotID)
 
-		// Parent keeps serving writes after the snapshot/clone exist: a fresh
-		// block, and an overwrite of the block the snapshot already froze.
+		// Parent keeps writing: a fresh block, and an overwrite of the
+		// block the snapshot already froze.
 		afterSnapshot := make([]byte, DefaultBlockSize)
 		rand.Read(afterSnapshot)
 		require.NoError(t, parent.Write(50, afterSnapshot))
@@ -536,10 +472,9 @@ func TestClone_FrozenAtSnapshotTime_ParentContinuesWriting(t *testing.T) {
 	})
 }
 
-// TestClone_ReadsAfterParentClosed answers (d)'s second half: the clone read
-// path (fetchBaseBlocksFromBackend -> Backend.ReadFromCtx) reads durable
-// backend state, not the parent VB instance's live memory, so it must keep
-// working after the parent stops.
+// TestClone_ReadsAfterParentClosed pins that the clone read path reads
+// durable backend state, not the parent VB instance's live memory, so it
+// keeps working after the parent stops.
 func TestClone_ReadsAfterParentClosed(t *testing.T) {
 	runWithBackends(t, "clone_reads_after_parent_closed", func(t *testing.T, parent *VB) {
 		data := make([]byte, DefaultBlockSize*3)
@@ -555,8 +490,7 @@ func TestClone_ReadsAfterParentClosed(t *testing.T) {
 		clone := createCloneVB(t, parent, snapshotID)
 
 		// "Close" the parent: stop its background goroutines the way a
-		// terminating instance would. The clone's read path must not depend
-		// on the parent VB instance -- or process -- staying alive.
+		// terminating instance would.
 		parent.StopChunkUploader()
 		parent.StopWALSyncer()
 
@@ -566,20 +500,11 @@ func TestClone_ReadsAfterParentClosed(t *testing.T) {
 	})
 }
 
-// --- (e): multi-level clone chains resolve correctly through
-// snapshotAncestor + buildFlatSection/parseFlatSection, and keep resolving
-// correctly even as every ancestor keeps mutating its own live data. ---
-
-// TestMultiLevelChain_PinsAncestorChunksAcrossOverwrites is the multi-level
-// analogue of TestCreateSnapshot_PinsSupersededChunk: a 3-generation chain
-// (base -> cloneA -> cloneB) where BOTH ancestors keep writing to their own
-// volumes after being snapshotted/cloned from. The grandchild (cloneB) must
-// resolve every block through the correct frozen ancestor layer
-// (snapshotAncestor / buildFlatSection / parseFlatSection), immune to either
-// ancestor's later mutations. TestSnapshotCOWChain and
-// TestSnapshotCOWChainDeep already cover chain resolution without
-// post-snapshot ancestor writes; this test adds the mutation dimension that
-// matters for chunk GC.
+// TestMultiLevelChain_PinsAncestorChunksAcrossOverwrites pins that in a
+// 3-generation chain (base -> cloneA -> cloneB) where both ancestors keep
+// writing after being snapshotted/cloned from, the grandchild resolves
+// every block through the correct frozen ancestor layer, immune to either
+// ancestor's later mutations.
 func TestMultiLevelChain_PinsAncestorChunksAcrossOverwrites(t *testing.T) {
 	runWithBackends(t, "multilevel_chain_pins_ancestors", func(t *testing.T, base *VB) {
 		blockSize := uint64(base.BlockSize)
@@ -607,8 +532,7 @@ func TestMultiLevelChain_PinsAncestorChunksAcrossOverwrites(t *testing.T) {
 
 		cloneB := createCloneVB(t, cloneA, cloneASnapID)
 
-		// Both ancestors keep mutating their own live data after being
-		// snapshotted/cloned from.
+		// Both ancestors keep mutating their own live data.
 		baseOverwrite := make([]byte, blockSize)
 		rand.Read(baseOverwrite)
 		require.NoError(t, base.Write(0, baseOverwrite))
@@ -621,14 +545,12 @@ func TestMultiLevelChain_PinsAncestorChunksAcrossOverwrites(t *testing.T) {
 		require.NoError(t, cloneA.Flush())
 		require.NoError(t, cloneA.WriteWALToChunk(true))
 
-		// cloneB must still resolve block 0 through the grandparent's frozen
-		// snapshot layer, unaffected by base's later overwrite.
+		// cloneB must resolve block 0 through the grandparent's frozen layer.
 		got, err := cloneB.ReadAt(0, blockSize)
 		require.NoError(t, err)
 		assert.Equal(t, baseData, got, "grandparent's post-snapshot overwrite must not be visible through the chain")
 
-		// ...and block 1 through the parent's frozen snapshot layer,
-		// unaffected by cloneA's later overwrite.
+		// ...and block 1 through the parent's frozen layer.
 		got, err = cloneB.ReadAt(blockSize, blockSize)
 		require.NoError(t, err)
 		assert.Equal(t, cloneAData, got, "parent's post-snapshot overwrite must not be visible through the chain")
