@@ -31,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nbdkit nbdkit-plugin-dev pkg-config
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
@@ -54,7 +54,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
@@ -71,7 +71,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
