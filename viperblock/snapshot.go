@@ -58,6 +58,54 @@ type InheritedLayer struct {
 	SourceVolumeNameHash [32]byte
 }
 
+// drainForSnapshot runs the flush -> WriteWALToChunk -> SaveLiveCheckpoint
+// sequence that gets the source volume fully persisted before its map is
+// frozen into a snapshot. That sequence is a drain in all but name, so it
+// holds drainMu for exactly the same reason DrainToBackendCtx does (see
+// drainMu's doc comment): two overlapping drains rotate different WAL
+// segments and can publish their live checkpoints out of order, leaving the
+// older map on the backend. The volume then boots pointing blocks at
+// superseded chunks and cold reads hand back stale bytes with no error
+// anywhere -- the durability half of the stale-drain repoint hazard.
+//
+// Scoped to its own function rather than deferred inside CreateSnapshot so
+// the lock is released before the (potentially slow) snapshot checkpoint
+// serialization and upload, which no drain contends with.
+func (vb *VB) drainForSnapshot() error {
+	vb.drainMu.Lock()
+	defer vb.drainMu.Unlock()
+
+	// Writes.mu is taken inside drainMu, matching DrainToBackendCtx's order.
+	vb.Writes.mu.Lock()
+	var flushErr error
+	if vb.UseShardedWAL {
+		flushErr = vb.flushLockedSharded()
+	} else {
+		flushErr = vb.flushLocked()
+	}
+	vb.Writes.mu.Unlock()
+	if flushErr != nil {
+		return fmt.Errorf("snapshot flush failed: %w", flushErr)
+	}
+
+	// Persist WAL to chunk files on backend (potentially slow S3 upload,
+	// no need to hold the write lock -- new writes go to the next WAL file)
+	if err := vb.WriteWALToChunk(true); err != nil {
+		return fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
+	}
+
+	// Chunk uploads no longer refresh the live checkpoint per-chunk (that
+	// was a parallel-upload hazard, see createChunkFile). Refresh it once
+	// here so the source volume's live checkpoint reflects the chunks just
+	// uploaded, same as DrainToBackendCtx does after its own drain.
+	// Non-fatal: a stale live checkpoint self-heals on the next drain.
+	if err := vb.SaveLiveCheckpoint(); err != nil {
+		vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
+	}
+
+	return nil
+}
+
 // CreateSnapshot flushes all in-flight data and creates a frozen snapshot of
 // the current block-to-object mapping. The snapshot is stored on the backend
 // under {snapshotID}/. No data is copied -- the snapshot references the
@@ -77,31 +125,8 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// Skip if this VB doesn't own the WAL files (e.g. viperblockd snapshot VB
 	// where the NBD plugin process owns the WAL).
 	if vb.ownsWAL() {
-		vb.Writes.mu.Lock()
-		var flushErr error
-		if vb.UseShardedWAL {
-			flushErr = vb.flushLockedSharded()
-		} else {
-			flushErr = vb.flushLocked()
-		}
-		vb.Writes.mu.Unlock()
-		if flushErr != nil {
-			return nil, fmt.Errorf("snapshot flush failed: %w", flushErr)
-		}
-
-		// Persist WAL to chunk files on backend (potentially slow S3 upload,
-		// no need to hold the write lock — new writes go to the next WAL file)
-		if err := vb.WriteWALToChunk(true); err != nil {
-			return nil, fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
-		}
-
-		// Chunk uploads no longer refresh the live checkpoint per-chunk (that
-		// was a parallel-upload hazard, see createChunkFile). Refresh it once
-		// here so the source volume's live checkpoint reflects the chunks
-		// just uploaded, same as DrainToBackendCtx does after its own drain.
-		// Non-fatal: a stale live checkpoint self-heals on the next drain.
-		if err := vb.SaveLiveCheckpoint(); err != nil {
-			vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
+		if err := vb.drainForSnapshot(); err != nil {
+			return nil, err
 		}
 	}
 
