@@ -215,6 +215,19 @@ type VB struct {
 	// class this locking removes.
 	rmwConflicts atomic.Uint64
 
+	// rmwHolders records which block owns each rmwLocks shard, as block+1 so
+	// the zero value reads as "free". There are only NumShards locks for the
+	// whole volume, so a failed TryLock is USUALLY two different blocks
+	// colliding on one shard; counting those as conflicts would report
+	// contention that has nothing to do with the lost-update class. Comparing
+	// the holder against the incoming block separates the two.
+	rmwHolders [NumShards]atomic.Uint64
+
+	// rmwShardCollisions counts the other case: a failed TryLock where the
+	// shard was held by a DIFFERENT block. Harmless to correctness, but a high
+	// rate means NumShards is too small for the write concurrency in play.
+	rmwShardCollisions atomic.Uint64
+
 	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
 	// to drain now instead of waiting for the next ChunkUploadInterval tick,
 	// once pendingBytes crosses FlushSize. Buffered 1: a pending trigger
@@ -1763,6 +1776,10 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 // already rebuilding the same block. Non-zero means the guest workload
 // produces same-block write concurrency, which is the precondition for the
 // lost-update class that per-block RMW serialization removes.
+func (vb *VB) RMWShardCollisions() uint64 {
+	return vb.rmwShardCollisions.Load()
+}
+
 func (vb *VB) RMWConflicts() uint64 {
 	return vb.rmwConflicts.Load()
 }
@@ -1783,16 +1800,27 @@ func (vb *VB) writeOneBlockLocked(ctx context.Context, b, blockSize uint64, part
 	// Contention on a partial write is the condition that used to silently
 	// drop an update; count it so the corruption class is observable rather
 	// than inferred after the fact.
+	shard := b & ShardMask
 	if partial && !lk.TryLock() {
-		vb.rmwConflicts.Add(1)
-		telemetry.RecordRMWConflict(ctx, vb.VolumeName)
-		vb.logger().DebugContext(ctx, "read-modify-write conflict: block already being rebuilt by another write",
-			"volume", vb.VolumeName, "block", b, "writeStart", writeStart, "writeEnd", writeEnd)
+		// Only a holder on the SAME block is the lost-update precondition; a
+		// different block means the two merely share one of NumShards locks.
+		if vb.rmwHolders[shard].Load() == b+1 {
+			vb.rmwConflicts.Add(1)
+			telemetry.RecordRMWConflict(ctx, vb.VolumeName)
+			vb.logger().DebugContext(ctx, "read-modify-write conflict: block already being rebuilt by another write",
+				"volume", vb.VolumeName, "block", b, "writeStart", writeStart, "writeEnd", writeEnd)
+		} else {
+			vb.rmwShardCollisions.Add(1)
+		}
 		lk.Lock()
 	} else if !partial {
 		lk.Lock()
 	}
-	defer lk.Unlock()
+	vb.rmwHolders[shard].Store(b + 1)
+	defer func() {
+		vb.rmwHolders[shard].Store(0)
+		lk.Unlock()
+	}()
 
 	blockData := make([]byte, blockSize)
 	if partial {
