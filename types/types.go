@@ -14,6 +14,14 @@ import (
 // viperblock, so can't import it back).
 var ErrNoSpace = errors.New("viperblock: backend out of space")
 
+// ErrShortRead is returned when a backend answers a ranged read with fewer
+// bytes than were requested without reporting an error of its own. S3-style
+// backends clamp a range that runs past the end of an object into a short
+// 206 with a matching Content-Length, so nothing upstream notices; callers
+// would otherwise copy that short body into a zero-initialised buffer and
+// cache the zero-filled tail as though it were real data.
+var ErrShortRead = errors.New("viperblock: backend returned a short read")
+
 type Backend interface {
 	Init() error
 	InitCtx(ctx context.Context) error
