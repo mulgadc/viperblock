@@ -2,6 +2,8 @@ package telemetry
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -25,6 +27,9 @@ var (
 	walOpDurationSum metric.Float64Counter
 
 	cacheLookups metric.Int64Counter
+
+	rmwConflicts metric.Int64Counter
+	volumeOpens  metric.Int64Counter
 
 	// cacheHitOpt/cacheMissOpt are pre-built so the per-block cache lookup
 	// path (inside the read hot loop) allocates nothing beyond the record
@@ -86,7 +91,68 @@ func instruments() {
 
 		cacheHitOpt = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "hit")))
 		cacheMissOpt = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "miss")))
+
+		rmwConflicts, err = m.Int64Counter("viperblock.write.rmw_conflicts",
+			metric.WithDescription("Partial writes that found another write already rebuilding the same block. Non-zero means guest I/O produces same-block write concurrency."),
+			metric.WithUnit("{conflict}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		volumeOpens, err = m.Int64Counter("viperblock.volume.opens",
+			metric.WithDescription("Volume opens, attributed by owning process identity, pid and role. Two distinct pids/roles reporting opens for one volume is a dual-open: more than one engine holds the volume."),
+			metric.WithUnit("{open}"))
+		if err != nil {
+			otel.Handle(err)
+		}
 	})
+}
+
+// RecordRMWConflict counts one read-modify-write conflict: a partial write
+// that had to wait because another write was already rebuilding the same
+// block. Before per-block RMW serialization this was the exact condition
+// under which one of the two writes was silently discarded, so a non-zero
+// count is the signal that the workload can produce that class of loss.
+func RecordRMWConflict(ctx context.Context, volume string) {
+	instruments()
+	if rmwConflicts == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{}
+	if volume != "" {
+		attrs = append(attrs, attribute.String("volume", volume))
+	}
+	rmwConflicts.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordVolumeOpen emits one volume-open event carrying the opening process's
+// identity: role ("nbdkit" for the data-path plugin, "daemon" for a
+// control-plane import, or "" when unset), executable name and pid.
+//
+// viperblock currently runs as BOTH an nbdkit plugin and a Go module imported
+// into the spinifex daemon, so a volume can be held by more than one engine
+// with no arbitration between them. mulga-t1sch removes the second engine; the
+// invariant it establishes is "one owner per volume". This metric is how that
+// invariant is observed: opens for a single volume carrying two different pids
+// or roles are a dual-open. It is both the evidence for the current bug class
+// and the permanent regression alarm for the plan's end state -- after
+// t1sch lands, any such series is a regression.
+func RecordVolumeOpen(ctx context.Context, volume, role string) {
+	instruments()
+	if volumeOpens == nil {
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.Int("pid", os.Getpid()),
+		attribute.String("process", filepath.Base(os.Args[0])),
+	}
+	if volume != "" {
+		attrs = append(attrs, attribute.String("volume", volume))
+	}
+	if role != "" {
+		attrs = append(attrs, attribute.String("role", role))
+	}
+	volumeOpens.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordBackendIO records one backend chunk-object read or write: op count,
