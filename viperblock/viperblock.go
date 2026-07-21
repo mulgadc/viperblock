@@ -49,6 +49,11 @@ const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 // bucket-wide scan (see ensureGCSnapshotSafe), and reclaiming is not urgent.
 const DefaultGCInterval time.Duration = 5 * time.Minute
 
+// DefaultCheckpointRetryBackoff is the first sleep between SaveLiveCheckpointCtx's
+// write attempts, doubling on each subsequent retry. Sized for a transient backend
+// blip rather than a hard outage: three attempts spend ~3s total before giving up.
+const DefaultCheckpointRetryBackoff time.Duration = time.Second
+
 // DefaultMaxPendingBytes bounds the combined size of Writes.Blocks and
 // PendingBackendWrites.Blocks — the guest-write backpressure high-watermark.
 // WriteAtCtx blocks the caller once this is crossed, draining synchronously
@@ -319,6 +324,12 @@ type VB struct {
 	// shared with the read-path mutex so LookupBlockToObject and friends
 	// stay uncontended.
 	saveStateMu sync.Mutex
+
+	// checkpointRetryBackoff is the first inter-attempt sleep in
+	// SaveLiveCheckpointCtx (0 uses DefaultCheckpointRetryBackoff). Only tests
+	// set it, shrinking a retry storm from seconds of real sleeping to
+	// microseconds.
+	checkpointRetryBackoff time.Duration
 
 	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
 	// objects no live block references. Default false — opt-in until the
@@ -1490,6 +1501,15 @@ func (vb *VB) maxPendingBytes() uint64 {
 		return DefaultMaxPendingBytes
 	}
 	return vb.MaxPendingBytes
+}
+
+// checkpointBackoff returns the configured first retry sleep, or the default if
+// unset (covers VB values assembled without going through New).
+func (vb *VB) checkpointBackoff() time.Duration {
+	if vb.checkpointRetryBackoff <= 0 {
+		return DefaultCheckpointRetryBackoff
+	}
+	return vb.checkpointRetryBackoff
 }
 
 // signalSizeTrigger asks the background chunk uploader to drain now, once
@@ -3622,7 +3642,7 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	vb.BlocksToObject.mu.RUnlock()
 
 	headers := []byte{}
-	backoff := time.Second
+	backoff := vb.checkpointBackoff()
 	var err error
 	for attempt := range 3 {
 		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)

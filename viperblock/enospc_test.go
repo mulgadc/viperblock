@@ -148,6 +148,11 @@ func newEnospcTestVB(t *testing.T) (*VB, *enospcBackend) {
 	vb.UseShardedWAL = false
 	vb.ShardedWAL = nil
 
+	// These tests drive tens of deliberately failing checkpoint writes; at the
+	// production backoff each one would really sleep ~3s. Retry ordering is
+	// what's under test, not the wait itself.
+	vb.checkpointRetryBackoff = time.Microsecond
+
 	require.NoError(t, vb.Backend.Init())
 	backend := &enospcBackend{Backend: vb.Backend}
 	vb.Backend = backend
@@ -328,16 +333,17 @@ func TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures(t *testing.T) {
 	}
 
 	start := time.Now()
-	// Each failing round costs SaveLiveCheckpointCtx's internal retry
-	// backoff (~3s), so 10 rounds is a real ~30s of wall clock.
-	err := runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 90*time.Second)
+	// newEnospcTestVB shrinks SaveLiveCheckpointCtx's retry backoff, so the 10
+	// bounded rounds cost microseconds rather than ~3s each. The timeout is a
+	// hang detector with generous headroom, not an expected duration.
+	err := runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 30*time.Second)
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "a backend that never recovers must eventually surface an error instead of hanging")
 	assert.NotErrorIs(t, err, ErrNoSpace, "a generic, non-out-of-space drain failure must not be misreported as ErrNoSpace")
 	assert.Contains(t, err.Error(), "consecutive drains failed", "error must be the maxDrainFailures-bounded error, not some other failure")
 	assert.False(t, vb.backendFull.Load(), "a generic drain failure must not latch backendFull -- that latch is reserved for real out-of-space errors")
-	assert.Less(t, elapsed, 90*time.Second, "must return once the bound trips, not hang until the test's own safety-net timeout")
+	assert.Less(t, elapsed, 30*time.Second, "must return once the bound trips, not hang until the test's own safety-net timeout")
 }
 
 // TestAwaitBackpressureFailureCounterResetsAfterInterleavedSuccess pins that
