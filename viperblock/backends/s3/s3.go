@@ -335,8 +335,18 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 		return nil, err
 	}
 
-	// The response should contain exactly the bytes we requested
-	// No slicing needed since we requested the exact range
+	// A ranged GET whose range starts inside the object but runs past its end
+	// is answered with a CLAMPED 206 -- a short body with a matching
+	// Content-Length, so io.ReadAll returns it without error. Callers copy the
+	// result into a full-size, zero-initialised buffer, so an unchecked short
+	// body becomes a silently zero-filled tail that is then cached as valid.
+	// Verified against predastore: asking for 1024 bytes past EOF returns
+	// exactly the available bytes with no error. Refuse it here instead.
+	if length > 0 && len(res) != int(length) {
+		return nil, fmt.Errorf("%w: %s offset %d: backend returned %d bytes, expected %d",
+			types.ErrShortRead, filename, offset, len(res), length)
+	}
+
 	return res, nil
 }
 

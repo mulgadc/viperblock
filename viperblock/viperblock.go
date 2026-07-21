@@ -4888,6 +4888,13 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 				return nil, err
 			}
 		} else {
+			// openChunkRun length-checks the encrypted path; the cleartext
+			// path must not be weaker. A short body here would leave the tail
+			// of data[start:end] zero-filled and then get cached as valid.
+			if len(blockData) != int(consecutiveBlockOffset) {
+				return nil, fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
+					types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
+			}
 			copy(data[start:end], blockData)
 		}
 
@@ -5418,6 +5425,12 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 				return err
 			}
 		} else {
+			// See vb.read: the cleartext path needs the same length check the
+			// encrypted path gets from openChunkRun.
+			if len(blockData) != int(consecutiveBlockOffset) {
+				return fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
+					types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
+			}
 			copy(data[start:end], blockData)
 		}
 
@@ -5526,6 +5539,12 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 				return fmt.Errorf("base chunk decrypt source %s: %w", sourceVolume, err)
 			}
 		} else {
+			// See vb.read: the cleartext path needs the same length check the
+			// encrypted path gets from openChunkRun.
+			if len(blockData) != int(consecutiveBlockOffset) {
+				return fmt.Errorf("%w: base source %s chunk %d offset %d run %d: got %d bytes, expected %d",
+					types.ErrShortRead, sourceVolume, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
+			}
 			copy(data[start:end], blockData)
 		}
 
