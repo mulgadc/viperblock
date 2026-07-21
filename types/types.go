@@ -2,9 +2,17 @@ package types
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 )
+
+// ErrNoSpace is returned by a Backend's Write/WriteCtx/WriteTo/WriteToCtx
+// when the underlying storage is full, so callers can check for it uniformly
+// via errors.Is regardless of backend. Lives here rather than in the
+// viperblock package to avoid an import cycle (backends are imported by
+// viperblock, so can't import it back).
+var ErrNoSpace = errors.New("viperblock: backend out of space")
 
 type Backend interface {
 	Init() error
@@ -18,6 +26,21 @@ type Backend interface {
 	ReadFromCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)
 	WriteTo(volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
 	WriteToCtx(ctx context.Context, volumeName string, fileType FileType, objectId uint64, headers *[]byte, data *[]byte) (err error)
+	// Delete removes an object from this backend's own volume. There is
+	// deliberately no cross-volume DeleteTo/DeleteFrom: deleters (chunk GC)
+	// only ever remove objects they minted themselves.
+	Delete(fileType FileType, objectId uint64) (err error)
+	DeleteCtx(ctx context.Context, fileType FileType, objectId uint64) (err error)
+	// ListPrefixes returns the top-level names under prefix, one level deep
+	// (delimiter "/"), scoped to the whole backend rather than one volume.
+	ListPrefixes(prefix string) (names []string, err error)
+	ListPrefixesCtx(ctx context.Context, prefix string) (names []string, err error)
+	// ListObjects returns every object's full key under prefix, recursively
+	// (no delimiter) — unlike ListPrefixes, these are leaf keys, not grouped
+	// path segments. Used to reconcile a volume's chunks/ directory against
+	// its in-memory state.
+	ListObjects(prefix string) (keys []string, err error)
+	ListObjectsCtx(ctx context.Context, prefix string) (keys []string, err error)
 	Sync()
 	GetBackendType() string
 	GetHost() string

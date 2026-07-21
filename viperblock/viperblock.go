@@ -18,7 +18,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -40,6 +42,17 @@ const DefaultFlushInterval time.Duration = 5 * time.Second
 const DefaultFlushSize uint32 = 64 * 1024 * 1024
 const DefaultWALSyncInterval time.Duration = 200 * time.Millisecond
 const DefaultChunkUploadInterval time.Duration = 30 * time.Second
+
+// DefaultGCInterval is how often the background chunk uploader also runs a
+// chunk GC sweep, when GCEnabled and GCInterval is left at zero. Longer than
+// DefaultChunkUploadInterval: a sweep's first run per VB lifetime does a
+// bucket-wide scan (see ensureGCSnapshotSafe), and reclaiming is not urgent.
+const DefaultGCInterval time.Duration = 5 * time.Minute
+
+// DefaultCheckpointRetryBackoff is the first sleep between SaveLiveCheckpointCtx's
+// write attempts, doubling on each subsequent retry. Sized for a transient backend
+// blip rather than a hard outage: three attempts spend ~3s total before giving up.
+const DefaultCheckpointRetryBackoff time.Duration = time.Second
 
 // DefaultMaxPendingBytes bounds the combined size of Writes.Blocks and
 // PendingBackendWrites.Blocks — the guest-write backpressure high-watermark.
@@ -174,8 +187,23 @@ type VB struct {
 	// drainInFlight ensures at most one goroutine actively drives
 	// DrainToBackendCtx from inside awaitBackpressure at a time; concurrent
 	// blocked writers poll pendingBytes instead of each launching a
-	// redundant drain.
+	// redundant drain. Only an optimization for the backpressure path —
+	// drainMu below is the actual cross-trigger exclusion guarantee.
 	drainInFlight atomic.Bool
+
+	// backendFull latches an out-of-space error from the backend (predastore
+	// 507/503, or local ENOSPC). Writes are acked before their chunk is PUT,
+	// so the error surfaces on a later drain; WriteAtCtx checks this latch
+	// up front and fails fast with ErrNoSpace while set. Cleared on the next
+	// successful drain.
+	backendFull atomic.Bool
+
+	// drainMu serializes DrainToBackendCtx across all its triggers. Two
+	// concurrent drains would rotate to different WAL segments and race in
+	// createChunkFile, where an older segment landing last can clobber a
+	// newer chunk's live pointer and let GC delete a still-referenced chunk.
+	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
+	drainMu sync.Mutex
 
 	// chunkUploadTrigger lets WriteAtCtx ask the background chunk uploader
 	// to drain now instead of waiting for the next ChunkUploadInterval tick,
@@ -296,6 +324,60 @@ type VB struct {
 	// shared with the read-path mutex so LookupBlockToObject and friends
 	// stay uncontended.
 	saveStateMu sync.Mutex
+
+	// checkpointRetryBackoff is the first inter-attempt sleep in
+	// SaveLiveCheckpointCtx (0 uses DefaultCheckpointRetryBackoff). Only tests
+	// set it, shrinking a retry storm from seconds of real sleeping to
+	// microseconds.
+	checkpointRetryBackoff time.Duration
+
+	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
+	// objects no live block references. Default false — opt-in until the
+	// cross-process "another process snapshots this volume mid-run" window
+	// (see ensureGCSnapshotSafe) has a durable answer.
+	GCEnabled bool
+
+	// GCInterval controls how often the background chunk uploader also runs
+	// a GC sweep (default DefaultGCInterval). <= 0 disables the periodic
+	// sweep, but Close/DrainToBackend still run one on the way out. Ignored
+	// when GCEnabled is false.
+	GCInterval time.Duration
+
+	gcTicker *time.Ticker
+
+	// gcRefcount counts, per chunk ObjectID, how many live BlockLookup
+	// entries reference it (protected by BlocksToObject.mu). Zero marks a GC
+	// candidate; entries persist until actually deleted so sweepChunks can
+	// find them. Only maintained when GCEnabled — rebuilt from the live map
+	// alone at load, so reconcileChunksOnce must close the "swept" gap once.
+	gcRefcount map[uint64]uint64
+
+	// gcReconciled marks whether reconcileChunksOnce has already run for
+	// this VB instance. Set once, lazily, on the first sweep attempt.
+	gcReconciled atomic.Bool
+
+	// gcFloor and gcFloorReady cache the lowest chunk ObjectID chunk GC may
+	// ever consider (see ensureGCFloor): below it, a chunk may still be
+	// referenced by the current numbered checkpoint, read as a fallback if
+	// the live checkpoint is unreadable. Cached for the process lifetime —
+	// numbered checkpoints are only rewritten at Close/RecoverLocalWALs.
+	gcFloor      atomic.Uint64
+	gcFloorReady atomic.Bool
+
+	// gcSnapshotSafe/gcSnapshotChecked cache ensureGCSnapshotSafe's result:
+	// whether any snapshot already references this volume. Cached for the
+	// process lifetime once checked; an error leaves gcSnapshotChecked false
+	// so the next sweep retries instead of caching a transient failure.
+	gcSnapshotSafe    atomic.Bool
+	gcSnapshotChecked atomic.Bool
+
+	// gcLatchedOff is set permanently, never cleared, the moment this VB
+	// instance does something that invalidates GC's invariants:
+	// CreateSnapshot (closes the in-process snapshot-ancestry hazard) or
+	// Reset (re-issues ObjectID 0, violating the "chunk IDs are never
+	// reused" invariant GC's refcount/floor reasoning relies on). Checked
+	// by ensureGCSnapshotSafe.
+	gcLatchedOff atomic.Bool
 }
 
 // CacheConfig holds configuration for the LRU cache.
@@ -358,7 +440,75 @@ type BlockLookup struct {
 	// SeqNum here is the only source. Always populated from BlockEntry.SeqNum
 	// in createChunkFile (zero for blocks written by pre-encryption code paths
 	// — those volumes are unreadable post-cutover by design).
+	//
+	// For NumBlocks == 1 this is the block's own SeqNum. For NumBlocks > 1
+	// it is StartBlock's SeqNum only, kept for wire-format compatibility;
+	// SeqNums below carries every block's own value, since blocks in a run
+	// are not guaranteed to share one.
 	SeqNum uint64
+
+	// SeqNums holds one SeqNum per block in this entry's [StartBlock,
+	// StartBlock+NumBlocks) run, in order. Nil for single-block entries,
+	// where SeqNum alone is authoritative. Never serialized directly — the
+	// on-disk format stays one record per physical block (expandBlockLookup).
+	SeqNums []uint64
+}
+
+// end returns the exclusive upper bound of the block range this entry
+// covers.
+func (bl BlockLookup) end() uint64 {
+	return bl.StartBlock + uint64(bl.NumBlocks)
+}
+
+// seqNumAt returns the SeqNum for the block at zero-based position i within
+// this entry's run, falling back to SeqNum when SeqNums wasn't populated
+// (always correct for the common NumBlocks == 1 case).
+func (bl BlockLookup) seqNumAt(i int) uint64 {
+	if i >= 0 && i < len(bl.SeqNums) {
+		return bl.SeqNums[i]
+	}
+	return bl.SeqNum
+}
+
+// offsetAt returns the on-disk object offset for the block at zero-based
+// position i within this entry's run, given the chunk's per-block byte
+// stride (BlockSize, or BlockSize+16 on encrypted volumes).
+func (bl BlockLookup) offsetAt(i int, stride uint32) uint32 {
+	return bl.ObjectOffset + utils.SafeIntToUint32(i)*stride
+}
+
+// sliceSeqNums returns the SeqNums for block positions [from, to) within
+// bl's run, suitable for building a fractured head/tail entry. Falls back
+// to a single-element slice derived from seqNumAt when bl.SeqNums wasn't
+// populated, so a fractured single-block (NumBlocks == 1) entry never loses
+// its SeqNum.
+func (bl BlockLookup) sliceSeqNums(from, to int) []uint64 {
+	if from >= to {
+		return nil
+	}
+	out := make([]uint64, to-from)
+	for i := from; i < to; i++ {
+		out[i-from] = bl.seqNumAt(i)
+	}
+	return out
+}
+
+// expandBlockLookup returns bl as a slice of single-block (NumBlocks == 1)
+// entries, one per block in its run. Used to preserve the on-disk
+// WAL/checkpoint wire format (one fixed 34-byte record per physical block)
+// exactly as before extent coalescing was introduced.
+func expandBlockLookup(bl BlockLookup, stride uint32) []BlockLookup {
+	out := make([]BlockLookup, bl.NumBlocks)
+	for i := range out {
+		out[i] = BlockLookup{
+			StartBlock:   bl.StartBlock + uint64(i),
+			NumBlocks:    1,
+			ObjectID:     bl.ObjectID,
+			ObjectOffset: bl.offsetAt(i, stride),
+			SeqNum:       bl.seqNumAt(i),
+		}
+	}
+	return out
 }
 
 type ConsecutiveBlock struct {
@@ -380,6 +530,160 @@ type ConsecutiveBlock struct {
 }
 
 type ConsecutiveBlocks []ConsecutiveBlock
+
+// resolveBlockLookup finds the coalesced entry covering block, if any,
+// returning it together with block's zero-based position within that
+// entry's run (0 for a direct StartBlock hit). Callers must hold
+// BlocksToObject.mu for at least reading.
+func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, bool) {
+	if bl, ok := b.BlockLookup[block]; ok {
+		return bl, 0, true
+	}
+	// Fall back to an O(n) containment scan: coalescing keys the map by
+	// StartBlock only, so a block inside a multi-block run has no entry of
+	// its own. n is bounded by the number of extents, not the number of
+	// blocks, so this stays cheap post-coalescing.
+	for _, bl := range b.BlockLookup {
+		if block > bl.StartBlock && block < bl.end() {
+			return bl, utils.SafeUint64ToInt(block - bl.StartBlock), true
+		}
+	}
+	return BlockLookup{}, 0, false
+}
+
+// insertCoalescedLocked inserts newEntry into BlockLookup, fracturing any
+// overlapping existing entries into their surviving head/tail; stride
+// recomputes the tail's ObjectOffset. Caller must hold BlocksToObject.mu.
+//
+// gcRefcount, if non-nil, is updated per removed/added entry rather than a
+// single delta, since a fracture can split one entry into zero, one, or two
+// survivors of the same ObjectID — the net change isn't always ±1.
+func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32, gcRefcount map[uint64]uint64) {
+	newStart := newEntry.StartBlock
+	newEnd := newEntry.end()
+
+	// Snapshot keys first: Go forbids inserting new keys into a map while
+	// ranging over it, and fracturing does delete+reinsert below.
+	keys := make([]uint64, 0, len(b.BlockLookup))
+	for k := range b.BlockLookup {
+		keys = append(keys, k)
+	}
+
+	for _, k := range keys {
+		existing, ok := b.BlockLookup[k]
+		if !ok {
+			continue // already replaced by an earlier iteration
+		}
+		exStart := existing.StartBlock
+		exEnd := existing.end()
+		if exEnd <= newStart || exStart >= newEnd {
+			continue // no overlap
+		}
+
+		delete(b.BlockLookup, k)
+		if gcRefcount != nil {
+			if n := gcRefcount[existing.ObjectID]; n > 0 {
+				gcRefcount[existing.ObjectID] = n - 1
+			}
+		}
+
+		// Surviving head: [exStart, newStart)
+		if exStart < newStart {
+			headLen := utils.SafeUint64ToInt(newStart - exStart)
+			head := BlockLookup{
+				StartBlock:   exStart,
+				NumBlocks:    utils.SafeIntToUint16(headLen),
+				ObjectID:     existing.ObjectID,
+				ObjectOffset: existing.ObjectOffset,
+				SeqNum:       existing.seqNumAt(0),
+				SeqNums:      existing.sliceSeqNums(0, headLen),
+			}
+			b.BlockLookup[head.StartBlock] = head
+			if gcRefcount != nil {
+				gcRefcount[head.ObjectID]++
+			}
+		}
+
+		// Surviving tail: [newEnd, exEnd)
+		if exEnd > newEnd {
+			tailStart := newEnd
+			tailOffset := utils.SafeUint64ToInt(tailStart - exStart)
+			tailLen := utils.SafeUint64ToInt(exEnd - tailStart)
+			tail := BlockLookup{
+				StartBlock:   tailStart,
+				NumBlocks:    utils.SafeIntToUint16(tailLen),
+				ObjectID:     existing.ObjectID,
+				ObjectOffset: existing.offsetAt(tailOffset, stride),
+				SeqNum:       existing.seqNumAt(tailOffset),
+				SeqNums:      existing.sliceSeqNums(tailOffset, tailOffset+tailLen),
+			}
+			b.BlockLookup[tail.StartBlock] = tail
+			if gcRefcount != nil {
+				gcRefcount[tail.ObjectID]++
+			}
+		}
+	}
+
+	b.BlockLookup[newEntry.StartBlock] = newEntry
+	if gcRefcount != nil {
+		gcRefcount[newEntry.ObjectID]++
+	}
+}
+
+// coalesceBlockLookup merges a flat, one-entry-per-block map (as decoded
+// from on-disk WAL/checkpoint records) into maximal coalesced runs keyed by
+// StartBlock, using the same adjacency criteria as createChunkFile so a
+// checkpoint round trip reproduces the same extents.
+//
+// The on-disk NumBlocks field is ignored for merge math — it's a legacy
+// per-run countdown, not a run length, and trusting it would corrupt
+// per-block AEAD nonces on reload. Runs are rebuilt from geometry alone.
+func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]BlockLookup {
+	out := make(map[uint64]BlockLookup, len(flat))
+	if len(flat) == 0 {
+		return out
+	}
+
+	keys := make([]uint64, 0, len(flat))
+	for k := range flat {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	i := 0
+	for i < len(keys) {
+		first := flat[keys[i]]
+		seqNums := []uint64{first.SeqNum}
+		prev := first
+		j := i + 1
+		for j < len(keys) {
+			cand := flat[keys[j]]
+			// prev covers a single block, so the next block number is
+			// prev.StartBlock+1 and its object offset is one stride further in.
+			if cand.StartBlock == prev.StartBlock+1 &&
+				cand.ObjectID == first.ObjectID &&
+				cand.ObjectOffset == prev.ObjectOffset+stride {
+				seqNums = append(seqNums, cand.SeqNum)
+				prev = cand
+				j++
+				continue
+			}
+			break
+		}
+
+		merged := BlockLookup{
+			StartBlock:   first.StartBlock,
+			NumBlocks:    utils.SafeIntToUint16(len(seqNums)),
+			ObjectID:     first.ObjectID,
+			ObjectOffset: first.ObjectOffset,
+			SeqNum:       first.SeqNum,
+			SeqNums:      seqNums,
+		}
+		out[merged.StartBlock] = merged
+		i = j
+	}
+	return out
+}
 
 type BlocksMap map[uint64]Block
 
@@ -487,6 +791,12 @@ var ErrRequestTooLarge = errors.New("request too large")
 var ErrRequestOutOfRange = errors.New("request out of range")
 var ErrRequestBlockSize = errors.New("request must be a multiple of block size")
 var ErrRequestBufferEmpty = errors.New("request requires a buffer > 0")
+
+// ErrNoSpace is returned by WriteAtCtx once the backendFull latch is set (see
+// the VB.backendFull field doc). Re-exports types.ErrNoSpace, the sentinel
+// the backends/file and backends/s3 packages return, so callers can use
+// errors.Is(err, viperblock.ErrNoSpace) without importing types.
+var ErrNoSpace = types.ErrNoSpace
 
 // ErrStateNotFound is returned by LoadState when both the local file and the
 // backend object are genuinely absent (NoSuchKey/os.ErrNotExist). The volume
@@ -701,6 +1011,12 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	if config.ChunkUploadInterval == 0 {
 		config.ChunkUploadInterval = DefaultChunkUploadInterval
 	}
+	// GCInterval: 0 means use default, negative means disabled (periodic
+	// sweep only; Close/DrainToBackend still run one on the way out).
+	// Applied regardless of GCEnabled, which StartChunkUploader gates on.
+	if config.GCInterval == 0 {
+		config.GCInterval = DefaultGCInterval
+	}
 
 	var lruCache *lru.Cache[uint64, []byte]
 
@@ -744,6 +1060,8 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		UploadWorkers:       config.UploadWorkers,
 		WALSyncInterval:     config.WALSyncInterval,
 		ChunkUploadInterval: config.ChunkUploadInterval,
+		GCEnabled:           config.GCEnabled,
+		GCInterval:          config.GCInterval,
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
 		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: blockToObjectWALMagic},
@@ -784,6 +1102,9 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	}
 
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+	if vb.GCEnabled {
+		vb.gcRefcount = make(map[uint64]uint64)
+	}
 
 	// New intentionally does not touch the process-wide slog default: a
 	// library must never mutate its caller's global logger state. All log
@@ -918,13 +1239,32 @@ func (vb *VB) StartChunkUploader() {
 	vb.chunkUploadDone = make(chan struct{})
 	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
 
+	// Chunk GC runs on its own cadence, decoupled from ChunkUploadInterval,
+	// so a short upload interval doesn't force GC's ancestry scan (see
+	// ensureGCSnapshotSafe) to run more often than necessary. gcTickerC
+	// stays nil (never fires below) when GC is off or GCInterval <= 0.
+	var gcTickerC <-chan time.Time
+	if vb.GCEnabled && vb.GCInterval > 0 {
+		vb.gcTicker = time.NewTicker(vb.GCInterval)
+		gcTickerC = vb.gcTicker.C
+	}
+
 	go func() {
 		defer close(vb.chunkUploadDone)
 		defer vb.chunkUploadTicker.Stop()
+		defer func() {
+			if vb.gcTicker != nil {
+				vb.gcTicker.Stop()
+			}
+		}()
 
 		for {
 			select {
 			case <-vb.chunkUploadTicker.C:
+				// DrainToBackendCtx itself latches/clears backendFull on
+				// ErrNoSpace/success, so a dropped error here is not
+				// silently lost — WriteAtCtx's up-front gate will start
+				// failing fast until a later drain clears the latch.
 				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					vb.logger().Warn("chunk uploader: DrainToBackend failed", "err", err)
 				}
@@ -935,13 +1275,15 @@ func (vb *VB) StartChunkUploader() {
 				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					vb.logger().Warn("chunk uploader: size-triggered DrainToBackend failed", "err", err)
 				}
+			case <-gcTickerC:
+				vb.runGCSweep(context.Background())
 			case <-vb.chunkUploadStop:
 				return
 			}
 		}
 	}()
 
-	vb.logger().Debug("chunk uploader started", "interval", vb.ChunkUploadInterval)
+	vb.logger().Debug("chunk uploader started", "interval", vb.ChunkUploadInterval, "gcEnabled", vb.GCEnabled, "gcInterval", vb.GCInterval)
 }
 
 // StopChunkUploader stops the background chunk upload goroutine.
@@ -956,6 +1298,7 @@ func (vb *VB) StopChunkUploader() {
 	vb.chunkUploadStop = nil
 	vb.chunkUploadDone = nil
 	vb.chunkUploadTicker = nil
+	vb.gcTicker = nil
 
 	vb.logger().Debug("chunk uploader stopped")
 }
@@ -1160,6 +1503,15 @@ func (vb *VB) maxPendingBytes() uint64 {
 	return vb.MaxPendingBytes
 }
 
+// checkpointBackoff returns the configured first retry sleep, or the default if
+// unset (covers VB values assembled without going through New).
+func (vb *VB) checkpointBackoff() time.Duration {
+	if vb.checkpointRetryBackoff <= 0 {
+		return DefaultCheckpointRetryBackoff
+	}
+	return vb.checkpointRetryBackoff
+}
+
 // signalSizeTrigger asks the background chunk uploader to drain now, once
 // pendingBytes crosses FlushSize, instead of waiting for the next
 // ChunkUploadInterval tick. Non-blocking: a trigger already pending
@@ -1190,6 +1542,12 @@ func (vb *VB) signalSizeTrigger() {
 // invoked by DrainToBackendCtx (which takes that same lock) cannot deadlock
 // against us. drainInFlight ensures only one blocked writer actually drives
 // the drain at a time; the rest poll pendingBytes with a bounded backoff.
+//
+// A drain that fails with ErrNoSpace stops the retry loop immediately
+// instead of backing off: pendingBytes will never fall under the
+// low-watermark on its own once the backend is out of space, so retrying
+// here would just hammer it. The error surfaces to the guest write that
+// triggered this wait.
 func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
 	if vb.PendingBytes() <= high {
@@ -1200,6 +1558,12 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	backoff := 10 * time.Millisecond
 	const maxBackoff = 500 * time.Millisecond
 
+	// Bound consecutive non-ErrNoSpace drain failures so a persistently
+	// failing drain doesn't spin here forever; a single success resets the
+	// count so transient backend slowness doesn't trip it.
+	const maxDrainFailures = 10
+	drainFailures := 0
+
 	for vb.PendingBytes() > low {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1209,7 +1573,16 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			err := vb.DrainToBackendCtx(ctx)
 			vb.drainInFlight.Store(false)
 			if err != nil {
-				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err)
+				if errors.Is(err, ErrNoSpace) {
+					return err
+				}
+				drainFailures++
+				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err, "consecutiveFailures", drainFailures)
+				if drainFailures >= maxDrainFailures {
+					return fmt.Errorf("write backpressure: %d consecutive drains failed, aborting: %w", drainFailures, err)
+				}
+			} else {
+				drainFailures = 0
 			}
 			if vb.PendingBytes() <= low {
 				break
@@ -1229,9 +1602,40 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	return nil
 }
 
+// backendNearFuller lets a backend report pre-full backpressure out-of-band
+// from write errors (the s3 backend via X-Predastore-Pool-Pressure). Kept as
+// an internal type-assertion rather than added to types.Backend, so backends
+// with no such concept (backends/file) are unaffected.
+type backendNearFuller interface {
+	NearFull() bool
+}
+
+var _ backendNearFuller = (*s3.Backend)(nil)
+
+// isBackendNearFull reports whether vb.Backend currently implements
+// backendNearFuller and observed its last write land in the nearfull
+// pressure band. Lock-free and cheap to call from the WriteAtCtx hot path
+// even when the backend doesn't implement the interface.
+func (vb *VB) isBackendNearFull() bool {
+	nf, ok := vb.Backend.(backendNearFuller)
+	return ok && nf.NearFull()
+}
+
 // WriteAtCtx is WriteAt with a caller-supplied context that flows through any
 // read-modify-write backend fetches for trace propagation.
 func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error {
+	// Fail fast while the backend is out of space, before buffering into
+	// Writes.Blocks — a write is acked before its chunk is PUT, so without
+	// this gate a full backend would keep accepting writes into memory.
+	//
+	// isBackendNearFull extends the fail-fast to the nearfull band: at FULL
+	// the backend also rejects drain PUTs, so already-acked dirty pages
+	// could never flush. DrainToBackendCtx stays ungated so buffered drains
+	// keep flushing into the remaining headroom.
+	if vb.backendFull.Load() || vb.isBackendNearFull() {
+		return ErrNoSpace
+	}
+
 	// First check the block exists in our volume size
 	if offset > vb.GetVolumeSize() {
 		return ErrRequestTooLarge
@@ -1445,11 +1849,28 @@ func (vb *VB) DrainToBackend() error {
 
 // DrainToBackendCtx is DrainToBackend with a caller-supplied context threaded
 // through the chunk-upload and checkpoint S3 writes.
-func (vb *VB) DrainToBackendCtx(ctx context.Context) error {
-	if err := vb.Flush(); err != nil {
+func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
+	// Serialize every drain trigger — see drainMu's doc comment for why
+	// overlapping drains are unsafe.
+	vb.drainMu.Lock()
+	defer vb.drainMu.Unlock()
+
+	// Every drain path funnels through here, so this is the single choke
+	// point for the backendFull latch: an out-of-space error anywhere in
+	// the drain sets it, and a clean completion clears it.
+	defer func() {
+		if err != nil {
+			if errors.Is(err, ErrNoSpace) {
+				vb.backendFull.Store(true)
+			}
+			return
+		}
+		vb.backendFull.Store(false)
+	}()
+
+	if err = vb.Flush(); err != nil {
 		return fmt.Errorf("drain flush: %w", err)
 	}
-	var err error
 	if vb.UseShardedWAL {
 		err = vb.WriteShardedWALToChunkCtx(ctx, true)
 	} else {
@@ -1458,7 +1879,7 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("drain chunk upload: %w", err)
 	}
-	if err := vb.SaveLiveCheckpointCtx(ctx); err != nil {
+	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
 	return nil
@@ -2486,6 +2907,18 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 
 	return nil
 }
+
+// blockStride returns the per-block on-disk byte distance within a chunk:
+// BlockSize normally, or BlockSize+16 on encrypted volumes to account for
+// the GCM tag appended after each sealed block.
+func (vb *VB) blockStride() uint32 {
+	stride := vb.BlockSize
+	if vb.EncryptionEnabled {
+		stride += 16
+	}
+	return stride
+}
+
 func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
@@ -2566,42 +2999,82 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 	headerLen := len(headers)
 
-	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
-	// each ciphertext block; unencrypted chunks stay at BlockSize.
-	stride := int(vb.BlockSize)
-	if vb.EncryptionEnabled {
-		stride += 16
-	}
+	strideU32 := vb.blockStride()
+	stride := int(strideU32)
 
 	vb.BlocksToObject.mu.Lock()
-	for k, block := range *matchedBlocks {
-		// Find out how many consecutive blocks there are
-		numBlocks := 1
-		for j := k + 1; j < len(*matchedBlocks); j++ {
-			if (*matchedBlocks)[j].Block == (*matchedBlocks)[j-1].Block+1 {
-				numBlocks++
-			} else {
-				break
-			}
+	// matchedBlocks is sorted by Block ascending (see caller). Coalesce each
+	// maximal consecutive run into a single BlockLookup entry instead of one
+	// entry per block: an uncoalesced map grows unboundedly with total bytes
+	// ever written, not with live data, which is what drove nbdkit RSS up on
+	// long-running volumes.
+	runStart := 0
+	for runStart < len(*matchedBlocks) {
+		runEnd := runStart + 1
+		for runEnd < len(*matchedBlocks) && (*matchedBlocks)[runEnd].Block == (*matchedBlocks)[runEnd-1].Block+1 {
+			runEnd++
+		}
+		numBlocks := runEnd - runStart
+		first := (*matchedBlocks)[runStart]
+
+		seqNums := make([]uint64, numBlocks)
+		for i := runStart; i < runEnd; i++ {
+			seqNums[i-runStart] = (*matchedBlocks)[i].SeqNum
 		}
 
 		newBlock := BlockLookup{
-			StartBlock:   block.Block,
+			StartBlock:   first.Block,
 			NumBlocks:    utils.SafeIntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
-			ObjectOffset: utils.SafeIntToUint32(headerLen + (k * stride)),
-			SeqNum:       block.SeqNum,
+			ObjectOffset: utils.SafeIntToUint32(headerLen + (runStart * stride)),
+			SeqNum:       first.SeqNum,
+			SeqNums:      seqNums,
 		}
 
-		// TODO: Optimise for number of consecutive blocks to reduce the memory size
-		vb.BlocksToObject.BlockLookup[block.Block] = newBlock
+		// resolveBlockLookup finds the covering entry even when this run
+		// starts inside an existing coalesced extent, not just an exact key.
+		oldBlock, _, hadOld := vb.BlocksToObject.resolveBlockLookup(first.Block)
 
-		// Update BlockStore: transition from Pending to Persisted. Pass the
-		// sealed SeqNum so the location and seqNum stay bound as a unit; a
-		// stale drain whose block was since re-written is rejected here.
+		// Reject a stale drain: an older WAL segment landing here last would
+		// otherwise overwrite the newer, live chunk and drop its refcount to
+		// zero, letting the next sweep delete a still-referenced chunk. Only
+		// advance on a strictly newer SeqNum. The stale chunk we already
+		// uploaded is recorded at refcount zero (if not already tracked) so
+		// it becomes a GC candidate instead of leaking silently.
+		if hadOld && oldBlock.SeqNum >= newBlock.SeqNum {
+			if vb.GCEnabled {
+				if _, tracked := vb.gcRefcount[newBlock.ObjectID]; !tracked {
+					vb.gcRefcount[newBlock.ObjectID] = 0
+				}
+			}
+			runStart = runEnd
+			continue
+		}
+
+		// Fracture any existing entry this run overwrites (e.g. a prior
+		// persisted extent partially rewritten) into its surviving
+		// head/tail before inserting the new run. gcRefcount is passed
+		// through so surviving fragments keep their share of the old
+		// chunk's refcount, rather than always dropping it by exactly one.
+		var gcRefcount map[uint64]uint64
+		if vb.GCEnabled {
+			gcRefcount = vb.gcRefcount
+		}
+		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32, gcRefcount)
+
+		// Transition from Pending to Persisted, one range op per run.
+		// Per-block SeqNums keep the location/seqNum binding atomic per
+		// block; a stale block is rejected per-block inside
+		// MarkPersistedRange, same as the single-block MarkPersisted guard.
 		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.MarkPersisted(block.Block, chunkIndex, newBlock.ObjectOffset, block.SeqNum)
+			blocks := make([]uint64, numBlocks)
+			for i := range blocks {
+				blocks[i] = first.Block + uint64(i)
+			}
+			vb.BlockStore.MarkPersistedRange(blocks, chunkIndex, newBlock.ObjectOffset, strideU32, seqNums)
 		}
+
+		runStart = runEnd
 	}
 	vb.BlocksToObject.dirty.Store(true)
 	vb.BlocksToObject.mu.Unlock()
@@ -2614,6 +3087,11 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// set above; the single serialized SaveLiveCheckpointCtx that every driver
 	// runs after up.wait() (DrainToBackendCtx, RecoverLocalWALs, Close) writes
 	// the complete coalesced map exactly once, after all chunk PUTs have landed.
+	//
+	// The same reasoning rules out sweeping GC candidates from here too: a
+	// chunk this call just dereferenced (oldBlock above) isn't safely
+	// deletable until the checkpoint that stops referencing it has landed;
+	// GC only sweeps from the serialized point right after that succeeds.
 	return nil
 }
 
@@ -2666,12 +3144,13 @@ func (vb *VB) SaveBlockStateCtx(ctx context.Context) (err error) {
 
 	//file.Write(header)
 
+	// Expand each coalesced entry back into one 34-byte record per physical
+	// block: the on-disk wire format stays unchanged even though the
+	// in-memory map is coalesced into extents.
+	stride := vb.blockStride()
 	for _, block := range vb.BlocksToObject.BlockLookup {
-		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
-
-		if err != nil {
-			vb.logger().Error("ERROR WRITING BLOCK TO BLOCK WAL:", "error", err)
-			return err
+		for _, single := range expandBlockLookup(block, stride) {
+			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
 		}
 	}
 
@@ -2768,9 +3247,21 @@ func ParseBlockCheckpointBytes(raw []byte, version uint16) (map[uint64]BlockLook
 // parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
 // Caller must hold BlocksToObject.mu (write).
 func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
+	// Rebuild refcounts from scratch alongside the map: zero-refcount GC
+	// candidates from a prior process lifetime aren't derivable from the
+	// loaded map (indistinguishable from a chunk never referenced), so
+	// they're lost here. That only makes GC miss already-known garbage
+	// across a restart; it never risks deleting something still live.
+	if vb.GCEnabled {
+		vb.gcRefcount = make(map[uint64]uint64)
+	}
 
 	vb.logger().Debug("Loaded checkpoint", "checkpoint", checkpoint)
+
+	// The on-disk format stays one record per physical block. Decode into a
+	// flat map first, then recoalesce into runs -- otherwise every (re)open
+	// of a large volume would revert straight back to one entry per block.
+	flat := make(map[uint64]BlockLookup)
 
 	// Track the highest chunk ObjectID the map references so ObjectNum can be
 	// reconciled to max+1 below, mirroring SeqNum -> maxSeqNum in RecoverLocalWALs.
@@ -2778,18 +3269,39 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	haveObject := false
 
 	err := walkBlockCheckpoint(checkpoint, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
-		vb.BlocksToObject.BlockLookup[block.StartBlock] = block
+		flat[block.StartBlock] = block
 		if !haveObject || block.ObjectID > maxObjectID {
 			maxObjectID = block.ObjectID
 			haveObject = true
-		}
-		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.SetPersisted(block.StartBlock, block.ObjectID, block.ObjectOffset, block.SeqNum)
 		}
 	})
 	if err != nil {
 		vb.logger().Error("Error reading checkpoint", "error", err)
 		return err
+	}
+
+	vb.BlocksToObject.BlockLookup = coalesceBlockLookup(flat, vb.blockStride())
+
+	// gcRefcount counts entries in the coalesced BlockLookup, not physical
+	// blocks, so it must be tallied post-coalesce -- tallying the flat,
+	// one-record-per-block decode above would overcount every multi-block
+	// run by its block count instead of by 1.
+	if vb.GCEnabled {
+		for _, entry := range vb.BlocksToObject.BlockLookup {
+			vb.gcRefcount[entry.ObjectID]++
+		}
+	}
+
+	if vb.UseBlockStore && vb.BlockStore != nil {
+		for _, entry := range vb.BlocksToObject.BlockLookup {
+			blocks := make([]uint64, entry.NumBlocks)
+			seqNums := make([]uint64, entry.NumBlocks)
+			for i := range blocks {
+				blocks[i] = entry.StartBlock + uint64(i)
+				seqNums[i] = entry.seqNumAt(i)
+			}
+			vb.BlockStore.SetPersistedRange(blocks, entry.ObjectID, entry.ObjectOffset, vb.blockStride(), seqNums)
+		}
 	}
 
 	// Runtime drains persist chunks but not config.json ObjectNum, so a re-Open can
@@ -2809,6 +3321,262 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	}
 
 	return nil
+}
+
+// numberedCheckpointHighWater reads the current WallNum's numbered
+// checkpoint (the fallback read by LoadBlockStateCtx) and returns the
+// highest chunk ObjectID it references. ok is false when no numbered
+// checkpoint has been written yet for this volume.
+func (vb *VB) numberedCheckpointHighWater(ctx context.Context) (highWater uint64, ok bool, err error) {
+	data, err := vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), 0, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+
+	haveObject := false
+	walkErr := walkBlockCheckpoint(data, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
+		if !haveObject || block.ObjectID > highWater {
+			highWater = block.ObjectID
+			haveObject = true
+		}
+	})
+	if walkErr != nil {
+		return 0, false, walkErr
+	}
+	return highWater, haveObject, nil
+}
+
+// ensureGCFloor lazily computes and caches the GC floor: one past the
+// highest chunk ObjectID referenced by the current numbered checkpoint, so
+// GC never deletes an object that checkpoint depends on if the live
+// checkpoint becomes unreadable. Cached for the VB lifetime — numbered
+// checkpoints are only rewritten at Close/RecoverLocalWALs.
+func (vb *VB) ensureGCFloor(ctx context.Context) uint64 {
+	if vb.gcFloorReady.Load() {
+		return vb.gcFloor.Load()
+	}
+
+	high, ok, err := vb.numberedCheckpointHighWater(ctx)
+	if err != nil {
+		vb.logger().Warn("chunk GC: failed to compute numbered-checkpoint floor, sweep skipped this round", "err", err)
+		// Not cached, so the next sweep retries. ^uint64(0) fails every
+		// "id >= floor" check this round instead of treating a transient
+		// read failure as "nothing to protect".
+		return ^uint64(0)
+	}
+
+	floor := uint64(0)
+	if ok {
+		floor = high + 1
+	}
+	vb.gcFloor.Store(floor)
+	vb.gcFloorReady.Store(true)
+	return floor
+}
+
+// snapPrefix is the top-level key prefix every CreateSnapshot writes a
+// snapshot's checkpoint and config.json under, and the same prefix
+// spinifex's DescribeSnapshots scans with a bucket-wide ListObjectsV2.
+const snapPrefix = "snap-"
+
+// ensureGCSnapshotSafe reports whether chunk GC may run against this volume:
+// safe only if no existing snapshot references it (scanForOwnSnapshots).
+// Cached for the process lifetime once a scan completes, safe or not — the
+// guard never loosens once a snapshot exists. A scan error is not cached.
+//
+// Misses a snapshot created by another process after the scan; that
+// cross-process gap is why GCEnabled defaults to false.
+func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
+	if vb.gcLatchedOff.Load() {
+		return false
+	}
+	if vb.gcSnapshotChecked.Load() {
+		return vb.gcSnapshotSafe.Load()
+	}
+
+	safe, err := vb.scanForOwnSnapshots(ctx)
+	if err != nil {
+		vb.logger().Warn("chunk GC: snapshot-ancestry scan failed, sweep skipped this round", "err", err)
+		return false
+	}
+
+	vb.gcSnapshotSafe.Store(safe)
+	vb.gcSnapshotChecked.Store(true)
+	if !safe {
+		vb.logger().Warn("chunk GC: disabled, an existing snapshot references this volume", "volume", vb.VolumeName)
+	}
+	return safe
+}
+
+// scanForOwnSnapshots answers "does any existing snapshot reference this
+// volume" by listing every "snap-" prefix in the backend and comparing each
+// candidate's config.json SourceVolumeName — snapshot IDs carry no derivable
+// relationship to the source volume name, so this can't be a bounded
+// per-volume listing. Cost is O(total snapshots in the deployment); run at
+// most once per VB lifetime, only when GCEnabled.
+func (vb *VB) scanForOwnSnapshots(ctx context.Context) (safe bool, err error) {
+	names, err := vb.Backend.ListPrefixesCtx(ctx, snapPrefix)
+	if err != nil {
+		return false, fmt.Errorf("list snapshot prefixes: %w", err)
+	}
+
+	for _, name := range names {
+		configData, readErr := vb.Backend.ReadFromCtx(ctx, name, types.FileTypeConfig, 0, 0, 0)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				// Checkpoint written but config.json not yet landed (see
+				// CreateSnapshot's write order) or already deleted. Either
+				// way this is not a currently-valid, readable snapshot, and
+				// nothing else can treat it as one either.
+				continue
+			}
+			return false, fmt.Errorf("read %s/config.json: %w", name, readErr)
+		}
+
+		var probe struct {
+			SourceVolumeName string `json:"SourceVolumeName"`
+		}
+		if unmarshalErr := json.Unmarshal(StateBody(configData), &probe); unmarshalErr != nil {
+			// Malformed or foreign metadata this scan doesn't understand.
+			// Fail closed: "cannot rule out", not "not mine".
+			return false, fmt.Errorf("parse %s/config.json: %w", name, unmarshalErr)
+		}
+
+		if probe.SourceVolumeName == vb.VolumeName {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// chunkKeyPattern extracts the ObjectID from a chunk key of the form
+// "{volumeName}/chunks/chunk.%08d.bin" (see types.GetFilePath), independent
+// of volumeName's own content (volume names are operator-chosen and must
+// not be assumed free of digits or path separators).
+var chunkKeyPattern = regexp.MustCompile(`/chunks/chunk\.(\d+)\.bin$`)
+
+// parseChunkObjectID extracts the ObjectID from a chunk object key, or
+// returns ok=false for any key that isn't a chunk file (e.g. an unrelated
+// key sharing a list prefix by coincidence).
+func parseChunkObjectID(key string) (id uint64, ok bool) {
+	m := chunkKeyPattern.FindStringSubmatch(key)
+	if m == nil {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(m[1], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+// reconcileChunksOnce lists this volume's own chunks/ prefix once per VB
+// lifetime and adds any untracked chunk object to gcRefcount at zero — a
+// chunk unreferenced since before the last close is otherwise
+// indistinguishable from one never minted, since parseBlockCheckpoint only
+// rebuilds gcRefcount from the live map. Scoped to this volume's own
+// prefix, unlike ensureGCSnapshotSafe's bucket-wide scan.
+//
+// Assumes gcRefcount's initial population runs once, before the first
+// sweep; a later rebuild would wipe the zero-entries this adds.
+func (vb *VB) reconcileChunksOnce(ctx context.Context) {
+	if vb.gcReconciled.Load() {
+		return
+	}
+
+	keys, err := vb.Backend.ListObjectsCtx(ctx, vb.VolumeName+"/chunks/")
+	if err != nil {
+		vb.logger().Warn("chunk GC: chunk-prefix reconcile failed, will retry next sweep", "err", err)
+		return
+	}
+
+	vb.BlocksToObject.mu.Lock()
+	for _, key := range keys {
+		id, ok := parseChunkObjectID(key)
+		if !ok {
+			continue
+		}
+		if _, tracked := vb.gcRefcount[id]; !tracked {
+			vb.gcRefcount[id] = 0
+		}
+	}
+	vb.BlocksToObject.mu.Unlock()
+
+	vb.gcReconciled.Store(true)
+}
+
+// sweepChunks deletes superseded chunk objects: below the watermark captured
+// here, at or above the numbered-checkpoint floor, with zero refcount. Call
+// only after a successful SaveLiveCheckpointCtx — a crash between checkpoint
+// save and sweep leaves garbage on disk (safe), never a dangling reference.
+func (vb *VB) sweepChunks(ctx context.Context) {
+	if !vb.GCEnabled {
+		return
+	}
+	if !vb.ensureGCSnapshotSafe(ctx) {
+		return
+	}
+
+	vb.reconcileChunksOnce(ctx)
+
+	floor := vb.ensureGCFloor(ctx)
+	// Captured once: any chunk minted after this point is excluded by the
+	// "id < watermark" check below, so BlocksToObject.mu need not be held
+	// across the delete calls that follow.
+	watermark := vb.ObjectNum.Load()
+
+	vb.BlocksToObject.mu.Lock()
+	var candidates []uint64
+	for id, refs := range vb.gcRefcount {
+		if refs == 0 && id >= floor && id < watermark {
+			candidates = append(candidates, id)
+		}
+	}
+	vb.BlocksToObject.mu.Unlock()
+
+	swept := vb.deleteChunkObjects(ctx, candidates)
+
+	if swept > 0 {
+		vb.logger().Info("chunk GC: sweep complete", "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
+	} else {
+		vb.logger().Debug("chunk GC: sweep found nothing to reclaim", "floor", floor, "watermark", watermark)
+	}
+}
+
+// deleteChunkObjects issues a DeleteObject call per chunk ObjectID and
+// returns how many were reclaimed (deleted or already gone). A delete that
+// fails otherwise is left in gcRefcount and out of the swept count, so the
+// next sweep retries it — under-collection (a leaked chunk) is preferred
+// over losing track of a candidate.
+func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) {
+	for _, id := range ids {
+		if err := vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id); err != nil && !errors.Is(err, os.ErrNotExist) {
+			vb.logger().Warn("chunk GC: delete failed, will retry next sweep", "objectID", id, "err", err)
+			continue
+		}
+		vb.BlocksToObject.mu.Lock()
+		delete(vb.gcRefcount, id)
+		vb.BlocksToObject.mu.Unlock()
+		swept++
+	}
+	return swept
+}
+
+// runGCSweep drains this VB to the backend -- persisting a live checkpoint
+// that already excludes zero-refcount chunks -- and, only if that succeeds,
+// sweeps the chunks it left excluded. Sweeping without a preceding
+// successful drain would risk deleting a chunk an already-durable
+// checkpoint still references; see sweepChunks's doc comment.
+func (vb *VB) runGCSweep(ctx context.Context) {
+	if err := vb.DrainToBackendCtx(ctx); err != nil {
+		vb.logger().Warn("chunk GC: drain before sweep failed, sweep skipped", "err", err)
+		return
+	}
+	vb.sweepChunks(ctx)
 }
 
 // Load the previous blockstate from disk.
@@ -2865,13 +3633,16 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	// the lock is not held across network writes or retry sleeps.
 	vb.BlocksToObject.mu.RLock()
 	checkpoint := vb.BlockToObjectWALHeader()
+	stride := vb.blockStride()
 	for _, block := range vb.BlocksToObject.BlockLookup {
-		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
+		for _, single := range expandBlockLookup(block, stride) {
+			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
+		}
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
 	headers := []byte{}
-	backoff := time.Second
+	backoff := vb.checkpointBackoff()
 	var err error
 	for attempt := range 3 {
 		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
@@ -3186,14 +3957,22 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		}
 	}
 
-	// Sync BlockStore from BlocksToObject since createChunkFile's MarkPersisted
-	// won't work during recovery (blocks aren't in Pending state in BlockStore)
+	// Sync BlockStore from BlocksToObject: createChunkFile's
+	// MarkPersistedRange doesn't apply during recovery (blocks aren't in
+	// Pending state), so install each coalesced run directly via
+	// SetPersistedRange. Idempotent; newer Hot/Pending entries still take
+	// precedence in ReadEntry.
 	if vb.UseBlockStore && vb.BlockStore != nil {
 		vb.BlocksToObject.mu.RLock()
-		for _, block := range sortedBlocks {
-			if lookup, ok := vb.BlocksToObject.BlockLookup[block.Block]; ok {
-				vb.BlockStore.SetPersisted(block.Block, lookup.ObjectID, lookup.ObjectOffset, block.SeqNum)
+		stride := vb.blockStride()
+		for _, lookup := range vb.BlocksToObject.BlockLookup {
+			blocks := make([]uint64, lookup.NumBlocks)
+			seqNums := make([]uint64, lookup.NumBlocks)
+			for i := range blocks {
+				blocks[i] = lookup.StartBlock + uint64(i)
+				seqNums[i] = lookup.seqNumAt(i)
 			}
+			vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
 		}
 		vb.BlocksToObject.mu.RUnlock()
 	}
@@ -3330,15 +4109,14 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	vb.logger().Debug("LookupBlockToObject", "block", block)
 
 	vb.BlocksToObject.mu.RLock()
-
-	blockLookup, ok := vb.BlocksToObject.BlockLookup[block]
-
+	blockLookup, pos, ok := vb.BlocksToObject.resolveBlockLookup(block)
+	stride := vb.blockStride()
 	vb.BlocksToObject.mu.RUnlock()
 
 	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
 
 	if ok {
-		return blockLookup.ObjectID, blockLookup.ObjectOffset, blockLookup.SeqNum, nil
+		return blockLookup.ObjectID, blockLookup.offsetAt(pos, stride), blockLookup.seqNumAt(pos), nil
 	} else {
 		return 0, 0, 0, ErrZeroBlock
 	}
@@ -4206,6 +4984,12 @@ func (vb *VB) Close() error {
 		// below still persists the same map to the numbered checkpoint.
 		if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
 			vb.logger().Warn("Close: SaveLiveCheckpoint failed", "err", cpErr)
+		} else {
+			// One last sweep, now that the live checkpoint durably excludes
+			// every zero-refcount chunk. Run before SaveBlockState so
+			// ensureGCFloor still sees the checkpoint from before this
+			// Close, not the one SaveBlockState is about to write.
+			vb.sweepChunks(context.Background())
 		}
 	}
 
@@ -4287,6 +5071,14 @@ func (vb *VB) ownsWAL() bool {
 }
 
 func (vb *VB) Reset() error {
+	// Reset re-issues ObjectID 0 below, violating the "chunk IDs are never
+	// reused" invariant GC's refcount/floor reasoning depends on — a reused
+	// ID could alias a chunk GC already deleted. Latch GC off permanently
+	// rather than trying to reconcile GC state across the reset.
+	if vb.GCEnabled {
+		vb.gcLatchedOff.Store(true)
+	}
+
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
 	vb.BlocksToObject.mu.Unlock()
@@ -4879,10 +5671,20 @@ func (vb *VB) SyncBlockStoreFromLegacy() {
 	}
 	vb.PendingBackendWrites.mu.RUnlock()
 
-	// Sync from BlocksToObject
+	// Sync from BlocksToObject. Each entry may cover a coalesced run of
+	// several blocks; SetPersistedRange installs the whole run as one
+	// extent instead of reverting it to one BlockStore entry per block.
+	// seqNum 0 for every block is a pre-existing quirk of this legacy sync
+	// path, kept as-is here.
 	vb.BlocksToObject.mu.RLock()
-	for blockNum, lookup := range vb.BlocksToObject.BlockLookup {
-		vb.BlockStore.SetPersisted(blockNum, lookup.ObjectID, lookup.ObjectOffset, 0)
+	stride := vb.blockStride()
+	for _, lookup := range vb.BlocksToObject.BlockLookup {
+		blocks := make([]uint64, lookup.NumBlocks)
+		seqNums := make([]uint64, lookup.NumBlocks)
+		for i := range blocks {
+			blocks[i] = lookup.StartBlock + uint64(i)
+		}
+		vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
 	}
 	vb.BlocksToObject.mu.RUnlock()
 

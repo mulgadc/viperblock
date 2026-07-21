@@ -66,13 +66,61 @@ const (
 // to reduce contention. It replaces the 4 separate data structures
 // (Writes, PendingBackendWrites, Cache, BlocksToObject) with a single
 // unified index that is updated incrementally on writes.
+//
+// Persisted blocks are the exception to per-block sharding: to avoid growing
+// the sharded index linearly with total volume data written, MarkPersistedRange
+// removes the per-block shard entries for a run uploaded in one chunk and
+// records a single coalesced persistedExtent covering it instead. Hot/Pending/
+// Cached blocks stay in the sharded index, since those states are already
+// bounded (WriteAtCtx backpressure, LRU cache size).
 type UnifiedBlockStore struct {
 	shards    [NumShards]*IndexShard
 	blockSize uint32
 	seqNum    atomic.Uint64
 
+	// persistedMu guards persistedExtents. Separate from the per-shard locks:
+	// a run's blocks are spread across many shards (shard = blockNum &
+	// ShardMask), so no single shard lock could cover a whole extent.
+	persistedMu      sync.RWMutex
+	persistedExtents map[uint64]persistedExtent
+
 	// Stats for monitoring
 	stats BlockStoreStats
+}
+
+// persistedExtent mirrors BlockLookup for the UnifiedBlockStore's own
+// coalesced index of Persisted-state blocks: one entry per consecutive run
+// uploaded together in a chunk, instead of one BlockEntry per block. stride
+// is the on-disk byte distance between two consecutive blocks in the run's
+// chunk (BlockSize, or BlockSize+16 for encrypted volumes). seqNums carries
+// each block's own write-generation SeqNum (index 0 == startBlock), since
+// numerically consecutive blocks are not necessarily from the same guest
+// write and the exact per-block value is needed to reconstruct the AEAD nonce.
+type persistedExtent struct {
+	startBlock   uint64
+	numBlocks    uint16
+	objectID     uint64
+	objectOffset uint32
+	stride       uint32
+	seqNums      []uint64
+}
+
+// end returns the exclusive end block of the extent.
+func (pe persistedExtent) end() uint64 {
+	return pe.startBlock + uint64(pe.numBlocks)
+}
+
+// seqNumAt returns the SeqNum of the block at position i (0-based) within the extent.
+func (pe persistedExtent) seqNumAt(i uint16) uint64 {
+	if int(i) < len(pe.seqNums) {
+		return pe.seqNums[i]
+	}
+	return 0
+}
+
+// offsetAt returns the ObjectOffset of the block at position i (0-based) within the extent.
+func (pe persistedExtent) offsetAt(i uint16) uint32 {
+	return pe.objectOffset + uint32(i)*pe.stride
 }
 
 // BlockStoreStats tracks operational statistics.
@@ -92,7 +140,8 @@ var ErrBlockNotFound = errors.New("block not found")
 // NewUnifiedBlockStore creates a new unified block store with the given block size.
 func NewUnifiedBlockStore(blockSize uint32) *UnifiedBlockStore {
 	ubs := &UnifiedBlockStore{
-		blockSize: blockSize,
+		blockSize:        blockSize,
+		persistedExtents: make(map[uint64]persistedExtent),
 	}
 
 	// Initialize all shards
@@ -108,6 +157,90 @@ func NewUnifiedBlockStore(blockSize uint32) *UnifiedBlockStore {
 // getShard returns the shard for a given block number.
 func (ubs *UnifiedBlockStore) getShard(blockNum uint64) *IndexShard {
 	return ubs.shards[blockNum&ShardMask]
+}
+
+// findPersistedExtentLocked returns the persistedExtent covering blockNum, if
+// any. Callers must hold persistedMu (read or write). Checks the fast path
+// first (blockNum is itself an extent's startBlock) before falling back to a
+// scan, which is cheap since the index is O(extents), not O(blocks).
+func (ubs *UnifiedBlockStore) findPersistedExtentLocked(blockNum uint64) (persistedExtent, bool) {
+	if pe, ok := ubs.persistedExtents[blockNum]; ok {
+		return pe, true
+	}
+	for _, pe := range ubs.persistedExtents {
+		if blockNum > pe.startBlock && blockNum < pe.end() {
+			return pe, true
+		}
+	}
+	return persistedExtent{}, false
+}
+
+// readPersisted resolves blockNum against the persisted-extent index and
+// returns it as a BlockEntry, matching the shape ReadEntry/ReadBlock hand
+// back for shard-resident entries.
+func (ubs *UnifiedBlockStore) readPersisted(blockNum uint64) (BlockEntry, bool) {
+	ubs.persistedMu.RLock()
+	pe, ok := ubs.findPersistedExtentLocked(blockNum)
+	ubs.persistedMu.RUnlock()
+	if !ok {
+		return BlockEntry{}, false
+	}
+	idx := uint16(blockNum - pe.startBlock) //nolint:gosec // G115: findPersistedExtentLocked only returns pe when blockNum < pe.end(), so blockNum-pe.startBlock < pe.numBlocks (uint16)
+	return BlockEntry{
+		SeqNum:       pe.seqNumAt(idx),
+		State:        BlockStatePersisted,
+		ObjectID:     pe.objectID,
+		ObjectOffset: pe.offsetAt(idx),
+	}, true
+}
+
+// fractureOverlapsLocked removes or splits existing persisted extents that
+// overlap [newStart, newStart+newNum), since the caller is about to insert a
+// fresher extent covering that range. An overwrite can land anywhere inside a
+// previously-coalesced extent, so every existing extent must be checked for
+// range overlap and any surviving head/tail re-inserted under its own
+// startBlock key. Callers must hold persistedMu (write).
+func (ubs *UnifiedBlockStore) fractureOverlapsLocked(newStart uint64, newNum uint16) {
+	newEnd := newStart + uint64(newNum)
+
+	keys := make([]uint64, 0, len(ubs.persistedExtents))
+	for k := range ubs.persistedExtents {
+		keys = append(keys, k)
+	}
+
+	for _, key := range keys {
+		existing := ubs.persistedExtents[key]
+		exStart, exEnd := existing.startBlock, existing.end()
+		if exEnd <= newStart || exStart >= newEnd {
+			continue // no overlap
+		}
+		delete(ubs.persistedExtents, key)
+
+		// Surviving head: [exStart, newStart)
+		if exStart < newStart {
+			headNum := newStart - exStart
+			head := existing
+			head.numBlocks = uint16(headNum) //nolint:gosec // G115: headNum = newStart-exStart < existing.numBlocks (uint16) since exStart < newStart < exEnd
+			if len(existing.seqNums) > 0 {
+				head.seqNums = append([]uint64(nil), existing.seqNums[:headNum]...)
+			}
+			ubs.persistedExtents[head.startBlock] = head
+		}
+
+		// Surviving tail: [newEnd, exEnd)
+		if exEnd > newEnd {
+			tailOffsetBlocks := newEnd - exStart
+			tailNum := exEnd - newEnd
+			tail := existing
+			tail.startBlock = newEnd
+			tail.numBlocks = uint16(tailNum)                                //nolint:gosec // G115: tailNum = exEnd-newEnd < existing.numBlocks (uint16) since newStart < newEnd < exEnd
+			tail.objectOffset = existing.offsetAt(uint16(tailOffsetBlocks)) //nolint:gosec // G115: tailOffsetBlocks = newEnd-exStart < existing.numBlocks (uint16) since exStart < newEnd < exEnd
+			if len(existing.seqNums) > 0 {
+				tail.seqNums = append([]uint64(nil), existing.seqNums[tailOffsetBlocks:]...)
+			}
+			ubs.persistedExtents[tail.startBlock] = tail
+		}
+	}
 }
 
 // ReadBlock returns the block entry for a given block number
@@ -126,10 +259,17 @@ func (ubs *UnifiedBlockStore) ReadBlock(blockNum uint64) (*BlockEntry, bool) {
 	}
 	shard.mu.RUnlock()
 	ubs.stats.Reads.Add(1)
-	if !exists {
-		return nil, false
+	if exists {
+		return &snapshot, true
 	}
-	return &snapshot, true
+
+	// Not in the sharded index -- it may have been coalesced into the
+	// persisted-extent index after upload. Resolve by range instead of
+	// treating a miss here as "never written".
+	if pe, ok := ubs.readPersisted(blockNum); ok {
+		return &pe, true
+	}
+	return nil, false
 }
 
 // ReadSingle is the fast path for single-block reads (most common case)
@@ -137,26 +277,37 @@ func (ubs *UnifiedBlockStore) ReadBlock(blockNum uint64) (*BlockEntry, bool) {
 func (ubs *UnifiedBlockStore) ReadSingle(blockNum uint64) ([]byte, BlockState, error) {
 	shard := ubs.getShard(blockNum)
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
+	entry, exists := shard.entries[blockNum]
+	var snapshot BlockEntry
+	if exists {
+		snapshot = *entry
+	}
+	shard.mu.RUnlock()
 
 	ubs.stats.Reads.Add(1)
 
-	entry, exists := shard.entries[blockNum]
 	if !exists {
+		// Not in the sharded index -- it may have been coalesced into the
+		// persisted-extent index after upload. Resolve by range instead of
+		// treating a miss here as "never written".
+		if _, ok := ubs.readPersisted(blockNum); ok {
+			ubs.stats.BackendReads.Add(1)
+			return nil, BlockStatePersisted, nil // Caller fetches from backend
+		}
 		ubs.stats.CacheMiss.Add(1)
 		return nil, BlockStateEmpty, ErrZeroBlock
 	}
 
-	switch entry.State {
+	switch snapshot.State {
 	case BlockStateHot:
 		ubs.stats.HotReads.Add(1)
-		return entry.Data, entry.State, nil
+		return snapshot.Data, snapshot.State, nil
 	case BlockStatePending:
 		ubs.stats.PendReads.Add(1)
-		return entry.Data, entry.State, nil
+		return snapshot.Data, snapshot.State, nil
 	case BlockStateCached:
 		ubs.stats.CacheHits.Add(1)
-		return entry.Data, entry.State, nil
+		return snapshot.Data, snapshot.State, nil
 	case BlockStatePersisted:
 		ubs.stats.BackendReads.Add(1)
 		return nil, BlockStatePersisted, nil // Caller fetches from backend
@@ -189,6 +340,13 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 
 	ubs.stats.Reads.Add(1)
 	if !exists {
+		// Not in the sharded index -- may have been coalesced into the
+		// persisted-extent index after upload. Resolve by range instead of
+		// treating a miss as "never written".
+		if pe, ok := ubs.readPersisted(blockNum); ok {
+			ubs.stats.BackendReads.Add(1)
+			return pe, true
+		}
 		ubs.stats.CacheMiss.Add(1)
 		return snapshot, false
 	}
@@ -317,6 +475,94 @@ func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset ui
 	return false
 }
 
+// MarkPersistedRange transitions a consecutive run of blocks from Pending to
+// Persisted in one call, coalescing eligible sub-runs into persistedExtent
+// entries instead of leaving one BlockEntry per block, so the index stays
+// O(extents) rather than O(blocks written). blocks and seqNums must be the
+// same length, in ascending block-number order; seqNums[i] is the SeqNum
+// blocks[i] was sealed under. objectOffset is the ObjectOffset of blocks[0];
+// stride is the on-disk byte distance between consecutive blocks in the
+// chunk. A block is only transitioned if still Pending with a matching
+// SeqNum, so one superseded by a newer write is left untouched. Extent
+// entries are inserted (pass 2) before shard entries are removed (pass 3),
+// so no reader ever observes a block as unwritten mid-transition. Returns
+// the number of blocks transitioned.
+func (ubs *UnifiedBlockStore) MarkPersistedRange(blocks []uint64, objectID uint64, objectOffset uint32, stride uint32, seqNums []uint64) int {
+	if len(blocks) == 0 || len(blocks) != len(seqNums) {
+		return 0
+	}
+
+	// Pass 1 (read-only): predict which blocks are still eligible. A
+	// concurrent write can invalidate a prediction before pass 3 finalizes
+	// it; pass 3 re-checks under lock before actually removing anything.
+	eligible := make([]bool, len(blocks))
+	anyEligible := false
+	for i, b := range blocks {
+		shard := ubs.getShard(b)
+		shard.mu.RLock()
+		entry, ok := shard.entries[b]
+		if ok && entry.State == BlockStatePending && entry.SeqNum == seqNums[i] {
+			eligible[i] = true
+			anyEligible = true
+		}
+		shard.mu.RUnlock()
+	}
+	if !anyEligible {
+		return 0
+	}
+
+	// Pass 2: make the persisted location resolvable via the extent index
+	// for every predicted-eligible, block-number-consecutive sub-run, before
+	// pass 3 removes anything from the sharded index.
+	ubs.persistedMu.Lock()
+	i := 0
+	for i < len(blocks) {
+		if !eligible[i] {
+			i++
+			continue
+		}
+		j := i
+		for j < len(blocks) && eligible[j] && j-i < 65535 && blocks[j] == blocks[i]+uint64(j-i) { //nolint:gosec // G115: j-i bounded by the 65535 loop guard before conversion
+			j++
+		}
+		run := persistedExtent{
+			startBlock:   blocks[i],
+			numBlocks:    uint16(j - i), //nolint:gosec // G115: j-i < 65535 by the loop guard above
+			objectID:     objectID,
+			objectOffset: objectOffset + uint32(i)*stride,
+			stride:       stride,
+			seqNums:      append([]uint64(nil), seqNums[i:j]...),
+		}
+		ubs.fractureOverlapsLocked(run.startBlock, run.numBlocks)
+		ubs.persistedExtents[run.startBlock] = run
+		i = j
+	}
+	ubs.persistedMu.Unlock()
+
+	// Pass 3: finalize by removing the per-block shard entries, re-checking
+	// eligibility under lock since a concurrent rewrite may have superseded a
+	// block after pass 1 sampled it. A raced block is left in the sharded
+	// index as-is (newer write wins); its stale pass-2 extent entry is
+	// corrected next time it is persisted.
+	transitioned := 0
+	for i, b := range blocks {
+		if !eligible[i] {
+			continue
+		}
+		shard := ubs.getShard(b)
+		shard.mu.Lock()
+		entry, ok := shard.entries[b]
+		if ok && entry.State == BlockStatePending && entry.SeqNum == seqNums[i] {
+			delete(shard.entries, b)
+			transitioned++
+		}
+		shard.mu.Unlock()
+	}
+
+	ubs.stats.Writes.Add(uint64(transitioned))
+	return transitioned
+}
+
 // SetPersisted directly sets a block to Persisted state with object info
 // Used for loading block mappings from checkpoints.
 func (ubs *UnifiedBlockStore) SetPersisted(blockNum, objectID uint64, offset uint32, seqNum uint64) {
@@ -337,6 +583,41 @@ func (ubs *UnifiedBlockStore) SetPersisted(blockNum, objectID uint64, offset uin
 		entry.ObjectID = objectID
 		entry.ObjectOffset = offset
 		entry.Data = nil
+	}
+}
+
+// SetPersistedRange is SetPersisted's bulk, extent-coalescing counterpart: it
+// installs a consecutive run of blocks as Persisted as a single
+// persistedExtent, instead of one shard entry per block. Used to reconstruct
+// BlockStore state from an on-disk checkpoint at load time. Unlike
+// MarkPersistedRange, there is no prior shard state to validate — the
+// checkpoint is authoritative, so this unconditionally installs the run,
+// fracturing away any overlapping extent.
+func (ubs *UnifiedBlockStore) SetPersistedRange(blocks []uint64, objectID uint64, objectOffset uint32, stride uint32, seqNums []uint64) {
+	if len(blocks) == 0 || len(blocks) != len(seqNums) {
+		return
+	}
+
+	ubs.persistedMu.Lock()
+	defer ubs.persistedMu.Unlock()
+
+	i := 0
+	for i < len(blocks) {
+		j := i + 1
+		for j < len(blocks) && j-i < 65535 && blocks[j] == blocks[i]+uint64(j-i) { //nolint:gosec // G115: j-i bounded by the 65535 loop guard before conversion
+			j++
+		}
+		run := persistedExtent{
+			startBlock:   blocks[i],
+			numBlocks:    uint16(j - i), //nolint:gosec // G115: j-i < 65535 by the loop guard above
+			objectID:     objectID,
+			objectOffset: objectOffset + uint32(i)*stride,
+			stride:       stride,
+			seqNums:      append([]uint64(nil), seqNums[i:j]...),
+		}
+		ubs.fractureOverlapsLocked(run.startBlock, run.numBlocks)
+		ubs.persistedExtents[run.startBlock] = run
+		i = j
 	}
 }
 
@@ -454,20 +735,30 @@ func (ubs *UnifiedBlockStore) GetPendingBlocks() []Block {
 func (ubs *UnifiedBlockStore) GetPersistedInfo(blockNum uint64) (objectID uint64, offset uint32, ok bool) {
 	shard := ubs.getShard(blockNum)
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
 	entry, exists := shard.entries[blockNum]
-	if !exists {
+	var snapshot BlockEntry
+	if exists {
+		snapshot = *entry
+	}
+	shard.mu.RUnlock()
+
+	if exists {
+		if snapshot.State == BlockStatePersisted || snapshot.State == BlockStateCached {
+			return snapshot.ObjectID, snapshot.ObjectOffset, true
+		}
 		return 0, 0, false
 	}
 
-	if entry.State == BlockStatePersisted || entry.State == BlockStateCached {
-		return entry.ObjectID, entry.ObjectOffset, true
+	// Not in the sharded index -- resolve via the coalesced persisted-extent
+	// index instead of treating a miss as "not persisted".
+	if pe, ok := ubs.readPersisted(blockNum); ok {
+		return pe.ObjectID, pe.ObjectOffset, true
 	}
 	return 0, 0, false
 }
 
-// Count returns the total number of blocks across all shards.
+// Count returns the total number of blocks tracked, across the sharded index
+// and the coalesced persisted-extent index.
 func (ubs *UnifiedBlockStore) Count() int {
 	total := 0
 	for i := range NumShards {
@@ -476,10 +767,27 @@ func (ubs *UnifiedBlockStore) Count() int {
 		total += len(shard.entries)
 		shard.mu.RUnlock()
 	}
+
+	ubs.persistedMu.RLock()
+	for _, pe := range ubs.persistedExtents {
+		total += int(pe.numBlocks)
+	}
+	ubs.persistedMu.RUnlock()
+
 	return total
 }
 
-// CountByState returns the count of blocks in each state.
+// PersistedExtentCount returns the number of coalesced extent entries in the
+// persisted-extent index -- O(extents), not O(blocks persisted). Exposed for
+// tests/metrics that need to observe the coalescing directly.
+func (ubs *UnifiedBlockStore) PersistedExtentCount() int {
+	ubs.persistedMu.RLock()
+	defer ubs.persistedMu.RUnlock()
+	return len(ubs.persistedExtents)
+}
+
+// CountByState returns the count of blocks in each state, across the sharded
+// index and the coalesced persisted-extent index.
 func (ubs *UnifiedBlockStore) CountByState() map[BlockState]int {
 	counts := make(map[BlockState]int)
 
@@ -492,10 +800,16 @@ func (ubs *UnifiedBlockStore) CountByState() map[BlockState]int {
 		shard.mu.RUnlock()
 	}
 
+	ubs.persistedMu.RLock()
+	for _, pe := range ubs.persistedExtents {
+		counts[BlockStatePersisted] += int(pe.numBlocks)
+	}
+	ubs.persistedMu.RUnlock()
+
 	return counts
 }
 
-// Clear removes all entries from the store.
+// Clear removes all entries from the store, including the persisted-extent index.
 func (ubs *UnifiedBlockStore) Clear() {
 	for i := range NumShards {
 		shard := ubs.shards[i]
@@ -503,17 +817,31 @@ func (ubs *UnifiedBlockStore) Clear() {
 		shard.entries = make(map[uint64]*BlockEntry)
 		shard.mu.Unlock()
 	}
+
+	ubs.persistedMu.Lock()
+	ubs.persistedExtents = make(map[uint64]persistedExtent)
+	ubs.persistedMu.Unlock()
 }
 
-// Delete removes a specific block from the store.
+// Delete removes a specific block from the store, whether it lives in the
+// sharded index or as part of a coalesced persisted extent (in the latter
+// case, fracturing that one block out of its extent).
 func (ubs *UnifiedBlockStore) Delete(blockNum uint64) bool {
 	shard := ubs.getShard(blockNum)
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
 	_, exists := shard.entries[blockNum]
 	if exists {
 		delete(shard.entries, blockNum)
+	}
+	shard.mu.Unlock()
+	if exists {
+		return true
+	}
+
+	ubs.persistedMu.Lock()
+	defer ubs.persistedMu.Unlock()
+	if _, ok := ubs.findPersistedExtentLocked(blockNum); ok {
+		ubs.fractureOverlapsLocked(blockNum, 1)
 		return true
 	}
 	return false

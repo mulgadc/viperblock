@@ -2,10 +2,13 @@ package file
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mulgadc/viperblock/telemetry"
@@ -56,6 +59,19 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 		outcome = "error"
 	}
 	telemetry.RecordBackendIO(ctx, "write", "file", backend.config.VolumeName, outcome, writeLen(headers, data), time.Since(start))
+	return err
+}
+
+// classifyWriteErr maps a local write failure into types.ErrNoSpace when the
+// underlying syscall reports ENOSPC (disk full). Any other error passes
+// through unchanged.
+func classifyWriteErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
+	}
 	return err
 }
 
@@ -196,6 +212,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	file, err := os.Create(filename)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create chunk file", "error", err)
 		return err
 	}
@@ -204,6 +221,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	_, err = file.Write(*headers)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write headers", "error", err)
 		return err
 	}
@@ -211,6 +229,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	_, err = file.Write(*data)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write data", "error", err)
 		return err
 	}
@@ -218,6 +237,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	err = file.Close()
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to close file", "error", err)
 		return err
 	}
@@ -278,6 +298,7 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 
 	file, err := os.Create(filename)
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create file", "error", err)
 		return err
 	}
@@ -287,7 +308,7 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 			if cerr := file.Close(); cerr != nil {
 				backend.log.Warn("failed to close file during cleanup", "error", cerr)
 			}
-			return err
+			return classifyWriteErr(err)
 		}
 	}
 
@@ -296,11 +317,91 @@ func (backend *Backend) WriteTo(volumeName string, fileType types.FileType, obje
 			if cerr := file.Close(); cerr != nil {
 				backend.log.Warn("failed to close file during cleanup", "error", cerr)
 			}
-			return err
+			return classifyWriteErr(err)
 		}
 	}
 
-	return file.Close()
+	return classifyWriteErr(file.Close())
+}
+
+// Delete removes the object identified by fileType/objectId from this
+// backend's own volume. os.Remove already reports errors.Is(err,
+// os.ErrNotExist) for a missing object, so no wrapping is needed here.
+func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err error) {
+	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+	return os.Remove(filename)
+}
+
+func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
+	start := time.Now()
+	err = backend.Delete(fileType, objectId)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "delete", "file", backend.config.VolumeName, outcome, 0, time.Since(start))
+	return err
+}
+
+// ListPrefixes returns the directory entries under BaseDir whose name has
+// prefix, one level deep. BaseDir is the backend's root, not this backend's
+// own VolumeName directory, so sibling volumes/snapshots are visible too.
+func (backend *Backend) ListPrefixes(prefix string) (names []string, err error) {
+	entries, err := os.ReadDir(backend.config.BaseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), prefix) {
+			names = append(names, entry.Name())
+		}
+	}
+	return names, nil
+}
+
+func (backend *Backend) ListPrefixesCtx(_ context.Context, prefix string) (names []string, err error) {
+	return backend.ListPrefixes(prefix)
+}
+
+// ListObjects returns every regular file's key (path relative to BaseDir)
+// under prefix, walked recursively. Missing directories are not an error,
+// matching ListPrefixes.
+func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
+	root := filepath.Join(backend.config.BaseDir, prefix)
+
+	walkErr := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(backend.config.BaseDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		keys = append(keys, filepath.ToSlash(rel))
+		return nil
+	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		return nil, walkErr
+	}
+
+	return keys, nil
+}
+
+func (backend *Backend) ListObjectsCtx(_ context.Context, prefix string) (keys []string, err error) {
+	return backend.ListObjects(prefix)
 }
 
 func (backend *Backend) GetHost() string {

@@ -332,6 +332,27 @@ WAL entries are consolidated into 4 MB chunk files for efficient backend storage
 
 Chunk files are stored at `{volume}/chunks/chunk.{objectId:08d}.bin` and are immutable once written.
 
+## Chunk Garbage Collection
+
+A chunk holds many blocks (`ObjBlockSize`, multi-MB) behind one `BlockLookup` entry per logical block (`ObjectID` field). Overwriting a block repoints its map entry at a new chunk; the old chunk is left on the backend. A chunk is **wholly unreferenced** once no live map entry names its `ObjectID` anywhere — every block it ever held has been superseded. Because chunk IDs are minted from a monotonic counter (`vb.ObjectNum`) and never reused, once a chunk is wholly unreferenced it stays that way for the rest of the volume's life: no future write can ever re-reference it. Chunk GC deletes exactly this class of object. It does not compact **partially**-garbage chunks (some blocks live, some superseded) — that requires read-modify-write repacking and is a separate, future phase.
+
+**Reference tracking.** `VB` maintains `gcRefcount map[uint64]uint64`, one entry per chunk `ObjectID` currently named by at least one `BlockLookup`, counting how many block entries name it. `createChunkFile` increments the new chunk's count and decrements the superseded chunk's count for every block it repoints; a count reaching zero marks the chunk swept-candidate (the entry is left in the map at zero rather than deleted, so a sweep can find it). `parseBlockCheckpoint` rebuilds this table from scratch on every checkpoint load, so it is always derivable from the current live map and needs no separate persistence. Only maintained when `GCEnabled` is true.
+
+**Sweep timing.** Deleting a chunk is only safe once the durable checkpoint that stops referencing it has landed — otherwise a crash regresses recovery to an older checkpoint that still points at a now-deleted chunk. The sweep therefore only ever runs immediately after a successful `SaveLiveCheckpointCtx` (as the last step of `DrainToBackendCtx`), never from `createChunkFile` (which runs under the parallel chunk-upload pool and cannot see a checkpoint-durable, coalesced view of the map — the same reason per-chunk live-checkpoint writes were removed from that path). It runs from the existing chunk-uploader goroutine on its own `GCInterval` ticker (default 5 minutes, decoupled from the 30-second `ChunkUploadInterval`; `<= 0` disables the periodic sweep), plus once more on `Close`.
+
+**Watermark clamp.** A sweep captures `watermark := vb.ObjectNum.Load()` once, at mark time, and only considers `ObjectID < watermark`. A chunk minted after that point is structurally excluded, without needing a mutex between writers and the sweep: unreferenced-is-terminal means a chunk that was live at mark time is still correctly excluded (nonzero refcount) at sweep time, and a chunk minted after mark time fails the watermark check outright.
+
+**The snapshot-ancestry hazard.** Snapshots do not copy data — `CreateSnapshot` freezes a checkpoint that references the source volume's existing chunks in place, and clone reads fetch those chunks directly from the source volume's prefix. A GC that only consults the live map would delete exactly the chunks a snapshot (or any clone/AMI descended from it) still needs the moment the source volume supersedes them — silent, cross-volume data loss. Two guards close this:
+
+- **Own-prefix only, structurally.** `Backend.Delete` has no `DeleteTo`/`DeleteFrom` cross-volume form; the interface makes it impossible for a volume to delete another volume's chunk, by construction.
+- **Binary snapshot-existence guard.** Before a volume's first sweep, `ensureGCSnapshotSafe` lists every top-level `snap-*` prefix in the backend (snapshots are NOT nested under the source volume's own prefix — they are independently-keyed, top-level siblings) and reads each candidate's `config.json` (via `StateBody`, which needs no decryption key — the metadata envelope authenticates, it does not encrypt) to compare `SourceVolumeName`. If **any** existing snapshot references this volume, GC is disabled entirely for it — no arithmetic floor derived from snapshot state, just a binary yes/no. The result is cached for the process lifetime once a scan succeeds. If `CreateSnapshot` is ever called on a GC-enabled instance afterward, GC is latched off permanently for that instance regardless of scan timing.
+
+This guard is deliberately conservative and does not attempt to distinguish "a snapshot exists but doesn't reference the chunks about to be swept" — any existing snapshot of the volume disables GC for it outright. It also does not cover a **different process** creating a snapshot of this volume after the scan already ran and cached "safe" — that cross-process window has no fix in this phase, which is why `GCEnabled` defaults to `false` and is opt-in per volume, only for volumes an operator can establish have no snapshot descendants (an AMI-derived boot volume is typically such a volume: it has a parent, but no snapshots *of itself*).
+
+**Numbered-checkpoint floor.** `LoadLiveCheckpointCtx` falls back to the older, numbered checkpoint (`checkpoints/blocks.%08d.bin`) when the live checkpoint is unreadable. That numbered checkpoint references chunks that may already be zero-refcount in the current live map. `ensureGCFloor` reads the current `WallNum`'s numbered checkpoint once per process lifetime and sets `GCFloor` to one past its highest referenced `ObjectID`, so GC never deletes anything that fallback path could still need. Net candidate predicate: **`GCFloor <= ObjectID < watermark` AND `refcount == 0`**.
+
+`Reset()` (which re-issues `ObjectID` 0) and `CreateSnapshot` both latch GC off permanently for the instance they run on, since both invalidate an invariant the design depends on (ID reuse, and snapshot ancestry, respectively).
+
 ---
 
 # 8. Block Mapping
@@ -580,6 +601,7 @@ The plugin implements the full nbdkit interface:
 | `base_dir` | Local storage directory |
 | `cache_size` | LRU cache size (percentage of system memory) |
 | `shardwal` | Enable sharded WAL (`true`/`false`) |
+| `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `false`) |
 
 ---
 

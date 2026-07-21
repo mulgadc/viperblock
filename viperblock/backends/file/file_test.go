@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/mulgadc/viperblock/types"
@@ -150,4 +153,202 @@ func TestSetConfigPanicsOnWrongConfigType(t *testing.T) {
 	assert.Panics(t, func() {
 		backend.SetConfig("not-a-file-config")
 	})
+}
+
+func TestDeleteAndDeleteCtx(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte{}
+	data := []byte("chunk-data")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 0, &headers, &data))
+	require.NoError(t, backend.Write(types.FileTypeChunk, 1, &headers, &data))
+
+	// Delete removes the object; a subsequent read fails with ErrNotExist.
+	require.NoError(t, backend.Delete(types.FileTypeChunk, 0))
+	_, err := backend.Read(types.FileTypeChunk, 0, 0, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	// The sibling object is untouched.
+	got, err := backend.Read(types.FileTypeChunk, 1, 0, uint32(len(data)))
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
+
+	// DeleteCtx behaves identically for a fresh object.
+	require.NoError(t, backend.DeleteCtx(context.Background(), types.FileTypeChunk, 1))
+	_, err = backend.Read(types.FileTypeChunk, 1, 0, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestDeleteAlreadyMissingReturnsErrNotExist(t *testing.T) {
+	backend := newTestBackend(t)
+
+	// Matches the s3 backend's wrapNotFound contract that chunk GC's sweep
+	// relies on to treat "already gone" as success.
+	err := backend.Delete(types.FileTypeChunk, 42)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	err = backend.DeleteCtx(context.Background(), types.FileTypeChunk, 42)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestListPrefixesAndListPrefixesCtx(t *testing.T) {
+	backend := newTestBackend(t)
+
+	// ListPrefixes lists directories under BaseDir, not under the backend's
+	// own VolumeName, so write two sibling "volumes" directly under BaseDir.
+	headers := []byte{}
+	data := []byte("x")
+	require.NoError(t, backend.WriteTo("snap-alpha", types.FileTypeConfig, 0, &headers, &data))
+	require.NoError(t, backend.WriteTo("snap-beta", types.FileTypeConfig, 0, &headers, &data))
+	require.NoError(t, backend.WriteTo("other-vol", types.FileTypeConfig, 0, &headers, &data))
+
+	names, err := backend.ListPrefixes("snap-")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"snap-alpha", "snap-beta"}, names)
+
+	names, err = backend.ListPrefixesCtx(context.Background(), "snap-")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"snap-alpha", "snap-beta"}, names)
+}
+
+func TestListPrefixesMissingBaseDirIsEmptyNotError(t *testing.T) {
+	backend := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: filepath.Join(t.TempDir(), "does-not-exist")})
+
+	names, err := backend.ListPrefixes("snap-")
+	require.NoError(t, err)
+	assert.Empty(t, names)
+}
+
+func TestListObjectsAndListObjectsCtx(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte{}
+	data := []byte("chunk")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 0, &headers, &data))
+	require.NoError(t, backend.Write(types.FileTypeChunk, 1, &headers, &data))
+	require.NoError(t, backend.Write(types.FileTypeChunk, 2, &headers, &data))
+
+	keys, err := backend.ListObjects(backend.config.VolumeName + "/chunks/")
+	require.NoError(t, err)
+	assert.Len(t, keys, 3)
+	for _, k := range keys {
+		assert.Contains(t, k, "chunks/chunk.")
+	}
+
+	keys, err = backend.ListObjectsCtx(context.Background(), backend.config.VolumeName+"/chunks/")
+	require.NoError(t, err)
+	assert.Len(t, keys, 3)
+
+	// Deleting one object drops it from a subsequent listing.
+	require.NoError(t, backend.Delete(types.FileTypeChunk, 1))
+	keys, err = backend.ListObjects(backend.config.VolumeName + "/chunks/")
+	require.NoError(t, err)
+	assert.Len(t, keys, 2)
+}
+
+func TestListObjectsMissingPrefixIsEmptyNotError(t *testing.T) {
+	backend := newTestBackend(t)
+
+	keys, err := backend.ListObjects("no-such-volume/chunks/")
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+}
+
+// TestClassifyWriteErr pins ENOSPC detection at any wrap depth, and that an
+// unrelated syscall.Errno passes through unclassified.
+func TestClassifyWriteErr(t *testing.T) {
+	cases := []struct {
+		name        string
+		in          error
+		wantNoSpace bool
+	}{
+		{
+			name:        "nil_passes_through",
+			in:          nil,
+			wantNoSpace: false,
+		},
+		{
+			name:        "bare_enospc_maps_to_no_space",
+			in:          syscall.ENOSPC,
+			wantNoSpace: true,
+		},
+		{
+			name: "path_error_wrapped_enospc_maps_to_no_space",
+			in: &os.PathError{
+				Op:   "write",
+				Path: "/tmp/some/chunk.bin",
+				Err:  syscall.ENOSPC,
+			},
+			wantNoSpace: true,
+		},
+		{
+			name:        "unrelated_errno_stays_unclassified",
+			in:          syscall.EACCES,
+			wantNoSpace: false,
+		},
+		{
+			name:        "unrelated_error_stays_unclassified",
+			in:          os.ErrPermission,
+			wantNoSpace: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyWriteErr(tc.in)
+			if tc.in == nil {
+				assert.NoError(t, got)
+				return
+			}
+			assert.Error(t, got)
+			if tc.wantNoSpace {
+				assert.ErrorIs(t, got, types.ErrNoSpace,
+					"want types.ErrNoSpace for %v, got %v", tc.in, got)
+			} else {
+				assert.NotErrorIs(t, got, types.ErrNoSpace,
+					"unexpected types.ErrNoSpace for %v", tc.in)
+			}
+		})
+	}
+}
+
+// TestWriteRealDiskFullMapsToNoSpace exercises Write's real error path against
+// a size-capped tmpfs. Requires CAP_SYS_ADMIN to mount tmpfs; skips rather than
+// failing when unavailable.
+func TestWriteRealDiskFullMapsToNoSpace(t *testing.T) {
+	mountPoint := t.TempDir()
+
+	if err := syscall.Mount("tmpfs", mountPoint, "tmpfs", 0, "size=65536"); err != nil {
+		t.Skipf("cannot mount a size-capped tmpfs (need CAP_SYS_ADMIN): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Unmount(mountPoint, 0)
+	})
+
+	backend := New(FileConfig{
+		VolumeName: "enospc-vol",
+		VolumeSize: 1024 * 1024 * 1024,
+		BaseDir:    mountPoint,
+	})
+	require.NoError(t, backend.Init())
+
+	headers := []byte("hdr")
+	data := make([]byte, 8192)
+
+	var writeErr error
+	for i := range uint64(64) {
+		if writeErr = backend.Write(types.FileTypeChunk, i, &headers, &data); writeErr != nil {
+			break
+		}
+	}
+
+	require.Error(t, writeErr, "writes should eventually exhaust the 64KiB tmpfs")
+	assert.ErrorIs(t, writeErr, types.ErrNoSpace,
+		"a real disk-full write error must classify as types.ErrNoSpace, got: %v", writeErr)
+	assert.ErrorIs(t, writeErr, syscall.ENOSPC,
+		"classification must preserve the underlying syscall.ENOSPC")
 }

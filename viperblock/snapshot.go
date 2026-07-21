@@ -63,6 +63,14 @@ type InheritedLayer struct {
 // under {snapshotID}/. No data is copied -- the snapshot references the
 // source volume's existing chunk files.
 func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
+	// Latch chunk GC off permanently the moment a snapshot is created,
+	// regardless of outcome below. This closes a race ensureGCSnapshotSafe
+	// can't: a snapshot created while a sweep is already in flight would
+	// otherwise stay invisible to that sweep's cached result.
+	if vb.GCEnabled && vb.gcLatchedOff.CompareAndSwap(false, true) {
+		vb.logger().Warn("chunk GC: disabled permanently, CreateSnapshot called on this volume", "volume", vb.VolumeName, "snapshotID", snapshotID)
+	}
+
 	vb.logger().Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
 
 	// 1. Flush hot writes to WAL and persist to chunks.
@@ -101,10 +109,16 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// For COW clones (vb.BaseBlockMap != nil), also write a flat inherited-blocks
 	// section so the snapshot is self-contained with no ancestry chain to walk.
 	vb.BlocksToObject.mu.RLock()
-	blockCount := uint64(len(vb.BlocksToObject.BlockLookup))
+	// BlockCount must be the physical block count, not the number of
+	// coalesced map entries — sum each entry's NumBlocks rather than len().
+	var blockCount uint64
 	checkpoint := vb.BlockToObjectWALHeader()
+	stride := vb.blockStride()
 	for _, block := range vb.BlocksToObject.BlockLookup {
-		checkpoint = append(checkpoint, vb.writeBlockWalChunk(&block)...)
+		blockCount += uint64(block.NumBlocks)
+		for _, single := range expandBlockLookup(block, stride) {
+			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
+		}
 	}
 	vb.BlocksToObject.mu.RUnlock()
 
@@ -427,11 +441,15 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 	}
 
 	// Build a seen-set from own blocks so inherited entries only include blocks
-	// not already covered by the volume's own delta.
+	// not already covered by the volume's own delta. Own entries may be
+	// coalesced runs (NumBlocks > 1), so expand each entry's full range into
+	// the seen-set rather than just its map key (StartBlock).
 	seen := make(map[uint64]struct{}, len(vb.BlocksToObject.BlockLookup))
 	vb.BlocksToObject.mu.RLock()
-	for k := range vb.BlocksToObject.BlockLookup {
-		seen[k] = struct{}{}
+	for _, bl := range vb.BlocksToObject.BlockLookup {
+		for i := uint16(0); i < bl.NumBlocks; i++ {
+			seen[bl.StartBlock+uint64(i)] = struct{}{}
+		}
 	}
 	vb.BlocksToObject.mu.RUnlock()
 

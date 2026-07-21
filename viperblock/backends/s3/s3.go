@@ -11,17 +11,34 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// poolPressureHeader is the response header predastore sets on a successful
+// PutObject once its storage pool nears FULL (FULL itself is instead
+// signalled via HTTP 507/503, see classifyWriteErr).
+const poolPressureHeader = "X-Predastore-Pool-Pressure"
+
+// poolPressureNearFull is the only header value this backend acts on.
+const poolPressureNearFull = "nearfull"
+
+// putObjectOperationName scopes the pool-pressure observer to PutObject
+// responses only, via awsmiddleware.GetOperationName.
+const putObjectOperationName = "PutObject"
 
 // schemeRE matches a leading URI scheme.
 var schemeRE = regexp.MustCompile("^[^:]+://")
@@ -61,6 +78,26 @@ func wrapNotFound(err error) error {
 	return err
 }
 
+// classifyWriteErr maps a PutObject error into types.ErrNoSpace when the HTTP
+// status is 507 (Insufficient Storage) or 503 (Service Unavailable) --
+// predastore's two signals for "out of space". Any other error passes
+// through unchanged.
+func classifyWriteErr(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) {
+		switch respErr.HTTPStatusCode() {
+		case http.StatusInsufficientStorage, http.StatusServiceUnavailable:
+			return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
+		}
+	}
+
+	return err
+}
+
 // 2. Define config structs.
 type S3Config struct {
 	VolumeName string
@@ -82,6 +119,11 @@ type S3Config struct {
 type S3Backend struct {
 	config S3Config
 	log    *slog.Logger
+
+	// backendNearFull mirrors the last observed X-Predastore-Pool-Pressure
+	// header from a PutObject response. Updated by the deserialize middleware
+	// registered in InitCtx; read via NearFull().
+	backendNearFull atomic.Bool
 }
 
 type Backend struct {
@@ -107,6 +149,41 @@ func (backend *Backend) SetLogger(logger *slog.Logger) {
 		logger = slog.Default()
 	}
 	backend.log = logger
+}
+
+// NearFull reports whether the most recently observed PutObject response
+// carried X-Predastore-Pool-Pressure: nearfull, so callers can back off
+// before the backend hits FULL. False until a PutObject has been observed.
+func (backend *Backend) NearFull() bool {
+	return backend.backendNearFull.Load()
+}
+
+// newPoolPressureMiddleware returns a deserialize-step middleware that records
+// whether each PutObject response carries X-Predastore-Pool-Pressure: nearfull
+// into backend.backendNearFull. Split out so tests can exercise it directly.
+func (backend *Backend) newPoolPressureMiddleware() middleware.DeserializeMiddleware {
+	return middleware.DeserializeMiddlewareFunc("PoolPressureObserver",
+		func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (
+			middleware.DeserializeOutput, middleware.Metadata, error,
+		) {
+			out, metadata, err := next.HandleDeserialize(ctx, in)
+
+			// Scope to PutObject only: GET/List responses carry no pool-pressure
+			// semantics and must not clobber the flag a concurrent PutObject set.
+			if awsmiddleware.GetOperationName(ctx) != putObjectOperationName {
+				return out, metadata, err
+			}
+
+			// The header is only set on a 2xx response; a failed PutObject
+			// (including the 507/503 FULL path) resolves to "not nearfull" here.
+			nearFull := false
+			if resp, ok := out.RawResponse.(*smithyhttp.Response); ok && resp != nil {
+				nearFull = resp.Header.Get(poolPressureHeader) == poolPressureNearFull
+			}
+			backend.backendNearFull.Store(nearFull)
+
+			return out, metadata, err
+		})
 }
 
 func (backend *Backend) Init() error {
@@ -182,6 +259,13 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 		Region:                       backend.config.Region,
 		HTTPClient:                   client,
 		Credentials:                  credentials.NewStaticCredentialsProvider(backend.config.AccessKey, backend.config.SecretKey, ""),
+		// Registers the pool-pressure observer after the SDK's own deserialize
+		// middleware, so RawResponse is already populated when it runs.
+		APIOptions: []func(*middleware.Stack) error{
+			func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(backend.newPoolPressureMiddleware(), middleware.After)
+			},
+		},
 	})
 
 	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -305,6 +389,7 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	_, err = backend.config.s3Client.PutObject(ctx, object)
 
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
 	}
@@ -382,11 +467,123 @@ func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileT
 
 	_, err = backend.config.s3Client.PutObject(ctx, object)
 	if err != nil {
+		err = classifyWriteErr(err)
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
 		return err
 	}
 
 	return nil
+}
+
+func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err error) {
+	return backend.DeleteCtx(context.Background(), fileType, objectId)
+}
+
+// DeleteCtx removes the object identified by fileType/objectId from this
+// backend's own volume. wrapNotFound is required here because predastore,
+// unlike real S3, errors on deleting an already-missing key.
+func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "delete", "s3", backend.config.VolumeName, outcome, 0, time.Since(start))
+	}()
+
+	if backend.config.s3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+
+	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
+
+	_, err = backend.config.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(filename),
+	})
+	if err != nil {
+		return wrapNotFound(err)
+	}
+	return nil
+}
+
+func (backend *Backend) ListPrefixes(prefix string) (names []string, err error) {
+	return backend.ListPrefixesCtx(context.Background(), prefix)
+}
+
+// ListPrefixesCtx returns the top-level "directory" names under prefix,
+// paginating through all results. Bucket-wide, not scoped to this backend's
+// own VolumeName.
+func (backend *Backend) ListPrefixesCtx(ctx context.Context, prefix string) (names []string, err error) {
+	if backend.config.s3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+
+	var continuationToken *string
+	for {
+		out, listErr := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(backend.config.Bucket),
+			Prefix:            aws.String(prefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: continuationToken,
+		})
+		if listErr != nil {
+			return nil, listErr
+		}
+
+		for _, cp := range out.CommonPrefixes {
+			if cp.Prefix == nil {
+				continue
+			}
+			names = append(names, strings.TrimSuffix(*cp.Prefix, "/"))
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+
+	return names, nil
+}
+
+func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
+	return backend.ListObjectsCtx(context.Background(), prefix)
+}
+
+// ListObjectsCtx returns every object's full key under prefix, recursively
+// (no Delimiter), paginating through every page of results.
+func (backend *Backend) ListObjectsCtx(ctx context.Context, prefix string) (keys []string, err error) {
+	if backend.config.s3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+
+	var continuationToken *string
+	for {
+		out, listErr := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(backend.config.Bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if listErr != nil {
+			return nil, listErr
+		}
+
+		for _, obj := range out.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			keys = append(keys, *obj.Key)
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+
+	return keys, nil
 }
 
 func (backend *Backend) Sync() {

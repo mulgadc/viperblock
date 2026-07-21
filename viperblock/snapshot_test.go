@@ -47,15 +47,22 @@ func TestCreateSnapshot(t *testing.T) {
 		baseMap, ident, err := vb.LoadSnapshotBlockMap(snapshotID)
 		require.NoError(t, err)
 		assert.Equal(t, vb.VolumeName, ident.SourceVolumeName)
-		assert.Len(t, baseMap.BlockLookup, len(vb.BlocksToObject.BlockLookup))
 
-		// Verify each block mapping matches
-		for block, lookup := range vb.BlocksToObject.BlockLookup {
-			baseLookup, ok := baseMap.BlockLookup[block]
-			assert.True(t, ok, "block %d missing from snapshot", block)
-			assert.Equal(t, lookup.ObjectID, baseLookup.ObjectID)
-			assert.Equal(t, lookup.ObjectOffset, baseLookup.ObjectOffset)
+		// vb's map may be coalesced into extents while the loaded snapshot
+		// map stays flat, so compare by physical block coverage.
+		stride := vb.blockStride()
+		wantBlocks := 0
+		for _, lookup := range vb.BlocksToObject.BlockLookup {
+			wantBlocks += int(lookup.NumBlocks)
+			for i := range int(lookup.NumBlocks) {
+				block := lookup.StartBlock + uint64(i)
+				baseLookup, ok := baseMap.BlockLookup[block]
+				assert.True(t, ok, "block %d missing from snapshot", block)
+				assert.Equal(t, lookup.ObjectID, baseLookup.ObjectID)
+				assert.Equal(t, lookup.offsetAt(i, stride), baseLookup.ObjectOffset)
+			}
 		}
+		assert.Len(t, baseMap.BlockLookup, wantBlocks)
 	})
 }
 
@@ -496,18 +503,24 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		assert.Len(t, layers[0].Blocks.BlockLookup, len(vb.BlocksToObject.BlockLookup),
-			"decoded block count must match parent")
-
-		for blockNum, want := range vb.BlocksToObject.BlockLookup {
-			got, ok := layers[0].Blocks.BlockLookup[blockNum]
-			assert.True(t, ok, "block %d missing from decoded flat section", blockNum)
-			if ok {
-				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
-				assert.Equal(t, want.ObjectOffset, got.ObjectOffset, "block %d ObjectOffset", blockNum)
-				assert.Equal(t, want.SeqNum, got.SeqNum, "block %d SeqNum", blockNum)
+		// vb's map may be coalesced into extents while the decoded flat
+		// section stays flat, so compare by physical block coverage.
+		stride := vb.blockStride()
+		wantBlocks := 0
+		for _, want := range vb.BlocksToObject.BlockLookup {
+			wantBlocks += int(want.NumBlocks)
+			for i := range int(want.NumBlocks) {
+				blockNum := want.StartBlock + uint64(i)
+				got, ok := layers[0].Blocks.BlockLookup[blockNum]
+				assert.True(t, ok, "block %d missing from decoded flat section", blockNum)
+				if ok {
+					assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
+					assert.Equal(t, want.offsetAt(i, stride), got.ObjectOffset, "block %d ObjectOffset", blockNum)
+					assert.Equal(t, want.seqNumAt(i), got.SeqNum, "block %d SeqNum", blockNum)
+				}
 			}
 		}
+		assert.Len(t, layers[0].Blocks.BlockLookup, wantBlocks, "decoded block count must match parent")
 	})
 }
 

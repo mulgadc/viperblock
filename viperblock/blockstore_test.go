@@ -473,6 +473,282 @@ func TestBlockState_String(t *testing.T) {
 	}
 }
 
+// pendingRun writes numBlocks consecutive blocks starting at startBlock,
+// transitions them Hot -> Pending, and returns their assigned SeqNums in
+// block order. Used to set up MarkPersistedRange test fixtures.
+func pendingRun(bs *UnifiedBlockStore, startBlock uint64, numBlocks int) (blocks []uint64, seqNums []uint64) {
+	data := make([]byte, bs.blockSize)
+	for i := range numBlocks {
+		b := startBlock + uint64(i)
+		sn := bs.Write(b, data)
+		bs.MarkPending(b)
+		blocks = append(blocks, b)
+		seqNums = append(seqNums, sn)
+	}
+	return blocks, seqNums
+}
+
+// TestBlockStore_MarkPersistedRange_Coalesces pins that persisting a
+// consecutive run produces one persistedExtent, not one BlockEntry per
+// block, while every block still resolves correctly via ReadEntry.
+func TestBlockStore_MarkPersistedRange_Coalesces(t *testing.T) {
+	bs := NewUnifiedBlockStore(4096)
+	const numBlocks = 1000
+	const startBlock = 5000
+	const stride = uint32(4096)
+	const objectOffset = uint32(128) // simulated chunk header length
+
+	blocks, seqNums := pendingRun(bs, startBlock, numBlocks)
+
+	got := bs.MarkPersistedRange(blocks /*objectID*/, 7, objectOffset, stride, seqNums)
+	if got != numBlocks {
+		t.Fatalf("MarkPersistedRange transitioned %d blocks, want %d", got, numBlocks)
+	}
+
+	// Acceptance criterion: O(extents), not O(blocks).
+	if n := bs.PersistedExtentCount(); n != 1 {
+		t.Fatalf("PersistedExtentCount() = %d, want 1 for one consecutive run", n)
+	}
+
+	// The per-block shard entries must be gone -- that's the whole point.
+	for _, b := range blocks {
+		shard := bs.getShard(b)
+		shard.mu.RLock()
+		_, exists := shard.entries[b]
+		shard.mu.RUnlock()
+		if exists {
+			t.Fatalf("block %d still has a shard entry after MarkPersistedRange", b)
+		}
+	}
+
+	// Every block, including ones mid-run, must resolve to its own location/SeqNum.
+	for i, b := range blocks {
+		entry, ok := bs.ReadEntry(b)
+		if !ok {
+			t.Fatalf("ReadEntry(%d): not found after coalescing", b)
+		}
+		if entry.State != BlockStatePersisted {
+			t.Fatalf("ReadEntry(%d): state = %s, want Persisted", b, entry.State)
+		}
+		if entry.ObjectID != 7 {
+			t.Fatalf("ReadEntry(%d): ObjectID = %d, want 7", b, entry.ObjectID)
+		}
+		wantOffset := objectOffset + uint32(i)*stride
+		if entry.ObjectOffset != wantOffset {
+			t.Fatalf("ReadEntry(%d): ObjectOffset = %d, want %d", b, entry.ObjectOffset, wantOffset)
+		}
+		if entry.SeqNum != seqNums[i] {
+			t.Fatalf("ReadEntry(%d): SeqNum = %d, want %d (per-block seqnum lost by coalescing)", b, entry.SeqNum, seqNums[i])
+		}
+	}
+
+	// GetPersistedInfo and ReadBlock must agree with ReadEntry for a non-start block.
+	mid := blocks[numBlocks/2]
+	objID, off, ok := bs.GetPersistedInfo(mid)
+	if !ok || objID != 7 || off != objectOffset+uint32(numBlocks/2)*stride {
+		t.Fatalf("GetPersistedInfo(%d) = (%d, %d, %v), want (7, %d, true)", mid, objID, off, ok, objectOffset+uint32(numBlocks/2)*stride)
+	}
+	if _, ok := bs.ReadBlock(mid); !ok {
+		t.Fatalf("ReadBlock(%d): not found after coalescing", mid)
+	}
+
+	// Total block count must still reflect every physical block.
+	if bs.Count() != numBlocks {
+		t.Fatalf("Count() = %d, want %d", bs.Count(), numBlocks)
+	}
+	if bs.CountByState()[BlockStatePersisted] != numBlocks {
+		t.Fatalf("CountByState()[Persisted] = %d, want %d", bs.CountByState()[BlockStatePersisted], numBlocks)
+	}
+}
+
+// TestBlockStore_MarkPersistedRange_Fracture pins that an overwrite landing
+// inside an existing coalesced extent splits it into a surviving head/tail
+// rather than leaving a stale entry shadowing the new data.
+func TestBlockStore_MarkPersistedRange_Fracture(t *testing.T) {
+	bs := NewUnifiedBlockStore(4096)
+	const stride = uint32(4096)
+
+	// First persist blocks [100, 110) as one extent in chunk 1.
+	blocks1, seq1 := pendingRun(bs, 100, 10)
+	if got := bs.MarkPersistedRange(blocks1, 1, 0, stride, seq1); got != 10 {
+		t.Fatalf("first MarkPersistedRange transitioned %d, want 10", got)
+	}
+	if n := bs.PersistedExtentCount(); n != 1 {
+		t.Fatalf("PersistedExtentCount() = %d, want 1 after first persist", n)
+	}
+
+	// Overwrite the middle [103,106) into chunk 2; must fracture [100,110)
+	// into a surviving head [100,103) and tail [106,110).
+	blocks2, seq2 := pendingRun(bs, 103, 3)
+	if got := bs.MarkPersistedRange(blocks2, 2, 500, stride, seq2); got != 3 {
+		t.Fatalf("second MarkPersistedRange transitioned %d, want 3", got)
+	}
+
+	// Expect 3 extents now: head [100,103), the new [103,106), tail [106,110).
+	if n := bs.PersistedExtentCount(); n != 3 {
+		t.Fatalf("PersistedExtentCount() = %d, want 3 after fracture", n)
+	}
+
+	// Head blocks [100,103) still resolve to chunk 1 at their original offsets.
+	for i, b := range []uint64{100, 101, 102} {
+		entry, ok := bs.ReadEntry(b)
+		if !ok || entry.ObjectID != 1 || entry.ObjectOffset != uint32(i)*stride || entry.SeqNum != seq1[i] {
+			t.Fatalf("head block %d = %+v, want ObjectID=1 ObjectOffset=%d SeqNum=%d", b, entry, uint32(i)*stride, seq1[i])
+		}
+	}
+
+	// Overwritten blocks [103,106) resolve to chunk 2.
+	for i, b := range []uint64{103, 104, 105} {
+		entry, ok := bs.ReadEntry(b)
+		if !ok || entry.ObjectID != 2 || entry.ObjectOffset != 500+uint32(i)*stride || entry.SeqNum != seq2[i] {
+			t.Fatalf("overwritten block %d = %+v, want ObjectID=2 ObjectOffset=%d SeqNum=%d", b, entry, 500+uint32(i)*stride, seq2[i])
+		}
+	}
+
+	// Tail blocks [106,110) still resolve to chunk 1, at offsets relative to
+	// the original extent's start, not the fracture point.
+	for i, b := range []uint64{106, 107, 108, 109} {
+		origIdx := i + 6 // position within the original [100,110) run
+		entry, ok := bs.ReadEntry(b)
+		if !ok || entry.ObjectID != 1 || entry.ObjectOffset != uint32(origIdx)*stride || entry.SeqNum != seq1[origIdx] {
+			t.Fatalf("tail block %d = %+v, want ObjectID=1 ObjectOffset=%d SeqNum=%d", b, entry, uint32(origIdx)*stride, seq1[origIdx])
+		}
+	}
+}
+
+// TestBlockStore_MarkPersistedRange_StaleWriteSkipped pins that a block
+// rewritten after being selected into a chunk, but before upload completes,
+// is left as Hot with the newer data rather than persisted under the stale
+// chunk's location.
+func TestBlockStore_MarkPersistedRange_StaleWriteSkipped(t *testing.T) {
+	bs := NewUnifiedBlockStore(4096)
+	const stride = uint32(4096)
+
+	blocks, seqNums := pendingRun(bs, 200, 5)
+
+	// Rewrite the middle block (202) before MarkPersistedRange runs, racing
+	// the chunk upload.
+	newData := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+	newSeq := bs.Write(202, newData)
+	if newSeq <= seqNums[2] {
+		t.Fatalf("test setup: expected newSeq > seqNums[2], got %d <= %d", newSeq, seqNums[2])
+	}
+
+	got := bs.MarkPersistedRange(blocks, 9, 0, stride, seqNums)
+	if got != 4 {
+		t.Fatalf("MarkPersistedRange transitioned %d blocks, want 4 (block 202 raced)", got)
+	}
+
+	// Block 202 must still be Hot with the newer data, untouched by the persist.
+	entry, ok := bs.ReadEntry(202)
+	if !ok {
+		t.Fatal("block 202 not found")
+	}
+	if entry.State != BlockStateHot {
+		t.Fatalf("block 202 state = %s, want Hot (superseding write must win)", entry.State)
+	}
+	if entry.SeqNum != newSeq {
+		t.Fatalf("block 202 SeqNum = %d, want %d", entry.SeqNum, newSeq)
+	}
+	if !bytes.Equal(entry.Data, newData) {
+		t.Fatal("block 202 data was clobbered by the stale persist")
+	}
+
+	// The other four blocks persisted correctly, split around the raced block.
+	for i, b := range []uint64{200, 201} {
+		e, ok := bs.ReadEntry(b)
+		if !ok || e.State != BlockStatePersisted || e.ObjectID != 9 || e.ObjectOffset != uint32(i)*stride {
+			t.Fatalf("block %d = %+v, want Persisted ObjectID=9 ObjectOffset=%d", b, e, uint32(i)*stride)
+		}
+	}
+	for i, b := range []uint64{203, 204} {
+		origIdx := i + 3
+		e, ok := bs.ReadEntry(b)
+		if !ok || e.State != BlockStatePersisted || e.ObjectID != 9 || e.ObjectOffset != uint32(origIdx)*stride {
+			t.Fatalf("block %d = %+v, want Persisted ObjectID=9 ObjectOffset=%d", b, e, uint32(origIdx)*stride)
+		}
+	}
+
+	if n := bs.PersistedExtentCount(); n != 2 {
+		t.Fatalf("PersistedExtentCount() = %d, want 2 (run split around the raced block)", n)
+	}
+}
+
+// TestBlockStore_MarkPersistedRange_ConcurrentRewrite exercises MarkPersistedRange
+// under -race against concurrent rewriters and readers: the race detector
+// must stay silent, and no reader may observe a block as never-written
+// mid-transition.
+func TestBlockStore_MarkPersistedRange_ConcurrentRewrite(t *testing.T) {
+	const stride = uint32(4096)
+	const startBlock = 900
+	const numBlocks = 64
+
+	for range 50 {
+		bs := NewUnifiedBlockStore(4096)
+		blocks, seqNums := pendingRun(bs, startBlock, numBlocks)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		stop := make(chan struct{})
+
+		// Persister: transition the whole run to Persisted.
+		wg.Go(func() {
+			<-start
+			bs.MarkPersistedRange(blocks, 3, 0, stride, seqNums)
+		})
+
+		// Rewriters: keep superseding random blocks, racing the persist.
+		data := make([]byte, bs.blockSize)
+		for range 4 {
+			wg.Go(func() {
+				<-start
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					b := startBlock + uint64(rand.IntN(numBlocks))
+					bs.Write(b, data)
+					bs.MarkPending(b)
+				}
+			})
+		}
+
+		// Readers: every block must always resolve to *some* non-empty state.
+		var sawEmpty atomic.Bool
+		for range 4 {
+			wg.Go(func() {
+				<-start
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					b := startBlock + uint64(rand.IntN(numBlocks))
+					entry, ok := bs.ReadEntry(b)
+					if !ok || entry.State == BlockStateEmpty {
+						sawEmpty.Store(true)
+					}
+				}
+			})
+		}
+
+		close(start)
+		// Let the rewriters/readers run alongside the persist, then stop them.
+		for i := range 2000 {
+			bs.ReadEntry(startBlock + uint64(i%numBlocks))
+		}
+		close(stop)
+		wg.Wait()
+
+		if sawEmpty.Load() {
+			t.Fatal("a reader observed a block as never-written mid-transition: insert-before-delete ordering violated")
+		}
+	}
+}
+
 // Benchmarks
 
 func BenchmarkBlockStore_SingleRead(b *testing.B) {
