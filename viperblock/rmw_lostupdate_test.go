@@ -52,10 +52,6 @@ func newRMWVB(t *testing.T) *VB {
 // The surviving block is byte-exact with generation N over exactly the range
 // the losing write covered -- the reported signature.
 func TestRMW_ConcurrentSubBlockWritesLoseAnUpdate(t *testing.T) {
-	t.Skip("KNOWN FAILING (mulga-siv-482): WriteAtCtx's read-modify-write is not " +
-		"atomic per block. Remove this Skip to see it red -- that is the acceptance " +
-		"criterion for the fix. Measured 24% loss over 200 forced-race rounds at 054a44a.")
-
 	vb := newRMWVB(t)
 	bs := int(vb.BlockSize)
 	half := bs / 2
@@ -111,10 +107,6 @@ func TestRMW_ConcurrentSubBlockWritesLoseAnUpdate(t *testing.T) {
 // TestRMW_ConcurrentSubBlockWrites_Repeated runs the same race repeatedly to
 // show how readily it lands, and reports the observed loss rate.
 func TestRMW_ConcurrentSubBlockWrites_Repeated(t *testing.T) {
-	t.Skip("KNOWN FAILING (mulga-siv-482): WriteAtCtx's read-modify-write is not " +
-		"atomic per block. Remove this Skip to see it red -- that is the acceptance " +
-		"criterion for the fix. Measured 24% loss over 200 forced-race rounds at 054a44a.")
-
 	const rounds = 200
 	lost := 0
 
