@@ -32,7 +32,7 @@ go_build_nbd:
 # Preflight — runs the same checks as GitHub Actions (lint + vuln + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race
+	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race test-integration
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
@@ -46,6 +46,15 @@ test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
+
+# Integration tier: tests that stand up a second VB engine over one volume, or
+# drive real network-failure behaviour against a dead host. They are gated
+# behind the `integration` build tag so the unit targets above stay inside
+# their 120s budget; the tag is additive, so this target runs the unit tests
+# too and needs a budget covering both.
+test-integration:
+	@echo -e "\n....Running integration tests for $(GO_PROJECT_NAME)...."
+	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 600s ./viperblock/... $(_RACEQ)
 
 # Run unit tests with race detector
 test-race:
@@ -84,5 +93,5 @@ govulncheck:
 	$(_Q)go tool govulncheck ./...
 	@echo "  govulncheck ok"
 
-.PHONY: build go_build go_build_nbd preflight test test-cover test-race diff-coverage bench run clean \
+.PHONY: build go_build go_build_nbd preflight test test-cover test-race test-integration diff-coverage bench run clean \
 	lint fix govulncheck

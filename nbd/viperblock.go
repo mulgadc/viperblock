@@ -233,6 +233,9 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		VolumeName: volume,
 		VolumeSize: size,
 		BaseDir:    base_dir,
+		// Data-path engine. Recorded on the volume-open metric so a volume
+		// simultaneously held by a control-plane import is visible.
+		Role: "nbdkit",
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,

@@ -45,6 +45,23 @@ jobs:
       - name: Check Diff Coverage
         run: scripts/diff-coverage.sh coverage.out --base HEAD~1
 
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      - name: Run Integration Tests
+        run: make test-integration
+
   race_detection:
     name: Race Detection
     runs-on: ubuntu-26.04
