@@ -939,3 +939,209 @@ func TestChunkGC_ConcurrentDrainAndSweepPreserveLiveChunks(t *testing.T) {
 		assert.Equalf(t, lastWritten[w], got, "writer %d: block range did not read back its last write -- a live chunk was superseded incorrectly or deleted", w)
 	}
 }
+
+// openSnapshotOnlyVB models the VB spinifex's daemon builds to snapshot a
+// volume another process is serving: same backend prefix, its own local WAL
+// directory, and no WAL opened, so ownsWAL() is false and CreateSnapshot
+// freezes the map it loaded rather than draining one it doesn't own.
+func openSnapshotOnlyVB(t *testing.T, backendRoot, localRoot, volumeName string) *VB {
+	t.Helper()
+
+	backendConfig := file.FileConfig{
+		VolumeName: volumeName,
+		VolumeSize: volumeSize,
+		BaseDir:    backendRoot,
+	}
+
+	vbconfig := VB{
+		VolumeName:      volumeName,
+		VolumeSize:      volumeSize,
+		BaseDir:         filepath.Join(localRoot, "viperblock"),
+		WALSyncInterval: -1,
+		GCInterval:      -1,
+		Cache: Cache{
+			Config: CacheConfig{Size: 0},
+		},
+	}
+
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		assert.NoError(t, vb.RemoveLocalFiles())
+	})
+
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.LoadState())
+	require.NoError(t, vb.LoadLiveCheckpoint())
+
+	return vb
+}
+
+// Test 16: a snapshot taken by another process, after the sweeping engine has
+// already cached its ancestry answer, must still stop that engine sweeping.
+// This is the case gcLatchedOff (in-process) and the cached scan both miss,
+// and it is spinifex's primary snapshot path: nbdkit serves and sweeps the
+// attached volume while the daemon snapshots it for CreateImage.
+func TestChunkGC_CrossProcessSnapshotLatchesSweeperOff(t *testing.T) {
+	backendRoot := t.TempDir()
+	volumeName := "vol-xproc-snap"
+	ctx := context.Background()
+
+	server := newGCTestVB(t, backendRoot, volumeName, true)
+
+	original := randomBlockData(4)
+	writeAndChunk(t, server, 0, original)
+	frozenChunkID := server.ObjectNum.Load() - 1
+
+	// Sweep once with no snapshot in existence: this is what caches the
+	// "safe" ancestry answer and the marker baseline for the VB's lifetime.
+	server.runGCSweep(ctx)
+	require.False(t, server.gcLatchedOff.Load(), "a volume with no snapshots must not latch off")
+	assertChunkPresent(t, server.Backend, volumeName, frozenChunkID)
+
+	// Another process snapshots the same volume. The serving engine above is
+	// never told. Persist state first, since the second VB opens the volume
+	// off the backend the way the daemon does.
+	require.NoError(t, server.SaveState())
+
+	snapshotID := "snap-" + volumeName
+	snapper := openSnapshotOnlyVB(t, backendRoot, t.TempDir(), volumeName)
+	_, err := snapper.CreateSnapshot(snapshotID)
+	require.NoError(t, err)
+
+	// The cached ancestry answer is now stale and still says "safe" -- it was
+	// computed before the snapshot existed and is never recomputed. Asserted
+	// explicitly so it is clear the marker check below is the only thing
+	// standing between this sweep and deleting the snapshot's chunks.
+	require.True(t, server.ensureGCSnapshotSafe(ctx), "precondition: the cached ancestry answer must still be the pre-snapshot one")
+
+	// The serving engine keeps writing, superseding every chunk the snapshot
+	// froze, then sweeps on that stale answer.
+	overwrite := randomBlockData(4)
+	writeAndChunk(t, server, 0, overwrite)
+	server.runGCSweep(ctx)
+	assertClosure(t, server)
+
+	assert.True(t, server.gcLatchedOff.Load(), "sweeper must latch off once the marker moves")
+	assertChunkPresent(t, server.Backend, volumeName, frozenChunkID)
+
+	// The snapshot restores byte-exact: the whole point of the pin.
+	clone := cloneGCTestVB(t, server, snapshotID, "vol-xproc-clone", false)
+	for i := range uint64(4) {
+		readData, err := clone.ReadAt(i*uint64(clone.BlockSize), uint64(clone.BlockSize))
+		require.NoError(t, err)
+		expected := original[i*uint64(DefaultBlockSize) : (i+1)*uint64(DefaultBlockSize)]
+		assert.Equal(t, expected, readData, "block %d mismatch reading through the cross-process snapshot", i)
+	}
+
+	// And the serving volume still reads its own latest data.
+	readBack, err := server.ReadAt(0, uint64(len(overwrite)))
+	require.NoError(t, err)
+	assert.Equal(t, overwrite, readBack)
+}
+
+// failingMarkerBackend wraps a real file backend and can be told to fail the
+// snapshot marker's write or read independently, for Tests 17 and 18.
+type failingMarkerBackend struct {
+	*file.Backend
+
+	failMarkerWrite atomic.Bool
+	failMarkerRead  atomic.Bool
+}
+
+var _ types.Backend = (*failingMarkerBackend)(nil)
+
+func (b *failingMarkerBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	if fileType == types.FileTypeSnapshotMarker && b.failMarkerWrite.Load() {
+		return errors.New("injected: snapshot marker write failure")
+	}
+	return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
+}
+
+func (b *failingMarkerBackend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
+	if fileType == types.FileTypeSnapshotMarker && b.failMarkerRead.Load() {
+		return nil, errors.New("injected: snapshot marker read failure")
+	}
+	return b.Backend.ReadCtx(ctx, fileType, objectId, offset, length)
+}
+
+// Test 17: a snapshot whose marker doesn't land must fail. Creating it anyway
+// would leave a snapshot no sweeping engine can observe, whose chunks can be
+// reclaimed underneath it.
+func TestChunkGC_SnapshotMarkerWriteFailureFailsSnapshot(t *testing.T) {
+	root := t.TempDir()
+	volumeName := "vol-marker-write-fault"
+	vb := newGCTestVB(t, root, volumeName, true)
+
+	fb, ok := vb.Backend.(*file.Backend)
+	require.True(t, ok)
+	wrapped := &failingMarkerBackend{Backend: fb}
+	vb.Backend = wrapped
+
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+
+	wrapped.failMarkerWrite.Store(true)
+	snapshotID := "snap-" + volumeName
+	_, err := vb.CreateSnapshot(snapshotID)
+	require.Error(t, err, "CreateSnapshot must fail when the snapshot marker cannot be published")
+
+	// Nothing a reader would accept as a snapshot may be left behind.
+	_, cfgErr := vb.Backend.ReadFrom(snapshotID, types.FileTypeConfig, 0, 0, 0)
+	require.Error(t, cfgErr)
+	assert.True(t, os.IsNotExist(cfgErr), "expected no snapshot config after a failed marker write, got %v", cfgErr)
+}
+
+// Test 18: a marker the sweeper cannot read is not evidence of "no snapshot".
+// The sweep must skip and retry, not delete.
+func TestChunkGC_SnapshotMarkerReadFailureSkipsSweep(t *testing.T) {
+	root := t.TempDir()
+	volumeName := "vol-marker-read-fault"
+	ctx := context.Background()
+
+	vb := newGCTestVB(t, root, volumeName, true)
+
+	fb, ok := vb.Backend.(*file.Backend)
+	require.True(t, ok)
+	wrapped := &failingMarkerBackend{Backend: fb}
+	vb.Backend = wrapped
+
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	garbageChunkID := vb.ObjectNum.Load() - 1
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+
+	wrapped.failMarkerRead.Store(true)
+	vb.runGCSweep(ctx)
+	assertClosure(t, vb)
+	assertChunkPresent(t, vb.Backend, volumeName, garbageChunkID)
+	assert.False(t, vb.gcLatchedOff.Load(), "a transient marker read failure must not latch GC off permanently")
+
+	// Clearing the fault lets the same chunk be reclaimed, proving the failure
+	// only deferred the sweep.
+	wrapped.failMarkerRead.Store(false)
+	vb.runGCSweep(ctx)
+	assertClosure(t, vb)
+	assertChunkGone(t, vb.Backend, volumeName, garbageChunkID)
+}
+
+// Test 19: a marker that never moves must not latch GC off. Guards the
+// opposite failure to Test 16 -- a marker check that fails closed on every
+// sweep would silently disable reclaim for every volume.
+func TestChunkGC_UnchangedMarkerStillSweeps(t *testing.T) {
+	root := t.TempDir()
+	volumeName := "vol-marker-steady"
+	ctx := context.Background()
+
+	vb := newGCTestVB(t, root, volumeName, true)
+
+	for pass := range 3 {
+		writeAndChunk(t, vb, 0, randomBlockData(4))
+		garbageChunkID := vb.ObjectNum.Load() - 1
+		writeAndChunk(t, vb, 0, randomBlockData(4))
+
+		vb.runGCSweep(ctx)
+		assertClosure(t, vb)
+		assertChunkGone(t, vb.Backend, volumeName, garbageChunkID)
+		assert.Falsef(t, vb.gcLatchedOff.Load(), "pass %d: an unmoved marker must not latch GC off", pass)
+	}
+}

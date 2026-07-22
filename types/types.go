@@ -71,6 +71,7 @@ const (
 	FileTypeSSHAuthKey
 	FileTypeWALChunkShard
 	FileTypeBlockCheckpointLive
+	FileTypeSnapshotMarker
 )
 
 // getFilePath returns the appropriate S3 path based on file type and objectId.
@@ -94,6 +95,10 @@ func GetFilePath(fileType FileType, objectId uint64, volumeName string) string {
 		return fmt.Sprintf("%s/wal/chunks/wal.%08d.shard_%02d.bin", volumeName, walNum, shardID)
 	case FileTypeBlockCheckpointLive:
 		return fmt.Sprintf("%s/checkpoints/blocks.live.bin", volumeName)
+	// One fixed key per volume, so a reader locates the most recent snapshot
+	// of a volume with a single GET rather than a listing.
+	case FileTypeSnapshotMarker:
+		return fmt.Sprintf("%s/snapshots.marker", volumeName)
 	default:
 		return fmt.Sprintf("%s/unknown.%08d.bin", volumeName, objectId)
 	}

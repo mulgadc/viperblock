@@ -370,9 +370,9 @@ type VB struct {
 	checkpointRetryBackoff time.Duration
 
 	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
-	// objects no live block references. Default false — opt-in until the
-	// cross-process "another process snapshots this volume mid-run" window
-	// (see ensureGCSnapshotSafe) has a durable answer.
+	// objects no live block references. Default false — opt-in, since a
+	// volume that is swept must satisfy the snapshot-ancestry rules in
+	// ensureGCSnapshotSafe and gcSnapshotMarkerMoved.
 	GCEnabled bool
 
 	// GCInterval controls how often the background chunk uploader also runs
@@ -408,6 +408,15 @@ type VB struct {
 	// so the next sweep retries instead of caching a transient failure.
 	gcSnapshotSafe    atomic.Bool
 	gcSnapshotChecked atomic.Bool
+
+	// gcMarkerBaseline is the volume's snapshot marker as it read at the
+	// moment gcSnapshotChecked was set, and gcMarkerMu guards it. Every sweep
+	// re-reads the marker and compares: a difference means some process
+	// snapshotted this volume since the ancestry scan, which the cached
+	// gcSnapshotSafe answer cannot see. Nil means the marker was absent, which
+	// is distinct from present-but-empty.
+	gcMarkerMu       sync.Mutex
+	gcMarkerBaseline []byte
 
 	// gcLatchedOff is set permanently, never cleared, the moment this VB
 	// instance does something that invalidates GC's invariants:
@@ -3535,8 +3544,9 @@ const snapPrefix = "snap-"
 // Cached for the process lifetime once a scan completes, safe or not — the
 // guard never loosens once a snapshot exists. A scan error is not cached.
 //
-// Misses a snapshot created by another process after the scan; that
-// cross-process gap is why GCEnabled defaults to false.
+// Only answers for snapshots that existed at scan time. Snapshots created
+// afterwards, including by another process, are caught per sweep by
+// gcSnapshotMarkerMoved.
 func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
 	if vb.gcLatchedOff.Load() {
 		return false
@@ -3545,11 +3555,25 @@ func (vb *VB) ensureGCSnapshotSafe(ctx context.Context) bool {
 		return vb.gcSnapshotSafe.Load()
 	}
 
+	// Read the marker BEFORE the scan, never after. A snapshot landing
+	// between the two reads is then either visible to the scan or a marker
+	// change against this baseline; taking the baseline afterwards would let
+	// that snapshot fall through both checks.
+	baseline, markerErr := vb.readSnapshotMarker(ctx)
+	if markerErr != nil {
+		vb.logger().Warn("chunk GC: snapshot-marker baseline read failed, sweep skipped this round", "err", markerErr)
+		return false
+	}
+
 	safe, err := vb.scanForOwnSnapshots(ctx)
 	if err != nil {
 		vb.logger().Warn("chunk GC: snapshot-ancestry scan failed, sweep skipped this round", "err", err)
 		return false
 	}
+
+	vb.gcMarkerMu.Lock()
+	vb.gcMarkerBaseline = baseline
+	vb.gcMarkerMu.Unlock()
 
 	vb.gcSnapshotSafe.Store(safe)
 	vb.gcSnapshotChecked.Store(true)
@@ -3599,6 +3623,77 @@ func (vb *VB) scanForOwnSnapshots(ctx context.Context) (safe bool, err error) {
 	}
 
 	return true, nil
+}
+
+// snapshotMarker is the payload of a volume's snapshots.marker object: a
+// change token naming the most recent snapshot taken of that volume. Readers
+// compare the marshalled bytes for equality and never interpret the fields,
+// which exist so an operator inspecting the key can tell what moved it.
+type snapshotMarker struct {
+	SnapshotID string    `json:"SnapshotID"`
+	CreatedAt  time.Time `json:"CreatedAt"`
+}
+
+// writeSnapshotMarker publishes snapshotID as this volume's most recent
+// snapshot, under the volume's own prefix so a reader finds it with one GET
+// instead of a bucket-wide listing.
+//
+// Callers must write the marker BEFORE reading any state the snapshot will
+// freeze. That ordering is what makes the marker sound across processes: a
+// sweeper reads it only after its own live checkpoint is durable, so a
+// snapshot that froze an older map necessarily wrote the marker first and the
+// sweeper sees the change.
+func (vb *VB) writeSnapshotMarker(ctx context.Context, snapshotID string) error {
+	payload, err := json.Marshal(snapshotMarker{SnapshotID: snapshotID, CreatedAt: time.Now()})
+	if err != nil {
+		return fmt.Errorf("marshal snapshot marker: %w", err)
+	}
+
+	headers := []byte{}
+	if err := vb.Backend.WriteCtx(ctx, types.FileTypeSnapshotMarker, 0, &headers, &payload); err != nil {
+		return fmt.Errorf("write snapshot marker: %w", err)
+	}
+	return nil
+}
+
+// readSnapshotMarker returns the volume's raw snapshot-marker bytes, or nil
+// when no snapshot has ever been taken of it. Absence is a valid baseline
+// that a first snapshot moves; only a genuine read failure is an error.
+func (vb *VB) readSnapshotMarker(ctx context.Context) ([]byte, error) {
+	data, err := vb.Backend.ReadCtx(ctx, types.FileTypeSnapshotMarker, 0, 0, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// gcSnapshotMarkerMoved reports whether any process has snapshotted this
+// volume since ensureGCSnapshotSafe captured its baseline — the case the
+// cached ancestry answer and CreateSnapshot's in-process latch both miss.
+// Once moved, GC latches off permanently for this VB, matching the in-process
+// latch: a snapshot pins chunks for as long as it exists.
+//
+// A read failure returns true without latching, so the sweep is skipped and
+// the next one retries rather than treating a transient error as "no
+// snapshot".
+func (vb *VB) gcSnapshotMarkerMoved(ctx context.Context) bool {
+	current, err := vb.readSnapshotMarker(ctx)
+	if err != nil {
+		vb.logger().Warn("chunk GC: snapshot-marker read failed, sweep skipped this round", "err", err)
+		return true
+	}
+
+	vb.gcMarkerMu.Lock()
+	moved := !bytes.Equal(current, vb.gcMarkerBaseline)
+	vb.gcMarkerMu.Unlock()
+
+	if moved && vb.gcLatchedOff.CompareAndSwap(false, true) {
+		vb.logger().Warn("chunk GC: disabled permanently, another process snapshotted this volume", "volume", vb.VolumeName)
+	}
+	return moved
 }
 
 // chunkKeyPattern extracts the ObjectID from a chunk key of the form
@@ -3685,6 +3780,16 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		}
 	}
 	vb.BlocksToObject.mu.Unlock()
+
+	// Last check before anything is deleted, and deliberately here rather than
+	// at the top of the sweep: the caller has already made this sweep's live
+	// checkpoint durable, so any snapshot that froze an older map than that
+	// checkpoint must have written its marker before this read. A snapshot
+	// that froze the same or a newer map cannot reference these candidates at
+	// all, since a chunk absent from the live map never returns to it.
+	if vb.gcSnapshotMarkerMoved(ctx) {
+		return
+	}
 
 	swept := vb.deleteChunkObjects(ctx, candidates)
 
