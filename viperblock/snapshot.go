@@ -2,6 +2,7 @@ package viperblock
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -117,6 +118,20 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// otherwise stay invisible to that sweep's cached result.
 	if vb.GCEnabled && vb.gcLatchedOff.CompareAndSwap(false, true) {
 		vb.logger().Warn("chunk GC: disabled permanently, CreateSnapshot called on this volume", "volume", vb.VolumeName, "snapshotID", snapshotID)
+	}
+
+	// The latch above only reaches a sweeper inside this process, and the
+	// engine that sweeps an attached volume (the NBD plugin) is a different
+	// one from the engine that snapshots it (the daemon). Publish the marker
+	// so that sweeper sees this snapshot, and publish it BEFORE the map is
+	// read below, which is what makes the sweeper's post-checkpoint read of it
+	// sound (see writeSnapshotMarker).
+	//
+	// Fail the snapshot if the marker doesn't land: a snapshot no sweeper can
+	// observe is one whose chunks may be reclaimed underneath it. A retryable
+	// error here is cheaper than a corrupt snapshot.
+	if err := vb.writeSnapshotMarker(context.Background(), snapshotID); err != nil {
+		return nil, err
 	}
 
 	vb.logger().Info("CreateSnapshot: flushing data", "snapshotID", snapshotID, "volume", vb.VolumeName)
