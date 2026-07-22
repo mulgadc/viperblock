@@ -1,3 +1,5 @@
+//go:build integration
+
 package viperblock
 
 import (
@@ -126,10 +128,7 @@ func TestDualOpen_DaemonSideInstanceDuringGuestWrites(t *testing.T) {
 
 	// Guest keeps writing while the daemon instance is held open.
 	for off := 0; off < total; off += piece {
-		end := off + piece
-		if end > total {
-			end = total
-		}
+		end := min(off+piece, total)
 		for i := off; i < end; i++ {
 			src[i] = byte(i*13 + 101)
 		}
@@ -191,10 +190,7 @@ func TestDualOpen_DaemonSnapshotDuringGuestWrites(t *testing.T) {
 
 	// Guest writes land AFTER the daemon captured its map.
 	for off := 0; off < total; off += piece {
-		end := off + piece
-		if end > total {
-			end = total
-		}
+		end := min(off+piece, total)
 		for i := off; i < end; i++ {
 			src[i] = byte(i*17 + 29)
 		}
@@ -248,10 +244,7 @@ func TestDualOpen_DaemonRemovesSharedLocalFiles(t *testing.T) {
 	}
 	// Guest writes sit in the WAL, NOT yet drained to chunks.
 	for off := 0; off < total; off += piece {
-		end := off + piece
-		if end > total {
-			end = total
-		}
+		end := min(off+piece, total)
 		require.NoError(t, nbd.WriteAt(uint64(off), append([]byte(nil), src[off:end]...)))
 	}
 	require.NoError(t, nbd.Flush()) // durable in the local WAL
@@ -329,10 +322,7 @@ func TestDualOpen_LaunchClonePathDoesNotDirtyCheckpoint(t *testing.T) {
 
 	want := append([]byte(nil), seed...)
 	for off := 0; off < total; off += piece {
-		end := off + piece
-		if end > total {
-			end = total
-		}
+		end := min(off+piece, total)
 		for i := off; i < end; i++ {
 			want[i] = byte(i*23 + 91)
 		}
