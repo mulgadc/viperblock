@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -111,9 +111,10 @@ func TestSequentialPartialWrites_ColdReopenByteExact(t *testing.T) {
 		types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 
 	src := make([]byte, total)
-	rnd := rand.New(rand.NewSource(20260721)) //nolint:gosec // G404: deterministic test fixture, not security material
-	_, err = rnd.Read(src)
-	require.NoError(t, err)
+	rnd := rand.New(rand.NewPCG(20260721, 20260721))
+	for i := range src {
+		src[i] = byte(rnd.IntN(256))
+	}
 
 	// Pass 1: strictly sequential fill.
 	for off := 0; off < total; off += piece {
@@ -124,10 +125,11 @@ func TestSequentialPartialWrites_ColdReopenByteExact(t *testing.T) {
 	// Pass 2: rewrite a scattered quarter so blocks are superseded and the
 	// block map fractures across chunk generations.
 	for range total / piece / 4 {
-		off := rnd.Intn(total/piece) * piece
+		off := rnd.IntN(total/piece) * piece
 		end := min(off+piece, total)
-		_, err = rnd.Read(src[off:end])
-		require.NoError(t, err)
+		for i := off; i < end; i++ {
+			src[i] = byte(rnd.IntN(256))
+		}
 		require.NoError(t, vb.WriteAt(uint64(off), append([]byte(nil), src[off:end]...)))
 	}
 

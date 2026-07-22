@@ -1772,14 +1772,18 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	return nil
 }
 
-// RMWConflicts returns the number of partial writes that found another write
-// already rebuilding the same block. Non-zero means the guest workload
-// produces same-block write concurrency, which is the precondition for the
-// lost-update class that per-block RMW serialization removes.
+// RMWShardCollisions returns the number of partial writes that found their
+// rmwLocks shard held by a DIFFERENT block. Harmless to correctness — the
+// two writes touch unrelated blocks — but a high rate means NumShards is too
+// small for the write concurrency in play.
 func (vb *VB) RMWShardCollisions() uint64 {
 	return vb.rmwShardCollisions.Load()
 }
 
+// RMWConflicts returns the number of partial writes that found another write
+// already rebuilding the same block. Non-zero means the guest workload
+// produces same-block write concurrency, which is the precondition for the
+// lost-update class that per-block RMW serialization removes.
 func (vb *VB) RMWConflicts() uint64 {
 	return vb.rmwConflicts.Load()
 }

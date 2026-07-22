@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mulgadc/viperblock/types"
@@ -23,6 +23,7 @@ import (
 // START is past the end is a loud 416 instead, which needs no defending.)
 type truncatingBackend struct {
 	types.Backend
+
 	trimChunk uint64
 	trimBytes int
 	fired     bool
@@ -80,9 +81,10 @@ func TestShortBackendRead_IsRefusedNotZeroFilled(t *testing.T) {
 	bs := int(vb.BlockSize)
 	const nBlocks = 8
 	payload := make([]byte, nBlocks*bs)
-	rnd := rand.New(rand.NewSource(4242)) //nolint:gosec // G404: deterministic test fixture
-	_, err = rnd.Read(payload)
-	require.NoError(t, err)
+	rnd := rand.New(rand.NewPCG(4242, 4242))
+	for i := range payload {
+		payload[i] = byte(rnd.IntN(256))
+	}
 
 	require.NoError(t, vb.WriteAt(0, append([]byte(nil), payload...)))
 	require.NoError(t, vb.DrainToBackend())
