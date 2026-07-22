@@ -141,6 +141,14 @@ type VB struct {
 	// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
 	WALSyncInterval time.Duration
 
+	// bgMu serialises the start and stop of both background goroutines (the
+	// WAL syncer and the chunk uploader). Their control fields below are
+	// otherwise a check-then-act that concurrent stoppers — a SIGTERM sweep
+	// racing a NATS unmount, say — turn into a double close or a nil-channel
+	// receive. Held across the wait for the goroutine to exit, so "stop
+	// returned" means "stopped" for every caller, not just the first.
+	bgMu sync.Mutex
+
 	// WAL syncer control (background goroutine for periodic fsync)
 	walSyncTicker *time.Ticker
 	walSyncStop   chan struct{}
@@ -1217,23 +1225,37 @@ func (vb *VB) StartWALSyncer() {
 		return
 	}
 
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Already running: starting a second goroutine would orphan the first,
+	// which would then keep syncing against fields the stopper has nil'd.
+	if vb.walSyncStop != nil {
+		return
+	}
+
 	vb.walSyncStop = make(chan struct{})
 	vb.walSyncDone = make(chan struct{})
 	vb.walSyncTicker = time.NewTicker(vb.WALSyncInterval)
 
+	// The goroutine closes over locals, never the VB fields: the stopper nils
+	// those, and a field read here would race that write however well the
+	// stopper itself is locked.
+	stop, done, ticker := vb.walSyncStop, vb.walSyncDone, vb.walSyncTicker
+
 	go func() {
-		defer close(vb.walSyncDone)
-		defer vb.walSyncTicker.Stop()
+		defer close(done)
+		defer ticker.Stop()
 
 		for {
 			select {
-			case <-vb.walSyncTicker.C:
+			case <-ticker.C:
 				if vb.UseShardedWAL {
 					vb.syncShardedWALIfDirty()
 				} else {
 					vb.syncWALIfDirty()
 				}
-			case <-vb.walSyncStop:
+			case <-stop:
 				// Final sync before shutdown
 				if vb.UseShardedWAL {
 					vb.syncShardedWALIfDirty()
@@ -1251,6 +1273,11 @@ func (vb *VB) StartWALSyncer() {
 // StopWALSyncer gracefully stops the background WAL sync goroutine.
 // It signals the goroutine to stop and waits for it to complete its final sync.
 func (vb *VB) StopWALSyncer() {
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Not running, or a concurrent caller already stopped it and nil'd the
+	// fields while this one waited for the mutex. Either way it is stopped.
 	if vb.walSyncStop == nil {
 		return
 	}
@@ -1274,6 +1301,15 @@ func (vb *VB) StartChunkUploader() {
 		return
 	}
 
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Already running — see StartWALSyncer for why a second goroutine is not
+	// merely redundant but unsafe.
+	if vb.chunkUploadStop != nil {
+		return
+	}
+
 	vb.chunkUploadStop = make(chan struct{})
 	vb.chunkUploadDone = make(chan struct{})
 	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
@@ -1283,23 +1319,28 @@ func (vb *VB) StartChunkUploader() {
 	// ensureGCSnapshotSafe) to run more often than necessary. gcTickerC
 	// stays nil (never fires below) when GC is off or GCInterval <= 0.
 	var gcTickerC <-chan time.Time
+	var gcTicker *time.Ticker
 	if vb.GCEnabled && vb.GCInterval > 0 {
 		vb.gcTicker = time.NewTicker(vb.GCInterval)
+		gcTicker = vb.gcTicker
 		gcTickerC = vb.gcTicker.C
 	}
 
+	// Locals, not VB fields, for the same reason as the WAL syncer.
+	stop, done, ticker := vb.chunkUploadStop, vb.chunkUploadDone, vb.chunkUploadTicker
+
 	go func() {
-		defer close(vb.chunkUploadDone)
-		defer vb.chunkUploadTicker.Stop()
+		defer close(done)
+		defer ticker.Stop()
 		defer func() {
-			if vb.gcTicker != nil {
-				vb.gcTicker.Stop()
+			if gcTicker != nil {
+				gcTicker.Stop()
 			}
 		}()
 
 		for {
 			select {
-			case <-vb.chunkUploadTicker.C:
+			case <-ticker.C:
 				// DrainToBackendCtx itself latches/clears backendFull on
 				// ErrNoSpace/success, so a dropped error here is not
 				// silently lost — WriteAtCtx's up-front gate will start
@@ -1316,7 +1357,7 @@ func (vb *VB) StartChunkUploader() {
 				}
 			case <-gcTickerC:
 				vb.runGCSweep(context.Background())
-			case <-vb.chunkUploadStop:
+			case <-stop:
 				return
 			}
 		}
@@ -1327,6 +1368,11 @@ func (vb *VB) StartChunkUploader() {
 
 // StopChunkUploader stops the background chunk upload goroutine.
 func (vb *VB) StopChunkUploader() {
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Not running, or a concurrent caller stopped it while this one waited
+	// for the mutex — see StopWALSyncer.
 	if vb.chunkUploadStop == nil {
 		return
 	}
