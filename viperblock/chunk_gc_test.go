@@ -1,10 +1,12 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -1143,5 +1145,70 @@ func TestChunkGC_UnchangedMarkerStillSweeps(t *testing.T) {
 		assertClosure(t, vb)
 		assertChunkGone(t, vb.Backend, volumeName, garbageChunkID)
 		assert.Falsef(t, vb.gcLatchedOff.Load(), "pass %d: an unmoved marker must not latch GC off", pass)
+	}
+}
+
+// newGCLogCaptureVB builds a GC-enabled VB whose logger writes to buf at Info
+// level. The level is the point: anything these tests assert on must survive a
+// handler that drops Debug, which is how the nbdkit plugin runs in production.
+func newGCLogCaptureVB(t *testing.T, root, volumeName string, buf *bytes.Buffer) *VB {
+	t.Helper()
+
+	vb := newGCTestVB(t, root, volumeName, true)
+	vb.log = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	return vb
+}
+
+// A sweep that reclaims nothing is the normal case for a healthy volume, and
+// it has to be visible at the level production actually runs at. Otherwise a
+// correctly-idle GC is indistinguishable from a GC that never ran, which is
+// what forced the env13 verification to count objects in the volume prefix
+// instead of reading the log.
+func TestChunkGC_IdleSweepIsVisibleAtInfoLevel(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	vb := newGCLogCaptureVB(t, root, "vol-idle-sweep-log", &buf)
+
+	// Live data only: every chunk is still referenced, so the sweep runs to
+	// completion and finds nothing to reclaim.
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	buf.Reset()
+	vb.runGCSweep(ctx)
+
+	logged := buf.String()
+	require.Contains(t, logged, "chunk GC: sweep complete",
+		"a sweep that reclaimed nothing must still report at Info; at Debug it is invisible in production")
+	assert.Contains(t, logged, "swept=0", "the sweep outcome must say how much it reclaimed, including none")
+	assert.Contains(t, logged, "candidates=0")
+	assert.Contains(t, logged, "volume=vol-idle-sweep-log", "the line must name the volume it swept")
+}
+
+// The snapshot-declined path is the silent-forever one: ensureGCSnapshotSafe
+// warns on its first scan, then answers from cache and says nothing, so every
+// later sweep on a pinned volume must report for itself.
+func TestChunkGC_DeclinedSweepIsVisibleOnEveryPass(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	vb := newGCLogCaptureVB(t, root, "vol-declined-sweep-log", &buf)
+
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	_, err := vb.CreateSnapshot("snap-vol-declined-sweep-log")
+	require.NoError(t, err)
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// Two passes: the second is the one that matters, since by then the
+	// snapshot-safety answer is cached and logs nothing of its own.
+	for pass := range 2 {
+		buf.Reset()
+		vb.runGCSweep(ctx)
+		assert.Contains(t, buf.String(), "chunk GC: sweep skipped",
+			"pass %d: a declined sweep must say so every time, not just on the first scan", pass+1)
 	}
 }

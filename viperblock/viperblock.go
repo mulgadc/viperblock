@@ -3761,6 +3761,11 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		return
 	}
 	if !vb.ensureGCSnapshotSafe(ctx) {
+		// Info rather than Debug because this is the silent-forever case: after
+		// the first scan ensureGCSnapshotSafe answers from its cache and logs
+		// nothing, so a volume GC has declined to touch would otherwise look
+		// exactly like a volume GC never visited.
+		vb.logger().Info("chunk GC: sweep skipped, snapshot-safety check declined", "volume", vb.VolumeName)
 		return
 	}
 
@@ -3788,16 +3793,21 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	// that froze the same or a newer map cannot reference these candidates at
 	// all, since a chunk absent from the live map never returns to it.
 	if vb.gcSnapshotMarkerMoved(ctx) {
+		vb.logger().Info("chunk GC: sweep abandoned, another process snapshotted this volume",
+			"volume", vb.VolumeName, "candidates", len(candidates))
 		return
 	}
 
 	swept := vb.deleteChunkObjects(ctx, candidates)
 
-	if swept > 0 {
-		vb.logger().Info("chunk GC: sweep complete", "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
-	} else {
-		vb.logger().Debug("chunk GC: sweep found nothing to reclaim", "floor", floor, "watermark", watermark)
-	}
+	// One line per sweep at Info, whatever the outcome. Reclaiming nothing is
+	// the normal, healthy case and has to be as visible as reclaiming
+	// something: at Debug it isn't, and a correctly-idle GC then reads
+	// identically to a GC that never ran — which is the wrong property for the
+	// component whose job is deleting data. At DefaultGCInterval this costs
+	// twelve lines an hour per volume.
+	vb.logger().Info("chunk GC: sweep complete",
+		"volume", vb.VolumeName, "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
 }
 
 // deleteChunkObjects issues a DeleteObject call per chunk ObjectID and
