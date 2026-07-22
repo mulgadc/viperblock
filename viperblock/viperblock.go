@@ -435,11 +435,11 @@ type BlockCache struct {
 }
 
 type Block struct {
+	Data   []byte `json:"Data"`
 	SeqNum uint64 `json:"SeqNum"`
 	Block  uint64 `json:"Block"`
 	Offset uint64 `json:"Offset"`
 	Len    uint64 `json:"Len"`
-	Data   []byte `json:"Data"`
 }
 
 type BlockOptimised struct {
@@ -460,10 +460,11 @@ type BlocksToObject struct {
 }
 
 type BlockLookup struct {
-	StartBlock   uint64
-	NumBlocks    uint16
-	ObjectID     uint64
-	ObjectOffset uint32
+	SeqNums []uint64
+
+	StartBlock uint64
+	ObjectID   uint64
+
 	// SeqNum is the chunk-write generation that produced this block's
 	// ciphertext on the backend. Drives nonce + AAD reconstruction on the
 	// decrypt path: the on-disk chunk carries no nonce, so the per-block
@@ -473,15 +474,12 @@ type BlockLookup struct {
 	//
 	// For NumBlocks == 1 this is the block's own SeqNum. For NumBlocks > 1
 	// it is StartBlock's SeqNum only, kept for wire-format compatibility;
-	// SeqNums below carries every block's own value, since blocks in a run
+	// SeqNums above carries every block's own value, since blocks in a run
 	// are not guaranteed to share one.
 	SeqNum uint64
 
-	// SeqNums holds one SeqNum per block in this entry's [StartBlock,
-	// StartBlock+NumBlocks) run, in order. Nil for single-block entries,
-	// where SeqNum alone is authoritative. Never serialized directly — the
-	// on-disk format stays one record per physical block (expandBlockLookup).
-	SeqNums []uint64
+	ObjectOffset uint32
+	NumBlocks    uint16
 }
 
 // end returns the exclusive upper bound of the block range this entry

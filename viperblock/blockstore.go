@@ -42,11 +42,11 @@ func (s BlockState) String() string {
 
 // BlockEntry represents a single block's metadata and data in the unified store.
 type BlockEntry struct {
-	SeqNum       uint64     // Sequence number for ordering writes
-	State        BlockState // Current state of the block
 	Data         []byte     // Block data for Hot/Pending/Cached states
+	SeqNum       uint64     // Sequence number for ordering writes
 	ObjectID     uint64     // Object ID for Persisted state (which chunk file)
 	ObjectOffset uint32     // Offset within the chunk file for Persisted state
+	State        BlockState // Current state of the block
 }
 
 // IndexShard is a single shard of the block index with its own lock.
@@ -97,12 +97,12 @@ type UnifiedBlockStore struct {
 // numerically consecutive blocks are not necessarily from the same guest
 // write and the exact per-block value is needed to reconstruct the AEAD nonce.
 type persistedExtent struct {
+	seqNums      []uint64
 	startBlock   uint64
-	numBlocks    uint16
 	objectID     uint64
 	objectOffset uint32
 	stride       uint32
-	seqNums      []uint64
+	numBlocks    uint16
 }
 
 // end returns the exclusive end block of the extent.
