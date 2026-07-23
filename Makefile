@@ -104,5 +104,12 @@ govulncheck:
 	$(_Q)go tool govulncheck ./...
 	@echo "  govulncheck ok"
 
+# NilAway — advisory nil-panic analysis. Not in preflight: it has a known
+# false-positive rate, so findings are triaged by hand rather than gating commits.
+nilaway:
+	@echo "Running nilaway..."
+	$(_Q)go tool nilaway -include-pkgs=github.com/mulgadc/viperblock -exclude-test-files ./...
+	@echo "  nilaway ok"
+
 .PHONY: build go_build go_build_nbd preflight test test-cover test-race test-integration diff-coverage bench run clean \
-	lint fix govulncheck
+	lint fix govulncheck nilaway
