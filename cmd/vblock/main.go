@@ -143,12 +143,21 @@ func main() {
 		EncryptionEnabled: mkey != nil,
 	}
 
-	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, *file)
+	// A plain stderr line keeps the viperblock library free of any terminal-UI
+	// dependency; the percentage throttle inside ImportDiskImage bounds this to
+	// ≤101 renders.
+	progress := func(current, total uint64) {
+		fmt.Fprintf(os.Stderr, "\rFlushing image to storage %s / %s", utils.HumanBytes(current), utils.HumanBytes(total))
+	}
+
+	err = v_utils.ImportDiskImage(&s3Config, &vbConfig, *file, progress)
 
 	if err != nil {
 		slog.Error("Failed to import disk image", "error", err)
 		os.Exit(1)
 	}
 
+	// Terminate the carriage-return progress line before the success message.
+	fmt.Fprintln(os.Stderr)
 	fmt.Println("Successfully imported disk image to Viperblock store")
 }

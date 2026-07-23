@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"time"
 
@@ -12,11 +11,56 @@ import (
 	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
-	"github.com/pterm/pterm"
 )
 
-// Helper function to import disk image to S3 backend.
-func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename string) error {
+// ProgressFunc reports cumulative bytes flushed against the total. It is
+// invoked at a bounded rate (throttled internally), so implementations may
+// render directly. A nil ProgressFunc disables progress reporting.
+type ProgressFunc func(current, total uint64)
+
+// progressReporter throttles progress callbacks to integer-percentage steps.
+// The render-frequency risk lives at the flush loop, so the throttle lives
+// there too — as pure integer arithmetic that bounds invocations to ≤101 for a
+// whole import (one per percent plus a final 100%), regardless of block count.
+// It holds no terminal-UI dependency; the rendering cost stays with the
+// caller's ProgressFunc.
+type progressReporter struct {
+	progress ProgressFunc
+	total    uint64
+	lastPct  int
+}
+
+// newProgressReporter seeds lastPct at -1 so the first report fires at 0%.
+func newProgressReporter(progress ProgressFunc, total uint64) progressReporter {
+	return progressReporter{progress: progress, total: total, lastPct: -1}
+}
+
+// report fires the callback only when the integer percentage advances.
+func (p *progressReporter) report(current uint64) {
+	if p.progress == nil || p.total == 0 {
+		return
+	}
+	pct := utils.SafeUint64ToInt(current * 100 / p.total)
+	if pct > p.lastPct {
+		p.lastPct = pct
+		p.progress(current, p.total)
+	}
+}
+
+// finish emits a terminal 100% so callers reach full even when the last block
+// did not land on a percentage boundary. It is skipped when a prior report
+// already hit 100% (current == total), so the callback is never fired twice at
+// the end and the total invocation count stays ≤101.
+func (p *progressReporter) finish() {
+	if p.progress == nil || p.total == 0 || p.lastPct >= 100 {
+		return
+	}
+	p.progress(p.total, p.total)
+}
+
+// Helper function to import disk image to S3 backend. progress, when non-nil,
+// receives throttled byte-count updates so each caller can render its own way.
+func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename string, progress ProgressFunc) error {
 	// Confirm filename can be opened
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0)
 	if err != nil {
@@ -158,17 +202,11 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	if totalBytes < 0 {
 		return fmt.Errorf("invalid file size: %d", totalBytes)
 	}
-	totalBlocks := uint64(totalBytes) / uint64(vb.BlockSize)
 
-	progressTotal := math.MaxInt
-	if totalBlocks <= uint64(math.MaxInt) {
-		progressTotal = int(totalBlocks)
-	}
-
-	bar, _ := pterm.DefaultProgressbar.
-		WithTitle("Flushing image to storage").
-		WithTotal(progressTotal).
-		Start()
+	// Progress is measured in bytes so callers render a unit that matches the
+	// download bar; the reporter throttles rendering to percentage steps.
+	reporter := newProgressReporter(progress, utils.SafeInt64ToUint64(totalBytes))
+	var current uint64
 
 	buf := make([]byte, vb.BlockSize)
 
@@ -181,9 +219,8 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		if bytes.Equal(buf[:n], nullBlock) {
 			//fmt.Printf("Null block found at %d, skipping\n", block)
 			block++
-			if block%1024 == 0 {
-				bar.Add(1024)
-			}
+			current += utils.SafeIntToUint64(n)
+			reporter.report(current)
 			continue
 		}
 
@@ -193,36 +230,31 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 			if err == io.EOF {
 				break
 			}
-			_, _ = bar.Stop()
 			return fmt.Errorf("failed to read disk file: %w", err)
 		}
 
 		if err := vb.WriteAt(block*uint64(vb.BlockSize), buf[:n]); err != nil {
-			_, _ = bar.Stop()
 			return fmt.Errorf("failed to write block %d: %w", block, err)
 		}
 
 		//fmt.Println("Write", "block", hex.EncodeToString(buf[:n]))
 
 		block++
-		if block%1024 == 0 {
-			bar.Add(1024)
-		}
+		current += utils.SafeIntToUint64(n)
+		reporter.report(current)
 
 		// Flush every 4MB
 		if block%uint64(vb.BlockSize) == 0 {
 			if err := vb.Flush(); err != nil {
-				_, _ = bar.Stop()
 				return fmt.Errorf("failed to flush at block %d: %w", block, err)
 			}
 			if err := vb.WriteWALToChunk(true); err != nil {
-				_, _ = bar.Stop()
 				return fmt.Errorf("failed to write WAL to chunk at block %d: %w", block, err)
 			}
 		}
 	}
 
-	_, _ = bar.Stop()
+	reporter.finish()
 
 	// Create a snapshot for AMI imports so that instance launches can use
 	// zero-copy cloning (OpenFromSnapshot) instead of block-by-block copy.

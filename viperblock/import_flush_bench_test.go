@@ -1,9 +1,10 @@
 package viperblock
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -63,8 +64,14 @@ func importImageBytes(b *testing.B) uint64 {
 // benchmark measures the flush path at maximum load.
 func makeSyntheticImage(size uint64) []byte {
 	img := make([]byte, size)
-	r := rand.New(rand.NewSource(1))
-	_, _ = r.Read(img)
+	// math/rand/v2 has no Read, so fill 8 bytes at a time from a fixed-seed PCG
+	// source; the trailing copy tolerates a size that is not a multiple of 8.
+	src := rand.NewPCG(1, 2)
+	for i := 0; i < len(img); i += 8 {
+		var word [8]byte
+		binary.LittleEndian.PutUint64(word[:], src.Uint64())
+		copy(img[i:], word[:])
+	}
 	return img
 }
 
@@ -155,7 +162,7 @@ func importImage(b *testing.B, vb *VB, img []byte) {
 	blockSize := uint64(vb.BlockSize)
 	nblocks := uint64(len(img)) / blockSize
 
-	for block := uint64(0); block < nblocks; block++ {
+	for block := range nblocks {
 		off := block * blockSize
 		require.NoError(b, vb.WriteAt(off, img[off:off+blockSize]))
 
@@ -182,8 +189,7 @@ func runImportBenchmark(b *testing.B, newVB func(b *testing.B, dir string, size 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		dir, err := os.MkdirTemp("", "vbimport-*")
-		require.NoError(b, err)
+		dir := b.TempDir()
 		vb := newVB(b, dir, size)
 		b.StartTimer()
 
