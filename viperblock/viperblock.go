@@ -2077,11 +2077,19 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	defer func() {
 		if err != nil {
 			if errors.Is(err, ErrNoSpace) {
-				vb.backendFull.Store(true)
+				// Log only the false→true edge (Swap returns the prior value) so a
+				// persistently full backend does not repeat the line on every drain
+				// attempt. This is the signal that guest writes are now failing fast.
+				if !vb.backendFull.Swap(true) {
+					vb.logger().Warn("backend out of space: latching writes off until a drain succeeds", "err", err)
+				}
 			}
 			return
 		}
-		vb.backendFull.Store(false)
+		// A clean drain clears the latch; log only the true→false recovery edge.
+		if vb.backendFull.Swap(false) {
+			vb.logger().Info("backend space recovered: drain succeeded, writes re-enabled")
+		}
 	}()
 
 	if err = vb.Flush(); err != nil {
