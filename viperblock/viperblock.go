@@ -4435,7 +4435,10 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	stride := vb.blockStride()
 	vb.BlocksToObject.mu.RUnlock()
 
-	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "blockLookup", blockLookup)
+	// Log the resolved scalars, not the BlockLookup struct: boxing a struct
+	// into slog's any forces a heap alloc at the call site on every block
+	// lookup, even at Info where this Debug line is dropped.
+	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "objectID", blockLookup.ObjectID, "found", ok)
 
 	if ok {
 		return blockLookup.ObjectID, blockLookup.offsetAt(pos, stride), blockLookup.seqNumAt(pos), nil
