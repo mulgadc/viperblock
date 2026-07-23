@@ -30,7 +30,7 @@ import (
 
 // poolPressureHeader is the response header predastore sets on a successful
 // PutObject once its storage pool nears FULL (FULL itself is instead
-// signalled via HTTP 507/503, see classifyWriteErr).
+// signalled via HTTP 507, see classifyWriteErr).
 const poolPressureHeader = "X-Predastore-Pool-Pressure"
 
 // poolPressureNearFull is the only header value this backend acts on.
@@ -78,10 +78,19 @@ func wrapNotFound(err error) error {
 	return err
 }
 
-// classifyWriteErr maps a PutObject error into types.ErrNoSpace when the HTTP
-// status is 507 (Insufficient Storage) or 503 (Service Unavailable) --
-// predastore's two signals for "out of space". Any other error passes
+// classifyWriteErr maps a PutObject error into types.ErrNoSpace ONLY when the
+// HTTP status is 507 (Insufficient Storage) -- predastore's single signal that
+// the store is genuinely full. Every other error, including 503, passes
 // through unchanged.
+//
+// 503 must NOT be treated as out-of-space: predastore returns 503 SlowDown
+// from its PutObject rate limiter, which is transient backpressure ("retry
+// with backoff"), not a full store. Mapping it to ErrNoSpace latched the
+// backendFull flag, and since every retry re-tripped the rate limit the latch
+// never cleared -- wedging the volume permanently under sustained churn. Left
+// as an ordinary error, a persistent 503 surfaces as a failed drain the
+// uploader retries on its next tick while write backpressure throttles the
+// guest, so the volume self-throttles instead of failing.
 func classifyWriteErr(err error) error {
 	if err == nil {
 		return nil
@@ -89,8 +98,7 @@ func classifyWriteErr(err error) error {
 
 	var respErr *smithyhttp.ResponseError
 	if errors.As(err, &respErr) {
-		switch respErr.HTTPStatusCode() {
-		case http.StatusInsufficientStorage, http.StatusServiceUnavailable:
+		if respErr.HTTPStatusCode() == http.StatusInsufficientStorage {
 			return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
 		}
 	}
