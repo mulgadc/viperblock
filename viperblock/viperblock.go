@@ -141,12 +141,12 @@ type VB struct {
 	// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
 	WALSyncInterval time.Duration
 
-	// bgMu serialises the start and stop of both background goroutines (the
-	// WAL syncer and the chunk uploader). Their control fields below are
-	// otherwise a check-then-act that concurrent stoppers — a SIGTERM sweep
-	// racing a NATS unmount, say — turn into a double close or a nil-channel
-	// receive. Held across the wait for the goroutine to exit, so "stop
-	// returned" means "stopped" for every caller, not just the first.
+	// bgMu serialises the start and stop of the background goroutines (the
+	// WAL syncer, the chunk uploader, and the GC sweeper). Their control
+	// fields below are otherwise a check-then-act that concurrent stoppers — a
+	// SIGTERM sweep racing a NATS unmount, say — turn into a double close or a
+	// nil-channel receive. Held across the wait for the goroutine to exit, so
+	// "stop returned" means "stopped" for every caller, not just the first.
 	bgMu sync.Mutex
 
 	// WAL syncer control (background goroutine for periodic fsync)
@@ -375,13 +375,19 @@ type VB struct {
 	// ensureGCSnapshotSafe and gcSnapshotMarkerMoved.
 	GCEnabled bool
 
-	// GCInterval controls how often the background chunk uploader also runs
-	// a GC sweep (default DefaultGCInterval). <= 0 disables the periodic
-	// sweep, but Close/DrainToBackend still run one on the way out. Ignored
-	// when GCEnabled is false.
+	// GCInterval controls how often the GC sweeper goroutine runs a sweep
+	// (default DefaultGCInterval). <= 0 disables the periodic sweep, but
+	// Close/DrainToBackend still run one on the way out. Ignored when
+	// GCEnabled is false.
 	GCInterval time.Duration
 
+	// GC sweeper control. The sweep runs on its own goroutine, NOT the chunk
+	// uploader's, so a drain that blocks inside DrainToBackendCtx (a slow or
+	// out-of-space backend retrying uploads) cannot starve the GC ticker —
+	// which is exactly when reclaim is needed most.
 	gcTicker *time.Ticker
+	gcStop   chan struct{}
+	gcDone   chan struct{}
 
 	// gcRefcount counts, per chunk ObjectID, how many live BlockLookup
 	// entries reference it (protected by BlocksToObject.mu). Zero marks a GC
@@ -1176,6 +1182,9 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	// Start background chunk uploader (if interval > 0)
 	vb.StartChunkUploader()
 
+	// Start the GC sweeper on its own goroutine (if GC enabled and interval > 0)
+	vb.StartChunkGC()
+
 	// Emit the volume-open event. Every New() starts a chunk uploader, so
 	// every construction is a potential WRITER of this volume, not a reader --
 	// which is why the open is worth recording with process identity. Opens
@@ -1323,29 +1332,12 @@ func (vb *VB) StartChunkUploader() {
 	vb.chunkUploadDone = make(chan struct{})
 	vb.chunkUploadTicker = time.NewTicker(vb.ChunkUploadInterval)
 
-	// Chunk GC runs on its own cadence, decoupled from ChunkUploadInterval,
-	// so a short upload interval doesn't force GC's ancestry scan (see
-	// ensureGCSnapshotSafe) to run more often than necessary. gcTickerC
-	// stays nil (never fires below) when GC is off or GCInterval <= 0.
-	var gcTickerC <-chan time.Time
-	var gcTicker *time.Ticker
-	if vb.GCEnabled && vb.GCInterval > 0 {
-		vb.gcTicker = time.NewTicker(vb.GCInterval)
-		gcTicker = vb.gcTicker
-		gcTickerC = vb.gcTicker.C
-	}
-
 	// Locals, not VB fields, for the same reason as the WAL syncer.
 	stop, done, ticker := vb.chunkUploadStop, vb.chunkUploadDone, vb.chunkUploadTicker
 
 	go func() {
 		defer close(done)
 		defer ticker.Stop()
-		defer func() {
-			if gcTicker != nil {
-				gcTicker.Stop()
-			}
-		}()
 
 		for {
 			select {
@@ -1364,7 +1356,50 @@ func (vb *VB) StartChunkUploader() {
 				if err := vb.DrainToBackendCtx(context.Background()); err != nil {
 					vb.logger().Warn("chunk uploader: size-triggered DrainToBackend failed", "err", err)
 				}
-			case <-gcTickerC:
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	vb.logger().Debug("chunk uploader started", "interval", vb.ChunkUploadInterval)
+}
+
+// StartChunkGC starts a background goroutine that periodically runs a chunk GC
+// sweep. It is deliberately a SEPARATE goroutine from the chunk uploader: a
+// sweep's drain-before-sweep and the uploader's drains serialise on drainMu,
+// but a drain that blocks (a slow or out-of-space backend retrying uploads)
+// only parks the goroutine it runs on. Sharing one select would let a stuck
+// uploader drain monopolise the goroutine and starve the GC ticker — exactly
+// when churn has made reclaim most urgent. Own goroutine, own cadence.
+func (vb *VB) StartChunkGC() {
+	if !vb.GCEnabled || vb.GCInterval <= 0 {
+		vb.logger().Debug("chunk GC sweeper disabled", "gcEnabled", vb.GCEnabled, "gcInterval", vb.GCInterval)
+		return
+	}
+
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Already running — see StartWALSyncer for why a second goroutine is unsafe.
+	if vb.gcStop != nil {
+		return
+	}
+
+	vb.gcStop = make(chan struct{})
+	vb.gcDone = make(chan struct{})
+	vb.gcTicker = time.NewTicker(vb.GCInterval)
+
+	// Locals, not VB fields, for the same reason as the WAL syncer.
+	stop, done, ticker := vb.gcStop, vb.gcDone, vb.gcTicker
+
+	go func() {
+		defer close(done)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
 				vb.runGCSweep(context.Background())
 			case <-stop:
 				return
@@ -1372,7 +1407,29 @@ func (vb *VB) StartChunkUploader() {
 		}
 	}()
 
-	vb.logger().Debug("chunk uploader started", "interval", vb.ChunkUploadInterval, "gcEnabled", vb.GCEnabled, "gcInterval", vb.GCInterval)
+	vb.logger().Debug("chunk GC sweeper started", "interval", vb.GCInterval)
+}
+
+// StopChunkGC gracefully stops the background GC sweep goroutine, waiting for
+// any in-flight sweep to finish.
+func (vb *VB) StopChunkGC() {
+	vb.bgMu.Lock()
+	defer vb.bgMu.Unlock()
+
+	// Not running, or a concurrent caller already stopped it and nil'd the
+	// fields while this one waited for the mutex — see StopWALSyncer.
+	if vb.gcStop == nil {
+		return
+	}
+
+	close(vb.gcStop)
+	<-vb.gcDone
+
+	vb.gcStop = nil
+	vb.gcDone = nil
+	vb.gcTicker = nil
+
+	vb.logger().Debug("chunk GC sweeper stopped")
 }
 
 // StopChunkUploader stops the background chunk upload goroutine.
@@ -5230,6 +5287,7 @@ func (vb *VB) Close() error {
 	vb.logger().Info("VB Close, flushing block state to disk")
 
 	// Stop background goroutines before flushing
+	vb.StopChunkGC()
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
 

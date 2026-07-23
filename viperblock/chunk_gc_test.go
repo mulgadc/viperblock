@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1211,4 +1212,198 @@ func TestChunkGC_DeclinedSweepIsVisibleOnEveryPass(t *testing.T) {
 		assert.Contains(t, buf.String(), "chunk GC: sweep skipped",
 			"pass %d: a declined sweep must say so every time, not just on the first scan", pass+1)
 	}
+}
+
+// TestChunkGC_TickerDispatchesSweep exercises the deployed dispatch path: the
+// background chunk-uploader goroutine's select loop, where the GC ticker case
+// lives alongside the drain cases. The plugin never calls runGCSweep directly —
+// it relies on this ticker firing — so a sweep that works when called by hand
+// (every other test here) proves nothing about whether it ever runs in prod.
+func TestChunkGC_TickerDispatchesSweep(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	safeBuf := &syncBuffer{buf: &buf}
+
+	backendConfig := file.FileConfig{VolumeName: "vol-ticker-gc", VolumeSize: volumeSize, BaseDir: root}
+	vbconfig := VB{
+		VolumeName: "vol-ticker-gc",
+		VolumeSize: volumeSize,
+		BaseDir:    filepath.Join(root, "viperblock"),
+		// Positive short intervals: mirror the plugin (which defaults these to
+		// 200ms / 30s / 5m) but fast enough for a test to see several ticks.
+		WALSyncInterval:     10 * time.Millisecond,
+		ChunkUploadInterval: 25 * time.Millisecond,
+		GCEnabled:           true,
+		GCInterval:          50 * time.Millisecond,
+		Logger:              slog.New(slog.NewTextHandler(safeBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Cache:               Cache{Config: CacheConfig{Size: 0}},
+	}
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		vb.StopChunkGC()
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
+		assert.NoError(t, vb.RemoveLocalFiles())
+	})
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	// Create garbage: write the same blocks twice so the first chunk is
+	// superseded and becomes a GC candidate.
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// Wait for the GC ticker (50ms) to fire several times.
+	require.Eventually(t, func() bool {
+		return strings.Contains(safeBuf.String(), "chunk GC: sweep")
+	}, 5*time.Second, 50*time.Millisecond,
+		"the GC ticker must dispatch runGCSweep on its own; no chunk GC line appeared in 5s of ticks")
+}
+
+// slowChunkBackend wraps a Backend and makes every chunk upload slow but still
+// progressing: it sleeps, then delegates and returns, releasing drainMu each
+// time. This is the env13 condition — sustained overwrite churn keeps the
+// chunk uploader ~continuously inside DrainToBackendCtx — WITHOUT the
+// unrecoverable, backend-full case (where a drain can never complete and no
+// amount of GC scheduling helps). blocked counts chunk writes in flight so the
+// test can confirm drains really are happening while GC sweeps.
+type slowChunkBackend struct {
+	types.Backend
+
+	delay   time.Duration
+	blocked atomic.Int32 // chunk writes currently sleeping
+}
+
+func (s *slowChunkBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	if fileType == types.FileTypeChunk {
+		s.blocked.Add(1)
+		defer s.blocked.Add(-1)
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
+}
+
+// TestChunkGC_SweepsUnderSustainedSlowDrains is the regression guard for the
+// production bug (mulga-99rr5): the GC ticker used to share the chunk-uploader
+// goroutine's select with the drain cases, so under sustained churn — where
+// that goroutine sits almost permanently inside a slow DrainToBackendCtx — the
+// GC tick lost the select race every time and never fired. With GC on its own
+// goroutine, a slow-but-progressing drain no longer starves it: the sweep runs
+// even while the uploader is continuously draining. If GC is ever folded back
+// into the uploader select, the sweep line stops appearing and this fails.
+func TestChunkGC_SweepsUnderSustainedSlowDrains(t *testing.T) {
+	root := t.TempDir()
+	ctx := context.Background()
+
+	var buf bytes.Buffer
+	safeBuf := &syncBuffer{buf: &buf}
+
+	backendConfig := file.FileConfig{VolumeName: "vol-slow-gc", VolumeSize: volumeSize, BaseDir: root}
+	vbconfig := VB{
+		VolumeName: "vol-slow-gc",
+		VolumeSize: volumeSize,
+		BaseDir:    filepath.Join(root, "viperblock"),
+		// Background loops stay off at New(): we wrap the backend and start the
+		// uploader + GC by hand so the slow backend is in place before they run.
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCEnabled:           true,
+		GCInterval:          30 * time.Millisecond,
+		Logger:              slog.New(slog.NewTextHandler(safeBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Cache:               Cache{Config: CacheConfig{Size: 0}},
+	}
+	vb, err := New(&vbconfig, FileBackend, backendConfig)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	// Make GC candidates with the fast, unwrapped backend: same blocks written
+	// twice so the first chunk is superseded and becomes sweepable.
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+	writeAndChunk(t, vb, 0, randomBlockData(4))
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// Wrap the backend so every subsequent chunk upload takes 60ms — slow enough
+	// that continuous churn keeps the uploader almost permanently inside a drain.
+	sb := &slowChunkBackend{Backend: vb.Backend, delay: 60 * time.Millisecond}
+	vb.Backend = sb
+
+	// Drive continuous writes so pendingBytes stays high and the uploader keeps
+	// re-entering DrainToBackendCtx back to back.
+	writerStop := make(chan struct{})
+	stopWriter := sync.OnceFunc(func() { close(writerStop) })
+	go func() {
+		blk := uint64(0)
+		for {
+			select {
+			case <-writerStop:
+				return
+			default:
+				_ = vb.Write(blk%64, randomBlockData(1))
+				_ = vb.Flush()
+				blk++
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Start the uploader and the (now independent) GC sweeper.
+	vb.ChunkUploadInterval = 20 * time.Millisecond
+	vb.StartChunkUploader()
+	vb.StartChunkGC()
+
+	// Teardown runs LIFO: stop the writer, then the goroutines, then remove files.
+	t.Cleanup(func() { assert.NoError(t, vb.RemoveLocalFiles()) })
+	t.Cleanup(vb.StopChunkUploader)
+	t.Cleanup(vb.StopChunkGC)
+	t.Cleanup(stopWriter)
+
+	// Confirm the uploader really is spending time inside slow drains — otherwise
+	// the assertion below would pass vacuously against an idle backend.
+	require.Eventually(t, func() bool { return sb.blocked.Load() > 0 }, 3*time.Second, 10*time.Millisecond,
+		"the chunk uploader never entered a slow drain")
+
+	// The GC sweep must fire on its own goroutine despite the uploader being
+	// continuously busy draining. On the pre-fix shared-goroutine code this line
+	// never appears under this load.
+	require.Eventually(t, func() bool {
+		return strings.Contains(safeBuf.String(), "chunk GC: sweep")
+	}, 8*time.Second, 50*time.Millisecond,
+		"GC never swept under sustained slow drains — a busy uploader must not starve the independent GC goroutine")
+}
+
+// syncBuffer serialises writes from the background goroutine with test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf *bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *syncBuffer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf.Reset()
 }
