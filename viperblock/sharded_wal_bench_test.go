@@ -134,6 +134,7 @@ func BenchmarkWrite_Concurrent8_ShardedWAL(b *testing.B) {
 }
 
 func BenchmarkFlush_LegacyWAL(b *testing.B) {
+	silenceVBLogs()
 	vb := setupBenchVB(b, false)
 
 	data := make([]byte, 4096)
@@ -149,6 +150,7 @@ func BenchmarkFlush_LegacyWAL(b *testing.B) {
 }
 
 func BenchmarkFlush_ShardedParallel(b *testing.B) {
+	silenceVBLogs()
 	vb := setupBenchVB(b, true)
 
 	data := make([]byte, 4096)
