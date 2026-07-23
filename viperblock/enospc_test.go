@@ -1,9 +1,12 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -277,6 +280,59 @@ func TestWriteAtCtxGateIsLoadBearing(t *testing.T) {
 	vb.pendingBytes.Add(-int64(blockSize))
 	backend.full.Store(false)
 	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+}
+
+// TestBackendFullLatchLogsTransitionsOnce pins that the backendFull latch logs
+// one line per edge: a Warn when a drain latches the backend out-of-space, an
+// Info when a later clean drain clears it. Each line fires exactly once per
+// transition -- driving two full latch/recover cycles proves the Swap-based
+// edge detection logs again on a fresh edge but never re-logs while the latch
+// state is unchanged, so these lines cannot flood ES under sustained churn.
+// This transition is the signal that guest writes started (and later stopped)
+// failing fast, which was invisible during the env RCA.
+func TestBackendFullLatchLogsTransitionsOnce(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	var buf bytes.Buffer
+	vb.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	blockSize := uint64(vb.BlockSize)
+
+	// latchOnce writes a block, latches the backend full, and drains: the
+	// false->true edge must fire. The write must precede the latch because
+	// WriteAtCtx fails fast once backendFull is set.
+	latchOnce := func(off uint64) {
+		require.NoError(t, vb.WriteAt(off, make([]byte, blockSize)))
+		backend.full.Store(true)
+		require.Error(t, vb.DrainToBackendCtx(context.Background()))
+		require.True(t, vb.backendFull.Load())
+	}
+	// recoverOnce clears the backend and drains clean: the true->false edge fires.
+	recoverOnce := func() {
+		backend.full.Store(false)
+		require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+		require.False(t, vb.backendFull.Load())
+	}
+
+	// Match the unique message substrings, not "backend out of space" -- the
+	// backend's own rejection error carries that same phrase, so it would
+	// over-count.
+	latchLine, recoverLine := "latching writes off", "backend space recovered"
+
+	latchOnce(0)
+	assert.Equal(t, 1, strings.Count(buf.String(), latchLine), "first false->true edge logs once")
+
+	recoverOnce()
+	assert.Equal(t, 1, strings.Count(buf.String(), recoverLine), "first true->false edge logs once")
+
+	// A second clean drain leaves the latch already-clear: no new recovery line.
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+	assert.Equal(t, 1, strings.Count(buf.String(), recoverLine), "a no-op drain must not re-log recovery")
+
+	// Second cycle: a fresh edge in each direction logs again, exactly once more.
+	latchOnce(blockSize)
+	assert.Equal(t, 2, strings.Count(buf.String(), latchLine), "a fresh false->true edge logs again")
+
+	recoverOnce()
+	assert.Equal(t, 2, strings.Count(buf.String(), recoverLine), "a fresh true->false edge logs again")
 }
 
 // TestErrNoSpaceIsTypesErrNoSpace pins that ErrNoSpace re-exports
