@@ -151,9 +151,10 @@ func TestWrapNotFound(t *testing.T) {
 	}
 }
 
-// TestClassifyWriteErr pins that only HTTP 507 and 503 classify as
-// types.ErrNoSpace; every other status, or an error with no HTTP response
-// attached, must pass through unchanged.
+// TestClassifyWriteErr pins that ONLY HTTP 507 classifies as types.ErrNoSpace.
+// 503 is predastore's transient SlowDown (rate limit) and must pass through as
+// an ordinary error, never out-of-space; every other status, or an error with
+// no HTTP response attached, also passes through unchanged.
 func TestClassifyWriteErr(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -171,9 +172,12 @@ func TestClassifyWriteErr(t *testing.T) {
 			wantNoSpace: true,
 		},
 		{
-			name:        "503_service_unavailable_maps_to_no_space",
+			// 503 SlowDown is transient rate-limit backpressure, not a full
+			// store — it must stay an ordinary (retryable) error so the
+			// backendFull latch never trips on it.
+			name:        "503_slowdown_stays_unclassified",
 			in:          newResponseError(http.StatusServiceUnavailable),
-			wantNoSpace: true,
+			wantNoSpace: false,
 		},
 		{
 			name:        "500_internal_error_stays_unclassified",
