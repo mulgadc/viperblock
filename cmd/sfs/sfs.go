@@ -333,6 +333,10 @@ func main() {
 			}
 
 			data, err := vb.Backend.Read(types.FileTypeChunk, objectID, objectOffset, utils.SafeUint64ToUint32(sfs.Blocksize))
+			if err != nil {
+				slog.Error("Could not read block", "error", err)
+				os.Exit(1)
+			}
 
 			// Position in the buffer where this block should go
 			pos := i * utils.SafeUint64ToInt(sfs.Blocksize)
@@ -347,11 +351,6 @@ func main() {
 			}
 
 			copy(fileBuffer[pos:pos+bytesToCopy], data[:bytesToCopy])
-
-			if err != nil {
-				slog.Error("Could not read block", "error", err)
-				os.Exit(1)
-			}
 		}
 
 		// Compare the SHA256 of the local file to the block storage version

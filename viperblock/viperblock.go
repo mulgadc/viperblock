@@ -1020,6 +1020,8 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		//volumeName = backendConfig.(s3.S3Config).VolumeName
 		//volumeSize = backendConfig.(s3.S3Config).VolumeSize
 		backend = s3.New(backendConfig)
+	default:
+		return nil, fmt.Errorf("unsupported backend type %q", btype)
 	}
 	backend.SetLogger(log)
 
@@ -5280,6 +5282,13 @@ func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]by
 
 	// Compute offset within the first block
 	innerOffset := offset % blockSize
+
+	// read() always returns a full-length buffer when err is nil or ErrZeroBlock
+	// (it only returns nil data alongside a genuine error), so this guard is
+	// belt-and-suspenders — it encodes that invariant rather than dereferencing blind.
+	if fullData == nil {
+		return nil, err
+	}
 	return fullData[innerOffset : innerOffset+length], err
 }
 
