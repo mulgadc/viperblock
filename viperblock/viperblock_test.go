@@ -80,8 +80,9 @@ var testHTTPClient = &http.Client{
 	},
 }
 
-// scratchDirPrefix names each run's predastore scratch directory. It is a
-// constant because sweepAbandonedScratchDirs matches on it.
+// scratchDirPrefix names each run's scratch root, which holds the predastore
+// data directory and every t.TempDir(). It is a constant because
+// sweepAbandonedScratchDirs matches on it.
 const scratchDirPrefix = "viperblock-predastore-"
 
 // scratchDirMaxAge is how old an abandoned scratch directory must be before it
@@ -149,12 +150,28 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 
-		dataDir, err := os.MkdirTemp("", scratchDirPrefix+"*")
+		// One root for everything this run writes to /tmp, swept as a unit.
+		runRoot, err := os.MkdirTemp("", scratchDirPrefix+"*")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
 			return 1
 		}
-		defer os.RemoveAll(dataDir)
+		defer os.RemoveAll(runRoot)
+
+		// t.TempDir() resolves through os.TempDir(), which reads TMPDIR, so
+		// rooting the run here nests every test's scratch inside runRoot. Left
+		// at the default each test strands its own Test*-named directory, which
+		// the prefix sweep above walks straight past.
+		if err := os.Setenv("TMPDIR", runRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to set TMPDIR: %v\n", err)
+			return 1
+		}
+
+		dataDir := filepath.Join(runRoot, "predastore")
+		if err := os.MkdirAll(dataDir, 0o750); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create predastore data dir: %v\n", err)
+			return 1
+		}
 
 		srv, err := predastoretest.Start(predastoretest.Options{
 			DataDir:    dataDir,
@@ -2572,4 +2589,16 @@ func TestSweepAbandonedScratchDirsToleratesUnreadableDir(t *testing.T) {
 	assert.NotPanics(t, func() {
 		sweepAbandonedScratchDirs(filepath.Join(t.TempDir(), "does-not-exist"))
 	})
+}
+
+// What makes the sweep sufficient: every test's scratch must nest inside this
+// run's own prefixed root. Rooted anywhere else, a killed run strands one
+// Test*-named directory per test that the prefix sweep cannot match, and on a
+// tmpfs /tmp that leak is charged to memory rather than disk.
+func TestTempDirNestsInsideSweepableRunRoot(t *testing.T) {
+	root := os.TempDir()
+	assert.True(t, strings.HasPrefix(filepath.Base(root), scratchDirPrefix),
+		"os.TempDir() = %q, want a %s* root so an abandoned run is sweepable", root, scratchDirPrefix)
+	assert.True(t, strings.HasPrefix(t.TempDir(), root+string(os.PathSeparator)),
+		"t.TempDir() must resolve inside %q", root)
 }
