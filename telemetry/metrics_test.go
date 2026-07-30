@@ -18,7 +18,7 @@ import (
 // create fresh instruments bound to the manual reader — otherwise the
 // package-level Once fired by an earlier test would keep pointing at
 // whatever provider was live when it first ran.
-func withManualReader(t *testing.T) *sdkmetric.ManualReader {
+func withManualReader(t testing.TB) *sdkmetric.ManualReader {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
 	prev := otel.GetMeterProvider()

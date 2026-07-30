@@ -31,11 +31,13 @@ var (
 	rmwConflicts metric.Int64Counter
 	volumeOpens  metric.Int64Counter
 
-	// cacheHitOpt/cacheMissOpt are pre-built so the per-block cache lookup
-	// path (inside the read hot loop) allocates nothing beyond the record
-	// call itself.
-	cacheHitOpt  metric.AddOption
-	cacheMissOpt metric.AddOption
+	// cacheHitOpts/cacheMissOpts are pre-built as slices, not bare options, so
+	// the per-block cache lookup path (inside the read hot loop) allocates
+	// nothing at all. Passing a bare AddOption to the variadic Add still heap-
+	// allocates the 16-byte backing slice on every call; passing a pre-built
+	// slice with ... reuses it.
+	cacheHitOpts  []metric.AddOption
+	cacheMissOpts []metric.AddOption
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -89,8 +91,12 @@ func instruments() {
 			otel.Handle(err)
 		}
 
-		cacheHitOpt = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "hit")))
-		cacheMissOpt = metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "miss")))
+		cacheHitOpts = []metric.AddOption{
+			metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "hit"))),
+		}
+		cacheMissOpts = []metric.AddOption{
+			metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "miss"))),
+		}
 
 		rmwConflicts, err = m.Int64Counter("viperblock.write.rmw_conflicts",
 			metric.WithDescription("Partial writes that found another write already rebuilding the same block. Non-zero means guest I/O produces same-block write concurrency."),
@@ -205,16 +211,16 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 }
 
 // RecordCacheLookup records one block-cache lookup outcome ("hit"/"miss").
-// Hot path: called per block in the read loop, so it uses a pre-built
-// AddOption rather than allocating an attribute set per call.
+// Hot path: called per block in the read loop, so it passes a pre-built option
+// slice rather than allocating an attribute set or a variadic slice per call.
 func RecordCacheLookup(ctx context.Context, hit bool) {
 	instruments()
 	if cacheLookups == nil {
 		return
 	}
 	if hit {
-		cacheLookups.Add(ctx, 1, cacheHitOpt)
+		cacheLookups.Add(ctx, 1, cacheHitOpts...)
 		return
 	}
-	cacheLookups.Add(ctx, 1, cacheMissOpt)
+	cacheLookups.Add(ctx, 1, cacheMissOpts...)
 }
