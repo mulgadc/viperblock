@@ -1456,16 +1456,24 @@ func (vb *VB) StopChunkUploader() {
 	vb.logger().Debug("chunk uploader stopped")
 }
 
-// syncWALIfDirty performs fsync on the active WAL file if there are pending writes.
-// This is the core of the periodic sync mechanism - it checks the dirty flag
-// and only syncs when necessary to avoid unnecessary I/O.
+// syncWALIfDirty is syncWAL for the periodic syncer, which has no caller to
+// report to and must not stop ticking on one bad fsync.
+func (vb *VB) syncWALIfDirty() {
+	if err := vb.syncWAL(); err != nil {
+		vb.logger().Error("WAL sync failed", "error", err)
+	}
+}
+
+// syncWAL performs fsync on the active WAL file if there are pending writes,
+// returning the fsync error so a barrier can refuse to report success on a
+// WAL that never reached stable storage.
 //
 // Note: Only the last file in vb.WAL.DB is the active WAL being written to.
 // Previous files are closed after WriteWALToChunk processes them.
-func (vb *VB) syncWALIfDirty() {
+func (vb *VB) syncWAL() error {
 	// Fast path: check dirty flag without lock
 	if !vb.WAL.dirty.Load() {
-		return
+		return nil
 	}
 
 	// Clear dirty flag before sync (writes during sync will re-set it)
@@ -1480,21 +1488,33 @@ func (vb *VB) syncWALIfDirty() {
 		activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
 		if activeWAL != nil {
 			if err := activeWAL.Sync(); err != nil {
-				vb.logger().Error("WAL sync failed", "error", err)
-				// Re-mark as dirty so next tick retries
+				// Re-mark as dirty so the next tick retries
 				vb.WAL.dirty.Store(true)
+				return fmt.Errorf("WAL sync: %w", err)
 			}
 		}
 	}
+	return nil
 }
 
-// syncShardedWALIfDirty fsyncs only the shards that have been written to since the last sync.
+// syncShardedWALIfDirty is syncShardedWAL for the periodic syncer, which has
+// no caller to report to and must not stop ticking on one bad fsync.
 func (vb *VB) syncShardedWALIfDirty() {
+	if err := vb.syncShardedWAL(); err != nil {
+		vb.logger().Error("Sharded WAL sync failed", "error", err)
+	}
+}
+
+// syncShardedWAL fsyncs only the shards written to since the last sync,
+// returning the first failure. Every dirty shard is attempted even after one
+// fails, so a single bad shard cannot leave the others unsynced.
+func (vb *VB) syncShardedWAL() error {
 	sw := vb.ShardedWAL
 	if sw == nil {
-		return
+		return nil
 	}
 
+	var firstErr error
 	for i := range NumShards {
 		shard := sw.Shards[i]
 
@@ -1508,12 +1528,15 @@ func (vb *VB) syncShardedWALIfDirty() {
 		shard.mu.RLock()
 		if shard.DB != nil {
 			if err := shard.DB.Sync(); err != nil {
-				vb.logger().Error("Sharded WAL sync failed", "shard", i, "error", err)
 				shard.dirty.Store(true)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
+				}
 			}
 		}
 		shard.mu.RUnlock()
 	}
+	return firstErr
 }
 
 // WAL functions.
@@ -2037,7 +2060,10 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 	return nil
 }
 
-// Flush the main memory (writes) to the WAL.
+// Flush writes buffered blocks to the WAL and fsyncs it. On success every
+// write acknowledged before the call is on stable storage on this host —
+// which is what a guest barrier promises. It does NOT mean the data has
+// reached the backend; that is what DrainToBackend is for.
 func (vb *VB) Flush() (err error) {
 	start := time.Now()
 	defer func() {
@@ -2048,6 +2074,22 @@ func (vb *VB) Flush() (err error) {
 		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
 	}()
 
+	if err = vb.flushWrites(); err != nil {
+		return err
+	}
+
+	// Sync outside Writes.mu so a slow fsync does not stall writers. Safe: the
+	// records being synced are already in the file, and a write landing after
+	// them only widens what this sync covers.
+	if vb.UseShardedWAL {
+		return vb.syncShardedWAL()
+	}
+	return vb.syncWAL()
+}
+
+// flushWrites moves buffered blocks into the WAL file under Writes.mu, with
+// no fsync of its own.
+func (vb *VB) flushWrites() error {
 	vb.Writes.mu.Lock()
 	defer vb.Writes.mu.Unlock()
 	if vb.UseShardedWAL {
