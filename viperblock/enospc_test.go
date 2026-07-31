@@ -27,6 +27,11 @@ type enospcBackend struct {
 
 	full atomic.Bool
 
+	// nearFull stands in for predastore's X-Predastore-Pool-Pressure header,
+	// which rides on a SUCCESSFUL write, so this toggle deliberately does not
+	// make any write fail.
+	nearFull atomic.Bool
+
 	// genericFail, when true, makes every FileTypeBlockCheckpointLive write
 	// return a persistent, non-ErrNoSpace error, so tests can prove
 	// awaitBackpressure bounds consecutive drain failures instead of
@@ -110,6 +115,12 @@ func (b *enospcBackend) WriteCtx(ctx context.Context, fileType types.FileType, o
 		b.afterWrite(fileType, err)
 	}
 	return err
+}
+
+// NearFull satisfies backendNearFuller, which the file backend does not
+// implement on its own.
+func (b *enospcBackend) NearFull() bool {
+	return b.nearFull.Load()
 }
 
 // newEnospcTestVB builds a minimal file-backed VB with its Backend wrapped
@@ -333,6 +344,61 @@ func TestBackendFullLatchLogsTransitionsOnce(t *testing.T) {
 
 	recoverOnce()
 	assert.Equal(t, 2, strings.Count(buf.String(), recoverLine), "a fresh true->false edge logs again")
+}
+
+// TestNearFullBackendStillAcceptsWrites pins that pool-pressure alone does not
+// reject a write. Predastore keeps accepting PUTs in the nearfull band (it only
+// rejects below the full watermark), so rejecting here cost every pool the
+// capacity between the two watermarks and failed every attached guest at once.
+func TestNearFullBackendStillAcceptsWrites(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	blockSize := uint64(vb.BlockSize)
+
+	backend.nearFull.Store(true)
+
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)),
+		"a nearfull backend must throttle writes, not reject them")
+	assert.False(t, vb.backendFull.Load(), "nearfull pressure must not latch backendFull")
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()),
+		"drains must keep flushing into the remaining headroom while nearfull")
+}
+
+// TestMaxPendingBytesShrinksWhileNearFull pins the throttle that replaces the
+// rejection: a nearfull backend makes writers block on synchronous drains
+// sooner, bounding how many acked writes are left dirty if it then goes full.
+func TestMaxPendingBytesShrinksWhileNearFull(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+
+	assert.Equal(t, DefaultMaxPendingBytes, vb.maxPendingBytes(), "an unset window uses the default")
+
+	backend.nearFull.Store(true)
+	assert.Equal(t, DefaultMaxPendingBytes/nearFullPendingDivisor, vb.maxPendingBytes(),
+		"nearfull must shrink the default window")
+
+	vb.MaxPendingBytes = 64 * 1024 * 1024
+	assert.Equal(t, vb.MaxPendingBytes/nearFullPendingDivisor, vb.maxPendingBytes(),
+		"nearfull must shrink an explicitly configured window too")
+
+	backend.nearFull.Store(false)
+	assert.Equal(t, vb.MaxPendingBytes, vb.maxPendingBytes(), "the full window returns once pressure clears")
+}
+
+// TestNearFullThenFullStillFailsFast pins that relaxing the nearfull gate did
+// not relax the real one: a backend that goes on to reject a drain still
+// latches backendFull and fails the next write.
+func TestNearFullThenFullStillFailsFast(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	blockSize := uint64(vb.BlockSize)
+
+	backend.nearFull.Store(true)
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
+
+	backend.full.Store(true)
+	require.ErrorIs(t, vb.DrainToBackendCtx(context.Background()), ErrNoSpace)
+	require.True(t, vb.backendFull.Load())
+
+	assert.ErrorIs(t, vb.WriteAt(blockSize, make([]byte, blockSize)), ErrNoSpace,
+		"a genuinely full backend must still fail writes fast")
 }
 
 // TestErrNoSpaceIsTypesErrNoSpace pins that ErrNoSpace re-exports

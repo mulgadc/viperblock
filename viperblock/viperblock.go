@@ -61,6 +61,11 @@ const DefaultCheckpointRetryBackoff time.Duration = time.Second
 // to backend ingest rate instead of ballooning unbounded anonymous memory.
 const DefaultMaxPendingBytes uint64 = 256 * 1024 * 1024
 
+// nearFullPendingDivisor shrinks the backpressure high-watermark while the
+// backend reports nearfull pressure. 8 takes the default 256MB window to 32MB,
+// still well above the 4MB chunk size so drains stay chunk-sized.
+const nearFullPendingDivisor uint64 = 8
+
 // DefaultUploadWorkers bounds the parallel chunk-upload worker pool used by
 // WriteWALToChunkCtx / WriteShardedWALToChunkCtx. 1 means fully serial.
 const DefaultUploadWorkers int = 16
@@ -1678,11 +1683,20 @@ func (vb *VB) PendingBytes() uint64 {
 
 // maxPendingBytes returns the configured high-watermark, or the default if
 // unset (covers VB values assembled without going through New).
+//
+// A nearfull backend shrinks the window instead of stopping writes: the
+// backend still accepts PUTs in that band, so the right response is to make
+// writers block on synchronous drains sooner. That also bounds how many acked
+// writes are left dirty if the backend goes on to reject outright.
 func (vb *VB) maxPendingBytes() uint64 {
-	if vb.MaxPendingBytes == 0 {
-		return DefaultMaxPendingBytes
+	high := vb.MaxPendingBytes
+	if high == 0 {
+		high = DefaultMaxPendingBytes
 	}
-	return vb.MaxPendingBytes
+	if vb.isBackendNearFull() {
+		high /= nearFullPendingDivisor
+	}
+	return high
 }
 
 // checkpointBackoff returns the configured first retry sleep, or the default if
@@ -1810,11 +1824,10 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	// Writes.Blocks — a write is acked before its chunk is PUT, so without
 	// this gate a full backend would keep accepting writes into memory.
 	//
-	// isBackendNearFull extends the fail-fast to the nearfull band: at FULL
-	// the backend also rejects drain PUTs, so already-acked dirty pages
-	// could never flush. DrainToBackendCtx stays ungated so buffered drains
-	// keep flushing into the remaining headroom.
-	if vb.backendFull.Load() || vb.isBackendNearFull() {
+	// Only backendFull qualifies, which is latched from a drain the backend
+	// actually rejected. Nearfull pressure rides on a SUCCESSFUL response and
+	// means "slow down", so it throttles via maxPendingBytes instead.
+	if vb.backendFull.Load() {
 		return ErrNoSpace
 	}
 
