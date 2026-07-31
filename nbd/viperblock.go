@@ -496,6 +496,11 @@ func (c *ViperBlockConnection) CanFlush() (bool, error) {
 	return true, nil
 }
 
+// Flush honours the NBD durability contract to the level this deployment
+// promises: on success, every write already acknowledged to the guest is
+// fsynced to the local WAL and survives host crash or power loss. It does not
+// wait for the data to reach predastore, so it does not survive loss of the
+// node itself.
 func (c *ViperBlockConnection) Flush(flags uint32) error {
 	if err := c.vb.Flush(); err != nil {
 		return backendErrToPluginError("Flush failed", err)

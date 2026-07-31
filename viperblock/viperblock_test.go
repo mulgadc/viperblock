@@ -1104,10 +1104,12 @@ func TestWALPeriodicSync(t *testing.T) {
 
 			if tc.expectSyncerRun {
 				// Verify dirty flag was set
-				// Note: dirty flag may already be cleared by syncer, so we write again
+				// Note: dirty flag may already be cleared by syncer, so we write again.
+				// flushWrites, not Flush: Flush fsyncs, which would clear the very
+				// flag the syncer is being tested on.
 				err = vb.WriteAt(uint64(vb.BlockSize), data)
 				require.NoError(t, err)
-				err = vb.Flush()
+				err = vb.flushWrites()
 				require.NoError(t, err)
 
 				// Check dirty flag is set (syncer hasn't run yet if interval > test duration)
