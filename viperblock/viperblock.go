@@ -5385,7 +5385,17 @@ func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]by
 	return fullData[innerOffset : innerOffset+length], err
 }
 
+// Close runs CloseCtx with a background context, so every non-shutdown
+// caller keeps its existing unbounded behaviour.
 func (vb *VB) Close() error {
+	return vb.CloseCtx(context.Background())
+}
+
+// CloseCtx is Close with a caller-supplied context threaded through the
+// backend WAL upload, checkpoint sweep and state saves. Flush and
+// RemoveLocalFiles stay context-free: the local WAL fsync must never be
+// cancellable, since it is what makes an aborted CloseCtx safe to recover from.
+func (vb *VB) CloseCtx(ctx context.Context) error {
 	vb.logger().Info("VB Close, flushing block state to disk")
 
 	// Stop background goroutines before flushing
@@ -5400,9 +5410,9 @@ func (vb *VB) Close() error {
 
 	var walErr error
 	if vb.UseShardedWAL {
-		walErr = vb.WriteShardedWALToChunk(true)
+		walErr = vb.WriteShardedWALToChunkCtx(ctx, true)
 	} else {
-		walErr = vb.WriteWALToChunk(true)
+		walErr = vb.WriteWALToChunkCtx(ctx, true)
 	}
 	if walErr != nil {
 		vb.logger().Error("Could not Write WAL to Chunk during Close, proceeding to save block state", "err", walErr)
@@ -5413,14 +5423,14 @@ func (vb *VB) Close() error {
 		// preferred over the numbered checkpoint saved below) reflects the
 		// chunks just uploaded during this Close. Non-fatal: SaveBlockState
 		// below still persists the same map to the numbered checkpoint.
-		if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
+		if cpErr := vb.SaveLiveCheckpointCtx(ctx); cpErr != nil {
 			vb.logger().Warn("Close: SaveLiveCheckpoint failed", "err", cpErr)
 		} else {
 			// One last sweep, now that the live checkpoint durably excludes
 			// every zero-refcount chunk. Run before SaveBlockState so
 			// ensureGCFloor still sees the checkpoint from before this
 			// Close, not the one SaveBlockState is about to write.
-			vb.sweepChunks(context.Background())
+			vb.sweepChunks(ctx)
 		}
 	}
 
@@ -5437,7 +5447,7 @@ func (vb *VB) Close() error {
 	}
 
 	// Upload the state to the backend
-	if err := vb.SaveState(); err != nil {
+	if err := vb.SaveStateCtx(ctx); err != nil {
 		vb.logger().Error("Could not save state", "err", err)
 		if firstErr == nil {
 			firstErr = err
@@ -5447,7 +5457,7 @@ func (vb *VB) Close() error {
 	// Always attempt to save the block checkpoint even if SaveState or WAL
 	// flush failed — in-memory BlockLookup may reflect successfully flushed
 	// writes from earlier Flush calls and must not be lost.
-	if err := vb.SaveBlockState(); err != nil {
+	if err := vb.SaveBlockStateCtx(ctx); err != nil {
 		vb.logger().Error("Could not save block state", "err", err)
 		if firstErr == nil {
 			firstErr = err
