@@ -5,6 +5,7 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 
@@ -14,26 +15,31 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// NewJSONLogger builds a *slog.Logger that writes JSON to stdout at the
+// logDest is where NewJSONLogger writes its JSON lines. Stderr, not stdout:
+// nbdkit repoints a plugin's fd 1 at /dev/null but leaves fd 2 on the parent's
+// journald socket, so a stdout logger discards everything the plugin emits.
+var logDest io.Writer = os.Stderr
+
+// NewJSONLogger builds a *slog.Logger that writes JSON to stderr at the
 // given level, with trace_id/span_id stamping. If Init already installed a
 // real OTLP LoggerProvider, the logger also fans out to it. Unlike
 // SetDefaultJSONLogger this never touches slog.SetDefault, so it is safe to
 // call from library code that only wants its own scoped logger.
 func NewJSONLogger(serviceName string, level slog.Level) *slog.Logger {
-	stdout := NewSlogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	stderr := NewSlogHandler(slog.NewJSONHandler(logDest, &slog.HandlerOptions{
 		Level: level,
 	}))
 
 	lp, ok := loggerglobal.GetLoggerProvider().(*sdklog.LoggerProvider)
 	if !ok {
-		return slog.New(stdout)
+		return slog.New(stderr)
 	}
 	bridge := otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(lp))
-	return slog.New(newFanoutHandler(stdout, bridge))
+	return slog.New(newFanoutHandler(stderr, bridge))
 }
 
 // SetDefaultJSONLogger installs the process-wide slog default built by
-// NewJSONLogger. Repeated calls re-establish stdout-at-level without ever
+// NewJSONLogger. Repeated calls re-establish stderr-at-level without ever
 // clobbering the OTLP bridge. Callers must invoke this explicitly
 // (standalone entrypoints only) — never from a constructor an embedder might
 // call, or it silently hijacks the host process's own logger.

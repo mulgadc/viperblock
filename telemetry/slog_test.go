@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 
@@ -75,12 +77,12 @@ func TestSlogHandlerPreservesWrapperThroughWithAttrs(t *testing.T) {
 	}
 }
 
-// TestSetDefaultJSONLoggerNoLoggerProviderIsStdoutOnly is the no-op
+// TestSetDefaultJSONLoggerNoLoggerProviderIsStderrOnly is the no-op
 // guarantee: with no real LoggerProvider installed (Init did not run, or
 // ran without an OTLP endpoint), SetDefaultJSONLogger must produce a
-// stdout-only default and never wrap it in a fanoutHandler — standalone
+// stderr-only default and never wrap it in a fanoutHandler — standalone
 // logging behavior stays unchanged with OTLP unconfigured.
-func TestSetDefaultJSONLoggerNoLoggerProviderIsStdoutOnly(t *testing.T) {
+func TestSetDefaultJSONLoggerNoLoggerProviderIsStderrOnly(t *testing.T) {
 	prevLP := loggerglobal.GetLoggerProvider()
 	defer loggerglobal.SetLoggerProvider(prevLP)
 	loggerglobal.SetLoggerProvider(lognoop.NewLoggerProvider())
@@ -91,7 +93,34 @@ func TestSetDefaultJSONLoggerNoLoggerProviderIsStdoutOnly(t *testing.T) {
 	SetDefaultJSONLogger("viperblockd", slog.LevelInfo)
 
 	if _, ok := slog.Default().Handler().(*fanoutHandler); ok {
-		t.Error("expected stdout-only handler without a real LoggerProvider, got fanoutHandler")
+		t.Error("expected stderr-only handler without a real LoggerProvider, got fanoutHandler")
+	}
+}
+
+// TestLogDestIsStderr pins the stream choice. nbdkit repoints a plugin's fd 1
+// at /dev/null while leaving fd 2 on the parent's journald socket, so a stdout
+// logger discards every line the plugin emits — including the volume seal path.
+func TestLogDestIsStderr(t *testing.T) {
+	if logDest != io.Writer(os.Stderr) {
+		t.Errorf("logDest = %v, want os.Stderr; nbdkit sends a plugin's stdout to /dev/null", logDest)
+	}
+	if logDest == io.Writer(os.Stdout) {
+		t.Error("logDest is os.Stdout, which the nbdkit plugin cannot write to")
+	}
+}
+
+// TestNewJSONLoggerWritesToLogDest proves the handler actually emits to
+// logDest, so TestLogDestIsStderr is asserting about the live destination.
+func TestNewJSONLoggerWritesToLogDest(t *testing.T) {
+	var buf bytes.Buffer
+	prev := logDest
+	logDest = &buf
+	defer func() { logDest = prev }()
+
+	NewJSONLogger("viperblockd", slog.LevelInfo).Info("seal probe")
+
+	if !bytes.Contains(buf.Bytes(), []byte("seal probe")) {
+		t.Errorf("log line missing from logDest: %s", buf.String())
 	}
 }
 
