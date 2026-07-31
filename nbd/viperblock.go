@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/viperblock/telemetry"
@@ -32,6 +33,11 @@ var pluginName = "viperblock"
 // to the otelslog bridge, matching the metrics-apm.app.<name> data stream
 // dashboards are built against.
 const serviceName = "viperblockd"
+
+// shutdownDrainTimeout bounds the backend half of connection close and plugin
+// unload. An aborted drain is safe: committed writes are in the fsync'd local
+// WAL and replay on the next attach.
+const shutdownDrainTimeout = 20 * time.Second
 
 // otelShutdown flushes the OTLP exporters on Unload, if telemetry.Init
 // configured real ones. nil (a no-op) when OTLP export is not configured.
@@ -502,13 +508,19 @@ func (c *ViperBlockConnection) Close() {
 
 	stopSnapshotListener()
 
+	// One budget for the drain and the close together, not one each: systemd's
+	// TimeoutStopSec backstops this, and two full budgets in series would
+	// overrun it and turn the backstop into a SIGKILL.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancel()
+
 	// DrainToBackend before Close so the live checkpoint is current. Close
 	// will also flush WAL chunks, but does not save the live checkpoint.
-	if err := c.vb.DrainToBackend(); err != nil {
+	if err := c.vb.DrainToBackendCtx(ctx); err != nil {
 		slog.Error("Close: DrainToBackend failed", "err", err)
 	}
 
-	if err := c.vb.Close(); err != nil {
+	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
 	}
 	activeVB = nil
@@ -534,10 +546,14 @@ func (p *ViperBlockPlugin) Unload() {
 	}
 	slog.Info("Unload: Close was not called, flushing block state now")
 	stopSnapshotListener()
-	if err := activeVB.DrainToBackend(); err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+	defer cancel()
+
+	if err := activeVB.DrainToBackendCtx(ctx); err != nil {
 		slog.Error("Unload: DrainToBackend failed", "err", err)
 	}
-	if err := activeVB.Close(); err != nil {
+	if err := activeVB.CloseCtx(ctx); err != nil {
 		slog.Error("Unload: could not close VB", "err", err)
 	}
 	activeVB = nil
