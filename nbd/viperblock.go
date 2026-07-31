@@ -522,6 +522,10 @@ func (c *ViperBlockConnection) Close() {
 
 	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
+	} else if err := viperblock.WriteSealReceipt(base_dir, volume); err != nil {
+		// Best effort: the seal already succeeded, so a missing receipt only
+		// costs the consumer a WARN it would otherwise have skipped.
+		slog.Error("Close: could not write seal receipt", "err", err)
 	}
 	activeVB = nil
 }
@@ -555,6 +559,10 @@ func (p *ViperBlockPlugin) Unload() {
 	}
 	if err := activeVB.CloseCtx(ctx); err != nil {
 		slog.Error("Unload: could not close VB", "err", err)
+	} else if err := viperblock.WriteSealReceipt(base_dir, volume); err != nil {
+		// Best effort: the seal already succeeded, so a missing receipt only
+		// costs the consumer a WARN it would otherwise have skipped.
+		slog.Error("Unload: could not write seal receipt", "err", err)
 	}
 	activeVB = nil
 }
