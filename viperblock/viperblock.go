@@ -5311,8 +5311,9 @@ func (vb *VB) Close() error {
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
 
-	if err := vb.Flush(); err != nil {
-		vb.logger().Error("failed to flush during Close", "error", err)
+	flushErr := vb.Flush()
+	if flushErr != nil {
+		vb.logger().Error("failed to flush during Close", "error", flushErr)
 	}
 
 	var walErr error
@@ -5345,12 +5346,20 @@ func (vb *VB) Close() error {
 
 	vb.logger().Debug("Saving Close state to", "path", path)
 
-	var firstErr error
+	// Whatever the flush and WAL upload above failed to move to the backend
+	// still exists only in the local files, so those failures have to survive
+	// to the RemoveLocalFiles gate below.
+	firstErr := flushErr
+	if firstErr == nil {
+		firstErr = walErr
+	}
 
 	// Upload the state to the backend
 	if err := vb.SaveState(); err != nil {
 		vb.logger().Error("Could not save state", "err", err)
-		firstErr = err
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
 
 	// Always attempt to save the block checkpoint even if SaveState or WAL
@@ -5363,7 +5372,10 @@ func (vb *VB) Close() error {
 		}
 	}
 
+	// Deleting now would destroy the only copy of the un-uploaded writes. Keep
+	// the files so the next Open recovers them from the local WAL.
 	if firstErr != nil {
+		vb.logger().Error("Close failed, keeping local files for recovery", "err", firstErr)
 		return firstErr
 	}
 
@@ -5373,9 +5385,6 @@ func (vb *VB) Close() error {
 		vb.logger().Error("Failed to remove local files", "err", err)
 	}
 
-	if walErr != nil {
-		return walErr
-	}
 	return nil
 }
 
