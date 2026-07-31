@@ -206,6 +206,12 @@ type VB struct {
 	// successful drain.
 	backendFull atomic.Bool
 
+	// pendingWALChunks holds WAL generations that were rotated out but whose
+	// chunk upload failed. Retried at the head of the next consolidation so
+	// the data is not stranded in-process until the next restart.
+	pendingWALChunks []uint64
+	pendingWALMu     sync.Mutex
+
 	// drainMu serializes DrainToBackendCtx across all its triggers. Two
 	// concurrent drains would rotate to different WAL segments and race in
 	// createChunkFile, where an older segment landing last can clobber a
@@ -2678,6 +2684,13 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 		return fmt.Errorf("ShardedWAL not initialized")
 	}
 
+	// Retry any generation stranded by an earlier failed upload before
+	// rotating in a new one, so the uploader ticker keeps retrying without
+	// waiting for a forced drain.
+	if err := vb.retryPendingWALChunks(ctx, vb.consolidateShardedWALGeneration); err != nil {
+		return err
+	}
+
 	// If no shard files are open, this VB instance doesn't own the WAL.
 	// Skip consolidation (matches legacy WriteWALToChunk empty-DB guard).
 	hasOpenShards := false
@@ -2775,6 +2788,24 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 		sw.Shards[i].mu.Unlock()
 	}
 
+	if err := vb.consolidateShardedWALGeneration(ctx, currentWALNum); err != nil {
+		vb.pendingWALMu.Lock()
+		vb.pendingWALChunks = append(vb.pendingWALChunks, currentWALNum)
+		vb.pendingWALMu.Unlock()
+		return err
+	}
+
+	return nil
+}
+
+// consolidateShardedWALGeneration reads generation walNum's closed shard
+// files in parallel, dedupes, sorts, and uploads chunks to the backend.
+// walNum must already be rotated out (its shard files closed) before
+// calling; this touches neither WallNum nor open shard files, so it is safe
+// to call on a generation that was rotated out by an earlier attempt.
+func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64) error {
+	sw := vb.ShardedWAL
+
 	// Read closed shard files in parallel
 	type shardResult struct {
 		blocks []Block
@@ -2790,7 +2821,7 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 			defer wg.Done()
 
 			filename := filepath.Join(sw.BaseDir,
-				types.GetShardedWALPath(vb.GetVolume(), currentWALNum, shardID))
+				types.GetShardedWALPath(vb.GetVolume(), walNum, shardID))
 
 			file, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 			if err != nil {
@@ -2881,7 +2912,7 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 	chunkBuffer := make([]byte, 0, vb.ObjBlockSize)
 	matchedBlocks := make([]Block, 0)
 
-	up, _ := vb.newParallelUploader(ctx, currentWALNum)
+	up, _ := vb.newParallelUploader(ctx, walNum)
 
 	for _, block := range sortedBlocks {
 		chunkBuffer = append(chunkBuffer, block.Data...)
@@ -2913,6 +2944,35 @@ func (vb *VB) WriteWALToChunk(force bool) error {
 	return vb.WriteWALToChunkCtx(context.Background(), force)
 }
 
+// retryPendingWALChunks retries WAL generations that were rotated out by an
+// earlier consolidation but whose chunk upload failed, oldest first. Each
+// entry is dropped only once its consolidation succeeds; the first failure
+// stops the retry immediately and is returned so the caller's drain still
+// reports it (and, on ErrNoSpace, keeps the backendFull latch set).
+func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(context.Context, uint64) error) error {
+	for {
+		vb.pendingWALMu.Lock()
+		if len(vb.pendingWALChunks) == 0 {
+			vb.pendingWALMu.Unlock()
+			return nil
+		}
+		walNum := vb.pendingWALChunks[0]
+		vb.pendingWALMu.Unlock()
+
+		if err := consolidate(ctx, walNum); err != nil {
+			return err
+		}
+
+		// Drop the entry only after a successful consolidation. Re-check the
+		// head in case a concurrent caller already removed it.
+		vb.pendingWALMu.Lock()
+		if len(vb.pendingWALChunks) > 0 && vb.pendingWALChunks[0] == walNum {
+			vb.pendingWALChunks = vb.pendingWALChunks[1:]
+		}
+		vb.pendingWALMu.Unlock()
+	}
+}
+
 // WriteWALToChunkCtx is WriteWALToChunk with a caller-supplied context
 // threaded through the chunk uploads. Consolidates the WAL (or dispatches to
 // the sharded WAL) into a durable chunk object on the backend.
@@ -2929,6 +2989,13 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	// Dispatch to sharded implementation when enabled
 	if vb.UseShardedWAL {
 		return vb.WriteShardedWALToChunkCtx(ctx, force)
+	}
+
+	// Retry any generation stranded by an earlier failed upload before
+	// rotating in a new one, so the uploader ticker keeps retrying without
+	// waiting for a forced drain.
+	if err := vb.retryPendingWALChunks(ctx, vb.consolidateWALGeneration); err != nil {
+		return err
 	}
 
 	// First, lock, and close the current WAL file
@@ -2973,8 +3040,23 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		return err
 	}
 
-	filename := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, currentWALNum, vb.GetVolume()))
-	//filename := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin", vb.WAL.BaseDir, vb.GetVolume(), currentWALNum)
+	if err := vb.consolidateWALGeneration(ctx, currentWALNum); err != nil {
+		vb.pendingWALMu.Lock()
+		vb.pendingWALChunks = append(vb.pendingWALChunks, currentWALNum)
+		vb.pendingWALMu.Unlock()
+		return err
+	}
+
+	return nil
+}
+
+// consolidateWALGeneration reads, dedupes, and uploads WAL generation walNum's
+// blocks to the backend as chunk objects. walNum must already be rotated out
+// of vb.WAL.DB (its file closed) before calling; this touches neither
+// WallNum nor open file handles, so it is safe to call on a generation that
+// was rotated out by an earlier consolidation attempt.
+func (vb *VB) consolidateWALGeneration(ctx context.Context, walNum uint64) error {
+	filename := fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, walNum, vb.GetVolume()))
 	pendingWAL2, err := os.OpenFile(filename, os.O_RDWR, 0600)
 	if err != nil {
 		return err
@@ -3101,7 +3183,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	var chunkBuffer = make([]byte, 0, vb.ObjBlockSize)
 	var matchedBlocks = make([]Block, 0)
 
-	up, ctx := vb.newParallelUploader(ctx, currentWALNum)
+	up, ctx := vb.newParallelUploader(ctx, walNum)
 
 	for _, block := range sortedBlocks {
 		chunkBuffer = append(chunkBuffer, block.Data...)
