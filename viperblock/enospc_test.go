@@ -56,6 +56,11 @@ type enospcBackend struct {
 	// BlocksToObject.dirty after a scripted checkpoint success, standing in
 	// for a concurrent guest write that would otherwise dirty it again.
 	afterWrite func(fileType types.FileType, err error)
+
+	// blockUntilCancelled, when true, makes WriteCtx block on ctx.Done()
+	// instead of writing, standing in for a slow or unreachable backend
+	// whose call never returns on its own.
+	blockUntilCancelled atomic.Bool
 }
 
 // enospcErr mirrors what backends/s3 and backends/file return once
@@ -110,6 +115,10 @@ func (b *enospcBackend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (b *enospcBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	if b.blockUntilCancelled.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	err := b.dispatch(fileType, func() error { return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data) })
 	if b.afterWrite != nil {
 		b.afterWrite(fileType, err)
@@ -531,6 +540,48 @@ func runBlockingWriteWithHangTimeout(t *testing.T, vb *VB, offset uint64, data [
 		t.Fatalf("WriteAt did not return within %s -- awaitBackpressure is hanging instead of bounding consecutive drain failures", timeout)
 		return nil // unreachable, t.Fatalf stops the goroutine
 	}
+}
+
+// TestWriteAtRecoveryProbeDoesNotHangAgainstUnresponsiveBackend pins that
+// the recovery probe cannot block a guest write indefinitely. WriteAt (the
+// guest write entrypoint) passes context.Background(), so without its own
+// deadline probeBackendRecovery would hang forever against a backend that
+// never responds, instead of failing fast with ErrNoSpace as it did before
+// the probe existed. backendRecoveryProbeTimeout is shrunk to a fixed,
+// non-sleeping bound so the probe's own deadline -- not a test sleep --
+// is what makes this deterministic.
+func TestWriteAtRecoveryProbeDoesNotHangAgainstUnresponsiveBackend(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	blockSize := uint64(vb.BlockSize)
+	vb.backendRecoveryProbeTimeout = time.Millisecond
+
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
+
+	backend.full.Store(true)
+	require.Error(t, vb.DrainToBackendCtx(context.Background()))
+	require.True(t, vb.backendFull.Load(), "latch must be set before we can test the probe against it")
+
+	// The backend now neither rejects nor accepts writes -- it just never
+	// responds, like an unreachable or badly overloaded backend.
+	backend.full.Store(false)
+	backend.blockUntilCancelled.Store(true)
+
+	// 5s is a generous hang detector, not the expected duration: the probe's
+	// own 1ms deadline is what should make this return, so this must not
+	// become a timing-flaky assertion on either bound.
+	err := runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 5*time.Second)
+	assert.ErrorIs(t, err, ErrNoSpace, "a write against an unresponsive backend must fail fast once the probe's own deadline expires, not hang")
+	assert.True(t, vb.backendFull.Load(), "a timed-out probe is not evidence of recovery -- the latch must remain set")
+	assert.False(t, vb.drainInFlight.Load(), "a timed-out probe must release drainInFlight, not leave it stuck true")
+
+	// Confirms drainInFlight was actually released above: a write that can
+	// win the CAS and observe real recovery must still succeed afterward.
+	backend.blockUntilCancelled.Store(false)
+	err = runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 5*time.Second)
+	assert.NoError(t, err, "once the backend actually responds, a later write must still be able to recover the latch")
+	assert.False(t, vb.backendFull.Load())
+
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
 }
 
 // TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures pins that a

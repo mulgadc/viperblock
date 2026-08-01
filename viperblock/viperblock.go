@@ -54,6 +54,11 @@ const DefaultGCInterval time.Duration = 5 * time.Minute
 // blip rather than a hard outage: three attempts spend ~3s total before giving up.
 const DefaultCheckpointRetryBackoff time.Duration = time.Second
 
+// DefaultBackendRecoveryProbeTimeout bounds probeBackendRecovery's drain, since
+// the guest write path (WriteAt) has no deadline of its own. Long enough for a
+// healthy round trip; short of a guest's own block-layer command timeout.
+const DefaultBackendRecoveryProbeTimeout time.Duration = 3 * time.Second
+
 // DefaultMaxPendingBytes bounds the combined size of Writes.Blocks and
 // PendingBackendWrites.Blocks — the guest-write backpressure high-watermark.
 // WriteAtCtx blocks the caller once this is crossed, draining synchronously
@@ -375,6 +380,11 @@ type VB struct {
 	// set it, shrinking a retry storm from seconds of real sleeping to
 	// microseconds.
 	checkpointRetryBackoff time.Duration
+
+	// backendRecoveryProbeTimeout bounds probeBackendRecovery's drain (0 uses
+	// DefaultBackendRecoveryProbeTimeout). Only tests set it, so a hanging
+	// fake backend times out in microseconds instead of the production bound.
+	backendRecoveryProbeTimeout time.Duration
 
 	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
 	// objects no live block references. Default false — opt-in, since a
@@ -1705,6 +1715,15 @@ func (vb *VB) checkpointBackoff() time.Duration {
 	return vb.checkpointRetryBackoff
 }
 
+// recoveryProbeTimeout returns the configured backendRecoveryProbeTimeout,
+// or the default if unset.
+func (vb *VB) recoveryProbeTimeout() time.Duration {
+	if vb.backendRecoveryProbeTimeout <= 0 {
+		return DefaultBackendRecoveryProbeTimeout
+	}
+	return vb.backendRecoveryProbeTimeout
+}
+
 // signalSizeTrigger asks the background chunk uploader to drain now, once
 // pendingBytes crosses FlushSize, instead of waiting for the next
 // ChunkUploadInterval tick. Non-blocking: a trigger already pending
@@ -1825,9 +1844,18 @@ func (vb *VB) probeBackendRecovery(ctx context.Context) bool {
 	}
 	defer vb.drainInFlight.Store(false)
 
+	// ctx may be context.Background() on the guest write path, so bound the
+	// drain explicitly -- otherwise a slow or unreachable backend would hang
+	// the write instead of failing fast, as it did before this probe existed.
+	probeCtx, cancel := context.WithTimeout(ctx, vb.recoveryProbeTimeout())
+	defer cancel()
+
 	// Gated on a real upload+checkpoint round trip, not a cached threshold,
-	// so the result can't flap: it reports exactly what the backend just did.
-	_ = vb.DrainToBackendCtx(ctx)
+	// so a clean result can't flap: it reports exactly what the backend just
+	// did. A timed-out or failed probe leaves the latch set.
+	if err := vb.DrainToBackendCtx(probeCtx); err != nil {
+		return false
+	}
 	return !vb.backendFull.Load()
 }
 
