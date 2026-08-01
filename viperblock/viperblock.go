@@ -197,21 +197,14 @@ type VB struct {
 	// exact linearizability with the slices is not required.
 	pendingBytes atomic.Int64
 
-	// drainInFlight ensures at most one goroutine actively drives
-	// DrainToBackendCtx from inside awaitBackpressure or probeBackendRecovery
-	// at a time; concurrent blocked writers poll pendingBytes (or, for the
-	// recovery probe, just fail fast) instead of each launching a redundant
-	// drain. Only an optimization for these write-path triggers — drainMu
-	// below is the actual cross-trigger exclusion guarantee.
+	// drainInFlight bounds awaitBackpressure and probeBackendRecovery to one
+	// active drain each at a time; other callers fail fast or poll instead of
+	// launching redundant drains. drainMu below is the real exclusion guarantee.
 	drainInFlight atomic.Bool
 
-	// backendFull latches an out-of-space error from the backend (predastore
-	// 507/503, or local ENOSPC). Writes are acked before their chunk is PUT,
-	// so the error surfaces on a later drain; WriteAtCtx checks this latch
-	// up front and fails fast with ErrNoSpace while set. Cleared on the next
-	// successful drain — including one driven synchronously by
-	// probeBackendRecovery, so a guest write retried after capacity is freed
-	// does not need a prior, otherwise-triggered successful drain first.
+	// backendFull latches when a drain reports the backend out of space, so
+	// WriteAtCtx can fail fast with ErrNoSpace up front. See
+	// DrainToBackendCtx's deferred handler for where it is set and cleared.
 	backendFull atomic.Bool
 
 	// pendingWALChunks holds WAL generations that were rotated out but whose
@@ -1822,27 +1815,18 @@ func (vb *VB) isBackendNearFull() bool {
 }
 
 // probeBackendRecovery drives a real DrainToBackendCtx while backendFull is
-// latched and reports whether the latch is clear afterward. This is the
-// same capacity check DrainToBackendCtx already performs on every trigger
-// (ticker, size threshold, explicit drain) -- calling it here just adds the
-// write path as a trigger, so a guest write retried after the operator
-// frees space observes recovery immediately instead of waiting for the next
-// background drain.
-//
-// drainInFlight ensures only one write drives the probe at a time; a
-// concurrent write just fails fast rather than piling onto a backend that
-// is still full or unreachable, since DrainToBackendCtx's own drainMu would
-// otherwise queue them into redundant, possibly slow calls. Because the
-// clear is gated on an actual successful upload+checkpoint round trip (not
-// a cheap threshold read), it cannot flap on its own: it reports exactly
-// what the backend just did, and repeated calls while backendFull is
-// already clear skip the probe entirely (see the caller's gate).
+// latched and reports whether the latch cleared, so a retried write can
+// observe recovery immediately instead of waiting for the next drain tick.
 func (vb *VB) probeBackendRecovery(ctx context.Context) bool {
+	// One write drives the probe at a time; concurrent writers fail fast
+	// rather than queuing on drainMu behind a possibly slow backend.
 	if !vb.drainInFlight.CompareAndSwap(false, true) {
 		return false
 	}
 	defer vb.drainInFlight.Store(false)
 
+	// Gated on a real upload+checkpoint round trip, not a cached threshold,
+	// so the result can't flap: it reports exactly what the backend just did.
 	_ = vb.DrainToBackendCtx(ctx)
 	return !vb.backendFull.Load()
 }
@@ -1858,11 +1842,8 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	// actually rejected. Nearfull pressure rides on a SUCCESSFUL response and
 	// means "slow down", so it throttles via maxPendingBytes instead.
 	if vb.backendFull.Load() {
-		// A write landing here is exactly the moment a guest retries after an
-		// operator frees space and resumes -- probe with a real drain instead
-		// of waiting for the next background ChunkUploadInterval tick, so
-		// genuine capacity recovery does not need a second resume to be
-		// observed.
+		// Probe for recovery instead of failing outright: this is exactly the
+		// moment a guest retries after an operator frees space and resumes.
 		if !vb.probeBackendRecovery(ctx) {
 			return ErrNoSpace
 		}
