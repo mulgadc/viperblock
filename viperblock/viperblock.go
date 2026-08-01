@@ -844,6 +844,7 @@ type AMIMetadata struct {
 	Distro          string            `json:"Distro,omitempty"`       // e.g. "debian", "ubuntu", "rocky", "alpine"; empty for AMIs registered before this field existed
 	DistroFamily    string            `json:"DistroFamily,omitempty"` // "debian" | "rhel" | "alpine"; drives cloud-init template branching. Empty defaults to debian-family rendering at launch time.
 	Tags            map[string]string `json:"Tags"`                   // Metadata tags
+	State           string            `json:"State,omitempty"`        // "pending" | "available"; empty for AMIs registered before this field existed, treated as available
 }
 
 // Error messages
@@ -4014,23 +4015,59 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		"volume", vb.VolumeName, "swept", swept, "candidates", len(candidates), "floor", floor, "watermark", watermark)
 }
 
-// deleteChunkObjects issues a DeleteObject call per chunk ObjectID and
-// returns how many were reclaimed (deleted or already gone). A delete that
-// fails otherwise is left in gcRefcount and out of the swept count, so the
-// next sweep retries it — under-collection (a leaked chunk) is preferred
-// over losing track of a candidate.
+// deleteChunkObjects issues DeleteObject calls across a bounded worker pool
+// (the same UploadWorkers count the write path uses) and returns how many
+// chunks were reclaimed (deleted or already gone). A delete that fails
+// otherwise is left in gcRefcount and out of the swept count, so the next
+// sweep retries it — under-collection (a leaked chunk) is preferred over
+// losing track of a candidate. Stops handing out new deletes once ctx is
+// done; deletes already in flight are allowed to finish.
 func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) {
-	for _, id := range ids {
-		if err := vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id); err != nil && !errors.Is(err, os.ErrNotExist) {
-			vb.logger().Warn("chunk GC: delete failed, will retry next sweep", "objectID", id, "err", err)
-			continue
-		}
-		vb.BlocksToObject.mu.Lock()
-		delete(vb.gcRefcount, id)
-		vb.BlocksToObject.mu.Unlock()
-		swept++
+	if len(ids) == 0 {
+		return 0
 	}
-	return swept
+
+	workers := vb.UploadWorkers
+	if workers <= 0 {
+		workers = DefaultUploadWorkers
+	}
+	if workers > len(ids) {
+		workers = len(ids)
+	}
+
+	idChan := make(chan uint64)
+	var sweptCount atomic.Int64
+	var wg sync.WaitGroup
+
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for id := range idChan {
+				if err := vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id); err != nil && !errors.Is(err, os.ErrNotExist) {
+					vb.logger().Warn("chunk GC: delete failed, will retry next sweep", "objectID", id, "err", err)
+					continue
+				}
+				vb.BlocksToObject.mu.Lock()
+				delete(vb.gcRefcount, id)
+				vb.BlocksToObject.mu.Unlock()
+				sweptCount.Add(1)
+			}
+		}()
+	}
+
+feed:
+	for _, id := range ids {
+		select {
+		case idChan <- id:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(idChan)
+	wg.Wait()
+
+	return int(sweptCount.Load())
 }
 
 // runGCSweep drains this VB to the backend -- persisting a live checkpoint

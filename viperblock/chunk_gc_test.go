@@ -1407,3 +1407,123 @@ func (s *syncBuffer) Reset() {
 	defer s.mu.Unlock()
 	s.buf.Reset()
 }
+
+// blockingDeleteBackend blocks every chunk DeleteCtx call until the test
+// closes release, tracking how many calls are blocked (in flight) at once.
+// This lets a test observe the delete worker pool's real concurrency
+// deterministically — no sleep, no wall-clock assertion — since the pass/fail
+// signal is peak concurrent call count, not elapsed time.
+type blockingDeleteBackend struct {
+	types.Backend
+
+	release  chan struct{}
+	inFlight atomic.Int32
+	peak     atomic.Int32
+}
+
+func (b *blockingDeleteBackend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) error {
+	if fileType == types.FileTypeChunk {
+		n := b.inFlight.Add(1)
+		defer b.inFlight.Add(-1)
+		for {
+			p := b.peak.Load()
+			if n <= p || b.peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Backend.DeleteCtx(ctx, fileType, objectId)
+}
+
+// TestChunkGC_DeleteChunkObjectsParallelizesAcrossWorkers is the regression
+// guard for the throughput mismatch between reclaim and ingest: the pre-fix
+// deleteChunkObjects issued one blocking DeleteCtx at a time, so a sustained
+// parallel writer could out-produce garbage faster than a serial sweep could
+// reclaim it, and the candidate list would only grow. This pins that deletes
+// now fan out across a bounded worker pool (mirroring UploadWorkers) instead
+// of running one at a time.
+//
+// The assertion is purely a concurrency count (peak in-flight deletes), never
+// wall-clock timing: the runners this suite executes on are demonstrably
+// CPU-starved and load-sensitive, so a "must complete within Xms" assertion
+// would be flaky by construction. require.Eventually below only waits for
+// goroutines that already exist to be scheduled — a generous, one-shot
+// synchronization bound, not a performance SLA — and the pass/fail signal is
+// the peak concurrent call count the backend observed.
+func TestChunkGC_DeleteChunkObjectsParallelizesAcrossWorkers(t *testing.T) {
+	root := t.TempDir()
+	vb := newGCTestVB(t, root, "vol-parallel-delete", true)
+
+	const workers = 4
+	const numCandidates = 12 // several multiples of workers
+	vb.UploadWorkers = workers
+
+	backend := &blockingDeleteBackend{Backend: vb.Backend, release: make(chan struct{})}
+	vb.Backend = backend
+
+	ids := make([]uint64, numCandidates)
+	vb.BlocksToObject.mu.Lock()
+	for i := range ids {
+		id := uint64(i + 1)
+		ids[i] = id
+		vb.gcRefcount[id] = 0
+	}
+	vb.BlocksToObject.mu.Unlock()
+
+	// A concurrent writer keeps mutating gcRefcount for the whole sweep (new,
+	// live entries that must never be deleted), so the worker pool's locking
+	// around gcRefcount is exercised under real contention, not just a single
+	// goroutine touching the map.
+	writerStop := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		next := uint64(numCandidates + 1)
+		for {
+			select {
+			case <-writerStop:
+				return
+			default:
+				vb.BlocksToObject.mu.Lock()
+				vb.gcRefcount[next] = 1 // referenced: never a delete candidate
+				vb.BlocksToObject.mu.Unlock()
+				next++
+			}
+		}
+	}()
+	t.Cleanup(func() { close(writerStop); <-writerDone })
+
+	done := make(chan int, 1)
+	go func() { done <- vb.deleteChunkObjects(context.Background(), ids) }()
+
+	// Every candidate blocks inside DeleteCtx until release is closed, so once
+	// the pool is fully occupied, in-flight sticks at exactly `workers` until
+	// then. On the pre-fix sequential loop this never exceeds 1.
+	require.Eventually(t, func() bool {
+		return backend.inFlight.Load() == int32(workers)
+	}, 5*time.Second, time.Millisecond,
+		"delete pool never reached its configured width of %d — deletes are not running in parallel", workers)
+
+	close(backend.release)
+
+	swept := <-done
+	assert.Equal(t, numCandidates, swept, "every candidate should have been swept")
+	assert.LessOrEqual(t, backend.peak.Load(), int32(workers), "pool exceeded its configured width")
+
+	// The candidate list must drain to zero, not merely shrink — every id
+	// handed to deleteChunkObjects is gone from gcRefcount once it returns.
+	vb.BlocksToObject.mu.Lock()
+	remaining := 0
+	for _, id := range ids {
+		if _, ok := vb.gcRefcount[id]; ok {
+			remaining++
+		}
+	}
+	vb.BlocksToObject.mu.Unlock()
+	assert.Equal(t, 0, remaining, "swept candidates must be removed from gcRefcount")
+}
