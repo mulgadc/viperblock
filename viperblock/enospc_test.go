@@ -401,6 +401,108 @@ func TestNearFullThenFullStillFailsFast(t *testing.T) {
 		"a genuinely full backend must still fail writes fast")
 }
 
+// TestWriteAtRecoversBackendFullLatchWithoutPriorSuccessfulDrain pins the
+// capacity-recovery fix: once the backend genuinely has room again, a guest
+// write retried against the still-latched backendFull gate must succeed
+// immediately -- it must not need an operator-invisible successful drain to
+// have already happened first. Before the fix this looped forever, since the
+// up-front gate returned ErrNoSpace unconditionally while backendFull was
+// set and nothing else drove a fresh drain.
+func TestWriteAtRecoversBackendFullLatchWithoutPriorSuccessfulDrain(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	blockSize := uint64(vb.BlockSize)
+
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
+
+	backend.full.Store(true)
+	require.Error(t, vb.DrainToBackendCtx(context.Background()))
+	require.True(t, vb.backendFull.Load(), "latch must be set before we can test it clearing")
+
+	// Genuine capacity recovery, exactly as an operator freeing space would
+	// produce -- but deliberately WITHOUT calling DrainToBackendCtx directly
+	// first. The only trigger available to production code at this point is
+	// the guest's own retried write landing on the still-latched gate.
+	backend.full.Store(false)
+
+	err := vb.WriteAt(blockSize, make([]byte, blockSize))
+	assert.NoError(t, err, "a write against a recovered backend must succeed on the first retry, not require a second resume")
+	assert.False(t, vb.backendFull.Load(), "the latch must have cleared as a side effect of the recovered write, not stayed stuck")
+
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+}
+
+// TestWriteAtCtxDoesNotClearLatchWhileGenuinelyFull pins the regression that
+// matters most: a write landing on the gate while the backend is STILL full
+// must not clear the latch, must still fail fast with ErrNoSpace, and must
+// leave no side effects (no buffered bytes, no change to the stranded
+// generation waiting to be retried). A fix that clears the latch
+// optimistically (e.g. on any write, or on a timer) would fail this test.
+func TestWriteAtCtxDoesNotClearLatchWhileGenuinelyFull(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	blockSize := uint64(vb.BlockSize)
+
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
+
+	backend.full.Store(true)
+	require.Error(t, vb.DrainToBackendCtx(context.Background()))
+	require.True(t, vb.backendFull.Load())
+	require.Equal(t, 1, pendingWALChunksLen(vb), "the failed generation must be tracked for retry")
+
+	// Backend stays genuinely full -- no capacity has actually recovered.
+	pendingBefore := vb.PendingBytes()
+
+	err := vb.WriteAt(blockSize, make([]byte, blockSize))
+	assert.ErrorIs(t, err, ErrNoSpace, "a write against a still-full backend must fail fast with ErrNoSpace")
+	assert.True(t, vb.backendFull.Load(), "the latch must remain set -- capacity has not actually recovered")
+	assert.Equal(t, pendingBefore, vb.PendingBytes(),
+		"a fast-failed write must not have buffered anything, even though it drove a recovery probe")
+	assert.Equal(t, 1, pendingWALChunksLen(vb), "the stranded generation must still be pending after a failed probe")
+
+	// Repeat: a second still-failing write must behave identically, not flip
+	// the latch on some later attempt just because it retried again.
+	err = vb.WriteAt(blockSize, make([]byte, blockSize))
+	assert.ErrorIs(t, err, ErrNoSpace)
+	assert.True(t, vb.backendFull.Load(), "repeated writes against a still-full backend must never clear the latch")
+
+	backend.full.Store(false)
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+}
+
+// TestWriteAtRecoveryDoesNotFlapAcrossRepeatedWrites pins that once the
+// latch has cleared off the back of a recovered write, a burst of further
+// writes does not re-drive redundant probes or toggle the latch back and
+// forth. The recovery log line is edge-triggered (see
+// TestBackendFullLatchLogsTransitionsOnce), so if the fix reset or
+// re-evaluated backendFull on every write instead of gating on its current
+// value, this would log "backend space recovered" more than once.
+func TestWriteAtRecoveryDoesNotFlapAcrossRepeatedWrites(t *testing.T) {
+	vb, backend := newEnospcTestVB(t)
+	var buf bytes.Buffer
+	vb.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	blockSize := uint64(vb.BlockSize)
+
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
+
+	backend.full.Store(true)
+	require.Error(t, vb.DrainToBackendCtx(context.Background()))
+	require.True(t, vb.backendFull.Load())
+
+	backend.full.Store(false)
+
+	for i := uint64(1); i <= 5; i++ {
+		err := vb.WriteAt(i*blockSize, make([]byte, blockSize))
+		require.NoError(t, err, "write %d against a recovered backend must succeed", i)
+		require.False(t, vb.backendFull.Load(), "latch must stay clear across repeated writes, not flap")
+	}
+
+	assert.Equal(t, 1, strings.Count(buf.String(), "backend space recovered"),
+		"recovery must log exactly once despite multiple writes landing after it")
+	assert.Equal(t, 1, strings.Count(buf.String(), "latching writes off"),
+		"the original latch trip must log exactly once; recovery writes must not re-trip it")
+
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+}
+
 // TestErrNoSpaceIsTypesErrNoSpace pins that ErrNoSpace re-exports
 // types.ErrNoSpace, and drain-path error wrapping doesn't break errors.Is
 // against either name.

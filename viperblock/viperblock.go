@@ -198,17 +198,20 @@ type VB struct {
 	pendingBytes atomic.Int64
 
 	// drainInFlight ensures at most one goroutine actively drives
-	// DrainToBackendCtx from inside awaitBackpressure at a time; concurrent
-	// blocked writers poll pendingBytes instead of each launching a
-	// redundant drain. Only an optimization for the backpressure path —
-	// drainMu below is the actual cross-trigger exclusion guarantee.
+	// DrainToBackendCtx from inside awaitBackpressure or probeBackendRecovery
+	// at a time; concurrent blocked writers poll pendingBytes (or, for the
+	// recovery probe, just fail fast) instead of each launching a redundant
+	// drain. Only an optimization for these write-path triggers — drainMu
+	// below is the actual cross-trigger exclusion guarantee.
 	drainInFlight atomic.Bool
 
 	// backendFull latches an out-of-space error from the backend (predastore
 	// 507/503, or local ENOSPC). Writes are acked before their chunk is PUT,
 	// so the error surfaces on a later drain; WriteAtCtx checks this latch
 	// up front and fails fast with ErrNoSpace while set. Cleared on the next
-	// successful drain.
+	// successful drain — including one driven synchronously by
+	// probeBackendRecovery, so a guest write retried after capacity is freed
+	// does not need a prior, otherwise-triggered successful drain first.
 	backendFull atomic.Bool
 
 	// pendingWALChunks holds WAL generations that were rotated out but whose
@@ -1818,6 +1821,32 @@ func (vb *VB) isBackendNearFull() bool {
 	return ok && nf.NearFull()
 }
 
+// probeBackendRecovery drives a real DrainToBackendCtx while backendFull is
+// latched and reports whether the latch is clear afterward. This is the
+// same capacity check DrainToBackendCtx already performs on every trigger
+// (ticker, size threshold, explicit drain) -- calling it here just adds the
+// write path as a trigger, so a guest write retried after the operator
+// frees space observes recovery immediately instead of waiting for the next
+// background drain.
+//
+// drainInFlight ensures only one write drives the probe at a time; a
+// concurrent write just fails fast rather than piling onto a backend that
+// is still full or unreachable, since DrainToBackendCtx's own drainMu would
+// otherwise queue them into redundant, possibly slow calls. Because the
+// clear is gated on an actual successful upload+checkpoint round trip (not
+// a cheap threshold read), it cannot flap on its own: it reports exactly
+// what the backend just did, and repeated calls while backendFull is
+// already clear skip the probe entirely (see the caller's gate).
+func (vb *VB) probeBackendRecovery(ctx context.Context) bool {
+	if !vb.drainInFlight.CompareAndSwap(false, true) {
+		return false
+	}
+	defer vb.drainInFlight.Store(false)
+
+	_ = vb.DrainToBackendCtx(ctx)
+	return !vb.backendFull.Load()
+}
+
 // WriteAtCtx is WriteAt with a caller-supplied context that flows through any
 // read-modify-write backend fetches for trace propagation.
 func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error {
@@ -1829,7 +1858,14 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	// actually rejected. Nearfull pressure rides on a SUCCESSFUL response and
 	// means "slow down", so it throttles via maxPendingBytes instead.
 	if vb.backendFull.Load() {
-		return ErrNoSpace
+		// A write landing here is exactly the moment a guest retries after an
+		// operator frees space and resumes -- probe with a real drain instead
+		// of waiting for the next background ChunkUploadInterval tick, so
+		// genuine capacity recovery does not need a second resume to be
+		// observed.
+		if !vb.probeBackendRecovery(ctx) {
+			return ErrNoSpace
+		}
 	}
 
 	// First check the block exists in our volume size
