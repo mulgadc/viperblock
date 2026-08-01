@@ -92,6 +92,25 @@ var disk []byte
 // disabled for this plugin instance.
 var loadedMasterKey *masterkey.Key
 
+// accessKeyEnv and secretKeyEnv name the environment variables that supply
+// S3 credentials when nbdkit's plugin argv did not set them. This keeps
+// credentials out of argv, which is world-readable via /proc/<pid>/cmdline
+// for the life of the process.
+const (
+	accessKeyEnv = "VB_ACCESS_KEY"
+	secretKeyEnv = "VB_SECRET_KEY"
+)
+
+// credentialFromArgOrEnv resolves a credential, preferring the nbdkit argv
+// value and falling back to the named environment variable when argv did
+// not set it. Mirrors LoadMasterKeyFromFlagOrEnv's flag-then-env precedence.
+func credentialFromArgOrEnv(argValue, envName string) string {
+	if argValue != "" {
+		return argValue
+	}
+	return os.Getenv(envName)
+}
+
 // NOTE: For profiling viperblock/nbdkit, use Linux perf instead of Go pprof.
 // Go's pprof does NOT work correctly when running as a CGO shared library.
 //
@@ -171,6 +190,11 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 }
 
 func (p *ViperBlockPlugin) ConfigComplete() error {
+	// Fall back to the environment when nbdkit's argv did not supply
+	// credentials, so spinifex can stop passing them as literal argv.
+	access_key = credentialFromArgOrEnv(access_key, accessKeyEnv)
+	secret_key = credentialFromArgOrEnv(secret_key, secretKeyEnv)
+
 	if size == 0 {
 		return nbdkit.PluginError{Errmsg: "size parameter is required"}
 	} else if volume == "" {
