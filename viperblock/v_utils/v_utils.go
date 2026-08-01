@@ -184,6 +184,13 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		return fmt.Errorf("failed to load block WAL: %w", err)
 	}
 
+	// Marks the AMI as in-progress before any data reaches the backend.
+	// Encrypted volumes persist this immediately below; unencrypted volumes
+	// carry it in memory until Close's own state save persists it.
+	if vbConfig.VolumeConfig.AMIMetadata.Name != "" {
+		vb.VolumeConfig.AMIMetadata.State = "pending"
+	}
+
 	// Encrypted volumes derive the AES-GCM nonce from VolumeUUID, which
 	// SaveState mints on first use. Mint it now, before the first chunk is
 	// sealed in the write loop, so every chunk and the AMI snapshot share one
@@ -270,6 +277,17 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	err = vb.Close()
 	if err != nil {
 		return fmt.Errorf("failed to close Viperblock store: %w", err)
+	}
+
+	// Only reached once Close has returned nil, confirming the flush, WAL
+	// upload and state save it runs internally all succeeded. Flipping the
+	// field any earlier would let Close's own state save persist "available"
+	// even when Close itself fails partway through.
+	if vbConfig.VolumeConfig.AMIMetadata.Name != "" {
+		vb.VolumeConfig.AMIMetadata.State = "available"
+		if err := vb.SaveState(); err != nil {
+			return fmt.Errorf("failed to persist final AMI state: %w", err)
+		}
 	}
 
 	return nil
