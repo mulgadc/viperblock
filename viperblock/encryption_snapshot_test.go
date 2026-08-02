@@ -429,8 +429,8 @@ func TestEncryptedChunk_LiveCheckpointSeqNumConsistency(t *testing.T) {
 	// SeqNum that was used to seal the corresponding chunk ciphertext.
 	writer.BlocksToObject.mu.RLock()
 	defer writer.BlocksToObject.mu.RUnlock()
-	for blockNum, want := range writer.BlocksToObject.BlockLookup {
-		got, ok := remounted.BlocksToObject.BlockLookup[blockNum]
+	for blockNum, want := range lookupMap(&writer.BlocksToObject) {
+		got, ok := lookupMap(&remounted.BlocksToObject)[blockNum]
 		require.True(t, ok, "block %d missing from live checkpoint after createChunkFile", blockNum)
 		assert.Equal(t, want.SeqNum, got.SeqNum,
 			"block %d: live checkpoint SeqNum must match seal-time SeqNum (AEAD nonce component)", blockNum)

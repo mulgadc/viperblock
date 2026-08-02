@@ -153,15 +153,19 @@ func TestEncryptedChunk_TamperByteFailsRead(t *testing.T) {
 	require.True(t, bytes.Equal(plaintext, got), "baseline decrypt failed; tamper test would be meaningless")
 
 	// Clear caches so the next read must hit the backend.
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1, // first write under a fresh VB allocates SeqNum 1
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 	env.vb.UseBlockStore = false
 
@@ -189,16 +193,20 @@ func TestEncryptedChunk_TagTamperFailsRead(t *testing.T) {
 	require.NoError(t, err)
 	env.writeAndChunk(t, 0, plaintext)
 
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 
 	chunkFile := env.chunkPath(env.vb.VolumeName, 0)
@@ -250,16 +258,17 @@ func TestEncryptedChunk_CrossVolumeSpliceFailsRead(t *testing.T) {
 	require.NoError(t, os.WriteFile(envB.chunkPath(envB.vb.VolumeName, 0), bBytes, 0600))
 
 	// Force B's read to hit the backend rather than its in-memory cache.
+	envB.vb.Cache.purge()
 	envB.vb.BlockStore = NewUnifiedBlockStore(envB.vb.BlockSize)
 	envB.vb.UseBlockStore = false
 	envB.vb.BlocksToObject.mu.Lock()
-	envB.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	envB.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(envB.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	envB.vb.BlocksToObject.mu.Unlock()
 
 	_, err = envB.vb.ReadAt(0, uint64(envB.blockSize))
@@ -292,7 +301,7 @@ func TestEncryptedChunk_InPlaceReplayFailsRead(t *testing.T) {
 	env.writeAndChunk(t, 5, newer)
 
 	env.vb.BlocksToObject.mu.RLock()
-	cur := env.vb.BlocksToObject.BlockLookup[5]
+	cur := lookupMap(&env.vb.BlocksToObject)[5]
 	env.vb.BlocksToObject.mu.RUnlock()
 	require.Equal(t, uint64(1), cur.ObjectID, "second write must land in chunk 1")
 
@@ -312,6 +321,10 @@ func TestEncryptedChunk_InPlaceReplayFailsRead(t *testing.T) {
 	require.NoError(t, os.WriteFile(env.chunkPath(env.vb.VolumeName, 1), chunk1, 0600))
 
 	// Force a backend re-read for block 5.
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 
@@ -414,16 +427,20 @@ func TestEncryptedChunk_PreEncryptionMagicRejected(t *testing.T) {
 
 	// Bypass caches so the next Read hits the backend (and therefore
 	// the magic preflight).
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 
 	// Rewrite the chunk file's first 4 bytes to the legacy VBCH magic

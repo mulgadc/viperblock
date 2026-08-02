@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/utils"
 )
 
 // SnapshotState holds metadata for a frozen snapshot stored on the backend.
@@ -76,16 +77,7 @@ func (vb *VB) drainForSnapshot() error {
 	vb.drainMu.Lock()
 	defer vb.drainMu.Unlock()
 
-	// Writes.mu is taken inside drainMu, matching DrainToBackendCtx's order.
-	vb.Writes.mu.Lock()
-	var flushErr error
-	if vb.UseShardedWAL {
-		flushErr = vb.flushLockedSharded()
-	} else {
-		flushErr = vb.flushLocked()
-	}
-	vb.Writes.mu.Unlock()
-	if flushErr != nil {
+	if flushErr := vb.flushWrites(); flushErr != nil {
 		return fmt.Errorf("snapshot flush failed: %w", flushErr)
 	}
 
@@ -154,12 +146,13 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	var blockCount uint64
 	checkpoint := vb.BlockToObjectWALHeader()
 	stride := vb.blockStride()
-	for _, block := range vb.BlocksToObject.BlockLookup {
+	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
 		blockCount += uint64(block.NumBlocks)
 		for _, single := range expandBlockLookup(block, stride) {
 			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
 		}
-	}
+		return true
+	})
 	vb.BlocksToObject.mu.RUnlock()
 
 	hasFlatSection := vb.BaseBlockMap != nil
@@ -359,9 +352,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	}
 
 	// 5. Deserialize own block lookup entries
-	baseMap := &BlocksToObject{
-		BlockLookup: make(map[uint64]BlockLookup),
-	}
+	baseMap := &BlocksToObject{}
 
 	offset := headerSize
 	end := headerSize + ownBlocksSize
@@ -370,13 +361,13 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		if err != nil {
 			return nil, ident, fmt.Errorf("failed to read snapshot block entry at offset %d: %w", offset, err)
 		}
-		baseMap.BlockLookup[block.StartBlock] = block
+		baseMap.lookup.set(block)
 		offset += blockWalChunkSize
 	}
 
 	// 6. Validate block count against metadata
-	if snap.BlockCount > 0 && uint64(len(baseMap.BlockLookup)) != snap.BlockCount {
-		return nil, ident, fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, len(baseMap.BlockLookup))
+	if snap.BlockCount > 0 && utils.SafeIntToUint64(baseMap.lookup.len()) != snap.BlockCount {
+		return nil, ident, fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, baseMap.lookup.len())
 	}
 
 	// 7. Parse the flat inherited-blocks section if present
@@ -391,7 +382,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	vb.logger().Debug("LoadSnapshotBlockMap: loaded",
 		"snapshotID", snapshotID,
 		"sourceVolume", snap.SourceVolumeName,
-		"blocks", len(baseMap.BlockLookup),
+		"blocks", baseMap.lookup.len(),
 		"inheritedLayers", len(ident.InheritedLayers))
 
 	return baseMap, ident, nil
@@ -438,7 +429,7 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 		"volume", vb.VolumeName,
 		"snapshotID", snapshotID,
 		"sourceVolume", ident.SourceVolumeName,
-		"baseBlocks", len(baseMap.BlockLookup),
+		"baseBlocks", baseMap.lookup.len(),
 		"ancestorLayers", len(vb.ancestors))
 
 	return nil
@@ -454,13 +445,13 @@ func (vb *VB) LookupBaseBlockToObject(block uint64) (uint64, uint32, uint64, err
 	}
 
 	vb.BaseBlockMap.mu.RLock()
-	lookup, ok := vb.BaseBlockMap.BlockLookup[block]
+	lookup, pos, ok := vb.BaseBlockMap.resolveBlockLookup(block)
 	vb.BaseBlockMap.mu.RUnlock()
 
 	if !ok {
 		return 0, 0, 0, ErrZeroBlock
 	}
-	return lookup.ObjectID, lookup.ObjectOffset, lookup.SeqNum, nil
+	return lookup.ObjectID, lookup.offsetAt(pos, vb.blockStride()), lookup.seqNumAt(pos), nil
 }
 
 // buildFlatSection serialises all inherited ancestor blocks into a binary
@@ -484,13 +475,14 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 	// not already covered by the volume's own delta. Own entries may be
 	// coalesced runs (NumBlocks > 1), so expand each entry's full range into
 	// the seen-set rather than just its map key (StartBlock).
-	seen := make(map[uint64]struct{}, len(vb.BlocksToObject.BlockLookup))
+	seen := make(map[uint64]struct{}, vb.BlocksToObject.lookup.len())
 	vb.BlocksToObject.mu.RLock()
-	for _, bl := range vb.BlocksToObject.BlockLookup {
+	vb.BlocksToObject.lookup.scan(func(bl BlockLookup) bool {
 		for i := uint16(0); i < bl.NumBlocks; i++ {
 			seen[bl.StartBlock+uint64(i)] = struct{}{}
 		}
-	}
+		return true
+	})
 	vb.BlocksToObject.mu.RUnlock()
 
 	// Collect layers in priority order: base map first, then deeper ancestors.
@@ -498,24 +490,26 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 
 	baseGroup := sourceGroup{name: vb.SourceVolumeName, uuid: vb.SourceVolumeUUID, nameHash: vb.sourceVolumeNameHash}
 	vb.BaseBlockMap.mu.RLock()
-	for k, v := range vb.BaseBlockMap.BlockLookup {
-		if _, exists := seen[k]; !exists {
+	vb.BaseBlockMap.lookup.scan(func(v BlockLookup) bool {
+		if _, exists := seen[v.StartBlock]; !exists {
 			baseGroup.blocks = append(baseGroup.blocks, v)
-			seen[k] = struct{}{}
+			seen[v.StartBlock] = struct{}{}
 		}
-	}
+		return true
+	})
 	vb.BaseBlockMap.mu.RUnlock()
 	sources = append(sources, baseGroup)
 
 	for _, anc := range vb.ancestors {
 		g := sourceGroup{name: anc.sourceVolumeName, uuid: anc.sourceVolumeUUID, nameHash: anc.sourceVolumeNameHash}
 		anc.blocks.mu.RLock()
-		for k, v := range anc.blocks.BlockLookup {
-			if _, exists := seen[k]; !exists {
+		anc.blocks.lookup.scan(func(v BlockLookup) bool {
+			if _, exists := seen[v.StartBlock]; !exists {
 				g.blocks = append(g.blocks, v)
-				seen[k] = struct{}{}
+				seen[v.StartBlock] = struct{}{}
 			}
-		}
+			return true
+		})
 		anc.blocks.mu.RUnlock()
 		sources = append(sources, g)
 	}
@@ -588,7 +582,7 @@ func parseFlatSection(data []byte) ([]InheritedLayer, error) {
 		numBlocks := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		offset += 4
 
-		bm := &BlocksToObject{BlockLookup: make(map[uint64]BlockLookup, numBlocks)}
+		bm := &BlocksToObject{}
 		// Reuse a zero-value VB just to call readBlockWalChunk (pure function on data).
 		var tmp VB
 		for j := range numBlocks {
@@ -599,7 +593,7 @@ func parseFlatSection(data []byte) ([]InheritedLayer, error) {
 			if err != nil {
 				return nil, fmt.Errorf("flat section: source %d: block %d: %w", i, j, err)
 			}
-			bm.BlockLookup[block.StartBlock] = block
+			bm.lookup.set(block)
 			offset += blockWalChunkSize
 		}
 		layers = append(layers, InheritedLayer{

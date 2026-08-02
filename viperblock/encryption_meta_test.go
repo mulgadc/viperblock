@@ -277,15 +277,19 @@ func TestBlockStoreReadEncrypted(t *testing.T) {
 
 	// Now tamper a byte on the chunk and verify the BlockStore path
 	// also fails closed.
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 	env.vb.BlockStore.SetPersisted(0, 0, uint32(env.blockOffset(0)), 1)
 

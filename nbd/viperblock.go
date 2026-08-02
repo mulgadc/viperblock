@@ -81,7 +81,7 @@ var access_key string
 var secret_key string
 var host string
 var base_dir string
-var cache_size int = 20
+var cache_size int = viperblock.DefaultCacheBlocks
 var max_pending_bytes uint64 = 0
 var upload_workers int = 16
 var use_shardwal bool = false

@@ -76,7 +76,7 @@ func TestBlockStore_StateTransitions(t *testing.T) {
 	data[0] = 0xAB
 
 	// Write block -> Hot state
-	bs.Write(50, data)
+	seqNum := bs.Write(50, data)
 	entry, ok := bs.ReadBlock(50)
 	if !ok {
 		t.Fatal("block not found after write")
@@ -86,7 +86,7 @@ func TestBlockStore_StateTransitions(t *testing.T) {
 	}
 
 	// Hot -> Pending
-	if !bs.MarkPending(50) {
+	if !bs.MarkPending(50, seqNum) {
 		t.Error("MarkPending failed")
 	}
 	entry, _ = bs.ReadBlock(50)
@@ -110,29 +110,6 @@ func TestBlockStore_StateTransitions(t *testing.T) {
 	}
 	if entry.Data != nil {
 		t.Error("Data should be nil for Persisted state")
-	}
-
-	// Persisted -> Cached
-	cacheData := make([]byte, 4096)
-	cacheData[0] = 0xCD
-	if !bs.Cache(50, cacheData) {
-		t.Error("Cache failed")
-	}
-	entry, _ = bs.ReadBlock(50)
-	if entry.State != BlockStateCached {
-		t.Errorf("expected Cached, got %s", entry.State.String())
-	}
-	if !bytes.Equal(entry.Data, cacheData) {
-		t.Error("cached data mismatch")
-	}
-
-	// Cached -> Persisted (eviction)
-	if !bs.EvictCache(50) {
-		t.Error("EvictCache failed")
-	}
-	entry, _ = bs.ReadBlock(50)
-	if entry.State != BlockStatePersisted {
-		t.Errorf("expected Persisted after eviction, got %s", entry.State.String())
 	}
 }
 
@@ -230,13 +207,14 @@ func TestBlockStore_GetBlocksByState(t *testing.T) {
 	data := make([]byte, 4096)
 
 	// Create 10 Hot blocks
+	seqs := make([]uint64, 10)
 	for i := range uint64(10) {
-		bs.Write(i, data)
+		seqs[i] = bs.Write(i, data)
 	}
 
 	// Move 5 to Pending
 	for i := range uint64(5) {
-		bs.MarkPending(i)
+		bs.MarkPending(i, seqs[i])
 	}
 
 	hotBlocks := bs.GetBlocksByState(BlockStateHot)
@@ -254,15 +232,16 @@ func TestBlockStore_GetHotBlocks(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
 
 	// Write some blocks
+	seqs := make([]uint64, 10)
 	for i := range uint64(10) {
 		data := make([]byte, 4096)
 		data[0] = byte(i)
-		bs.Write(i, data)
+		seqs[i] = bs.Write(i, data)
 	}
 
 	// Mark some as pending
 	for i := range uint64(5) {
-		bs.MarkPending(i)
+		bs.MarkPending(i, seqs[i])
 	}
 
 	hotBlocks := bs.GetHotBlocks()
@@ -356,16 +335,17 @@ func TestBlockStore_CountByState(t *testing.T) {
 	data := make([]byte, 4096)
 
 	// Create mixed states
+	seqs := make([]uint64, 30)
 	for i := range uint64(30) {
-		bs.Write(i, data)
+		seqs[i] = bs.Write(i, data)
 	}
 
 	// 10 stay Hot, 10 go Pending, 10 go Persisted
 	for i := uint64(10); i < 20; i++ {
-		bs.MarkPending(i)
+		bs.MarkPending(i, seqs[i])
 	}
 	for i := uint64(20); i < 30; i++ {
-		bs.MarkPending(i)
+		bs.MarkPending(i, seqs[i])
 		e, _ := bs.ReadBlock(i)
 		bs.MarkPersisted(i, 0, 0, e.SeqNum)
 	}
@@ -481,7 +461,7 @@ func pendingRun(bs *UnifiedBlockStore, startBlock uint64, numBlocks int) (blocks
 	for i := range numBlocks {
 		b := startBlock + uint64(i)
 		sn := bs.Write(b, data)
-		bs.MarkPending(b)
+		bs.MarkPending(b, sn)
 		blocks = append(blocks, b)
 		seqNums = append(seqNums, sn)
 	}
@@ -709,8 +689,8 @@ func TestBlockStore_MarkPersistedRange_ConcurrentRewrite(t *testing.T) {
 					default:
 					}
 					b := startBlock + uint64(rand.IntN(numBlocks))
-					bs.Write(b, data)
-					bs.MarkPending(b)
+					sn := bs.Write(b, data)
+					bs.MarkPending(b, sn)
 				}
 			})
 		}
@@ -870,10 +850,8 @@ func BenchmarkBlockStore_StateTransition(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		blockNum := uint64(i)
 		seqNum := bs.Write(blockNum, data)
-		bs.MarkPending(blockNum)
+		bs.MarkPending(blockNum, seqNum)
 		bs.MarkPersisted(blockNum, uint64(i), uint32(i*4096), seqNum)
-		bs.Cache(blockNum, data)
-		bs.EvictCache(blockNum)
 	}
 }
 
