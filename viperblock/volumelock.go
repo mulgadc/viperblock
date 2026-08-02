@@ -18,26 +18,16 @@ var ErrVolumeLocked = errors.New("viperblock: volume is locked by another opener
 const volumeLockFileName = ".viperblock.lock"
 
 // AcquireVolumeLock takes an exclusive, non-blocking flock on a per-volume
-// lock file under baseDir/volume, so at most one caller at a time can
-// proceed through the New -> LoadState -> ... -> OpenWAL sequence for a
-// given volume. This is defence-in-depth at the storage layer: it does not
-// replace control-plane single-owner-per-volume enforcement, it stops a
-// second local opener from tearing WAL/state files underneath the first.
+// lock file, admitting only one caller through New..OpenWAL at a time. This
+// is storage-layer defence-in-depth, not control-plane ownership.
 //
-// flock is per-open-file-description, so two separate callers in the SAME
-// process (nbdkit's parallel thread model admitting concurrent connections)
-// contend for the lock exactly like two different processes would — this is
-// the proven repro vector for mulga-w1iu8. The kernel drops the lock
-// automatically when every file descriptor referencing this open file
-// description closes, including on process death, so a crashed holder can
-// never leave a stale lock that wedges the next attach. That property is why
-// flock is used here instead of a PID lockfile, which needs its own
-// (fallible) staleness-detection logic.
+// flock is per-open-file-description, so same-process callers (nbdkit's
+// parallel thread model) contend like separate processes would. The kernel
+// drops it on last-fd-close or process death, so crashes can't wedge the
+// lock -- unlike a PID lockfile, which needs its own staleness detection.
 //
-// Returns the open, locked *os.File; the caller must keep it open for the
-// lifetime of the volume and release it via ReleaseVolumeLock. Does not
-// block: a lock already held by another opener fails fast with
-// ErrVolumeLocked rather than queuing.
+// Returns the open, locked file; caller releases it via ReleaseVolumeLock.
+// Non-blocking: a lock already held fails fast with ErrVolumeLocked.
 func AcquireVolumeLock(baseDir, volume string) (*os.File, error) {
 	dir := filepath.Join(baseDir, volume)
 	if err := os.MkdirAll(dir, 0750); err != nil {

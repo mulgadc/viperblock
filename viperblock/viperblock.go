@@ -912,6 +912,12 @@ var ErrPreEncryptionFormat = errors.New("viperblock: chunk has pre-encryption fo
 // (it validates the header once, at offset 0, then reads fixed-size records).
 var ErrWALAlreadyOpen = errors.New("viperblock: WAL file already has content, refusing to append a second header")
 
+// ErrWALHeaderShort is returned by readWALFileForRecovery when a WAL file is
+// smaller than the header, e.g. a crash between create and header flush. It
+// holds no recoverable records, so RecoverLocalWALs deletes it on sight
+// rather than keeping it for retry.
+var ErrWALHeaderShort = errors.New("viperblock: WAL file too short to contain a header")
+
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
 // absence is normal on multi-node deployments and post-restart recovery. The
@@ -1589,19 +1595,9 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 		return fmt.Errorf("failed to open WAL file: %w", err)
 	}
 
-	// The chunk WAL (vb.WAL) is the only WAL type that both rotates to a
-	// fresh walNum on every boot (RecoverLocalWALs drains/removes prior
-	// generations, then the caller increments WallNum before opening) and is
-	// actually replayed record-by-record by readWALFileForRecovery, which
-	// validates the header once at offset 0 and desyncs on anything appended
-	// after it. A non-empty file at a freshly rotated walNum means another
-	// writer already created and header-stamped it -- refuse rather than
-	// append a second header into the middle of its records.
-	//
-	// BlockToObjectWAL is intentionally excluded: its walNum is never
-	// rotated across reopens (every boot reopens walNum unchanged), so a
-	// prior header is expected, not a collision, and nothing replays this
-	// file's records (RecoverLocalWALs only scans the chunk-WAL directory).
+	// Chunk WAL: a non-empty file at a freshly rotated walNum means another
+	// writer already header-stamped it; refuse instead of corrupting it.
+	// BlockToObjectWAL never rotates, so a prior header there is expected.
 	if wal.WALMagic == vb.WAL.WALMagic {
 		info, statErr := file.Stat()
 		if statErr != nil {
@@ -4282,6 +4278,12 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	headerSize := vb.WALHeaderSize()
 	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(f, header); err != nil {
+		// Confirm via Stat rather than trusting io.EOF/ErrUnexpectedEOF alone,
+		// so a transient read error on a full-length file still falls through
+		// to the generic (keep-for-retry) path below instead of being deleted.
+		if info, statErr := f.Stat(); statErr == nil && info.Size() < int64(headerSize) {
+			return nil, 0, fmt.Errorf("%w: %s: %w", ErrWALHeaderShort, filename, err)
+		}
 		return nil, 0, fmt.Errorf("failed to read WAL header: %w", err)
 	}
 
@@ -4448,6 +4450,16 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 			// the volume up; the file stays on disk for forensics + retry.
 			if errors.Is(err, ErrIntegrity) {
 				return fmt.Errorf("WAL recovery: integrity failure in %s: %w", fname, err)
+			}
+			// A short-header stub (torn create) holds no recoverable
+			// records by definition. Deleting it here is what stops it
+			// wedging OpenWAL's refuse-a-nonempty-file guard forever.
+			if errors.Is(err, ErrWALHeaderShort) {
+				vb.logger().Warn("WAL recovery: removing short-header stub WAL file", "file", fname, "error", err)
+				if rmErr := os.Remove(fullPath); rmErr != nil {
+					vb.logger().Warn("WAL recovery: failed to remove short-header WAL file", "file", fname, "error", rmErr)
+				}
+				continue
 			}
 			vb.logger().Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
 			continue

@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -97,4 +98,55 @@ func TestOpenWAL_ConcurrentDoubleOpenNeverCorrupts(t *testing.T) {
 		return
 	}
 	assert.Empty(t, blocks, "a header-only WAL must recover zero blocks, not fabricated ones")
+}
+
+// TestRecoverLocalWALs_RemovesShortHeaderStub covers a different crash point
+// than the double-open tests above: a torn create, where a file shorter than
+// the WAL header exists at the exact walNum the next boot will target (e.g.
+// crash between os.OpenFile and the header write finishing). Such a stub
+// holds no recoverable records, so RecoverLocalWALs must delete it rather
+// than keep it for retry -- keeping it would make openWALLocked's refuse-a-
+// nonempty-file guard trip on every subsequent boot, wedging the volume
+// closed forever instead of merely losing the torn write.
+func TestRecoverLocalWALs_RemovesShortHeaderStub(t *testing.T) {
+	dir := t.TempDir()
+	key := testKey(t, 0x42)
+	const volName = "vol-short-header-stub"
+	const volSize = 4 * 1024 * 1024
+	cfg := file.FileConfig{BaseDir: dir, VolumeName: volName}
+
+	seed, err := New(&VB{
+		VolumeName: volName, VolumeSize: volSize, BaseDir: dir,
+		MasterKey: key, EncryptionEnabled: true,
+	}, "file", cfg)
+	require.NoError(t, err)
+	require.NoError(t, seed.Backend.Init())
+	require.NoError(t, seed.SaveState())
+	seed.StopChunkUploader()
+	seed.StopWALSyncer()
+
+	// A fresh volume's WallNum loads as 0, so the first open after recovery
+	// always targets walNum 1 -- stage the stub at exactly that number.
+	walPath := filepath.Join(dir, types.GetFilePath(types.FileTypeWALChunk, 1, volName))
+	require.NoError(t, os.MkdirAll(filepath.Dir(walPath), 0750))
+	require.NoError(t, os.WriteFile(walPath, []byte{0x01, 0x02, 0x03}, 0600))
+
+	vb, err := New(&VB{
+		VolumeName: volName, VolumeSize: volSize, BaseDir: dir,
+		MasterKey: key, EncryptionEnabled: true, Role: "nbdkit",
+	}, "file", cfg)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.LoadState())
+	require.NoError(t, vb.EnsureVolumeUUID())
+	require.NoError(t, vb.LoadLiveCheckpoint())
+	require.NoError(t, vb.RecoverLocalWALs())
+
+	_, statErr := os.Stat(walPath)
+	assert.True(t, os.IsNotExist(statErr), "short-header stub must be removed by RecoverLocalWALs")
+
+	walNum := vb.WAL.WallNum.Add(1)
+	require.Equal(t, uint64(1), walNum, "sanity: this open must target the exact walNum the stub was staged at")
+	err = vb.OpenWAL(&vb.WAL, filepath.Join(dir, types.GetFilePath(types.FileTypeWALChunk, walNum, volName)))
+	require.NoError(t, err, "the volume must open cleanly once the stub is cleaned up, not wedge forever")
 }
