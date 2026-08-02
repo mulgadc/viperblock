@@ -829,6 +829,7 @@ type VolumeMetadata struct {
 	DeviceName          string            `json:"DeviceName"`          // e.g. "/dev/nbd1"
 	VolumeType          string            `json:"VolumeType"`          // e.g. "gp3", "io1"
 	IOPS                int               `json:"IOPS"`                // For provisioned volumes
+	Throughput          int               `json:"Throughput"`          // gp3 MiB/s (125-1000); zero means unset/pre-field volume
 	Tags                map[string]string `json:"Tags"`                // User-defined metadata
 	SnapshotID          string            `json:"SnapshotID"`          // If created from a snapshot
 	DeleteOnTermination bool              `json:"DeleteOnTermination"` // Whether to delete volume when instance terminates
