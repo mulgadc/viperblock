@@ -912,6 +912,7 @@ type VolumeMetadata struct {
 	DeviceName          string            `json:"DeviceName"`          // e.g. "/dev/nbd1"
 	VolumeType          string            `json:"VolumeType"`          // e.g. "gp3", "io1"
 	IOPS                int               `json:"IOPS"`                // For provisioned volumes
+	Throughput          int               `json:"Throughput"`          // gp3 MiB/s (125-1000); zero means unset/pre-field volume
 	Tags                map[string]string `json:"Tags"`                // User-defined metadata
 	SnapshotID          string            `json:"SnapshotID"`          // If created from a snapshot
 	DeleteOnTermination bool              `json:"DeleteOnTermination"` // Whether to delete volume when instance terminates
@@ -985,6 +986,21 @@ var ErrIntegrity = errors.New("viperblock: integrity check failed")
 // create a new encrypted volume and copy data across via guest-side tooling
 // (dd, filesystem-level copy). Callers must refuse to open the volume.
 var ErrPreEncryptionFormat = errors.New("viperblock: chunk has pre-encryption format (VBCH) but volume opened with EncryptionEnabled=true; create a new encrypted volume and copy data across via guest-side tooling")
+
+// ErrWALAlreadyOpen is returned by OpenWAL when the target WAL file already
+// has content. Every normal caller (boot, rotation) targets a walNum that
+// RecoverLocalWALs has just drained/removed or that was freshly incremented,
+// so a non-empty file here means another writer already opened it — most
+// likely a second concurrent VB instance racing the same volume. Appending a
+// second header would land mid-stream, which the WAL reader cannot parse
+// (it validates the header once, at offset 0, then reads fixed-size records).
+var ErrWALAlreadyOpen = errors.New("viperblock: WAL file already has content, refusing to append a second header")
+
+// ErrWALHeaderShort is returned by readWALFileForRecovery when a WAL file is
+// smaller than the header, e.g. a crash between create and header flush. It
+// holds no recoverable records, so RecoverLocalWALs deletes it on sight
+// rather than keeping it for retry.
+var ErrWALHeaderShort = errors.New("viperblock: WAL file too short to contain a header")
 
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
@@ -1660,6 +1676,21 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open WAL file: %w", err)
+	}
+
+	// Chunk WAL: a non-empty file at a freshly rotated walNum means another
+	// writer already header-stamped it; refuse instead of corrupting it.
+	// BlockToObjectWAL never rotates, so a prior header there is expected.
+	if wal.WALMagic == vb.WAL.WALMagic {
+		info, statErr := file.Stat()
+		if statErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("failed to stat WAL file: %w", statErr)
+		}
+		if info.Size() > 0 {
+			_ = file.Close()
+			return fmt.Errorf("%w: %s has %d existing bytes", ErrWALAlreadyOpen, filename, info.Size())
+		}
 	}
 
 	// Append the WAL header, format
@@ -4354,6 +4385,12 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	headerSize := vb.WALHeaderSize()
 	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(f, header); err != nil {
+		// Confirm via Stat rather than trusting io.EOF/ErrUnexpectedEOF alone,
+		// so a transient read error on a full-length file still falls through
+		// to the generic (keep-for-retry) path below instead of being deleted.
+		if info, statErr := f.Stat(); statErr == nil && info.Size() < int64(headerSize) {
+			return nil, 0, fmt.Errorf("%w: %s: %w", ErrWALHeaderShort, filename, err)
+		}
 		return nil, 0, fmt.Errorf("failed to read WAL header: %w", err)
 	}
 
@@ -4520,6 +4557,16 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 			// the volume up; the file stays on disk for forensics + retry.
 			if errors.Is(err, ErrIntegrity) {
 				return fmt.Errorf("WAL recovery: integrity failure in %s: %w", fname, err)
+			}
+			// A short-header stub (torn create) holds no recoverable
+			// records by definition. Deleting it here is what stops it
+			// wedging OpenWAL's refuse-a-nonempty-file guard forever.
+			if errors.Is(err, ErrWALHeaderShort) {
+				vb.logger().Warn("WAL recovery: removing short-header stub WAL file", "file", fname, "error", err)
+				if rmErr := os.Remove(fullPath); rmErr != nil {
+					vb.logger().Warn("WAL recovery: failed to remove short-header WAL file", "file", fname, "error", rmErr)
+				}
+				continue
 			}
 			vb.logger().Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
 			continue
@@ -4957,19 +5004,34 @@ func (vb *VB) pushStateToBackend(ctx context.Context, persisted []byte) error {
 // writeFileAtomic writes data to path atomically via tmp + fsync + rename +
 // fsync(parent). On return without error, the file exists at path with the
 // new contents fully durable on disk. A crash before return may leave a
-// stale path.tmp behind (caller-tolerable: next SaveState rewrites it).
+// stale *.tmp-* file behind (caller-tolerable: next SaveState rewrites path;
+// stale tmp siblings are otherwise inert).
 //
 // The parent dir is created if absent so a remount on a node that never held
 // the volume locally (LoadState pulls authoritative state from the backend,
 // then persists it locally) does not fail opening the tmp file with ENOENT.
+//
+// The tmp name is unique per call (os.CreateTemp, O_EXCL under the hood) so
+// two concurrent writers of the same path -- e.g. independently-constructed
+// *VB instances racing persistStateLocal for the same volume -- never share
+// an inode. A fixed "path.tmp" name let one writer's O_TRUNC clobber the
+// other's in-flight write, and one writer's rename delete the other's tmp,
+// producing a torn file that fails AEAD authentication on the next load.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	base := filepath.Base(path)
+	f, err := os.CreateTemp(dir, base+".tmp-*")
 	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// os.CreateTemp always creates with 0600; the caller's perm may differ.
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
