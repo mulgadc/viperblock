@@ -61,7 +61,7 @@ func TestCreateSnapshot(t *testing.T) {
 				assert.Equal(t, lookup.offsetAt(i, stride), baseLookup.ObjectOffset)
 			}
 		}
-		assert.Equal(t, baseMap.lookup.len(), wantBlocks)
+		assert.Equal(t, wantBlocks, baseMap.lookup.len())
 	})
 }
 
@@ -520,7 +520,7 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 				}
 			}
 		}
-		assert.Equal(t, layers[0].Blocks.lookup.len(), wantBlocks, "decoded block count must match parent")
+		assert.Equal(t, wantBlocks, layers[0].Blocks.lookup.len(), "decoded block count must match parent")
 	})
 }
 

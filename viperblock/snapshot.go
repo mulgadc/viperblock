@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/utils"
 )
 
 // SnapshotState holds metadata for a frozen snapshot stored on the backend.
@@ -76,16 +77,7 @@ func (vb *VB) drainForSnapshot() error {
 	vb.drainMu.Lock()
 	defer vb.drainMu.Unlock()
 
-	// Writes.mu is taken inside drainMu, matching DrainToBackendCtx's order.
-	vb.Writes.mu.Lock()
-	var flushErr error
-	if vb.UseShardedWAL {
-		flushErr = vb.flushLockedSharded()
-	} else {
-		flushErr = vb.flushLocked()
-	}
-	vb.Writes.mu.Unlock()
-	if flushErr != nil {
+	if flushErr := vb.flushWrites(); flushErr != nil {
 		return fmt.Errorf("snapshot flush failed: %w", flushErr)
 	}
 
@@ -374,7 +366,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	}
 
 	// 6. Validate block count against metadata
-	if snap.BlockCount > 0 && uint64(baseMap.lookup.len()) != snap.BlockCount {
+	if snap.BlockCount > 0 && utils.SafeIntToUint64(baseMap.lookup.len()) != snap.BlockCount {
 		return nil, ident, fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, baseMap.lookup.len())
 	}
 

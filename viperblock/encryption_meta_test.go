@@ -277,6 +277,10 @@ func TestBlockStoreReadEncrypted(t *testing.T) {
 
 	// Now tamper a byte on the chunk and verify the BlockStore path
 	// also fails closed.
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.BlocksToObject.mu.Lock()
 	env.vb.BlocksToObject.lookup.set(BlockLookup{

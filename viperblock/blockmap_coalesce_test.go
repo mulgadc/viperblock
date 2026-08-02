@@ -70,7 +70,7 @@ func TestBlockMapCoalesce_SequentialWrite(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, vb.BlocksToObject.lookup.len(), 1, "one consecutive run must coalesce into one BlockLookup entry")
+	require.Equal(t, 1, vb.BlocksToObject.lookup.len(), "one consecutive run must coalesce into one BlockLookup entry")
 	entry := lookupMap(&vb.BlocksToObject)[0]
 	vb.BlocksToObject.mu.RUnlock()
 	require.Equal(t, uint16(numBlocks), entry.NumBlocks)
@@ -104,7 +104,7 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, vb.BlocksToObject.lookup.len(), 1)
+	require.Equal(t, 1, vb.BlocksToObject.lookup.len())
 	vb.BlocksToObject.mu.RUnlock()
 
 	// Overwrite [8, 12) -- strictly inside the [0, 20) extent, leaving
@@ -115,7 +115,7 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, vb.BlocksToObject.lookup.len(), 3, "overwrite must fracture the original extent into head/new/tail")
+	require.Equal(t, 3, vb.BlocksToObject.lookup.len(), "overwrite must fracture the original extent into head/new/tail")
 	head, headOK := lookupMap(&vb.BlocksToObject)[0]
 	mid, midOK := lookupMap(&vb.BlocksToObject)[8]
 	tail, tailOK := lookupMap(&vb.BlocksToObject)[12]
@@ -160,7 +160,7 @@ func TestBlockMapCoalesce_MultiChunkBoundary(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, vb.BlocksToObject.lookup.len(), 3, "20 blocks at 8 blocks/chunk must produce 3 extents")
+	require.Equal(t, 3, vb.BlocksToObject.lookup.len(), "20 blocks at 8 blocks/chunk must produce 3 extents")
 	e0, ok0 := lookupMap(&vb.BlocksToObject)[0]
 	e1, ok1 := lookupMap(&vb.BlocksToObject)[8]
 	e2, ok2 := lookupMap(&vb.BlocksToObject)[16]
@@ -203,7 +203,7 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, vb.BlocksToObject.lookup.len(), 3, "encrypted volumes coalesce the same way as plaintext ones")
+	require.Equal(t, 3, vb.BlocksToObject.lookup.len(), "encrypted volumes coalesce the same way as plaintext ones")
 	vb.BlocksToObject.mu.RUnlock()
 
 	got, err := vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
@@ -321,7 +321,7 @@ func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 
 	// Capture the real per-block AEAD SeqNums the chunk was actually sealed with.
 	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, vb.BlocksToObject.lookup.len(), 1, "the write must have coalesced into one extent")
+	require.Equal(t, 1, vb.BlocksToObject.lookup.len(), "the write must have coalesced into one extent")
 	entry := lookupMap(&vb.BlocksToObject)[0]
 	realSeqNums := make([]uint64, numBlocks)
 	for i := range numBlocks {

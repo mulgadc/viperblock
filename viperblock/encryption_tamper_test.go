@@ -153,6 +153,10 @@ func TestEncryptedChunk_TamperByteFailsRead(t *testing.T) {
 	require.True(t, bytes.Equal(plaintext, got), "baseline decrypt failed; tamper test would be meaningless")
 
 	// Clear caches so the next read must hit the backend.
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.BlocksToObject.mu.Lock()
 	env.vb.BlocksToObject.lookup.set(BlockLookup{
@@ -189,6 +193,10 @@ func TestEncryptedChunk_TagTamperFailsRead(t *testing.T) {
 	require.NoError(t, err)
 	env.writeAndChunk(t, 0, plaintext)
 
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 	env.vb.BlocksToObject.mu.Lock()
@@ -250,6 +258,7 @@ func TestEncryptedChunk_CrossVolumeSpliceFailsRead(t *testing.T) {
 	require.NoError(t, os.WriteFile(envB.chunkPath(envB.vb.VolumeName, 0), bBytes, 0600))
 
 	// Force B's read to hit the backend rather than its in-memory cache.
+	envB.vb.Cache.purge()
 	envB.vb.BlockStore = NewUnifiedBlockStore(envB.vb.BlockSize)
 	envB.vb.UseBlockStore = false
 	envB.vb.BlocksToObject.mu.Lock()
@@ -312,6 +321,10 @@ func TestEncryptedChunk_InPlaceReplayFailsRead(t *testing.T) {
 	require.NoError(t, os.WriteFile(env.chunkPath(env.vb.VolumeName, 1), chunk1, 0600))
 
 	// Force a backend re-read for block 5.
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 
@@ -414,6 +427,10 @@ func TestEncryptedChunk_PreEncryptionMagicRejected(t *testing.T) {
 
 	// Bypass caches so the next Read hits the backend (and therefore
 	// the magic preflight).
+	// Drop the plaintext cache alongside the block store: a cached copy is
+	// returned without re-decrypting, so it would mask the tamper this test
+	// exists to catch.
+	env.vb.Cache.purge()
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 	env.vb.BlocksToObject.mu.Lock()

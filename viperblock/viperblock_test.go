@@ -765,9 +765,7 @@ func TestWriteAndRead(t *testing.T) {
 						//t.Log("Checking cache for block", tc.blockID+i)
 
 						if cachedData, ok := vb.Cache.lru.Get(tc.blockID + i); ok {
-							//slog.Info("CACHE HIT:", "block", tc.blockID+i)
-
-							assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], cachedData)
+							assert.Equal(t, tc.data[blockCount:blockCount+uint64(vb.BlockSize)], cachedData.data)
 						}
 
 						blockCount += uint64(vb.BlockSize)
@@ -1963,7 +1961,7 @@ func TestPendingBackendWritesDeduplication(t *testing.T) {
 					expected := make([]byte, DefaultBlockSize)
 					msg := fmt.Sprintf("cache_block_%d", i)
 					copy(expected[:len(msg)], msg)
-					assert.Equal(t, expected, cachedData, "Cached block %d data mismatch", i)
+					assert.Equal(t, expected, cachedData.data, "Cached block %d data mismatch", i)
 				}
 			}
 		})

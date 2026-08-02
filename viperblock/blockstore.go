@@ -364,6 +364,91 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 	return snapshot, true
 }
 
+// ReadEntryRun resolves the count blocks starting at startBlock into out,
+// setting found[i] for each block that resolved. Both slices must have length
+// count. Semantics per block are identical to ReadEntry -- a shard-resident
+// entry is newer than anything in the persisted index and wins -- but the
+// persisted index is consulted once for the whole run instead of once per
+// block.
+//
+// That matters for more than the tree descent: readPersisted takes
+// persistedMu for reading on every call, so a 1 MiB guest read used to
+// acquire it 256 times. Go's RWMutex blocks new readers behind a waiting
+// writer, so each of those acquisitions was a chance to stall behind a chunk
+// upload. This takes it once.
+func (ubs *UnifiedBlockStore) ReadEntryRun(startBlock, count uint64, out []BlockEntry, found []bool) {
+	if count == 0 {
+		return
+	}
+	ubs.stats.Reads.Add(count)
+
+	// Pass 1: the sharded index, which holds the hot/pending/cached overlay.
+	gaps := false
+	for i := range count {
+		blockNum := startBlock + i
+		shard := ubs.getShard(blockNum)
+		shard.mu.RLock()
+		entry, exists := shard.entries[blockNum]
+		if exists {
+			out[i] = *entry
+		}
+		shard.mu.RUnlock()
+
+		found[i] = exists
+		if !exists {
+			gaps = true
+			continue
+		}
+		switch out[i].State {
+		case BlockStateHot:
+			ubs.stats.HotReads.Add(1)
+		case BlockStatePending:
+			ubs.stats.PendReads.Add(1)
+		case BlockStateCached:
+			ubs.stats.CacheHits.Add(1)
+		case BlockStatePersisted:
+			ubs.stats.BackendReads.Add(1)
+		default:
+			ubs.stats.CacheMiss.Add(1)
+		}
+	}
+	if !gaps {
+		return
+	}
+
+	// Pass 2: one locked walk of the persisted index for whatever pass 1 did
+	// not resolve. A block coalesced into an extent after upload has no shard
+	// entry of its own, so a pass-1 miss is not "never written".
+	end := startBlock + count
+	ubs.persistedMu.RLock()
+	ubs.persistedExtents.overlaps(startBlock, end, func(pe persistedExtent) bool {
+		lo, hi := max(pe.startBlock, startBlock), min(pe.end(), end)
+		for blockNum := lo; blockNum < hi; blockNum++ {
+			i := blockNum - startBlock
+			if found[i] {
+				continue // the overlay already answered for this block
+			}
+			idx := uint16(blockNum - pe.startBlock) //nolint:gosec // G115: blockNum < pe.end() bounds this by pe.numBlocks (uint16)
+			out[i] = BlockEntry{
+				SeqNum:       pe.seqNumAt(idx),
+				State:        BlockStatePersisted,
+				ObjectID:     pe.objectID,
+				ObjectOffset: pe.offsetAt(idx),
+			}
+			found[i] = true
+			ubs.stats.BackendReads.Add(1)
+		}
+		return true
+	})
+	ubs.persistedMu.RUnlock()
+
+	for i := range count {
+		if !found[i] {
+			ubs.stats.CacheMiss.Add(1)
+		}
+	}
+}
+
 // Write stores a block in the Hot state and returns the assigned sequence number
 // The index is updated immediately (not rebuilt on read).
 func (ubs *UnifiedBlockStore) Write(blockNum uint64, data []byte) uint64 {
@@ -423,9 +508,9 @@ func (ubs *UnifiedBlockStore) WriteWithSeqNum(blockNum uint64, data []byte, seqN
 	shard.mu.Unlock()
 }
 
-// MarkPending transitions a block from Hot to Pending state
-// Called by Flush() after WAL write succeeds.
-func (ubs *UnifiedBlockStore) MarkPending(blockNum uint64) bool {
+// MarkPending transitions a block from Hot to Pending state.
+// Called by Flush() after the WAL write succeeds.
+func (ubs *UnifiedBlockStore) MarkPending(blockNum, seqNum uint64) bool {
 	shard := ubs.getShard(blockNum)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
@@ -435,7 +520,10 @@ func (ubs *UnifiedBlockStore) MarkPending(blockNum uint64) bool {
 		return false
 	}
 
-	if entry.State == BlockStateHot {
+	// seqNum identifies the write that actually reached the WAL. A block
+	// rewritten since then is Hot with a higher SeqNum and that newer data is
+	// not durable yet, so it must stay Hot.
+	if entry.State == BlockStateHot && entry.SeqNum == seqNum {
 		entry.State = BlockStatePending
 		return true
 	}
@@ -617,50 +705,6 @@ func (ubs *UnifiedBlockStore) SetPersistedRange(blocks []uint64, objectID uint64
 		ubs.persistedExtents.set(run)
 		i = j
 	}
-}
-
-// Cache transitions a block from Persisted to Cached state after backend read.
-func (ubs *UnifiedBlockStore) Cache(blockNum uint64, data []byte) bool {
-	shard := ubs.getShard(blockNum)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	entry, ok := shard.entries[blockNum]
-	if !ok {
-		return false
-	}
-
-	// Only cache if currently Persisted (not Hot or Pending which have newer data)
-	if entry.State == BlockStatePersisted {
-		// Make copy of data
-		dataCopy := make([]byte, len(data))
-		copy(dataCopy, data)
-
-		entry.State = BlockStateCached
-		entry.Data = dataCopy
-		return true
-	}
-	return false
-}
-
-// EvictCache transitions a block from Cached back to Persisted state
-// Used for LRU eviction.
-func (ubs *UnifiedBlockStore) EvictCache(blockNum uint64) bool {
-	shard := ubs.getShard(blockNum)
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	entry, ok := shard.entries[blockNum]
-	if !ok {
-		return false
-	}
-
-	if entry.State == BlockStateCached {
-		entry.State = BlockStatePersisted
-		entry.Data = nil
-		return true
-	}
-	return false
 }
 
 // GetBlocksByState returns all block numbers in a given state

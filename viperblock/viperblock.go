@@ -49,6 +49,11 @@ const DefaultChunkUploadInterval time.Duration = 30 * time.Second
 // bucket-wide scan (see ensureGCSnapshotSafe), and reclaiming is not urgent.
 const DefaultGCInterval time.Duration = 5 * time.Minute
 
+// DefaultCacheBlocks is the plaintext block cache size, in blocks, that a
+// caller gets if it asks for a cache without sizing one. 32768 x 4 KiB =
+// 128 MiB per volume, so a host packed with volumes should size it down.
+const DefaultCacheBlocks = 32768
+
 // DefaultCheckpointRetryBackoff is the first sleep between SaveLiveCheckpointCtx's
 // write attempts, doubling on each subsequent retry. Sized for a transient backend
 // blip rather than a hard outage: three attempts spend ~3s total before giving up.
@@ -70,6 +75,24 @@ const DefaultMaxPendingBytes uint64 = 256 * 1024 * 1024
 // backend reports nearfull pressure. 8 takes the default 256MB window to 32MB,
 // still well above the 4MB chunk size so drains stay chunk-sized.
 const nearFullPendingDivisor uint64 = 8
+
+// The backpressure budget is a bound on unflushed bytes, so it is meaningless
+// above what the WAL device can actually hold. The budget is clamped to
+// walFreeFraction of the free space, sampled at most once per
+// walFreeSampleInterval so a statfs never lands on a per-write path, and never
+// clamped below walMinPendingBytes -- at that point the drain is the only thing
+// that can help and starving it of headroom does not.
+const (
+	walFreeFraction       uint64 = 2
+	walMinPendingBytes    uint64 = 16 * 1024 * 1024
+	walFreeSampleInterval        = 5 * time.Second
+)
+
+// backpressureLowFraction sets the release point as a fraction of the
+// high-watermark. Releasing at half meant a writer that tripped backpressure
+// waited for 128 MiB to drain before it could proceed; the gap only has to be
+// wide enough to stop the writer re-tripping on its next write.
+const backpressureLowFraction uint64 = 4 // release at 3/4 of high
 
 // DefaultUploadWorkers bounds the parallel chunk-upload worker pool used by
 // WriteWALToChunkCtx / WriteShardedWALToChunkCtx. 1 means fully serial.
@@ -207,6 +230,11 @@ type VB struct {
 	// launching redundant drains. drainMu below is the real exclusion guarantee.
 	drainInFlight atomic.Bool
 
+	// Last sampled free space on the WAL device, and when it was taken, so
+	// maxPendingBytes can clamp without a statfs per call.
+	walFreeBytes     atomic.Uint64
+	walFreeSampledAt atomic.Int64
+
 	// backendFull latches when a drain reports the backend out of space, so
 	// WriteAtCtx can fail fast with ErrNoSpace up front. See
 	// DrainToBackendCtx's deferred handler for where it is set and cleared.
@@ -224,6 +252,11 @@ type VB struct {
 	// newer chunk's live pointer and let GC delete a still-referenced chunk.
 	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
 	drainMu sync.Mutex
+
+	// flushMu serialises flushWrites. Writes.mu used to do this implicitly by
+	// being held across the whole WAL write, which also blocked every guest
+	// write for its duration; this keeps flushes ordered without that.
+	flushMu sync.Mutex
 
 	// rmwLocks serialize each block's read-modify-write cycle in WriteAtCtx,
 	// sharded by block number. See writeOneBlockLocked.
@@ -460,10 +493,68 @@ type CacheConfig struct {
 	SystemMemoryPercent int
 }
 
+// cachedBlock is a plaintext copy of a block, tagged with the sequence number
+// it was read under. The tag is what lets the cache be safe without write-path
+// invalidation: an overwritten block is re-persisted under a higher sequence
+// number, so a stale entry fails the check at lookup and is treated as a miss
+// rather than served.
+type cachedBlock struct {
+	seqNum uint64
+	data   []byte
+}
+
+// Cache is a bounded plaintext block cache sitting beside the authoritative
+// block index, not inside it. Eviction drops cached data only; the persisted
+// location of a block always remains resolvable from the extent index.
 type Cache struct {
 	mu     sync.RWMutex
-	lru    *lru.Cache[uint64, []byte]
+	lru    *lru.Cache[uint64, cachedBlock]
 	Config CacheConfig
+}
+
+// get returns the cached plaintext for a block only if it was cached under the
+// sequence number the caller resolved, so a superseded copy is never served.
+func (c *Cache) get(block, seqNum uint64) ([]byte, bool) {
+	if c.Config.Size == 0 {
+		return nil, false
+	}
+	cb, ok := c.lru.Get(block)
+	if !ok || cb.seqNum != seqNum {
+		return nil, false
+	}
+	return cb.data, true
+}
+
+// purge drops every cached block. The authoritative index is untouched: every
+// block stays resolvable from its persisted location.
+func (c *Cache) purge() {
+	if c.lru != nil {
+		c.lru.Purge()
+	}
+}
+
+// cacheFetched stores the plaintext of every block that was just fetched from a
+// backend. It takes the per-block request records rather than caching from
+// inside the fetch helpers, because those coalesce blocks into runs carrying a
+// single SeqNum -- the wrong granularity to tag a cache entry with.
+func (vb *VB) cacheFetched(data []byte, runs ...ConsecutiveBlocks) {
+	if vb.Cache.Config.Size == 0 {
+		return
+	}
+	for _, cbs := range runs {
+		for _, cb := range cbs {
+			vb.Cache.put(cb.StartBlock, cb.SeqNum, data[cb.OffsetStart:cb.OffsetEnd])
+		}
+	}
+}
+
+// put stores a copy of data. The caller's buffer is cloned because it is
+// usually a window into a larger read buffer that it will keep writing to.
+func (c *Cache) put(block, seqNum uint64, data []byte) {
+	if c.Config.Size == 0 {
+		return
+	}
+	c.lru.Add(block, cachedBlock{seqNum: seqNum, data: bytes.Clone(data)})
 }
 
 type ObjectMap struct {
@@ -955,7 +1046,7 @@ func (vb *VB) SetCacheSize(size int, percentage int) error {
 	defer vb.Cache.mu.Unlock()
 
 	// Create new LRU cache with specified size
-	newCache, err := lru.New[uint64, []byte](size)
+	newCache, err := lru.New[uint64, cachedBlock](size)
 	if err != nil {
 		return fmt.Errorf("failed to create new LRU cache: %w", err)
 	}
@@ -1081,17 +1172,16 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.GCInterval = DefaultGCInterval
 	}
 
-	var lruCache *lru.Cache[uint64, []byte]
+	var lruCache *lru.Cache[uint64, cachedBlock]
 
 	if config.Cache.Config.Size == 0 {
-		//config.Cache.Config.Size = calculateCacheSize(config.BlockSize, 30)
-		//config.Cache.Config.UseSystemMemory = true
-		//config.Cache.Config.SystemMemoryPercent = 30
+		// Size 0 is the established "no cache" request; callers that want one
+		// set it explicitly (spinifex passes DefaultCacheBlocks).
 		config.Cache.Config.UseSystemMemory = false
 		config.Cache.Config.SystemMemoryPercent = 0
 	} else {
 		// Create LRU cache with calculated size
-		lruCache, err = lru.New[uint64, []byte](config.Cache.Config.Size)
+		lruCache, err = lru.New[uint64, cachedBlock](config.Cache.Config.Size)
 		if err != nil {
 			panic(fmt.Sprintf("failed to create LRU cache: %v", err))
 		}
@@ -1695,7 +1785,28 @@ func (vb *VB) maxPendingBytes() uint64 {
 	if vb.isBackendNearFull() {
 		high /= nearFullPendingDivisor
 	}
+	if free := vb.walFreeBytesSampled(); free > 0 {
+		high = min(high, max(free/walFreeFraction, walMinPendingBytes))
+	}
 	return high
+}
+
+// walFreeBytesSampled returns the cached free space on the WAL device,
+// refreshing it at most once per walFreeSampleInterval. A refresh that races
+// with another caller yields to it and returns the previous sample rather than
+// issuing a second statfs.
+func (vb *VB) walFreeBytesSampled() uint64 {
+	now := time.Now().UnixNano()
+	last := vb.walFreeSampledAt.Load()
+	if now-last < int64(walFreeSampleInterval) {
+		return vb.walFreeBytes.Load()
+	}
+	if !vb.walFreeSampledAt.CompareAndSwap(last, now) {
+		return vb.walFreeBytes.Load()
+	}
+	free := walDeviceFreeBytes(vb.WAL.BaseDir)
+	vb.walFreeBytes.Store(free)
+	return free
 }
 
 // checkpointBackoff returns the configured first retry sleep, or the default if
@@ -1735,9 +1846,9 @@ func (vb *VB) signalSizeTrigger() {
 	}
 }
 
-// awaitBackpressure blocks the caller once pendingBytes has crossed
-// MaxPendingBytes, driving DrainToBackendCtx synchronously until pendingBytes
-// falls back under the low-watermark (MaxPendingBytes/2). This is the core
+// awaitBackpressure blocks the caller once pendingBytes has crossed the
+// high-watermark, driving DrainToBackendCtx synchronously until pendingBytes
+// falls back under the low-watermark (3/4 of it). This is the core
 // backpressure mechanism: a guest write that outruns the backend's ingest
 // rate self-throttles here instead of growing Writes.Blocks /
 // PendingBackendWrites.Blocks without bound.
@@ -1758,9 +1869,11 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 		return nil
 	}
 
-	low := high / 2
+	low := high - high/backpressureLowFraction
 	backoff := 10 * time.Millisecond
-	const maxBackoff = 500 * time.Millisecond
+	// The loop re-checks pendingBytes on every wake, so a long backoff only
+	// adds latency after the drain that unblocked the writer has finished.
+	const maxBackoff = 50 * time.Millisecond
 
 	// Bound consecutive non-ErrNoSpace drain failures so a persistently
 	// failing drain doesn't spin here forever; a single success resets the
@@ -2144,15 +2257,55 @@ func (vb *VB) Flush() (err error) {
 	return vb.syncWAL()
 }
 
-// flushWrites moves buffered blocks into the WAL file under Writes.mu, with
-// no fsync of its own.
+// flushWrites moves buffered blocks into the WAL file, with no fsync of its
+// own. Writes.mu is held only to snapshot the buffer and, later, to retire the
+// blocks that landed -- not across the WAL write itself, which would block
+// every guest write for the duration of a disk write.
 func (vb *VB) flushWrites() error {
+	vb.flushMu.Lock()
+	defer vb.flushMu.Unlock()
+
 	vb.Writes.mu.Lock()
-	defer vb.Writes.mu.Unlock()
-	if vb.UseShardedWAL {
-		return vb.flushLockedSharded()
+	flushBlocks := make([]Block, len(vb.Writes.Blocks))
+	copy(flushBlocks, vb.Writes.Blocks)
+	vb.Writes.mu.Unlock()
+
+	if len(flushBlocks) == 0 {
+		return nil
 	}
-	return vb.flushLocked()
+	if vb.UseShardedWAL {
+		return vb.flushSnapshotSharded(flushBlocks)
+	}
+	return vb.flushSnapshot(flushBlocks)
+}
+
+// retireFlushed removes from the write buffer every block the WAL now holds,
+// and hands them to PendingBackendWrites. A block is kept if it was rewritten
+// while the WAL write was in progress -- flushed records the SeqNum that
+// landed, so a strictly newer one in the buffer has not been written yet and
+// must survive to the next flush.
+func (vb *VB) retireFlushed(flushBlocks []Block, flushed map[uint64]uint64) {
+	if len(flushed) == 0 {
+		return
+	}
+
+	vb.Writes.mu.Lock()
+	remaining := make([]Block, 0, len(vb.Writes.Blocks))
+	for _, b := range vb.Writes.Blocks {
+		if seq, ok := flushed[b.Block]; !ok || b.SeqNum > seq {
+			remaining = append(remaining, b)
+		}
+	}
+	vb.Writes.Blocks = remaining
+	vb.Writes.mu.Unlock()
+
+	vb.PendingBackendWrites.mu.Lock()
+	for _, b := range flushBlocks {
+		if _, ok := flushed[b.Block]; ok {
+			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
+		}
+	}
+	vb.PendingBackendWrites.mu.Unlock()
 }
 
 // DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
@@ -2208,11 +2361,9 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	return nil
 }
 
-// flushLocked flushes hot writes to WAL. Caller must hold vb.Writes.mu.Lock().
-func (vb *VB) flushLocked() error {
-	flushBlocks := make([]Block, len(vb.Writes.Blocks))
-	copy(flushBlocks, vb.Writes.Blocks)
-
+// flushSnapshot flushes a snapshot of the hot writes to the WAL. It does not
+// hold Writes.mu; the caller serialises flushes via flushMu.
+func (vb *VB) flushSnapshot(flushBlocks []Block) error {
 	// flushed maps block number -> latest SeqNum that landed in the WAL,
 	// used to filter vb.Writes.Blocks and feed PendingBackendWrites. It
 	// dedupes by block number, so its cardinality CANNOT be used to detect
@@ -2231,32 +2382,15 @@ func (vb *VB) flushLocked() error {
 		successCount++
 		flushed[block.Block] = block.SeqNum
 
-		// Mark block as Pending in BlockStore (Hot -> Pending transition)
+		// Mark block as Pending in BlockStore (Hot -> Pending transition).
+		// Keyed on SeqNum: without Writes.mu held, the block may have been
+		// rewritten since the snapshot, and that newer data is not in the WAL.
 		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.MarkPending(block.Block)
+			vb.BlockStore.MarkPending(block.Block, block.SeqNum)
 		}
 	}
 
-	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
-	if len(flushed) > 0 {
-		remaining := make([]Block, 0)
-		for _, b := range vb.Writes.Blocks {
-			if _, ok := flushed[b.Block]; !ok {
-				remaining = append(remaining, b)
-			}
-		}
-
-		vb.Writes.Blocks = remaining
-	}
-
-	// Append only successfully flushed blocks to PendingBackendWrites
-	vb.PendingBackendWrites.mu.Lock()
-	for _, b := range flushBlocks {
-		if _, ok := flushed[b.Block]; ok {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
-		}
-	}
-	vb.PendingBackendWrites.mu.Unlock()
+	vb.retireFlushed(flushBlocks, flushed)
 
 	if successCount < len(flushBlocks) {
 		return fmt.Errorf("partial flush: %d of %d records flushed", successCount, len(flushBlocks))
@@ -2265,17 +2399,10 @@ func (vb *VB) flushLocked() error {
 	return nil
 }
 
-// flushLockedSharded flushes hot writes to the sharded WAL in parallel.
-// Blocks are grouped by shard and written concurrently — one goroutine per shard.
-// Caller must hold vb.Writes.mu.Lock().
-func (vb *VB) flushLockedSharded() error {
-	flushBlocks := make([]Block, len(vb.Writes.Blocks))
-	copy(flushBlocks, vb.Writes.Blocks)
-
-	if len(flushBlocks) == 0 {
-		return nil
-	}
-
+// flushSnapshotSharded flushes a snapshot of the hot writes to the sharded WAL
+// in parallel, one goroutine per shard. It does not hold Writes.mu; the caller
+// serialises flushes via flushMu.
+func (vb *VB) flushSnapshotSharded(flushBlocks []Block) error {
 	// Group blocks by shard
 	var shardGroups [NumShards][]Block
 	for _, block := range flushBlocks {
@@ -2314,7 +2441,7 @@ func (vb *VB) flushLockedSharded() error {
 				flushed[block.Block] = block.SeqNum
 
 				if vb.UseBlockStore && vb.BlockStore != nil {
-					vb.BlockStore.MarkPending(block.Block)
+					vb.BlockStore.MarkPending(block.Block, block.SeqNum)
 				}
 			}
 			results[shardID].flushed = flushed
@@ -2337,25 +2464,7 @@ func (vb *VB) flushLockedSharded() error {
 		}
 	}
 
-	// Filter vb.Writes.Blocks to keep only blocks NOT successfully flushed
-	if len(allFlushed) > 0 {
-		remaining := make([]Block, 0)
-		for _, b := range vb.Writes.Blocks {
-			if _, ok := allFlushed[b.Block]; !ok {
-				remaining = append(remaining, b)
-			}
-		}
-		vb.Writes.Blocks = remaining
-	}
-
-	// Append successfully flushed blocks to PendingBackendWrites
-	vb.PendingBackendWrites.mu.Lock()
-	for _, b := range flushBlocks {
-		if _, ok := allFlushed[b.Block]; ok {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
-		}
-	}
-	vb.PendingBackendWrites.mu.Unlock()
+	vb.retireFlushed(flushBlocks, allFlushed)
 
 	if firstErr != nil {
 		return fmt.Errorf("partial sharded flush: %d of %d records flushed: %w", totalSuccess, len(flushBlocks), firstErr)
@@ -3380,9 +3489,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			n++
 		} else {
 			// Block was successfully written to backend, update cache
-			if vb.Cache.Config.Size > 0 {
-				vb.Cache.lru.Add(block.Block, block.Data)
-			}
+			vb.Cache.put(block.Block, block.SeqNum, block.Data)
 			freedBytes += int64(len(block.Data))
 		}
 	}
@@ -5277,17 +5384,11 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			continue
 		}
 
-		// Next query the LRU cache if the data does not exist in the HOT write path, or pending write buffer.
-		if vb.Cache.Config.Size > 0 {
-			if cachedData, ok := vb.Cache.lru.Get(currentBlock); ok {
-				//vb.logger().Info("[READ] LRU CACHE BLOCK:", "block", currentBlock)
-
-				copy(data[start:end], cachedData)
-				continue
-			}
-		}
-
-		// Next, fetch which object and offset the block is within
+		// Next, fetch which object and offset the block is within. This is
+		// resolved before consulting the cache, not after, because the cache
+		// is validated against the block's current sequence number -- without
+		// it a block that was overwritten and re-persisted would be served
+		// from its stale cached copy.
 		objectID, objectOffset, seqNum, err := vb.LookupBlockToObject(currentBlock)
 		if err != nil {
 			if !errors.Is(err, ErrZeroBlock) {
@@ -5343,6 +5444,11 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 
 		vb.logger().Debug("[READ] OBJECT ID:", "objectID", objectID, "objectOffset", objectOffset)
 
+		if cachedData, ok := vb.Cache.get(currentBlock, seqNum); ok {
+			copy(data[start:end], cachedData)
+			continue
+		}
+
 		consecutiveBlocks = append(consecutiveBlocks, ConsecutiveBlock{
 			BlockPosition: i,
 			StartBlock:    currentBlock,
@@ -5358,29 +5464,19 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 	// Loop through all consecutive blocks that are required to fetch from the backend
 	var consecutiveBlocksToRead ConsecutiveBlocks
 
-	// Store which consecutive blocks we have already read - pre-allocate
-	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
-
-	for i := 0; i < len(consecutiveBlocks); i++ {
+	for i := 0; i < len(consecutiveBlocks); {
 		vb.logger().Debug("[READ] CONSECUTIVE BLOCK:", "startBlock", consecutiveBlocks[i].StartBlock, "numBlocks", consecutiveBlocks[i].NumBlocks, "offsetStart", consecutiveBlocks[i].OffsetStart, "offsetEnd", consecutiveBlocks[i].OffsetEnd, "objectID", consecutiveBlocks[i].ObjectID, "objectOffset", consecutiveBlocks[i].ObjectOffset)
 
-		// Skip if this blocks belongs to a previous consecutive block
-		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
-			vb.logger().Debug("[READ] SKIPPING CONSECUTIVE BLOCK READ:", "startBlock", consecutiveBlocks[i].StartBlock)
-			continue
+		// Extend the run while blocks stay contiguous within one chunk, then
+		// resume from its end. Advancing the index is what stops an absorbed
+		// block starting a run of its own, so no seen-set is needed.
+		j := i + 1
+		for j < len(consecutiveBlocks) &&
+			consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1 &&
+			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+			j++
 		}
-
-		// Find out how many consecutive blocks there are
-		numBlocks := 1
-		for j := i + 1; j < len(consecutiveBlocks); j++ {
-			// If our StartBlock is consecutive, and the ObjectID is the same, then we have a consecutive block to read from our backend
-			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) && (consecutiveBlocks)[j].ObjectID == (consecutiveBlocks)[j-1].ObjectID {
-				numBlocks++
-				consecutiveBlocksRead[consecutiveBlocks[j].StartBlock] = true
-			} else {
-				break
-			}
-		}
+		numBlocks := j - i
 
 		// Carry per-block SeqNums for the run so the encrypted decrypt loop
 		// below can reconstruct each block's nonce + AAD. Unused on
@@ -5388,7 +5484,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		var seqNums []uint64
 		if vb.EncryptionEnabled {
 			seqNums = make([]uint64, numBlocks)
-			for k := 0; k < numBlocks; k++ {
+			for k := range numBlocks {
 				seqNums[k] = consecutiveBlocks[i+k].SeqNum
 			}
 		}
@@ -5403,6 +5499,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
 			SeqNums:       seqNums,
 		})
+		i = j
 	}
 
 	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
@@ -5450,14 +5547,6 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			}
 			copy(data[start:end], blockData)
 		}
-
-		// Update the cache with the read data
-		if vb.Cache.Config.Size > 0 {
-			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
-				currentBlock := cb.StartBlock + i
-				vb.Cache.lru.Add(currentBlock, bytes.Clone(data[start+i*uint64(vb.BlockSize):start+(i+1)*uint64(vb.BlockSize)]))
-			}
-		}
 	}
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
@@ -5477,6 +5566,9 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			return nil, err
 		}
 	}
+
+	vb.cacheFetched(data, consecutiveBlocks, baseConsecutiveBlocks)
+	vb.cacheFetched(data, ancestorConsBlocks...)
 
 	return data, zeroBlockErr
 }
@@ -5680,9 +5772,7 @@ func (vb *VB) Reset() error {
 
 	vb.pendingBytes.Store(0)
 
-	if vb.Cache.lru != nil {
-		vb.Cache.lru.Purge()
-	}
+	vb.Cache.purge()
 
 	// Reset BlockStore if enabled
 	if vb.BlockStore != nil {
@@ -5819,20 +5909,29 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 	var baseConsecutiveBlocks ConsecutiveBlocks
 	ancestorConsBlocks := make([]ConsecutiveBlocks, len(vb.ancestors))
 
+	// Resolve the whole request against the block store in one call. A single
+	// atomically-captured snapshot per block (state + data + persisted
+	// location together) -- NOT ReadSingle followed by a separate ReadBlock
+	// call, which would leave a window for a concurrent rewrite to change the
+	// entry between the two reads and hand back a torn (stale-state,
+	// fresh-location) pair. See ReadEntryRun's doc comment.
+	entries := make([]BlockEntry, blockRequests)
+	resolved := make([]bool, blockRequests)
+	vb.BlockStore.ReadEntryRun(block, blockRequests, entries, resolved)
+
+	// Ancestor layers are probed under one lock each rather than one lock per
+	// block per ancestor, which on a 1 MiB read with two ancestors was 512
+	// acquisitions.
+	ancestorLocked := false
+
 	for i := range blockRequests {
 		currentBlock := block + i
 		start := i * uint64(vb.BlockSize)
 		end := start + uint64(vb.BlockSize)
 
-		// O(1) lookup using BlockStore. A single atomically-captured snapshot
-		// (state + data + persisted location together) — NOT ReadSingle
-		// followed by a separate ReadBlock call, which would leave a window
-		// for a concurrent rewrite to change the entry between the two reads
-		// and hand back a torn (stale-state, fresh-location) pair. See
-		// ReadEntry's doc comment.
-		entry, exists := vb.BlockStore.ReadEntry(currentBlock)
+		entry := entries[i]
 		state := entry.State
-		if !exists {
+		if !resolved[i] {
 			state = BlockStateEmpty
 		}
 
@@ -5843,6 +5942,14 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 			copy(data[start:end], entry.Data)
 
 		case BlockStatePersisted:
+			// The index resolved a location; the plaintext may still be in the
+			// bounded cache, in which case no backend round trip is needed.
+			if cachedData, ok := vb.Cache.get(currentBlock, entry.SeqNum); ok {
+				telemetry.RecordCacheLookup(ctx, true)
+				copy(data[start:end], cachedData)
+				continue
+			}
+
 			// Need to fetch from backend: a cache miss.
 			telemetry.RecordCacheLookup(ctx, false)
 
@@ -5875,12 +5982,16 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 					continue
 				}
 			}
-			// Base map miss — check ancestor layers
+			// Base map miss -- check ancestor layers
+			if !ancestorLocked && len(vb.ancestors) > 0 {
+				for ai := range vb.ancestors {
+					vb.ancestors[ai].blocks.mu.RLock()
+				}
+				ancestorLocked = true
+			}
 			ancFound := false
 			for ai := range vb.ancestors {
-				vb.ancestors[ai].blocks.mu.RLock()
 				lookup, pos, ok := vb.ancestors[ai].blocks.resolveBlockLookup(currentBlock)
-				vb.ancestors[ai].blocks.mu.RUnlock()
 				if ok {
 					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
 						BlockPosition: i,
@@ -5899,9 +6010,15 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 			if ancFound {
 				continue
 			}
-			// ReadEntry's !exists / default-state paths both correspond to
-			// "no own-volume, base-map, or ancestor data for this block".
+			// ReadEntryRun's unresolved blocks correspond to "no own-volume,
+			// base-map, or ancestor data for this block".
 			zeroBlockErr = ErrZeroBlock
+		}
+	}
+
+	if ancestorLocked {
+		for ai := range vb.ancestors {
+			vb.ancestors[ai].blocks.mu.RUnlock()
 		}
 	}
 
@@ -5931,6 +6048,9 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 		}
 	}
 
+	vb.cacheFetched(data, consecutiveBlocks, baseConsecutiveBlocks)
+	vb.cacheFetched(data, ancestorConsBlocks...)
+
 	return data, zeroBlockErr
 }
 
@@ -5938,28 +6058,22 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 // Used by both legacy and BlockStore read paths.
 func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
 	var consecutiveBlocksToRead ConsecutiveBlocks
-	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
-
-	for i := range consecutiveBlocks {
-		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
-			continue
+	for i := 0; i < len(consecutiveBlocks); {
+		// Extend the run while blocks stay contiguous within one chunk, then
+		// resume from its end. Advancing the index is what stops an absorbed
+		// block starting a run of its own, so no seen-set is needed.
+		j := i + 1
+		for j < len(consecutiveBlocks) &&
+			consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1 &&
+			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+			j++
 		}
-
-		numBlocks := 1
-		for j := i + 1; j < len(consecutiveBlocks); j++ {
-			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) &&
-				consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
-				numBlocks++
-				consecutiveBlocksRead[consecutiveBlocks[j].StartBlock] = true
-			} else {
-				break
-			}
-		}
+		numBlocks := j - i
 
 		var seqNums []uint64
 		if vb.EncryptionEnabled {
 			seqNums = make([]uint64, numBlocks)
-			for k := 0; k < numBlocks; k++ {
+			for k := range numBlocks {
 				seqNums[k] = consecutiveBlocks[i+k].SeqNum
 			}
 		}
@@ -5974,6 +6088,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
 			SeqNums:       seqNums,
 		})
+		i = j
 	}
 
 	stride := vb.BlockSize
@@ -6013,26 +6128,6 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 			}
 			copy(data[start:end], blockData)
 		}
-
-		// Cache blocks in BlockStore (post-decrypt plaintext)
-		if vb.UseBlockStore {
-			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
-				currentBlock := cb.StartBlock + i
-				blockStart := start + i*uint64(vb.BlockSize)
-				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.BlockStore.Cache(currentBlock, data[blockStart:blockEnd])
-			}
-		}
-
-		// Also update legacy LRU cache if enabled (post-decrypt plaintext)
-		if vb.Cache.Config.Size > 0 {
-			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
-				currentBlock := cb.StartBlock + i
-				blockStart := start + i*uint64(vb.BlockSize)
-				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.Cache.lru.Add(currentBlock, bytes.Clone(data[blockStart:blockEnd]))
-			}
-		}
 	}
 
 	return nil
@@ -6047,28 +6142,22 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 		return fmt.Errorf("fetchBaseBlocksFromBackend: sourceVolume is empty")
 	}
 	var consecutiveBlocksToRead ConsecutiveBlocks
-	consecutiveBlocksRead := make(map[uint64]bool, len(consecutiveBlocks))
-
-	for i := range consecutiveBlocks {
-		if _, ok := consecutiveBlocksRead[consecutiveBlocks[i].StartBlock]; ok {
-			continue
+	for i := 0; i < len(consecutiveBlocks); {
+		// Extend the run while blocks stay contiguous within one chunk, then
+		// resume from its end. Advancing the index is what stops an absorbed
+		// block starting a run of its own, so no seen-set is needed.
+		j := i + 1
+		for j < len(consecutiveBlocks) &&
+			consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1 &&
+			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+			j++
 		}
-
-		numBlocks := 1
-		for j := i + 1; j < len(consecutiveBlocks); j++ {
-			if (consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1) &&
-				consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
-				numBlocks++
-				consecutiveBlocksRead[consecutiveBlocks[j].StartBlock] = true
-			} else {
-				break
-			}
-		}
+		numBlocks := j - i
 
 		var seqNums []uint64
 		if vb.EncryptionEnabled {
 			seqNums = make([]uint64, numBlocks)
-			for k := 0; k < numBlocks; k++ {
+			for k := range numBlocks {
 				seqNums[k] = consecutiveBlocks[i+k].SeqNum
 			}
 		}
@@ -6083,6 +6172,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
 			SeqNums:       seqNums,
 		})
+		i = j
 	}
 
 	stride := vb.BlockSize
@@ -6126,25 +6216,6 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 					types.ErrShortRead, sourceVolume, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
 			}
 			copy(data[start:end], blockData)
-		}
-
-		// Cache blocks in BlockStore (post-decrypt plaintext)
-		if vb.UseBlockStore {
-			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
-				currentBlock := cb.StartBlock + i
-				blockStart := start + i*uint64(vb.BlockSize)
-				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.BlockStore.Cache(currentBlock, data[blockStart:blockEnd])
-			}
-		}
-
-		if vb.Cache.Config.Size > 0 {
-			for i := uint64(0); i < uint64(cb.NumBlocks); i++ {
-				currentBlock := cb.StartBlock + i
-				blockStart := start + i*uint64(vb.BlockSize)
-				blockEnd := blockStart + uint64(vb.BlockSize)
-				vb.Cache.lru.Add(currentBlock, bytes.Clone(data[blockStart:blockEnd]))
-			}
 		}
 	}
 
@@ -6224,7 +6295,7 @@ func (vb *VB) FlushBlockStore() error {
 		successCount++
 		flushed[block.Block] = block.SeqNum
 		// Transition to Pending in BlockStore
-		vb.BlockStore.MarkPending(block.Block)
+		vb.BlockStore.MarkPending(block.Block, block.SeqNum)
 	}
 
 	// Also update legacy Writes buffer for compatibility
@@ -6266,7 +6337,7 @@ func (vb *VB) SyncBlockStoreFromLegacy() {
 	vb.PendingBackendWrites.mu.RLock()
 	for _, block := range vb.PendingBackendWrites.Blocks {
 		vb.BlockStore.WriteWithSeqNum(block.Block, block.Data, block.SeqNum)
-		vb.BlockStore.MarkPending(block.Block)
+		vb.BlockStore.MarkPending(block.Block, block.SeqNum)
 	}
 	vb.PendingBackendWrites.mu.RUnlock()
 

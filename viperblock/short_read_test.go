@@ -96,6 +96,7 @@ func TestShortBackendRead_IsRefusedNotZeroFilled(t *testing.T) {
 	// has to come from the backend.
 	trunc := &truncatingBackend{Backend: vb.Backend, trimChunk: objectID, trimBytes: 1024}
 	vb.Backend = trunc
+	vb.Cache.purge()
 	vb.BlockStore.Clear()
 	vb.Writes.mu.Lock()
 	vb.Writes.Blocks = nil
