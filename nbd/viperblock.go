@@ -59,6 +59,13 @@ type ViperBlockConnection struct {
 // shutdown mode).
 var activeVB *viperblock.VB
 
+// volumeLock holds the flock'd file for the currently-open volume, admission
+// control for the race CanMultiConn's false return only advises about (it
+// does not gate connection admission — nbdkit's Go binding hard-codes
+// NBDKIT_THREAD_MODEL_PARALLEL). Acquired in Open before New() constructs a
+// VB, released in Close/Unload. See viperblock.AcquireVolumeLock.
+var volumeLock *os.File
+
 // snapshotListener is the unix socket that spinifex connects to before calling
 // CreateSnapshot. The handler calls DrainToBackend and acks "OK\n", ensuring S3
 // state is current without requiring every guest fsync to hit S3.
@@ -249,6 +256,34 @@ func (p *ViperBlockPlugin) GetReady() error {
 
 func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
 
+	// Admission control: at most one Open() proceeds past this point per
+	// volume. Acquired before viperblock.New() so a second concurrent
+	// connection (nbdkit's parallel thread model) never races the first
+	// through LoadState/OpenWAL/persistStateLocal — the vector that tears
+	// config.json and corrupts WAL headers. Non-blocking: a losing opener
+	// fails fast with a clear error instead of queuing.
+	lock, err := viperblock.AcquireVolumeLock(base_dir, volume)
+	if err != nil {
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open volume %q: %v", volume, err)}
+	}
+	volumeLock = lock
+
+	// Release the lock on every early return below — those are failed Open
+	// attempts, and the caller (nbdkit, retried by the client) must not be
+	// wedged behind a half-finished Open. success is only set true once the
+	// connection is fully constructed and handed back, at which point the
+	// lock's lifetime transfers to Close/Unload.
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		if relErr := viperblock.ReleaseVolumeLock(volumeLock); relErr != nil {
+			slog.Error("Open: failed to release volume lock after error", "err", relErr)
+		}
+		volumeLock = nil
+	}()
+
 	cfg := s3.S3Config{
 		VolumeName: volume,
 		VolumeSize: size,
@@ -364,6 +399,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	activeVB = vb
 	snapshotListenerDone = startSnapshotListener(vb, filepath.Join(base_dir, volume, "snapshot.sock"))
+	success = true
 	return &ViperBlockConnection{vb: vb}, nil
 }
 
@@ -557,6 +593,14 @@ func (c *ViperBlockConnection) Close() {
 		slog.Error("Close: could not write seal receipt", "err", err)
 	}
 	activeVB = nil
+
+	// Release the volume lock last, after the VB is fully drained and
+	// closed, so a racing opener that was refused admission cannot start
+	// until this connection has genuinely finished with the volume.
+	if err := viperblock.ReleaseVolumeLock(volumeLock); err != nil {
+		slog.Error("Close: failed to release volume lock", "err", err)
+	}
+	volumeLock = nil
 }
 
 // Unload is called by nbdkit immediately before the process exits. It flushes
@@ -575,6 +619,15 @@ func (p *ViperBlockPlugin) Unload() {
 	}()
 
 	if activeVB == nil {
+		// Close may have already run (lock already released), or Open may
+		// have failed after acquiring the lock but before its own defer ran
+		// (process exiting mid-Open). Release defensively either way so
+		// Unload never leaves a lock behind — ReleaseVolumeLock(nil) is a
+		// no-op if there is nothing to release.
+		if err := viperblock.ReleaseVolumeLock(volumeLock); err != nil {
+			slog.Error("Unload: failed to release volume lock", "err", err)
+		}
+		volumeLock = nil
 		return
 	}
 	slog.Info("Unload: Close was not called, flushing block state now")
@@ -594,6 +647,10 @@ func (p *ViperBlockPlugin) Unload() {
 		slog.Error("Unload: could not write seal receipt", "err", err)
 	}
 	activeVB = nil
+	if err := viperblock.ReleaseVolumeLock(volumeLock); err != nil {
+		slog.Error("Unload: failed to release volume lock", "err", err)
+	}
+	volumeLock = nil
 }
 
 //----------------------------------------------------------------------

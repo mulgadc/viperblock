@@ -6,10 +6,10 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 
@@ -122,8 +122,66 @@ func TestWriteFileAtomic_RoundTrip(t *testing.T) {
 	got, err = os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, updated, got)
-	_, err = os.Stat(path + ".tmp")
-	assert.ErrorIs(t, err, os.ErrNotExist, "tmp file should not remain after rename")
+
+	// The tmp name is randomized per call (os.CreateTemp), so glob for any
+	// leftover sibling rather than a fixed "path.tmp" suffix.
+	leftovers, err := filepath.Glob(path + ".tmp-*")
+	require.NoError(t, err)
+	assert.Empty(t, leftovers, "no tmp file should remain after rename")
+}
+
+// TestWriteFileAtomic_ConcurrentWritersNeverTear is the direct A/B test for
+// mulga-w1iu8 defect 1: many goroutines writing the SAME path concurrently
+// must never produce a torn file. The old fixed "path.tmp" name let one
+// writer's O_TRUNC clobber another's in-flight write and one writer's rename
+// delete another's tmp, publishing a mix of two payloads (or, for an
+// encrypted VBState, a blob that fails AEAD authentication). Each writer's
+// payload here has a distinct length so a torn merge is detectable as a
+// byte-for-byte mismatch against every single payload, not just a length
+// check.
+func TestWriteFileAtomic_ConcurrentWritersNeverTear(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	const writers = 16
+	payloads := make([][]byte, writers)
+	for i := range payloads {
+		payloads[i] = bytes.Repeat([]byte{byte('A' + i)}, 4096+i*37)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = writeFileAtomic(path, payloads[idx], 0600)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "writer %d", i)
+	}
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	matched := false
+	for _, p := range payloads {
+		if bytes.Equal(got, p) {
+			matched = true
+			break
+		}
+	}
+	assert.True(t, matched,
+		"final file (%d bytes) must exactly match exactly one writer's payload -- a mismatch means the rename published a torn mix of two writers", len(got))
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp-", "no leftover tmp file should remain: %s", e.Name())
+	}
 }
 
 // A remount on a node that never held the volume locally has no per-volume
@@ -294,12 +352,16 @@ func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
 
 	hwBefore := vb.seqNumHighWater.Load()
 
-	// Wedge writeFileAtomic by parking a directory at the tmp path: the next
-	// SaveState's OpenFile(O_CREATE|O_WRONLY) fails with EISDIR. Removing the
-	// per-volume dir no longer wedges since writeFileAtomic recreates it.
+	// Wedge writeFileAtomic by replacing the per-volume dir with a plain
+	// file: writeFileAtomic's os.MkdirAll(dir, ...) fails with ENOTDIR
+	// before it ever reaches os.CreateTemp (whose name is now randomized per
+	// call, so it can no longer be pre-occupied by path). This is a
+	// filesystem type mismatch, not a permission check, so it wedges
+	// regardless of the test's uid. Removing the per-volume dir no longer
+	// wedges since writeFileAtomic recreates it.
 	configDir := filepath.Join(vb.BaseDir, vb.GetVolume())
-	tmpPath := filepath.Join(configDir, "config.json.tmp")
-	require.NoError(t, os.MkdirAll(tmpPath, 0700))
+	require.NoError(t, os.RemoveAll(configDir))
+	require.NoError(t, os.WriteFile(configDir, []byte("blocking"), 0600))
 
 	vb.SeqNum.Store(hwBefore + 5)
 	_, err := vb.reserveSeqNum(context.Background(), 1)
@@ -310,7 +372,7 @@ func TestReserveSeqNum_FailedSaveStateDoesNotPublishHighWater(t *testing.T) {
 
 	// And after the failure is cleared, a successor reservation must persist
 	// and publish the same target hw — no skipped window, no double-count.
-	require.NoError(t, os.RemoveAll(tmpPath))
+	require.NoError(t, os.RemoveAll(configDir))
 	_, err = vb.reserveSeqNum(context.Background(), 1)
 	require.NoError(t, err)
 	assert.Greater(t, vb.seqNumHighWater.Load(), hwBefore,
@@ -333,7 +395,10 @@ func TestSaveState_AtomicRenameLeavesNoTmp(t *testing.T) {
 		if e.IsDir() {
 			continue
 		}
-		assert.False(t, strings.HasSuffix(e.Name(), ".tmp"), "no .tmp should remain: %s", e.Name())
+		// The tmp name is now "config.json.tmp-<random>", so a trailing
+		// HasSuffix(".tmp") check would silently stop catching leftovers —
+		// match on the ".tmp-" infix the randomized suffix always follows.
+		assert.NotContains(t, e.Name(), ".tmp-", "no .tmp-* should remain: %s", e.Name())
 		if e.Name() == "config.json" {
 			sawConfig = true
 		}
