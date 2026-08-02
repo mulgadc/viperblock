@@ -279,13 +279,13 @@ func TestBlockStoreReadEncrypted(t *testing.T) {
 	// also fails closed.
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 	env.vb.BlockStore.SetPersisted(0, 0, uint32(env.blockOffset(0)), 1)
 

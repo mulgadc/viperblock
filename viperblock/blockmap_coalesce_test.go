@@ -70,8 +70,8 @@ func TestBlockMapCoalesce_SequentialWrite(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Len(t, vb.BlocksToObject.BlockLookup, 1, "one consecutive run must coalesce into one BlockLookup entry")
-	entry := vb.BlocksToObject.BlockLookup[0]
+	require.Equal(t, vb.BlocksToObject.lookup.len(), 1, "one consecutive run must coalesce into one BlockLookup entry")
+	entry := lookupMap(&vb.BlocksToObject)[0]
 	vb.BlocksToObject.mu.RUnlock()
 	require.Equal(t, uint16(numBlocks), entry.NumBlocks)
 
@@ -104,7 +104,7 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Len(t, vb.BlocksToObject.BlockLookup, 1)
+	require.Equal(t, vb.BlocksToObject.lookup.len(), 1)
 	vb.BlocksToObject.mu.RUnlock()
 
 	// Overwrite [8, 12) -- strictly inside the [0, 20) extent, leaving
@@ -115,10 +115,10 @@ func TestBlockMapCoalesce_OverwriteFracturesExtent(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Len(t, vb.BlocksToObject.BlockLookup, 3, "overwrite must fracture the original extent into head/new/tail")
-	head, headOK := vb.BlocksToObject.BlockLookup[0]
-	mid, midOK := vb.BlocksToObject.BlockLookup[8]
-	tail, tailOK := vb.BlocksToObject.BlockLookup[12]
+	require.Equal(t, vb.BlocksToObject.lookup.len(), 3, "overwrite must fracture the original extent into head/new/tail")
+	head, headOK := lookupMap(&vb.BlocksToObject)[0]
+	mid, midOK := lookupMap(&vb.BlocksToObject)[8]
+	tail, tailOK := lookupMap(&vb.BlocksToObject)[12]
 	vb.BlocksToObject.mu.RUnlock()
 
 	require.True(t, headOK && midOK && tailOK, "expected entries keyed at 0, 8, 12")
@@ -160,10 +160,10 @@ func TestBlockMapCoalesce_MultiChunkBoundary(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Len(t, vb.BlocksToObject.BlockLookup, 3, "20 blocks at 8 blocks/chunk must produce 3 extents")
-	e0, ok0 := vb.BlocksToObject.BlockLookup[0]
-	e1, ok1 := vb.BlocksToObject.BlockLookup[8]
-	e2, ok2 := vb.BlocksToObject.BlockLookup[16]
+	require.Equal(t, vb.BlocksToObject.lookup.len(), 3, "20 blocks at 8 blocks/chunk must produce 3 extents")
+	e0, ok0 := lookupMap(&vb.BlocksToObject)[0]
+	e1, ok1 := lookupMap(&vb.BlocksToObject)[8]
+	e2, ok2 := lookupMap(&vb.BlocksToObject)[16]
 	vb.BlocksToObject.mu.RUnlock()
 
 	require.True(t, ok0 && ok1 && ok2, "expected extents keyed at 0, 8, 16")
@@ -203,7 +203,7 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	require.Len(t, vb.BlocksToObject.BlockLookup, 3, "encrypted volumes coalesce the same way as plaintext ones")
+	require.Equal(t, vb.BlocksToObject.lookup.len(), 3, "encrypted volumes coalesce the same way as plaintext ones")
 	vb.BlocksToObject.mu.RUnlock()
 
 	got, err := vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
@@ -250,7 +250,7 @@ func TestBlockMapCoalesce_EntryCountIsExtentsNotBlocks(t *testing.T) {
 	require.NoError(t, vb.WriteWALToChunk(true))
 
 	vb.BlocksToObject.mu.RLock()
-	entryCount := len(vb.BlocksToObject.BlockLookup)
+	entryCount := vb.BlocksToObject.lookup.len()
 	vb.BlocksToObject.mu.RUnlock()
 
 	wantExtents := (numBlocks + blocksPerChunk - 1) / blocksPerChunk // ceil
@@ -321,8 +321,8 @@ func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 
 	// Capture the real per-block AEAD SeqNums the chunk was actually sealed with.
 	vb.BlocksToObject.mu.RLock()
-	require.Len(t, vb.BlocksToObject.BlockLookup, 1, "the write must have coalesced into one extent")
-	entry := vb.BlocksToObject.BlockLookup[0]
+	require.Equal(t, vb.BlocksToObject.lookup.len(), 1, "the write must have coalesced into one extent")
+	entry := lookupMap(&vb.BlocksToObject)[0]
 	realSeqNums := make([]uint64, numBlocks)
 	for i := range numBlocks {
 		realSeqNums[i] = entry.seqNumAt(i)
@@ -355,7 +355,7 @@ func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
 	// Drop all in-memory state and reload purely from the forged legacy bytes.
 	vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
 	vb.BlocksToObject.mu.Lock()
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+	vb.BlocksToObject.lookup.clear()
 	err = vb.parseBlockCheckpoint(legacy)
 	vb.BlocksToObject.mu.Unlock()
 	require.NoError(t, err)

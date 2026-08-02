@@ -92,9 +92,7 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 		BlockToObjectWAL: WAL{
 			WALMagic: owner.BlockToObjectWAL.WALMagic,
 		},
-		BlocksToObject: BlocksToObject{
-			BlockLookup: make(map[uint64]BlockLookup),
-		},
+		BlocksToObject: BlocksToObject{},
 	}
 	require.NoError(t, reader.LoadLiveCheckpoint())
 	require.False(t, reader.ownsWAL(), "reader must not own the WAL -- this is the path under test")
@@ -155,10 +153,10 @@ func TestCreateSnapshot_OwningPath_ObjectNumAtLeastReferencedChunks(t *testing.T
 
 		baseMap, _, err := vb.LoadSnapshotBlockMap(snapshotID)
 		require.NoError(t, err)
-		require.NotEmpty(t, baseMap.BlockLookup)
+		require.NotEmpty(t, lookupMap(baseMap))
 
 		var maxReferenced uint64
-		for _, bl := range baseMap.BlockLookup {
+		for _, bl := range lookupMap(baseMap) {
 			if bl.ObjectID > maxReferenced {
 				maxReferenced = bl.ObjectID
 			}

@@ -3,7 +3,6 @@ package viperblock
 import (
 	"crypto/rand"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -52,17 +51,17 @@ func TestCreateSnapshot(t *testing.T) {
 		// map stays flat, so compare by physical block coverage.
 		stride := vb.blockStride()
 		wantBlocks := 0
-		for _, lookup := range vb.BlocksToObject.BlockLookup {
+		for _, lookup := range lookupMap(&vb.BlocksToObject) {
 			wantBlocks += int(lookup.NumBlocks)
 			for i := range int(lookup.NumBlocks) {
 				block := lookup.StartBlock + uint64(i)
-				baseLookup, ok := baseMap.BlockLookup[block]
+				baseLookup, ok := lookupMap(baseMap)[block]
 				assert.True(t, ok, "block %d missing from snapshot", block)
 				assert.Equal(t, lookup.ObjectID, baseLookup.ObjectID)
 				assert.Equal(t, lookup.offsetAt(i, stride), baseLookup.ObjectOffset)
 			}
 		}
-		assert.Len(t, baseMap.BlockLookup, wantBlocks)
+		assert.Equal(t, baseMap.lookup.len(), wantBlocks)
 	})
 }
 
@@ -271,25 +270,26 @@ func TestSnapshotWithUnopenedShardedWAL(t *testing.T) {
 		// Create a second VB that loads state but does NOT open WAL files
 		// (simulates viperblockd's snapshot VB)
 		snapshotVB := &VB{
-			VolumeName:    vb.VolumeName,
-			VolumeSize:    vb.VolumeSize,
-			BlockSize:     vb.BlockSize,
-			ObjBlockSize:  vb.ObjBlockSize,
-			Version:       vb.Version,
-			BaseDir:       vb.BaseDir,
-			UseShardedWAL: true,
-			ShardedWAL:    NewShardedWAL(vb.BaseDir, vb.WAL.WALMagic),
-			Backend:       vb.Backend,
-			ChunkMagic:    vb.ChunkMagic,
-			BlocksToObject: BlocksToObject{
-				BlockLookup: make(map[uint64]BlockLookup),
-			},
-			BlockStore:    NewUnifiedBlockStore(vb.BlockSize),
-			UseBlockStore: true,
+			VolumeName:     vb.VolumeName,
+			VolumeSize:     vb.VolumeSize,
+			BlockSize:      vb.BlockSize,
+			ObjBlockSize:   vb.ObjBlockSize,
+			Version:        vb.Version,
+			BaseDir:        vb.BaseDir,
+			UseShardedWAL:  true,
+			ShardedWAL:     NewShardedWAL(vb.BaseDir, vb.WAL.WALMagic),
+			Backend:        vb.Backend,
+			ChunkMagic:     vb.ChunkMagic,
+			BlocksToObject: BlocksToObject{},
+			BlockStore:     NewUnifiedBlockStore(vb.BlockSize),
+			UseBlockStore:  true,
 		}
 		// Copy block-to-object map (simulates LoadState + LoadBlockState)
 		vb.BlocksToObject.mu.RLock()
-		maps.Copy(snapshotVB.BlocksToObject.BlockLookup, vb.BlocksToObject.BlockLookup)
+		vb.BlocksToObject.lookup.scan(func(bl BlockLookup) bool {
+			snapshotVB.BlocksToObject.lookup.set(bl)
+			return true
+		})
 		vb.BlocksToObject.mu.RUnlock()
 		snapshotVB.SeqNum.Store(vb.SeqNum.Load())
 		snapshotVB.ObjectNum.Store(vb.ObjectNum.Load())
@@ -507,11 +507,11 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 		// section stays flat, so compare by physical block coverage.
 		stride := vb.blockStride()
 		wantBlocks := 0
-		for _, want := range vb.BlocksToObject.BlockLookup {
+		for _, want := range lookupMap(&vb.BlocksToObject) {
 			wantBlocks += int(want.NumBlocks)
 			for i := range int(want.NumBlocks) {
 				blockNum := want.StartBlock + uint64(i)
-				got, ok := layers[0].Blocks.BlockLookup[blockNum]
+				got, ok := lookupMap(layers[0].Blocks)[blockNum]
 				assert.True(t, ok, "block %d missing from decoded flat section", blockNum)
 				if ok {
 					assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
@@ -520,7 +520,7 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 				}
 			}
 		}
-		assert.Len(t, layers[0].Blocks.BlockLookup, wantBlocks, "decoded block count must match parent")
+		assert.Equal(t, layers[0].Blocks.lookup.len(), wantBlocks, "decoded block count must match parent")
 	})
 }
 
@@ -554,9 +554,7 @@ func TestLiveCheckpointFallback(t *testing.T) {
 			BlockToObjectWAL: WAL{
 				WALMagic: vb.BlockToObjectWAL.WALMagic,
 			},
-			BlocksToObject: BlocksToObject{
-				BlockLookup: make(map[uint64]BlockLookup),
-			},
+			BlocksToObject: BlocksToObject{},
 		}
 
 		// No live checkpoint exists: must fall back to LoadBlockState.
@@ -565,11 +563,11 @@ func TestLiveCheckpointFallback(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		assert.Len(t, reader.BlocksToObject.BlockLookup, len(vb.BlocksToObject.BlockLookup),
+		assert.Equal(t, reader.BlocksToObject.lookup.len(), vb.BlocksToObject.lookup.len(),
 			"fallback must restore the full block map")
 
-		for blockNum, want := range vb.BlocksToObject.BlockLookup {
-			got, ok := reader.BlocksToObject.BlockLookup[blockNum]
+		for blockNum, want := range lookupMap(&vb.BlocksToObject) {
+			got, ok := lookupMap(&reader.BlocksToObject)[blockNum]
 			assert.True(t, ok, "block %d missing after fallback", blockNum)
 			if ok {
 				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
@@ -615,9 +613,7 @@ func TestLiveCheckpointRoundtrip(t *testing.T) {
 			BlockToObjectWAL: WAL{
 				WALMagic: vb.BlockToObjectWAL.WALMagic,
 			},
-			BlocksToObject: BlocksToObject{
-				BlockLookup: make(map[uint64]BlockLookup),
-			},
+			BlocksToObject: BlocksToObject{},
 		}
 
 		require.NoError(t, reader.LoadLiveCheckpoint())
@@ -625,11 +621,11 @@ func TestLiveCheckpointRoundtrip(t *testing.T) {
 		vb.BlocksToObject.mu.RLock()
 		defer vb.BlocksToObject.mu.RUnlock()
 
-		assert.Len(t, reader.BlocksToObject.BlockLookup, len(vb.BlocksToObject.BlockLookup),
+		assert.Equal(t, reader.BlocksToObject.lookup.len(), vb.BlocksToObject.lookup.len(),
 			"live checkpoint must contain all written blocks")
 
-		for blockNum, want := range vb.BlocksToObject.BlockLookup {
-			got, ok := reader.BlocksToObject.BlockLookup[blockNum]
+		for blockNum, want := range lookupMap(&vb.BlocksToObject) {
+			got, ok := lookupMap(&reader.BlocksToObject)[blockNum]
 			assert.True(t, ok, "block %d missing from live checkpoint", blockNum)
 			if ok {
 				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d: ObjectID mismatch", blockNum)
@@ -665,7 +661,7 @@ func TestObjectNumReconcileOnLoad(t *testing.T) {
 
 		var maxObjectID uint64
 		vb.BlocksToObject.mu.RLock()
-		for _, bl := range vb.BlocksToObject.BlockLookup {
+		for _, bl := range lookupMap(&vb.BlocksToObject) {
 			if bl.ObjectID > maxObjectID {
 				maxObjectID = bl.ObjectID
 			}
@@ -685,9 +681,7 @@ func TestObjectNumReconcileOnLoad(t *testing.T) {
 				BlockToObjectWAL: WAL{
 					WALMagic: vb.BlockToObjectWAL.WALMagic,
 				},
-				BlocksToObject: BlocksToObject{
-					BlockLookup: make(map[uint64]BlockLookup),
-				},
+				BlocksToObject: BlocksToObject{},
 			}
 		}
 
@@ -738,7 +732,7 @@ func TestRecoverLocalWALsNoChunkReuse(t *testing.T) {
 
 	var maxObjectID uint64
 	vb.BlocksToObject.mu.RLock()
-	for _, bl := range vb.BlocksToObject.BlockLookup {
+	for _, bl := range lookupMap(&vb.BlocksToObject) {
 		if bl.ObjectID > maxObjectID {
 			maxObjectID = bl.ObjectID
 		}

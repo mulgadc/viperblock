@@ -496,7 +496,11 @@ type BlocksToObject struct {
 	mu    sync.RWMutex
 	dirty atomic.Bool
 
-	BlockLookup map[uint64]BlockLookup
+	lookup extentIndex[BlockLookup]
+
+	// fractureScratch is reused across insertCoalescedLocked calls to hold the
+	// overlapping entries, which must be collected before the index is mutated.
+	fractureScratch []BlockLookup
 }
 
 type BlockLookup struct {
@@ -520,6 +524,12 @@ type BlockLookup struct {
 
 	ObjectOffset uint32
 	NumBlocks    uint16
+}
+
+// start returns the inclusive lower bound of the block range this entry
+// covers.
+func (bl BlockLookup) start() uint64 {
+	return bl.StartBlock
 }
 
 // end returns the exclusive upper bound of the block range this entry
@@ -604,19 +614,11 @@ type ConsecutiveBlocks []ConsecutiveBlock
 // entry's run (0 for a direct StartBlock hit). Callers must hold
 // BlocksToObject.mu for at least reading.
 func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, bool) {
-	if bl, ok := b.BlockLookup[block]; ok {
-		return bl, 0, true
+	bl, ok := b.lookup.find(block)
+	if !ok {
+		return BlockLookup{}, 0, false
 	}
-	// Fall back to an O(n) containment scan: coalescing keys the map by
-	// StartBlock only, so a block inside a multi-block run has no entry of
-	// its own. n is bounded by the number of extents, not the number of
-	// blocks, so this stays cheap post-coalescing.
-	for _, bl := range b.BlockLookup {
-		if block > bl.StartBlock && block < bl.end() {
-			return bl, utils.SafeUint64ToInt(block - bl.StartBlock), true
-		}
-	}
-	return BlockLookup{}, 0, false
+	return bl, utils.SafeUint64ToInt(block - bl.StartBlock), true
 }
 
 // insertCoalescedLocked inserts newEntry into BlockLookup, fracturing any
@@ -630,25 +632,15 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 	newStart := newEntry.StartBlock
 	newEnd := newEntry.end()
 
-	// Snapshot keys first: Go forbids inserting new keys into a map while
-	// ranging over it, and fracturing does delete+reinsert below.
-	keys := make([]uint64, 0, len(b.BlockLookup))
-	for k := range b.BlockLookup {
-		keys = append(keys, k)
-	}
+	// Collect the overlapping entries before touching the index: fracturing
+	// deletes and reinserts, which cannot be done during an ordered walk.
+	b.fractureScratch = b.lookup.collectOverlaps(b.fractureScratch[:0], newStart, newEnd)
 
-	for _, k := range keys {
-		existing, ok := b.BlockLookup[k]
-		if !ok {
-			continue // already replaced by an earlier iteration
-		}
+	for _, existing := range b.fractureScratch {
 		exStart := existing.StartBlock
 		exEnd := existing.end()
-		if exEnd <= newStart || exStart >= newEnd {
-			continue // no overlap
-		}
 
-		delete(b.BlockLookup, k)
+		b.lookup.remove(exStart)
 		if gcRefcount != nil {
 			if n := gcRefcount[existing.ObjectID]; n > 0 {
 				gcRefcount[existing.ObjectID] = n - 1
@@ -666,7 +658,7 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 				SeqNum:       existing.seqNumAt(0),
 				SeqNums:      existing.sliceSeqNums(0, headLen),
 			}
-			b.BlockLookup[head.StartBlock] = head
+			b.lookup.set(head)
 			if gcRefcount != nil {
 				gcRefcount[head.ObjectID]++
 			}
@@ -685,14 +677,14 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 				SeqNum:       existing.seqNumAt(tailOffset),
 				SeqNums:      existing.sliceSeqNums(tailOffset, tailOffset+tailLen),
 			}
-			b.BlockLookup[tail.StartBlock] = tail
+			b.lookup.set(tail)
 			if gcRefcount != nil {
 				gcRefcount[tail.ObjectID]++
 			}
 		}
 	}
 
-	b.BlockLookup[newEntry.StartBlock] = newEntry
+	b.lookup.set(newEntry)
 	if gcRefcount != nil {
 		gcRefcount[newEntry.ObjectID]++
 	}
@@ -1174,7 +1166,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		vb.volumeNameHash = computeVolumeNameHash(config.VolumeName)
 	}
 
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+	vb.BlocksToObject.lookup.clear()
 	if vb.GCEnabled {
 		vb.gcRefcount = make(map[uint64]uint64)
 	}
@@ -3555,11 +3547,12 @@ func (vb *VB) SaveBlockStateCtx(ctx context.Context) (err error) {
 	// block: the on-disk wire format stays unchanged even though the
 	// in-memory map is coalesced into extents.
 	stride := vb.blockStride()
-	for _, block := range vb.BlocksToObject.BlockLookup {
+	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
 		for _, single := range expandBlockLookup(block, stride) {
 			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
 		}
-	}
+		return true
+	})
 
 	filepath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))
 	file, err := os.Create(filepath)
@@ -3651,7 +3644,7 @@ func ParseBlockCheckpointBytes(raw []byte, version uint16) (map[uint64]BlockLook
 	return blocks, nil
 }
 
-// parseBlockCheckpoint deserialises a checkpoint binary into BlocksToObject.BlockLookup.
+// parseBlockCheckpoint deserialises a checkpoint binary into the block index.
 // Caller must hold BlocksToObject.mu (write).
 func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// Rebuild refcounts from scratch alongside the map: zero-refcount GC
@@ -3687,20 +3680,24 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 		return err
 	}
 
-	vb.BlocksToObject.BlockLookup = coalesceBlockLookup(flat, vb.blockStride())
+	vb.BlocksToObject.lookup.clear()
+	for _, entry := range coalesceBlockLookup(flat, vb.blockStride()) {
+		vb.BlocksToObject.lookup.set(entry)
+	}
 
 	// gcRefcount counts entries in the coalesced BlockLookup, not physical
 	// blocks, so it must be tallied post-coalesce -- tallying the flat,
 	// one-record-per-block decode above would overcount every multi-block
 	// run by its block count instead of by 1.
 	if vb.GCEnabled {
-		for _, entry := range vb.BlocksToObject.BlockLookup {
+		vb.BlocksToObject.lookup.scan(func(entry BlockLookup) bool {
 			vb.gcRefcount[entry.ObjectID]++
-		}
+			return true
+		})
 	}
 
 	if vb.UseBlockStore && vb.BlockStore != nil {
-		for _, entry := range vb.BlocksToObject.BlockLookup {
+		vb.BlocksToObject.lookup.scan(func(entry BlockLookup) bool {
 			blocks := make([]uint64, entry.NumBlocks)
 			seqNums := make([]uint64, entry.NumBlocks)
 			for i := range blocks {
@@ -3708,7 +3705,8 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 				seqNums[i] = entry.seqNumAt(i)
 			}
 			vb.BlockStore.SetPersistedRange(blocks, entry.ObjectID, entry.ObjectOffset, vb.blockStride(), seqNums)
-		}
+			return true
+		})
 	}
 
 	// Runtime drains persist chunks but not config.json ObjectNum, so a re-Open can
@@ -4183,11 +4181,12 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	vb.BlocksToObject.mu.RLock()
 	checkpoint := vb.BlockToObjectWALHeader()
 	stride := vb.blockStride()
-	for _, block := range vb.BlocksToObject.BlockLookup {
+	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
 		for _, single := range expandBlockLookup(block, stride) {
 			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
 		}
-	}
+		return true
+	})
 	vb.BlocksToObject.mu.RUnlock()
 
 	headers := []byte{}
@@ -4461,12 +4460,13 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 	vb.BlocksToObject.mu.RLock()
 	var maxObjectID uint64
 	haveObject := false
-	for _, lookup := range vb.BlocksToObject.BlockLookup {
+	vb.BlocksToObject.lookup.scan(func(lookup BlockLookup) bool {
 		if !haveObject || lookup.ObjectID > maxObjectID {
 			maxObjectID = lookup.ObjectID
 			haveObject = true
 		}
-	}
+		return true
+	})
 	vb.BlocksToObject.mu.RUnlock()
 	if haveObject {
 		next := maxObjectID + 1
@@ -4514,7 +4514,7 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 	if vb.UseBlockStore && vb.BlockStore != nil {
 		vb.BlocksToObject.mu.RLock()
 		stride := vb.blockStride()
-		for _, lookup := range vb.BlocksToObject.BlockLookup {
+		vb.BlocksToObject.lookup.scan(func(lookup BlockLookup) bool {
 			blocks := make([]uint64, lookup.NumBlocks)
 			seqNums := make([]uint64, lookup.NumBlocks)
 			for i := range blocks {
@@ -4522,7 +4522,8 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 				seqNums[i] = lookup.seqNumAt(i)
 			}
 			vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
-		}
+			return true
+		})
 		vb.BlocksToObject.mu.RUnlock()
 	}
 
@@ -5313,7 +5314,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			ancFound := false
 			for ai := range vb.ancestors {
 				vb.ancestors[ai].blocks.mu.RLock()
-				lookup, ok := vb.ancestors[ai].blocks.BlockLookup[currentBlock]
+				lookup, pos, ok := vb.ancestors[ai].blocks.resolveBlockLookup(currentBlock)
 				vb.ancestors[ai].blocks.mu.RUnlock()
 				if ok {
 					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
@@ -5323,8 +5324,8 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 						OffsetStart:   start,
 						OffsetEnd:     end,
 						ObjectID:      lookup.ObjectID,
-						ObjectOffset:  lookup.ObjectOffset,
-						SeqNum:        lookup.SeqNum,
+						ObjectOffset:  lookup.offsetAt(pos, vb.blockStride()),
+						SeqNum:        lookup.seqNumAt(pos),
 					})
 					ancFound = true
 					break
@@ -5666,7 +5667,7 @@ func (vb *VB) Reset() error {
 	}
 
 	vb.BlocksToObject.mu.Lock()
-	vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup, 0)
+	vb.BlocksToObject.lookup.clear()
 	vb.BlocksToObject.mu.Unlock()
 
 	vb.Writes.mu.Lock()
@@ -5878,7 +5879,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 			ancFound := false
 			for ai := range vb.ancestors {
 				vb.ancestors[ai].blocks.mu.RLock()
-				lookup, ok := vb.ancestors[ai].blocks.BlockLookup[currentBlock]
+				lookup, pos, ok := vb.ancestors[ai].blocks.resolveBlockLookup(currentBlock)
 				vb.ancestors[ai].blocks.mu.RUnlock()
 				if ok {
 					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
@@ -5888,8 +5889,8 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 						OffsetStart:   start,
 						OffsetEnd:     end,
 						ObjectID:      lookup.ObjectID,
-						ObjectOffset:  lookup.ObjectOffset,
-						SeqNum:        lookup.SeqNum,
+						ObjectOffset:  lookup.offsetAt(pos, vb.blockStride()),
+						SeqNum:        lookup.seqNumAt(pos),
 					})
 					ancFound = true
 					break
@@ -6276,14 +6277,15 @@ func (vb *VB) SyncBlockStoreFromLegacy() {
 	// path, kept as-is here.
 	vb.BlocksToObject.mu.RLock()
 	stride := vb.blockStride()
-	for _, lookup := range vb.BlocksToObject.BlockLookup {
+	vb.BlocksToObject.lookup.scan(func(lookup BlockLookup) bool {
 		blocks := make([]uint64, lookup.NumBlocks)
 		seqNums := make([]uint64, lookup.NumBlocks)
 		for i := range blocks {
 			blocks[i] = lookup.StartBlock + uint64(i)
 		}
 		vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
-	}
+		return true
+	})
 	vb.BlocksToObject.mu.RUnlock()
 
 	// Sync sequence number

@@ -823,7 +823,7 @@ func TestWriteAndRead(t *testing.T) {
 		if vb.UseShardedWAL && vb.ShardedWAL != nil {
 			prevWALNum = vb.ShardedWAL.WallNum.Load()
 		}
-		compareState := vb.BlocksToObject.BlockLookup
+		compareState := lookupMap(&vb.BlocksToObject)
 
 		// Gracefully close VB and save state to disk (only once after all subtests)
 		// Note: Close() removes local files after uploading state to backend
@@ -848,7 +848,7 @@ func TestWriteAndRead(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Compare they are the same
-		assert.Equal(t, compareState, vb.BlocksToObject.BlockLookup)
+		assert.Equal(t, compareState, lookupMap(&vb.BlocksToObject))
 	})
 }
 
@@ -1989,7 +1989,7 @@ func TestRecoverLocalWALs(t *testing.T) {
 			// At this point blocks are in WAL file on disk but NOT in chunks/S3.
 			// Simulate a crash: reset in-memory state without calling Close/WriteWALToChunk.
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2038,7 +2038,7 @@ func TestRecoverLocalWALsEmpty(t *testing.T) {
 
 			// BlocksToObject should be empty
 			vb.BlocksToObject.mu.RLock()
-			count := len(vb.BlocksToObject.BlockLookup)
+			count := vb.BlocksToObject.lookup.len()
 			vb.BlocksToObject.mu.RUnlock()
 			assert.Equal(t, 0, count, "BlocksToObject should remain empty")
 		})
@@ -2077,7 +2077,7 @@ func TestRecoverLocalWALsPartialRecord(t *testing.T) {
 
 			// Reset in-memory state (simulate crash)
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2131,7 +2131,7 @@ func TestRecoverLocalWALsDedup(t *testing.T) {
 
 			// Reset in-memory state (simulate crash)
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2178,7 +2178,7 @@ func TestRecoverLocalWALsSeqNumAdvancement(t *testing.T) {
 
 			// Simulate crash: reset in-memory state
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2248,7 +2248,7 @@ func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
 
 			// Reset in-memory state (simulate crash)
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2296,7 +2296,7 @@ func TestRecoverLocalWALsFileCleanup(t *testing.T) {
 
 			// Simulate crash
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2340,7 +2340,7 @@ func TestRecoverLocalWALsBlockStoreSync(t *testing.T) {
 
 			// Simulate crash
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2387,7 +2387,7 @@ func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
 
 			// Simulate crash
 			vb.BlocksToObject.mu.Lock()
-			vb.BlocksToObject.BlockLookup = make(map[uint64]BlockLookup)
+			vb.BlocksToObject.lookup.clear()
 			vb.BlocksToObject.mu.Unlock()
 
 			vb.PendingBackendWrites.mu.Lock()
@@ -2439,7 +2439,7 @@ func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
 
 			// BlocksToObject should be empty
 			vb.BlocksToObject.mu.RLock()
-			count := len(vb.BlocksToObject.BlockLookup)
+			count := vb.BlocksToObject.lookup.len()
 			vb.BlocksToObject.mu.RUnlock()
 			assert.Equal(t, 0, count, "BlocksToObject should remain empty when all WALs are corrupt")
 

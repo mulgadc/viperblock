@@ -148,7 +148,7 @@ func TestParseBlockCheckpointBytesMatchesVBLoad(t *testing.T) {
 		// flat, so compare by physical block coverage rather than map shape.
 		stride := vb.blockStride()
 		wantTotal := 0
-		for _, entry := range vb.BlocksToObject.BlockLookup {
+		for _, entry := range lookupMap(&vb.BlocksToObject) {
 			wantTotal += int(entry.NumBlocks)
 			for i := range int(entry.NumBlocks) {
 				blockNum := entry.StartBlock + uint64(i)

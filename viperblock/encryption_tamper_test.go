@@ -155,13 +155,13 @@ func TestEncryptedChunk_TamperByteFailsRead(t *testing.T) {
 	// Clear caches so the next read must hit the backend.
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1, // first write under a fresh VB allocates SeqNum 1
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 	env.vb.UseBlockStore = false
 
@@ -192,13 +192,13 @@ func TestEncryptedChunk_TagTamperFailsRead(t *testing.T) {
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 
 	chunkFile := env.chunkPath(env.vb.VolumeName, 0)
@@ -253,13 +253,13 @@ func TestEncryptedChunk_CrossVolumeSpliceFailsRead(t *testing.T) {
 	envB.vb.BlockStore = NewUnifiedBlockStore(envB.vb.BlockSize)
 	envB.vb.UseBlockStore = false
 	envB.vb.BlocksToObject.mu.Lock()
-	envB.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	envB.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(envB.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	envB.vb.BlocksToObject.mu.Unlock()
 
 	_, err = envB.vb.ReadAt(0, uint64(envB.blockSize))
@@ -292,7 +292,7 @@ func TestEncryptedChunk_InPlaceReplayFailsRead(t *testing.T) {
 	env.writeAndChunk(t, 5, newer)
 
 	env.vb.BlocksToObject.mu.RLock()
-	cur := env.vb.BlocksToObject.BlockLookup[5]
+	cur := lookupMap(&env.vb.BlocksToObject)[5]
 	env.vb.BlocksToObject.mu.RUnlock()
 	require.Equal(t, uint64(1), cur.ObjectID, "second write must land in chunk 1")
 
@@ -417,13 +417,13 @@ func TestEncryptedChunk_PreEncryptionMagicRejected(t *testing.T) {
 	env.vb.BlockStore = NewUnifiedBlockStore(env.vb.BlockSize)
 	env.vb.UseBlockStore = false
 	env.vb.BlocksToObject.mu.Lock()
-	env.vb.BlocksToObject.BlockLookup[0] = BlockLookup{
+	env.vb.BlocksToObject.lookup.set(BlockLookup{
 		StartBlock:   0,
 		NumBlocks:    1,
 		ObjectID:     0,
 		ObjectOffset: uint32(env.blockOffset(0)),
 		SeqNum:       1,
-	}
+	})
 	env.vb.BlocksToObject.mu.Unlock()
 
 	// Rewrite the chunk file's first 4 bytes to the legacy VBCH magic

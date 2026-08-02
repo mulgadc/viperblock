@@ -181,15 +181,15 @@ func assertClosure(t *testing.T, vb *VB) {
 	t.Helper()
 
 	vb.BlocksToObject.mu.RLock()
-	ownLookup := make(map[uint64]BlockLookup, len(vb.BlocksToObject.BlockLookup))
-	maps.Copy(ownLookup, vb.BlocksToObject.BlockLookup)
+	ownLookup := make(map[uint64]BlockLookup, vb.BlocksToObject.lookup.len())
+	maps.Copy(ownLookup, lookupMap(&vb.BlocksToObject))
 	vb.BlocksToObject.mu.RUnlock()
 	assertMapClosure(t, vb.Backend, vb.VolumeName, ownLookup)
 
 	if vb.BaseBlockMap != nil {
 		vb.BaseBlockMap.mu.RLock()
-		baseLookup := make(map[uint64]BlockLookup, len(vb.BaseBlockMap.BlockLookup))
-		maps.Copy(baseLookup, vb.BaseBlockMap.BlockLookup)
+		baseLookup := make(map[uint64]BlockLookup, vb.BaseBlockMap.lookup.len())
+		maps.Copy(baseLookup, lookupMap(vb.BaseBlockMap))
 		vb.BaseBlockMap.mu.RUnlock()
 		assertMapClosure(t, vb.Backend, vb.SourceVolumeName, baseLookup)
 	}
@@ -199,8 +199,8 @@ func assertClosure(t *testing.T, vb *VB) {
 			continue
 		}
 		anc.blocks.mu.RLock()
-		ancLookup := make(map[uint64]BlockLookup, len(anc.blocks.BlockLookup))
-		maps.Copy(ancLookup, anc.blocks.BlockLookup)
+		ancLookup := make(map[uint64]BlockLookup, anc.blocks.lookup.len())
+		maps.Copy(ancLookup, lookupMap(anc.blocks))
 		anc.blocks.mu.RUnlock()
 		assertMapClosure(t, vb.Backend, anc.sourceVolumeName, ancLookup)
 	}
@@ -836,7 +836,7 @@ func TestChunkGC_StaleDrainNeverClobbersNewerChunk(t *testing.T) {
 	// The block must still point at the NEWER chunk, and refcounts must be
 	// exactly: live chunk 1, orphaned stale chunk tracked at 0.
 	vb.BlocksToObject.mu.RLock()
-	lookup, mapOK := vb.BlocksToObject.BlockLookup[0]
+	lookup, mapOK := lookupMap(&vb.BlocksToObject)[0]
 	newerRefs := vb.gcRefcount[newerChunkID]
 	staleRefs, staleTracked := vb.gcRefcount[staleChunkID]
 	vb.BlocksToObject.mu.RUnlock()
