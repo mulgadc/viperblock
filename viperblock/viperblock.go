@@ -903,6 +903,15 @@ var ErrIntegrity = errors.New("viperblock: integrity check failed")
 // (dd, filesystem-level copy). Callers must refuse to open the volume.
 var ErrPreEncryptionFormat = errors.New("viperblock: chunk has pre-encryption format (VBCH) but volume opened with EncryptionEnabled=true; create a new encrypted volume and copy data across via guest-side tooling")
 
+// ErrWALAlreadyOpen is returned by OpenWAL when the target WAL file already
+// has content. Every normal caller (boot, rotation) targets a walNum that
+// RecoverLocalWALs has just drained/removed or that was freshly incremented,
+// so a non-empty file here means another writer already opened it — most
+// likely a second concurrent VB instance racing the same volume. Appending a
+// second header would land mid-stream, which the WAL reader cannot parse
+// (it validates the header once, at offset 0, then reads fixed-size records).
+var ErrWALAlreadyOpen = errors.New("viperblock: WAL file already has content, refusing to append a second header")
+
 // classifyStateLoad maps the local and backend LoadStateRequest errors into a
 // sentinel suitable for callers. The local read is informational — its
 // absence is normal on multi-node deployments and post-restart recovery. The
@@ -1578,6 +1587,31 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("failed to open WAL file: %w", err)
+	}
+
+	// The chunk WAL (vb.WAL) is the only WAL type that both rotates to a
+	// fresh walNum on every boot (RecoverLocalWALs drains/removes prior
+	// generations, then the caller increments WallNum before opening) and is
+	// actually replayed record-by-record by readWALFileForRecovery, which
+	// validates the header once at offset 0 and desyncs on anything appended
+	// after it. A non-empty file at a freshly rotated walNum means another
+	// writer already created and header-stamped it -- refuse rather than
+	// append a second header into the middle of its records.
+	//
+	// BlockToObjectWAL is intentionally excluded: its walNum is never
+	// rotated across reopens (every boot reopens walNum unchanged), so a
+	// prior header is expected, not a collision, and nothing replays this
+	// file's records (RecoverLocalWALs only scans the chunk-WAL directory).
+	if wal.WALMagic == vb.WAL.WALMagic {
+		info, statErr := file.Stat()
+		if statErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("failed to stat WAL file: %w", statErr)
+		}
+		if info.Size() > 0 {
+			_ = file.Close()
+			return fmt.Errorf("%w: %s has %d existing bytes", ErrWALAlreadyOpen, filename, info.Size())
+		}
 	}
 
 	// Append the WAL header, format
@@ -4849,19 +4883,34 @@ func (vb *VB) pushStateToBackend(ctx context.Context, persisted []byte) error {
 // writeFileAtomic writes data to path atomically via tmp + fsync + rename +
 // fsync(parent). On return without error, the file exists at path with the
 // new contents fully durable on disk. A crash before return may leave a
-// stale path.tmp behind (caller-tolerable: next SaveState rewrites it).
+// stale *.tmp-* file behind (caller-tolerable: next SaveState rewrites path;
+// stale tmp siblings are otherwise inert).
 //
 // The parent dir is created if absent so a remount on a node that never held
 // the volume locally (LoadState pulls authoritative state from the backend,
 // then persists it locally) does not fail opening the tmp file with ENOENT.
+//
+// The tmp name is unique per call (os.CreateTemp, O_EXCL under the hood) so
+// two concurrent writers of the same path -- e.g. independently-constructed
+// *VB instances racing persistStateLocal for the same volume -- never share
+// an inode. A fixed "path.tmp" name let one writer's O_TRUNC clobber the
+// other's in-flight write, and one writer's rename delete the other's tmp,
+// producing a torn file that fails AEAD authentication on the next load.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	base := filepath.Base(path)
+	f, err := os.CreateTemp(dir, base+".tmp-*")
 	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// os.CreateTemp always creates with 0600; the caller's perm may differ.
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
