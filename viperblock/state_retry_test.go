@@ -1,7 +1,7 @@
 // Unit tests for LoadStateRequestCtx's backend-path retry: a bounded,
 // backed-off re-attempt of the VBState backend read that distinguishes a
 // transient/truncated read from genuinely-missing state or a fail-closed
-// crypto failure. See docs/development/bugs/recovery-vbstate-transient-read-misclassified.md.
+// crypto failure.
 
 package viperblock
 
@@ -77,6 +77,29 @@ func TestLoadStateRequestCtx_RetriesTruncatedBackendRead(t *testing.T) {
 		}
 		// Truncate the envelope so it fails JSON parsing, exactly like a
 		// connection dropped mid-body -- not a bit flip, a short read.
+		return data[:len(data)-5], nil
+	}
+	vb.Backend = flaky
+
+	state, err := vb.LoadStateRequestCtx(context.Background(), "")
+	require.NoError(t, err)
+	assert.Equal(t, vb.VolumeName, state.VolumeName)
+	assert.Equal(t, 2, flaky.callCount(), "must succeed on the second attempt, not the first")
+}
+
+// TestLoadStateRequestCtx_RetriesTruncatedPlainBackendRead covers the
+// unencrypted path, where nothing inspects the payload before the final JSON
+// decode — so truncation first surfaces there and must still be retried.
+func TestLoadStateRequestCtx_RetriesTruncatedPlainBackendRead(t *testing.T) {
+	vb := newFileBackedVB(t, "vol-retry-plain", nil)
+	vb.BlockSize = DefaultBlockSize
+	require.NoError(t, vb.SaveState())
+
+	flaky := &flakyConfigBackend{Backend: vb.Backend}
+	flaky.mutate = func(call int, data []byte, err error) ([]byte, error) {
+		if err != nil || call != 1 {
+			return data, err
+		}
 		return data[:len(data)-5], nil
 	}
 	vb.Backend = flaky

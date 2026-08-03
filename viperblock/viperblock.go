@@ -5320,10 +5320,9 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 }
 
 // stateReadMaxAttempts and stateReadInitialBackoff bound the backend-path
-// retry in LoadStateRequestCtx: 4 attempts, exponential backoff from 100ms
-// (100ms/200ms/400ms between attempts), comfortably covering a predastore
-// warm-up window of ~1s without materially slowing a genuine failure.
-const stateReadMaxAttempts = 4
+// retry in LoadStateRequestCtx: 5 attempts over ~1.5s of backoff, covering an
+// observed ~1s backend warm-up with margin.
+const stateReadMaxAttempts = 5
 
 const stateReadInitialBackoff = 100 * time.Millisecond
 
@@ -5441,7 +5440,10 @@ func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state V
 	// jsonData is already the verified payload, so StateBody is a no-op.
 	err = json.NewDecoder(bytes.NewReader(StateBody(jsonData))).Decode(&state)
 
-	return state, false, err
+	// On a plain volume nothing above inspects the payload, so a truncated
+	// blob first surfaces here as a JSON error — the same truncation shape
+	// the envelope split catches for encrypted volumes, so retry it too.
+	return state, err != nil, err
 }
 
 // Private function to read a block from the storage backend, use ReadAt for public access.
