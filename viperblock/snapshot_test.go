@@ -783,6 +783,78 @@ func TestRecoverLocalWALsNoChunkReuse(t *testing.T) {
 	}
 }
 
+// TestNewCarriesSnapshotLinkFromConfig covers the way EBS CreateVolume builds a
+// clone: it never calls OpenFromSnapshot itself, it sets SnapshotID on the
+// config it hands New and relies on SaveState persisting it, so that the next
+// open (a different process, with no local state) restores the base map through
+// LoadState. New dropping either field yields a config.json with an empty
+// SnapshotID and a clone that serves an all-zeros disk.
+func TestNewCarriesSnapshotLinkFromConfig(t *testing.T) {
+	runWithBackends(t, "new_carries_snapshot_link", func(t *testing.T, source *VB) {
+		data := make([]byte, DefaultBlockSize)
+		rand.Read(data)
+
+		require.NoError(t, source.Write(0, data))
+		require.NoError(t, source.Flush())
+		require.NoError(t, source.WriteWALToChunk(true))
+
+		snapshotID := fmt.Sprintf("snap-%s", source.VolumeName)
+		_, err := source.CreateSnapshot(snapshotID)
+		require.NoError(t, err)
+
+		cloneName := fmt.Sprintf("newclone-%s-%s", source.VolumeName, snapshotID)
+		btype := source.Backend.GetBackendType()
+
+		// The create half: New with the snapshot link on the config, then the
+		// Backend.Init + SaveState that CreateVolume performs, and nothing else.
+		createCfg := VB{
+			VolumeName:       cloneName,
+			VolumeSize:       source.VolumeSize,
+			BaseDir:          source.BaseDir,
+			WALSyncInterval:  -1,
+			Cache:            Cache{Config: CacheConfig{Size: 0}},
+			SnapshotID:       snapshotID,
+			SourceVolumeName: source.VolumeName,
+		}
+		creator, err := New(&createCfg, btype, cloneBackendConfigFor(source, cloneName))
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, creator.RemoveLocalFiles()) })
+
+		assert.Equal(t, snapshotID, creator.SnapshotID,
+			"New must carry the snapshot link, or SaveState persists an empty one")
+		assert.Equal(t, source.VolumeName, creator.SourceVolumeName)
+
+		require.NoError(t, creator.Backend.Init())
+		require.NoError(t, creator.SaveState())
+
+		// The open half: a fresh VB that knows only the volume name, as nbdkit
+		// does when it serves the volume to a guest.
+		openCfg := VB{
+			VolumeName:      cloneName,
+			VolumeSize:      source.VolumeSize,
+			BaseDir:         source.BaseDir,
+			WALSyncInterval: -1,
+			Cache:           Cache{Config: CacheConfig{Size: 0}},
+		}
+		reader, err := New(&openCfg, btype, cloneBackendConfigFor(source, cloneName))
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, reader.RemoveLocalFiles()) })
+
+		openCloneBackend(t, reader)
+		require.NoError(t, reader.LoadState())
+
+		assert.Equal(t, snapshotID, reader.SnapshotID, "LoadState must restore the snapshot link")
+		assert.Equal(t, source.VolumeName, reader.SourceVolumeName)
+		require.NotNil(t, reader.BaseBlockMap, "LoadState must have called OpenFromSnapshot")
+
+		require.NoError(t, reader.LoadBlockState())
+
+		readData, err := reader.ReadAt(0, uint64(reader.BlockSize))
+		require.NoError(t, err)
+		assert.Equal(t, data, readData, "the clone must read the source's data, not zeros")
+	})
+}
+
 // createCloneVB creates a new VB instance configured as a clone of the given
 // snapshot. It creates its own backend so that writes target the clone's
 // namespace, while ReadFrom can still access the source volume's chunks.
@@ -790,13 +862,43 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 	t.Helper()
 
 	cloneName := fmt.Sprintf("clone-%s-%s", source.VolumeName, snapshotID)
+	cloneBackendConfig := cloneBackendConfigFor(source, cloneName)
 
-	// Create a separate backend for the clone with its own volume name
-	// but pointing to the same storage location (BaseDir/Bucket)
+	vbconfig := VB{
+		VolumeName:      cloneName,
+		VolumeSize:      source.VolumeSize,
+		BaseDir:         source.BaseDir,
+		WALSyncInterval: -1, // Disable syncer in tests
+		Cache: Cache{
+			Config: CacheConfig{Size: 0},
+		},
+	}
+
+	clone, err := New(&vbconfig, source.Backend.GetBackendType(), cloneBackendConfig)
+	require.NoError(t, err)
+
+	// Registered before the setup below can call FailNow, which would otherwise
+	// skip cleanup and leave the clone's VB tree behind.
+	t.Cleanup(func() {
+		assert.NoError(t, clone.RemoveLocalFiles())
+	})
+
+	openCloneBackend(t, clone)
+
+	// Load snapshot base map
+	err = clone.OpenFromSnapshot(snapshotID)
+	require.NoError(t, err)
+
+	return clone
+}
+
+// cloneBackendConfigFor builds a backend config in the clone's own namespace
+// that still points at the storage location holding the source's chunks, so
+// ReadFrom and OpenFromSnapshot can resolve them.
+func cloneBackendConfigFor(source *VB, cloneName string) any {
 	var cloneBackendConfig any
-	btype := source.Backend.GetBackendType()
 
-	switch btype {
+	switch source.Backend.GetBackendType() {
 	case "file":
 		// Derive the backend root from the source rather than naming it, so the
 		// clone follows its source wherever that is rooted. setupTestVB roots
@@ -822,44 +924,25 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 		}
 	}
 
-	vbconfig := VB{
-		VolumeName:      cloneName,
-		VolumeSize:      source.VolumeSize,
-		BaseDir:         source.BaseDir,
-		WALSyncInterval: -1, // Disable syncer in tests
-		Cache: Cache{
-			Config: CacheConfig{Size: 0},
-		},
-	}
+	return cloneBackendConfig
+}
 
-	clone, err := New(&vbconfig, btype, cloneBackendConfig)
-	require.NoError(t, err)
+// openCloneBackend initialises a clone's backend and opens its WAL files.
+func openCloneBackend(t *testing.T, clone *VB) {
+	t.Helper()
 
-	// Registered before the setup below can call FailNow, which would otherwise
-	// skip cleanup and leave the clone's VB tree behind.
-	t.Cleanup(func() {
-		assert.NoError(t, clone.RemoveLocalFiles())
-	})
+	require.NoError(t, clone.Backend.Init())
 
-	err = clone.Backend.Init()
-	require.NoError(t, err)
-
-	// Open WAL files for the clone
+	var err error
 	if clone.UseShardedWAL {
 		err = clone.OpenShardedWAL()
 	} else {
-		err = clone.OpenWAL(&clone.WAL, fmt.Sprintf("%s/%s", clone.WAL.BaseDir, fmt.Sprintf("%s/wal/chunks/wal.%08d.bin", cloneName, 0)))
+		err = clone.OpenWAL(&clone.WAL, fmt.Sprintf("%s/%s", clone.WAL.BaseDir, fmt.Sprintf("%s/wal/chunks/wal.%08d.bin", clone.VolumeName, 0)))
 	}
 	require.NoError(t, err)
 
-	err = clone.OpenWAL(&clone.BlockToObjectWAL, fmt.Sprintf("%s/%s", clone.BlockToObjectWAL.BaseDir, fmt.Sprintf("%s/wal/blocks/blocks.%08d.bin", cloneName, 0)))
+	err = clone.OpenWAL(&clone.BlockToObjectWAL, fmt.Sprintf("%s/%s", clone.BlockToObjectWAL.BaseDir, fmt.Sprintf("%s/wal/blocks/blocks.%08d.bin", clone.VolumeName, 0)))
 	require.NoError(t, err)
-
-	// Load snapshot base map
-	err = clone.OpenFromSnapshot(snapshotID)
-	require.NoError(t, err)
-
-	return clone
 }
 
 // TestSnapshotCOWChain verifies that a snapshot taken from a COW clone carries

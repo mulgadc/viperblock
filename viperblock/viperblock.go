@@ -1264,6 +1264,13 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		MasterKey:         config.MasterKey,
 		EncryptionEnabled: config.EncryptionEnabled,
 
+		// A clone constructed straight from config (EBS CreateVolume from a
+		// snapshot) carries its snapshot link here and nowhere else. Dropping
+		// it would have SaveState persist an empty SnapshotID, so the next open
+		// loads no base map and serves an all-zeros disk.
+		SnapshotID:       config.SnapshotID,
+		SourceVolumeName: config.SourceVolumeName,
+
 		log: log,
 	}
 
