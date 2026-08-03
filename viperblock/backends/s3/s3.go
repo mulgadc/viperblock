@@ -355,6 +355,18 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 			types.ErrShortRead, filename, offset, len(res), length)
 	}
 
+	// A full-object read (length == 0, used for config.json and other
+	// metadata) has no range to compare against, so a connection that drops
+	// mid-body previously went unnoticed: io.ReadAll returns the truncated
+	// bytes with no error. Compare against the response's own Content-Length
+	// when the server supplied one. ContentLength is nil/negative for a
+	// chunked response, which carries no such promise to check against.
+	if length == 0 && textResult.ContentLength != nil && *textResult.ContentLength >= 0 &&
+		len(res) != int(*textResult.ContentLength) {
+		return nil, fmt.Errorf("%w: %s: backend returned %d bytes, expected %d",
+			types.ErrShortRead, filename, len(res), *textResult.ContentLength)
+	}
+
 	return res, nil
 }
 

@@ -5319,21 +5319,76 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 	return vb.LoadStateRequestCtx(context.Background(), filename)
 }
 
+// stateReadMaxAttempts and stateReadInitialBackoff bound the backend-path
+// retry in LoadStateRequestCtx: 4 attempts, exponential backoff from 100ms
+// (100ms/200ms/400ms between attempts), comfortably covering a predastore
+// warm-up window of ~1s without materially slowing a genuine failure.
+const stateReadMaxAttempts = 4
+
+const stateReadInitialBackoff = 100 * time.Millisecond
+
 // LoadStateRequestCtx is LoadStateRequest with a caller-supplied context
-// threaded through the backend fetch.
+// threaded through the backend fetch. A local file read (filename != "") is
+// single-shot — it is not racing anything. A backend read (filename == "")
+// retries transport- and truncation-shaped failures with bounded backoff,
+// since post-reboot recovery races the backend's own startup and a single
+// unretried short read would otherwise be misclassified as permanent
+// corruption. The final error keeps the same ErrIntegrity/ErrEncryptionMismatch
+// contract existing callers match on.
 func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state VBState, err error) {
+	if filename != "" {
+		state, _, err = vb.loadStateAttemptCtx(ctx, filename)
+		return state, err
+	}
+
+	backoff := stateReadInitialBackoff
+	var retryable bool
+	for attempt := 1; attempt <= stateReadMaxAttempts; attempt++ {
+		state, retryable, err = vb.loadStateAttemptCtx(ctx, "")
+		if err == nil {
+			return state, nil
+		}
+		if !retryable || attempt == stateReadMaxAttempts {
+			return state, err
+		}
+
+		vb.logger().WarnContext(ctx, "LoadStateRequestCtx: transient VBState backend read failed, retrying",
+			"volume", vb.GetVolume(), "attempt", attempt, "err", err)
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return state, ctx.Err()
+		case <-timer.C:
+		}
+		backoff *= 2
+	}
+
+	return state, err
+}
+
+// loadStateAttemptCtx performs a single VBState read-and-parse attempt,
+// either from filename (if non-empty) or from vb.Backend, and reports
+// whether a failure is transient/truncation-shaped and therefore safe to
+// retry. Object-not-found, a wrong-key KeyFingerprint, and a tag-verify
+// failure are never retryable: they are either genuinely missing state or a
+// fail-closed crypto failure, not a race with a warming-up backend.
+func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state VBState, retryable bool, err error) {
 	var jsonData []byte
 
 	// Read from file
 	if filename != "" {
 		jsonData, err = os.ReadFile(filename)
 		if err != nil {
-			return state, err
+			return state, false, err
 		}
 	} else {
 		jsonData, err = vb.Backend.ReadCtx(ctx, types.FileTypeConfig, 0, 0, 0)
 		if err != nil {
-			return state, err
+			// Object-not-found is genuinely missing state, not a transient
+			// backend hiccup — retrying it only burns the recovery window.
+			return state, !errors.Is(err, os.ErrNotExist), err
 		}
 	}
 
@@ -5352,7 +5407,9 @@ func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state V
 	if vb.EncryptionEnabled {
 		payload, tag, splitErr := splitEnvelope(jsonData)
 		if splitErr != nil {
-			return state, fmt.Errorf("%w: VBState envelope: %w", ErrIntegrity, splitErr)
+			// A malformed envelope is what a partially-served/truncated blob
+			// looks like from here, not necessarily tampering — retryable.
+			return state, true, fmt.Errorf("%w: VBState envelope: %w", ErrIntegrity, splitErr)
 		}
 		var peek struct {
 			VolumeUUID     [4]byte `json:"VolumeUUID"`
@@ -5360,16 +5417,18 @@ func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state V
 			KeyFingerprint string  `json:"KeyFingerprint"`
 		}
 		if err := json.Unmarshal(payload, &peek); err != nil {
-			return state, fmt.Errorf("%w: VBState peek parse: %w", ErrIntegrity, err)
+			// Same reasoning as the envelope split above: truncation-shaped.
+			return state, true, fmt.Errorf("%w: VBState peek parse: %w", ErrIntegrity, err)
 		}
 		if peek.KeyFingerprint != vb.MasterKey.Fingerprint {
-			return state, fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
+			return state, false, fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
 				ErrEncryptionMismatch, vb.VolumeName, peek.KeyFingerprint, vb.MasterKey.Fingerprint)
 		}
 		nonce := makeNonce(peek.StateSeqNum, peek.VolumeUUID, DomainVBStateMeta)
 		aad := makeMetaAAD(vb.volumeNameHash, "vbstate", peek.StateSeqNum)
 		if err := verifyMeta(vb.aead, payload, tag, aad, nonce); err != nil {
-			return state, fmt.Errorf("%w: VBState tag verify: %w", ErrIntegrity, err)
+			// A genuine tag-verify failure is fail-closed, not retried.
+			return state, false, fmt.Errorf("%w: VBState tag verify: %w", ErrIntegrity, err)
 		}
 		jsonData = payload
 	}
@@ -5382,7 +5441,7 @@ func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state V
 	// jsonData is already the verified payload, so StateBody is a no-op.
 	err = json.NewDecoder(bytes.NewReader(StateBody(jsonData))).Decode(&state)
 
-	return state, err
+	return state, false, err
 }
 
 // Private function to read a block from the storage backend, use ReadAt for public access.

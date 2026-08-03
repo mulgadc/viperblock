@@ -1,14 +1,19 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
@@ -340,4 +345,97 @@ func TestPoolPressureMiddlewareClearsOnFailedPutObject(t *testing.T) {
 	})
 	assert.Same(t, wantErr, err, "the middleware must pass the underlying error through unchanged")
 	assert.False(t, backend.NearFull(), "a failed PutObject with no pool-pressure header must clear NearFull")
+}
+
+// roundTripFunc adapts a plain function to http.RoundTripper so tests can
+// hand ReadCtx a canned response without a real network or predastore server.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+// newTestBackend builds an S3 backend whose s3Client is wired to rt instead
+// of a real network. It bypasses InitCtx (which issues a ListObjectsV2
+// existence check the fake transport does not model) and constructs the SDK
+// client directly, mirroring InitCtx's own s3.New call.
+func newTestBackend(rt http.RoundTripper) *Backend {
+	backend := New(S3Config{VolumeName: "vol", Bucket: "bucket", Region: "us-east-1"})
+	backend.config.s3Client = s3.New(s3.Options{
+		BaseEndpoint: aws.String("https://s3.test"),
+		UsePathStyle: true,
+		Region:       "us-east-1",
+		HTTPClient:   &http.Client{Transport: rt},
+		Credentials:  credentials.NewStaticCredentialsProvider("ak", "sk", ""),
+	})
+	return backend
+}
+
+// TestReadCtx_FullObjectShortBodyIsRefused pins that a full-object GET
+// (length == 0, the path VBState config.json reads use) whose body arrives
+// shorter than the server's own Content-Length is surfaced as
+// types.ErrShortRead rather than silently accepted as the whole object. This
+// is the transport-side half of the config.json truncation that a single
+// unretried recovery read used to misclassify as permanent corruption.
+func TestReadCtx_FullObjectShortBodyIsRefused(t *testing.T) {
+	full := []byte("this is the complete config.json body")
+	short := full[:len(full)-10]
+
+	backend := newTestBackend(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		header := http.Header{}
+		header.Set("Content-Length", strconv.Itoa(len(full)))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       io.NopCloser(bytes.NewReader(short)),
+			Request:    req,
+		}, nil
+	}))
+
+	_, err := backend.ReadCtx(context.Background(), types.FileTypeConfig, 0, 0, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, types.ErrShortRead)
+}
+
+// TestReadCtx_FullObjectChunkedResponseSkipsGuard pins that a chunked
+// response (no Content-Length header, so the SDK leaves ContentLength nil)
+// still succeeds -- there is nothing to compare the body against, so the
+// guard must not guess and must not reject a legitimate chunked read.
+func TestReadCtx_FullObjectChunkedResponseSkipsGuard(t *testing.T) {
+	full := []byte("this is the complete config.json body")
+
+	backend := newTestBackend(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(bytes.NewReader(full)),
+			Request:    req,
+		}, nil
+	}))
+
+	got, err := backend.ReadCtx(context.Background(), types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, full, got)
+}
+
+// TestReadCtx_FullObjectMatchingContentLengthSucceeds is the control case:
+// a full-object body whose length matches Content-Length must not trip the
+// new guard.
+func TestReadCtx_FullObjectMatchingContentLengthSucceeds(t *testing.T) {
+	full := []byte("this is the complete config.json body")
+
+	backend := newTestBackend(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		header := http.Header{}
+		header.Set("Content-Length", strconv.Itoa(len(full)))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     header,
+			Body:       io.NopCloser(bytes.NewReader(full)),
+			Request:    req,
+		}, nil
+	}))
+
+	got, err := backend.ReadCtx(context.Background(), types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, full, got)
 }
