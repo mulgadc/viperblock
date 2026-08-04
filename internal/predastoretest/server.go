@@ -2,15 +2,11 @@
 // (Raft + QUIC + Badger) for viperblock tests.
 //
 // Predastore v1.2+ removed the single-process filesystem backend. The S3
-// server panics if started without a wired backend in its config (httpserver.go
-// leaves s.backend nil and the first listObjects request derefs it). Since the
-// v5 cluster topology, that backend must be built and run separately via the
-// clusterrun package and handed to the S3 frontend with WithPreparedBackend.
-// This helper boots a full cluster runtime (shard-storage + state-replica
-// nodes, all colocated in this process over the in-process pipe transport,
-// so no network ports beyond the S3 HTTPS listener are needed) so
-// viperblock's S3-backend tests have a working endpoint without dragging the
-// test code into predastore internals.
+// server panics if started without [[nodes]] in its config (httpserver.go
+// leaves s.backend nil and the first listObjects request derefs it).
+// This helper boots a full 3-node distributed cluster on loopback ports
+// so viperblock's S3-backend tests have a working endpoint without
+// dragging the test code into predastore internals.
 package predastoretest
 
 import (
@@ -30,8 +26,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/mulgadc/predastore/clusterrun"
-	"github.com/mulgadc/predastore/pkg/masterkey"
 	predastoresvc "github.com/mulgadc/predastore/s3"
 )
 
@@ -39,13 +33,12 @@ import (
 // CertPath, KeyPath. Everything else has sensible defaults for viperblock.
 type Options struct {
 	// DataDir is the writable working directory used for master key, config
-	// file, and per-node cluster data directories (Raft state, shard store).
+	// file, Badger / Raft data dirs and per-node QUIC store directories.
 	// Caller owns lifecycle (usually t.TempDir or os.MkdirTemp).
 	DataDir string
 
-	// CertPath / KeyPath point at a TLS keypair used by the S3 server's HTTPS
-	// frontend. The cluster runtime itself needs no TLS material here: every
-	// node runs colocated in this process over the in-process pipe.
+	// CertPath / KeyPath point at a TLS keypair used by both the S3 server
+	// and the embedded s3db (Raft IAM) servers.
 	CertPath string
 	KeyPath  string
 
@@ -59,15 +52,13 @@ type Options struct {
 	DataShards   int
 	ParityShards int
 
-	// NodeCount is the number of shard-storage nodes; default
-	// DataShards+ParityShards. A fixed number of Raft state-replica nodes
-	// (stateReplicaCount) is always added on top of these.
+	// NodeCount is the number of DB + QUIC nodes; default 3.
 	NodeCount int
 }
 
 // Server is a running in-process predastore cluster. Endpoint is the
 // "host:port" of the S3 HTTPS listener (no scheme). Shutdown tears down
-// the HTTP server and the cluster runtime (Raft replicas, shard stores).
+// the HTTP server, distributed backend, Raft cluster and QUIC servers.
 type Server struct {
 	Endpoint  string
 	Bucket    string
@@ -76,11 +67,6 @@ type Server struct {
 	Region    string
 
 	srv *predastoresvc.Server
-
-	// rtCancel stops the cluster runtime's Run goroutine; rtDone reports its
-	// exit so Shutdown can drain it instead of leaking it across tests.
-	rtCancel context.CancelFunc
-	rtDone   <-chan error
 }
 
 // Shutdown stops the cluster. Safe to call once.
@@ -90,30 +76,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	err := s.srv.Shutdown(ctx)
 	s.srv = nil
-
-	if s.rtCancel != nil {
-		s.rtCancel()
-	}
-	if s.rtDone != nil {
-		select {
-		case rtErr := <-s.rtDone:
-			if rtErr != nil && err == nil {
-				err = fmt.Errorf("predastore cluster runtime: %w", rtErr)
-			}
-		case <-ctx.Done():
-			if err == nil {
-				err = ctx.Err()
-			}
-		}
-		s.rtDone = nil
-	}
 	return err
 }
-
-// stateReplicaCount is the number of Raft state-replica nodes in the test
-// cluster. Fixed rather than derived from NodeCount: Raft quorum wants an
-// odd replica count, independent of how many RS shards the caller asked for.
-const stateReplicaCount = 3
 
 const configTmpl = `version = "1.0"
 region = "{{.Region}}"
@@ -122,23 +86,24 @@ region = "{{.Region}}"
 data = {{.DataShards}}
 parity = {{.ParityShards}}
 
-[[host]]
-id = 1
-bind_addr = "127.0.0.1:{{.HostPort}}"
-public_addr = "127.0.0.1:{{.HostPort}}"
-data_dir = "{{.ClusterDataDir}}"
-
-{{range .StorageNodes}}
-[[node]]
+{{range .DBNodes}}
+[[db]]
 id = {{.ID}}
-host_id = 1
-role = "shard-storage"
+host = "127.0.0.1"
+port = {{.HTTPPort}}
+raft_port = {{.RaftPort}}
+path = "db/node-{{.ID}}"
+access_key_id = "{{$.AccessKey}}"
+secret_access_key = "{{$.SecretKey}}"
+{{if .Leader}}leader = true{{end}}
 {{end}}
-{{range .ReplicaNodes}}
-[[node]]
+
+{{range .QuicNodes}}
+[[nodes]]
 id = {{.ID}}
-host_id = 1
-role = "state-replica"
+host = "127.0.0.1"
+port = {{.Port}}
+path = "store/node-{{.ID}}"
 {{end}}
 
 [[auth]]
@@ -150,23 +115,27 @@ policy = [
 ]
 `
 
-// nodeIDTmpl renders a single [[node]] table entry; role is fixed by which
-// slice (StorageNodes vs ReplicaNodes) the template range is over.
-type nodeIDTmpl struct {
-	ID int
+type dbNodeTmpl struct {
+	ID       int
+	HTTPPort int
+	RaftPort int
+	Leader   bool
+}
+
+type quicNodeTmpl struct {
+	ID   int
+	Port int
 }
 
 type configTmplData struct {
-	Region         string
-	DataShards     int
-	ParityShards   int
-	AccessKey      string
-	SecretKey      string
-	AccountID      string
-	HostPort       int
-	ClusterDataDir string
-	StorageNodes   []nodeIDTmpl
-	ReplicaNodes   []nodeIDTmpl
+	Region       string
+	DataShards   int
+	ParityShards int
+	AccessKey    string
+	SecretKey    string
+	AccountID    string
+	DBNodes      []dbNodeTmpl
+	QuicNodes    []quicNodeTmpl
 }
 
 // Start brings up a distributed predastore cluster and pre-creates the
@@ -204,31 +173,38 @@ func Start(opts Options) (*Server, error) {
 		opts.NodeCount = opts.DataShards + opts.ParityShards
 	}
 
-	// The topology needs a host address even though nothing binds it: every
-	// node here is local, so the cluster runtime never opens the network
-	// transport. A real free port just keeps the config honest.
-	hostPort, err := freeTCPPort()
-	if err != nil {
-		return nil, fmt.Errorf("alloc cluster host port: %w", err)
-	}
-
+	// Per-node ports.
 	tmplData := configTmplData{
-		Region:         opts.Region,
-		DataShards:     opts.DataShards,
-		ParityShards:   opts.ParityShards,
-		AccessKey:      opts.AccessKey,
-		SecretKey:      opts.SecretKey,
-		AccountID:      opts.AccountID,
-		HostPort:       hostPort,
-		ClusterDataDir: filepath.Join(opts.DataDir, "cluster"),
+		Region:       opts.Region,
+		DataShards:   opts.DataShards,
+		ParityShards: opts.ParityShards,
+		AccessKey:    opts.AccessKey,
+		SecretKey:    opts.SecretKey,
+		AccountID:    opts.AccountID,
 	}
 	for i := 1; i <= opts.NodeCount; i++ {
-		tmplData.StorageNodes = append(tmplData.StorageNodes, nodeIDTmpl{ID: i})
-	}
-	// Node ids are unique across roles, so replicas continue numbering after
-	// the storage nodes rather than restarting at 1.
-	for i := 1; i <= stateReplicaCount; i++ {
-		tmplData.ReplicaNodes = append(tmplData.ReplicaNodes, nodeIDTmpl{ID: opts.NodeCount + i})
+		dbHTTP, err := freeTCPPort()
+		if err != nil {
+			return nil, fmt.Errorf("alloc db http port: %w", err)
+		}
+		dbRaft, err := freeTCPPort()
+		if err != nil {
+			return nil, fmt.Errorf("alloc db raft port: %w", err)
+		}
+		quicPort, err := freeUDPPort()
+		if err != nil {
+			return nil, fmt.Errorf("alloc quic port: %w", err)
+		}
+		tmplData.DBNodes = append(tmplData.DBNodes, dbNodeTmpl{
+			ID:       i,
+			HTTPPort: dbHTTP,
+			RaftPort: dbRaft,
+			Leader:   i == 1,
+		})
+		tmplData.QuicNodes = append(tmplData.QuicNodes, quicNodeTmpl{
+			ID:   i,
+			Port: quicPort,
+		})
 	}
 
 	s3Port, err := freeTCPPort()
@@ -259,70 +235,32 @@ func Start(opts Options) (*Server, error) {
 	if err := writeRandomKey(keyPath, 32); err != nil {
 		return nil, fmt.Errorf("write master key: %w", err)
 	}
-	key, err := masterkey.Load(keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("load master key: %w", err)
-	}
-
-	cfg := &predastoresvc.Config{ConfigPath: cfgPath, BasePath: opts.DataDir}
-	if err := cfg.ReadConfig(); err != nil {
-		return nil, fmt.Errorf("read predastore config: %w", err)
-	}
-
-	// Build the cluster runtime (shard stores + Raft replicas) and run it in
-	// the background; the S3 frontend below only wraps its backend.
-	rt, err := clusterrun.Build(cfg, clusterrun.AllNodeIDs(cfg), opts.CertPath, opts.KeyPath, key)
-	if err != nil {
-		return nil, fmt.Errorf("build predastore cluster runtime: %w", err)
-	}
-	rtCtx, rtCancel := context.WithCancel(context.Background())
-	rtDone := make(chan error, 1)
-	go func() {
-		rtDone <- rt.Run(rtCtx)
-	}()
-
-	// Writes need a committed leader; starting the S3 frontend before one
-	// exists would fail the bucket creation below for no reason other than
-	// timing.
-	if err := rt.WaitReady(30 * time.Second); err != nil {
-		rtCancel()
-		<-rtDone
-		return nil, fmt.Errorf("predastore cluster did not elect a leader: %w", err)
-	}
 
 	srv, err := predastoresvc.NewServer(
 		predastoresvc.WithConfigPath(cfgPath),
 		predastoresvc.WithAddress("127.0.0.1", s3Port),
 		predastoresvc.WithTLS(opts.CertPath, opts.KeyPath),
 		predastoresvc.WithBasePath(opts.DataDir),
+		predastoresvc.WithBackend(predastoresvc.BackendDistributed),
 		predastoresvc.WithEncryptionKeyFile(keyPath),
-		predastoresvc.WithPreparedBackend(rt.Backend),
 	)
 	if err != nil {
-		rtCancel()
-		<-rtDone
 		return nil, fmt.Errorf("predastore NewServer: %w", err)
 	}
 
 	if err := srv.ListenAndServeAsync(); err != nil {
 		shutdownBestEffort(srv)
-		rtCancel()
-		<-rtDone
 		return nil, fmt.Errorf("predastore ListenAndServeAsync: %w", err)
 	}
 
 	endpoint := fmt.Sprintf("127.0.0.1:%d", s3Port)
 	if err := waitForHTTPS("https://"+endpoint, 30*time.Second); err != nil {
 		shutdownBestEffort(srv)
-		rtCancel()
-		<-rtDone
 		return nil, fmt.Errorf("predastore did not become ready: %w", err)
 	}
 
 	if err := createBucket(endpoint, opts); err != nil {
 		shutdownBestEffort(srv)
-		rtCancel()
-		<-rtDone
 		return nil, fmt.Errorf("create bucket %q: %w", opts.BucketName, err)
 	}
 
@@ -333,8 +271,6 @@ func Start(opts Options) (*Server, error) {
 		SecretKey: opts.SecretKey,
 		Region:    opts.Region,
 		srv:       srv,
-		rtCancel:  rtCancel,
-		rtDone:    rtDone,
 	}, nil
 }
 
@@ -364,6 +300,19 @@ func freeTCPPort() (int, error) {
 	addr, ok := l.Addr().(*net.TCPAddr)
 	if !ok {
 		return 0, fmt.Errorf("predastoretest: TCP listener returned %T, want *net.TCPAddr", l.Addr())
+	}
+	return addr.Port, nil
+}
+
+func freeUDPPort() (int, error) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer pc.Close()
+	addr, ok := pc.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("predastoretest: UDP listener returned %T, want *net.UDPAddr", pc.LocalAddr())
 	}
 	return addr.Port, nil
 }
