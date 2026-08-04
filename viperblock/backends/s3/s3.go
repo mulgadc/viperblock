@@ -355,6 +355,15 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 			types.ErrShortRead, filename, offset, len(res), length)
 	}
 
+	// A full-object read has no range to check against, so a body truncated
+	// mid-transfer reads back clean. Compare against the response's own
+	// Content-Length; a chunked response has none and promises nothing.
+	if length == 0 && textResult.ContentLength != nil && *textResult.ContentLength >= 0 &&
+		len(res) != int(*textResult.ContentLength) {
+		return nil, fmt.Errorf("%w: %s: backend returned %d bytes, expected %d",
+			types.ErrShortRead, filename, len(res), *textResult.ContentLength)
+	}
+
 	return res, nil
 }
 
