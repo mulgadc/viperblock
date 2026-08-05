@@ -1,62 +1,35 @@
-# Viperblock
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="Viperblock by Mulga — WAL-backed block storage for QEMU and KVM, combining fast local writes with durable S3-backed volumes.” width="900">
+</p>
 
-Viperblock developed by [Mulga Defense Corporation](https://mulgadc.com/) is a High-performance, WAL-backed block storage engine. Viperblock is the **EBS backend for [Spinifex](https://github.com/mulgadc/spinifex)**, providing durable block volumes for QEMU/KVM virtual machines over the NBD protocol.
+<p align="center">
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-3fb950?style=flat-square" alt="License"></a>
+  <a href="https://mulgadc.com"><img src="https://img.shields.io/badge/home-mulga-orange?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9IiNmZmYiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTE2LjcxOCA4Ljg5MWMtMS4yODUgMS4zNy0zLjE3OCAyLjMxNy00LjY5NSAzLjQ0LS44NTQuNjMtMy4wODkgMi4yNy0xLjYxIDMuMzQ0IDEuNzg4IDEuMjk4IDYuMjQzLjE2NCA3Ljc4NS0xLjI2Ljg0LS43NzUuODE0LTEuODIyLS4zMjgtMi4yNTktMS4yMzUtLjQ3Mi0yLjY2LS4xMTEtMy45MTMuMDg3LS4wNDIuMDA3LS4xMzEuMDU1LS4xMjMtLjAyLjUyMy0uMzM2Ljk5My0uNzUgMS41MDMtMS4xMDIuNDkyLS4zNCAxLjA5Ny0uODI3IDEuNy0uODM4IDEuODcxLS4wMzQgMy43OTkuODkgNC4yODcgMi44MTUuODExIDMuMjAzLTMuMDA2IDUuNzE1LTUuNzg0IDUuOTQybDEuNjE0LS43NDdjLjYwNS0uMzYgMS4yMTctLjczNCAxLjc1Mi0xLjE5Ni4xMzMtLjExNS4yMy0uMjYzLjM0Mi0uMzczLjAyNy0uMDI2LjMwMi0uMTQ0LjE0NC0uMTUtMS40NDEuOTQ1LTMuMTI3IDEuNTcyLTQuODEzIDEuOTMyLS41OC4xMjMtMS4xOTUuMjQyLTEuNzg1LjI1Ny4wMTUuMDguMDg3LjA2NC4xNC4wOC40NzYuMTU0IDEuMDIuMjQ1IDEuNTE2LjMyLjA2OC4wNTItLjAwNi4wNzQtLjA2LjA4MS0uNDQ4LjA1OC0uOTIzLjE0My0xLjM3LjE2Ni0xLjI3LjA2NC0yLjU1LS4wNjgtMy43NzctLjM4bC0uNjktMS45NTdjLS4wNi4wMDYtLjA2My4wNi0uMDc5LjEwMy0uMDYuMTctLjMwNSAxLjQxNy0uMzg3IDEuNDM1LS42Ni0uMi0xLjI1MS0uNjQ3LTEuNzM2LTEuMTMybDEuMTUtMi4wNi0xLjgzNSAxLjAxMWMtLjI1OC0uNTgzLS4zMDUtMS4yNDMtLjIxOS0xLjg3bDIuMzc1LTEuMThjLS43MzktLjA0OS0xLjQ4Ni4wNjgtMi4yMi4xNDUuMTI1LS4zNi4yNzctLjcxOC40NjItMS4wNTEuMDY3LS4xMjIuNDI2LS43MjEuNTItLjcyNC44Ni4xNjQgMS43ODYuMjQxIDIuNjQ4LjA3NGwtMS44Ny0uNzcxLS4wNjktLjA5M2MuMzgyLS4zNi43Ny0uNzE3IDEuMTk5LTEuMDI0LjgwNC4yMzQgMS42My40MjIgMi40NzMuNDMzTDkuMzUgOS4zNDJhNyA3IDAgMCAxIC41NjctLjQwMWMuMTYtLjEwMy42MDktLjQwMi43NzItLjM4LjY1LjIyMSAxLjMyNC4zNzggMi4wMS40MzMtLjMxMy0uMzI1LS45MDktLjU2NC0xLjIxLS44NjgtLjAzMy0uMDM0LS4wNTgtLjAzNi0uMDQzLS4wOTguNzg3LS40NTIgMS42NjItLjkwMSAyLjM0LTEuNTE3LjY5LS42MjkgMS40MjEtMS42NTYuOTI0LTIuNjA1LjU3My4xODIgMS4wNjcuOTA2IDEuMDU0IDEuNTEyLS4wMzQgMS42NzYtMS44MjIgMy4xNy0yLjk0MyA0LjIyMiAxLjczMi0uNzI4IDMuNzE0LTIuMjMgMy43MS00LjMwNS0uMDAzLTEuNjg4LTEuNTQtMi4zNjUtMi45OTMtMi41MThhMy4yIDMuMiAwIDAgMS0uMzg1IDEuMDg3Yy0uNDI4LjcxOS0xLjMwMiAxLjE2OC0xLjc1OCAxLjkxNS0uMzExLjUxLS4zNyAxLjE5NS0xLjAzMSAxLjM5LS4yNy4wOC0uNjE3LjA5My0uODk3LjA5NGwuNjE1LS4zMjVjLjY4OS0uNTA2LjY3Ny0xLjQyIDEuMDk5LTIuMS0uMDUtLjA3LS41NDUtLjItLjY2LS4yMjktLjUxLS4xMjUtMS4zNzUtLjI4NS0xLjg4Ni0uMjUtLjE1Ny4wMS0uODY5LjEyMS0uOTMuMjQyLS4wODguMTc3LjM0MS45My40NjggMS4xMDEuMDI1LjAzNS4wNzcuMDI2LjA4LjAzLjAyNC4wMzEuMDA3LjEwNS0uMDYuMDhhNSA1IDAgMCAxLS40MDQtLjI4M2MtLjUwMy0uMzg4LTEuMDc4LS45NzQtMS40OTktMS40NDctLjA2OC0uMTY2LS4xNi0uMzUuMDAyLS40ODcuODg4LS41NSAxLjc2OC0xLjEyNiAyLjY3LTEuNjUxIDIuNjcxLTEuNTU4IDUuNzExLTMuMzE4IDguMjY3LS40NjUgMi4xMTkgMi4zNjYgMS41MTQgNS4yMTItLjUxMiA3LjM3MnptLTguMjI0LTUuMzhjLjY5OS0uMTIyIDIuMDE4LjU3MiAyLjIzNS0uNDU2LjAyMS0uMS0uMDM2LS4xNTcuMDItLjI1NS4wNDMtLjA3My4yODYtLjI1LjM3LS4zMTguMjctLjIxNy41NzctLjM4Ny44NDItLjYxMi0xLjAyOS4xNjYtMi4wNjUuNzU2LTIuOTY0IDEuMjc3LS4xNDkuMDg2LS4zMS4xNzYtLjQ1MS4yNzMtLjAzNy4wMjUtLjA3NS0uMDA2LS4wNTMuMDltLTQuODMgMTAuODQ0Yy0xLjcxNSAxLjg4MS0xLjMyNSA0LjU3LjQ5NCA2LjIxNyAxLjgxMSAxLjY0MSA0LjY2IDIuMjIzIDcuMDQ4IDIuMTA4IDIuMTUyLS4xMDMgNC4zMzctLjgxMiA2LjQ2LS4wOTEuODI1LjI4IDEuNTQ2LjgwNSAyLjE2IDEuNDExLS4wODMtLjQtLjMyNC0uODE5LS41NTgtMS4xNTktMi4xMy0zLjA5NS02LjI3LTEuOTM1LTkuNDI2LTIuNTUzLTEuNzExLS4zMzUtMy40OTEtMS4xMTgtNC41MzMtMi41NjctLjkwMS0xLjI1My0xLjA0Mi0yLjczLS41OTUtNC4xOTQtLjA5MS0uMDktLjk1Mi43MjEtMS4wNS44MjhtNi4zNjYtOC42NjdjLS4zODIuMzM5LS43ODcuNjYtMS4yMTIuOTQ4bC0xLjIwNy41OWMxLjAyMi4wMzkgMi4wOC0uNTQ2IDIuNDItMS41MzciLz48L3N2Zz4=" alt="mulgadc.com"></a>
+</p>
 
-Viperblock combines an in-memory write buffer for fast acknowledgment, a write-ahead log on local NVMe for crash durability, and batched 4 MB chunk uploads to pluggable storage backends including S3-compatible object stores. Volumes are exposed as network block devices via an [nbdkit](https://gitlab.com/nbdkit/nbdkit) plugin, giving guest VMs a standard block device backed by durable, distributed storage.
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#run-an-nbd-volume">NBD usage</a> ·
+  <a href="#capabilities">Capabilities</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="#storage-backends">Storage Backends</a> ·
+  <a href="#spinifex-integration">Spinifex Integration</a> ·
+  <a href="#development">Development</a> ·
+  <a href="https://docs.mulgadc.com">Docs</a>
+</p>
 
-For full architectural details, binary formats, and data flow diagrams, see **[DESIGN.md](DESIGN.md)**.
+---
 
-## Key Features
+# Viperblock: WAL-backed block storage for QEMU and KVM
 
-- **WAL-backed durability** — writes are acknowledged from memory, flushed to a write-ahead log on fast local storage, then consolidated into 4 MB chunks on the backend
-- **Sharded WAL** — 16 independent WAL shards eliminate write lock contention across concurrent block writes
-- **Extent-based block mapping** — inspired by ext4 extents, consecutive blocks are merged into single index entries for efficient lookups
-- **O(1) block lookups** — 16-way sharded `UnifiedBlockStore` tracks every block's lifecycle state with per-shard locking
-- **Snapshots and clones** — point-in-time snapshots with copy-on-write clone support (no data duplication)
-- **Pluggable backends** — local filesystem, in-memory (testing), or S3-compatible storage ([Predastore](https://github.com/mulgadc/predastore), AWS S3)
-- **NBD integration** — nbdkit plugin exposes volumes as network block devices for QEMU/KVM
-- **LRU caching** — configurable cache sized by block count or system memory percentage
-- **Arena allocator** — bump-pointer allocator with 4 MB slabs reduces GC pressure on the write path
+Viperblock is a block-storage engine for virtual machines running on QEMU and
+KVM. It provides durable writes, snapshots, caching and pluggable storage
+backends through an NBD interface.
 
-## Architecture Overview
+Viperblock is the storage engine used by Spinifex for EBS-compatible volumes.
 
-```
-QEMU/KVM VM ──── NBD Protocol ────▶ nbdkit + viperblock plugin
-                                              │
-                                    ┌─────────▼───────────┐
-                                    │  Viperblock Engine  │
-                                    │                     │
-                                    │  Write Buffer       │
-                                    │       │             │
-                                    │       ▼             │
-                                    │  WAL (NVMe)         │
-                                    │       │             │
-                                    │       ▼             │
-                                    │  4 MB Chunks        │
-                                    │       │             │
-                                    │       ▼             │
-                                    │  Storage Backend    │
-                                    │  (File/S3/Memory)   │
-                                    └─────────────────────┘
-```
-
-See [DESIGN.md](DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
-
-## Part of the Spinifex Stack
-
-Viperblock is one of three components in the [Spinifex](https://github.com/mulgadc/spinifex) AWS-compatible infrastructure platform:
-
-| Component | Role | Repository |
-|-----------|------|------------|
-| **[Spinifex](https://github.com/mulgadc/spinifex)** | VM orchestration (EC2-compatible) | [mulgadc/spinifex](https://github.com/mulgadc/spinifex) |
-| **Viperblock** | Block storage (EBS-compatible) | [mulgadc/viperblock](https://github.com/mulgadc/viperblock) |
-| **[Predastore](https://github.com/mulgadc/predastore)** | Object storage (S3-compatible) | [mulgadc/predastore](https://github.com/mulgadc/predastore) |
-
-When deployed with Spinifex, Viperblock subscribes to NATS topics (`ebs.createvolume`, `ebs.mount`, `ebs.attachvolume`, etc.) for EBS-compatible volume lifecycle management. The Spinifex daemon sends a mount request; Viperblock starts nbdkit and returns an NBD URI that QEMU uses to back a virtual disk.
-
-Viperblock can also be used standalone for any application that needs durable block storage with S3 as a backend tier.
-
-## Getting Started
+## Quick Start
 
 ### Dependencies
 
@@ -72,30 +45,22 @@ cd viperblock
 make build
 ```
 
-This produces:
-- `./bin/sfs` — Simple File System demo
-- `./bin/vblock` — Volume management CLI
-- `./lib/nbdkit-viperblock-plugin.so` — NBD plugin for nbdkit
+The build produces:
 
-### Run Tests
+- `bin/sfs` — Simple File System demonstration
+- `bin/vblock` — volume-management CLI
+- `lib/nbdkit-viperblock-plugin.so` — nbdkit plugin
 
-```bash
-make test        # Unit tests
-make preflight   # Full CI checks (format, vet, security, tests, race detector)
-```
+## Run an NBD volume
 
-## Usage
-
-### NBD (Production)
-
-Viperblock volumes are served to QEMU/KVM via nbdkit. When used with Spinifex, this is managed automatically via NATS. For standalone use:
+Viperblock volumes are served to QEMU/KVM through nbdkit. Spinifex manages this automatically; for standalone use:
 
 ```bash
 nbdkit --filter=blocksize ./lib/nbdkit-viperblock-plugin.so \
-    volume=my-volume \
-    size=$((10*1024*1024*1024)) \
-    base_dir=/data/viperblock \
-    cache_size=20
+  volume=my-volume \
+  size=$((10*1024*1024*1024)) \
+  base_dir=/data/viperblock \
+  cache_size=20
 ```
 
 Plugin parameters:
@@ -113,15 +78,41 @@ Plugin parameters:
 | `shardwal` | Enable sharded WAL (`true`/`false`) |
 | `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `false`) |
 
-### SFS Demo
+## Capabilities
 
-The Simple File System (SFS) demo demonstrates Viperblock with a simulated filesystem:
+- Durable write-ahead logging
+- Sixteen sharded WAL writers
+- Extent-based allocation and constant-time lookup
+- Copy-on-write snapshots and clones
+- File, memory and S3-compatible storage backends
+- NBD access through nbdkit
+- LRU read caching
+- Arena-based memory allocation
+- CRC32 integrity checks
+
+## Architecture
+
+<p align="center">
+  <img src=".github/assets/platform.svg" alt="Viperblock: QEMU and KVM workloads on top, fast block I/O through NBD and an NVMe-backed write-ahead log, with durable volumes stored locally or in S3-compatible object storage." width="900">
+</p>
+
+See [DESIGN.md](DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
+
+## Storage Backends
+
+| Backend | Intended use |
+| --- | --- |
+| Memory | Tests and temporary volumes |
+| Filesystem | Local development and standalone storage |
+| S3-compatible | Distributed or remote persistent storage |
+
+### SFS Demonstration
 
 ```bash
-# File backend (development)
+# File backend
 ./bin/sfs -btype file -dir /path/to/data -vol my-volume -voldata /tmp/vb
 
-# S3 backend (with Predastore or AWS S3)
+# S3-compatible backend
 AWS_HOST="https://localhost:8443/" \
 AWS_BUCKET="viperblock" \
 AWS_ACCESS_KEY="EXAMPLEKEY" \
@@ -156,6 +147,28 @@ A summary of the key design choices. See [DESIGN.md](DESIGN.md) for the full tre
 
 **CRC32 checksums everywhere.** Every WAL record includes a CRC32 checksum validated during replay and consolidation. Corrupt records are detected before they reach chunk storage.
 
+## Spinifex Integration
+
+Within Spinifex, Viperblock handles EBS-compatible volume storage and snapshots.
+It subscribes to volume-lifecycle NATS subjects, starts nbdkit for an attached
+volume, and returns an NBD URI for QEMU.
+
+| Component | Role |
+|-----------|------|
+| **[Spinifex](https://github.com/mulgadc/spinifex)** | VM orchestration (EC2-compatible) |
+| **Viperblock** | Block storage (EBS-compatible) |
+| **[Predastore](https://github.com/mulgadc/predastore)** | Object storage (S3-compatible) |
+| **[Northstar](https://github.com/mulgadc/northstar)** | Authoritative DNS (Route53-compatible) |
+
+Viperblock can also be used standalone for any application that needs durable block storage with S3 as a backend tier.
+
+## Development
+
+```bash
+make test
+make preflight
+```
+
 ## Research
 
 The following papers informed the design of Viperblock:
@@ -164,6 +177,12 @@ The following papers informed the design of Viperblock:
 - Zhou, D. et al. "Enabling high-performance and secure userspace NVM file systems with the trio architecture." *SOSP 2023.* https://doi.org/10.1145/3600006.3613171
 - Li, H. et al. "Ursa: Hybrid block storage for cloud-scale virtual disks." *EuroSys 2019.* https://doi.org/10.1145/3302424.3303967
 
+## Trademarks
+
+Amazon Web Services, AWS and Amazon EBS are trademarks of Amazon.com, Inc. or
+its affiliates. Viperblock is not affiliated with or endorsed by Amazon Web
+Services.
+
 ## License
 
-Viperblock is licensed under the GNU Affero General Public License v3.0 (AGPLv3). See [LICENSE](LICENSE) for the full text.
+Viperblock is licensed under the [GNU Affero General Public License v3.0 (AGPLv3)](LICENSE) license.
