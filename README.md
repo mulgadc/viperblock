@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#key-features">Key Features</a> ·
-  <a href="#architecture-overview">Architecture Overview</a> ·
+  <a href="#architecture">Architecture</a> ·
   <a href="#spinifex-compatible">Spinifex Compatible</a> ·
   <a href="#getting-started">Getting Started</a> ·
   <a href="#usage">Usage</a> ·
@@ -39,27 +39,11 @@ For full architectural details, binary formats, and data flow diagrams, see **[D
 - **LRU caching** — configurable cache sized by block count or system memory percentage
 - **Arena allocator** — bump-pointer allocator with 4 MB slabs reduces GC pressure on the write path
 
-## Architecture Overview
+## Architecture
 
-```
-QEMU/KVM VM ──── NBD Protocol ────▶ nbdkit + viperblock plugin
-                                              │
-                                    ┌─────────▼───────────┐
-                                    │  Viperblock Engine  │
-                                    │                     │
-                                    │  Write Buffer       │
-                                    │       │             │
-                                    │       ▼             │
-                                    │  WAL (NVMe)         │
-                                    │       │             │
-                                    │       ▼             │
-                                    │  4 MB Chunks        │
-                                    │       │             │
-                                    │       ▼             │
-                                    │  Storage Backend    │
-                                    │  (File/S3/Memory)   │
-                                    └─────────────────────┘
-```
+<p align="center">
+  <img src=".github/assets/platform.svg" alt="Viperblock: QEMU and KVM workloads on top, fast block I/O through NBD and an NVMe-backed write-ahead log, with durable volumes stored locally or in S3-compatible object storage." width="900">
+</p>
 
 See [DESIGN.md](DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
 
