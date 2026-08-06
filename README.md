@@ -23,9 +23,7 @@
 
 # Viperblock: WAL-backed block storage for QEMU and KVM
 
-Viperblock is a block-storage engine for virtual machines running on QEMU and
-KVM. It provides durable writes, snapshots, caching and pluggable storage
-backends through an NBD interface.
+Viperblock is a block-storage engine for virtual machines running on QEMU and KVM. It provides durable writes, snapshots, caching and pluggable storage backends through an NBD interface.
 
 Viperblock is the storage engine used by Spinifex for EBS-compatible volumes.
 
@@ -149,9 +147,7 @@ A summary of the key design choices. See [DESIGN.md](DESIGN.md) for the full tre
 
 ## Spinifex Integration
 
-Within Spinifex, Viperblock handles EBS-compatible volume storage and snapshots.
-It subscribes to volume-lifecycle NATS subjects, starts nbdkit for an attached
-volume, and returns an NBD URI for QEMU.
+Within Spinifex, Viperblock handles EBS-compatible volume storage and snapshots. It subscribes to volume-lifecycle NATS subjects, starts nbdkit for an attached volume, and returns an NBD URI for QEMU.
 
 | Component | Role |
 |-----------|------|
@@ -179,9 +175,7 @@ The following papers informed the design of Viperblock:
 
 ## Trademarks
 
-Amazon Web Services, AWS and Amazon EBS are trademarks of Amazon.com, Inc. or
-its affiliates. Viperblock is not affiliated with or endorsed by Amazon Web
-Services.
+Amazon Web Services, AWS and Amazon EBS are trademarks of Amazon.com, Inc. or its affiliates. Viperblock is not affiliated with or endorsed by Amazon Web Services.
 
 ## License
 
