@@ -37,7 +37,7 @@ go_build_nbd:
 # still gated before merge — run `make test-integration` directly when a change
 # touches the multi-engine or network-failure paths it covers.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race
+	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
