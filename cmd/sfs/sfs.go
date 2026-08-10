@@ -131,7 +131,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Creating Viperblock backend with btype, config", *btype, cfg)
 	vb, err := viperblock.New(&viperblock.VB{
 		VolumeName:        *vol,
 		VolumeSize:        *volsize,
