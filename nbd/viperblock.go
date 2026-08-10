@@ -315,7 +315,9 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		GCEnabled: gc_enabled,
 	}
 
-	slog.Info("Creating Viperblock backend with btype, config", cfg)
+	// Credentials on cfg are deliberately not logged.
+	slog.Info("creating viperblock backend", "backend", "s3", "volume", cfg.VolumeName,
+		"bucket", cfg.Bucket, "region", cfg.Region, "endpoint", cfg.Host)
 	vb, err := viperblock.New(&vbconfig, "s3", cfg)
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}

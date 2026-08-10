@@ -120,6 +120,9 @@ func main() {
 			SecretKey: aws_secret_key,
 			Host:      aws_host,
 		}
+		// Credentials on the config are deliberately not logged.
+		slog.Info("creating viperblock backend", "backend", *btype, "volume", *vol,
+			"bucket", aws_bucket, "region", aws_region, "endpoint", aws_host)
 	}
 
 	mkey, err := viperblock.LoadMasterKeyFromFlagOrEnv(*encryptionKeyFile)
