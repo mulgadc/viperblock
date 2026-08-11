@@ -547,8 +547,8 @@ func (vb *VB) checkSnapshotOwnership(snapshotID string, snap *SnapshotState) err
 		return fmt.Errorf("copy snapshot: source %s has invalid SourceVolumeNameHash", snapshotID)
 	}
 	if !bytes.Equal(uuid, vb.VolumeUUID[:]) || !bytes.Equal(nameHash, vb.volumeNameHash[:]) {
-		return fmt.Errorf("copy snapshot: source %s belongs to volume %q, not %q — copy must run on the snapshot's own volume so StateSeqNum stays unique in its nonce subspace",
-			snapshotID, snap.SourceVolumeName, vb.VolumeName)
+		return fmt.Errorf("%w: copy snapshot: source %s belongs to volume %q, not %q — copy must run on the snapshot's own volume so StateSeqNum stays unique in its nonce subspace",
+			ErrSnapshotVolumeMismatch, snapshotID, snap.SourceVolumeName, vb.VolumeName)
 	}
 	return nil
 }

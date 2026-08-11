@@ -964,6 +964,12 @@ var ErrStateNotFound = errors.New("viperblock: state not found")
 // retry with backoff; the state may become available shortly.
 var ErrStateBackendUnavailable = errors.New("viperblock: state backend unavailable")
 
+// ErrSnapshotVolumeMismatch is returned when an operation that must run on a
+// snapshot's own source volume is attempted from a different volume. It is a
+// caller error — the request named the wrong volume — so callers should
+// classify it as invalid input rather than as a fault in this volume.
+var ErrSnapshotVolumeMismatch = errors.New("viperblock: snapshot belongs to another volume")
+
 // ErrEncryptionMismatch is returned when the runtime master key and the
 // persisted VBState disagree on whether the volume is encrypted, when the
 // KeyFingerprint on disk does not match the loaded key, or when an encrypted

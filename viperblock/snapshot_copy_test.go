@@ -136,6 +136,7 @@ func TestCopySnapshotMeta_RejectsForeignVolume(t *testing.T) {
 
 	_, err = other.CopySnapshotMeta("snap-copy-foreign-src", "snap-copy-foreign-dst")
 	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSnapshotVolumeMismatch, "callers classify this as a caller error, so it must be matchable without string matching")
 	assert.Contains(t, err.Error(), "copy must run on the snapshot's own volume")
 
 	_, readErr := other.Backend.ReadFrom("snap-copy-foreign-dst", types.FileTypeBlockCheckpoint, 0, 0, 0)
