@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.4
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.34
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.0
-	github.com/aws/smithy-go v1.27.6
+	github.com/aws/smithy-go v1.27.7
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mulgadc/predastore v1.16.0
 	github.com/stretchr/testify v1.11.1
