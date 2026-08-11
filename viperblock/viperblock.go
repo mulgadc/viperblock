@@ -459,6 +459,12 @@ type VB struct {
 	gcFloor      atomic.Uint64
 	gcFloorReady atomic.Bool
 
+	// streamNextBlock is the block a purely sequential reader would ask for
+	// next. Readahead fires only on a request that starts exactly there, so a
+	// random reader never pays for it. Deliberately racy: a wrong guess costs
+	// a wider fetch, never a wrong answer.
+	streamNextBlock atomic.Uint64
+
 	// gcSnapshotSafe/gcSnapshotChecked cache ensureGCSnapshotSafe's result:
 	// whether any snapshot already references this volume. Cached for the
 	// process lifetime once checked; an error leaves gcSnapshotChecked false
@@ -1307,6 +1313,8 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750); err != nil {
 		return nil, fmt.Errorf("failed to create checkpoint directory: %w", err)
 	}
+
+	vb.streamNextBlock.Store(noStreamPosition)
 
 	return vb, nil
 }
@@ -4786,6 +4794,108 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 	return nil
 }
 
+// noStreamPosition marks "no read has happened yet", so the first read of a
+// volume is not mistaken for the continuation of a stream.
+const noStreamPosition = ^uint64(0)
+
+// readAheadBlocks caps how far a sequential fetch is widened past what was
+// asked for: 256 blocks is 1 MiB at the default block size, which turns a
+// 64 KiB stream into one round trip per sixteen requests. The chunk bounds it
+// too, so the widest possible fetch is one whole chunk.
+const readAheadBlocks = 256
+
+// extendRunForReadahead grows a run forward through the same chunk, returning
+// the trailing blocks that could be fetched in the same round trip and their
+// SeqNums. It stops at the first block that is unmapped, lands in a different
+// chunk, or is not contiguous within this one — a discontinuity means another
+// round trip, which is what readahead exists to avoid.
+func (vb *VB) extendRunForReadahead(cb ConsecutiveBlock) (extra int, seqNums []uint64) {
+	// Never prefetch more than the cache can hold: blocks fetched only to be
+	// evicted before the request that wanted them are read, decrypted and
+	// thrown away. Volumes opened with a small cache get a small readahead.
+	limit := min(readAheadBlocks, vb.Cache.Config.Size)
+
+	stride := vb.blockStride()
+	nextBlock := cb.StartBlock + uint64(cb.NumBlocks)
+	nextOffset := cb.ObjectOffset + uint32(cb.NumBlocks)*stride
+
+	for extra < limit {
+		objectID, objectOffset, seqNum, err := vb.LookupBlockToObject(nextBlock)
+		if err != nil || objectID != cb.ObjectID || objectOffset != nextOffset {
+			break
+		}
+		seqNums = append(seqNums, seqNum)
+		extra++
+		nextBlock++
+		nextOffset += stride
+	}
+	return extra, seqNums
+}
+
+// readRun fetches one coalesced run into dst, optionally widened by extra
+// trailing blocks which are cached rather than returned. dst must be exactly
+// cb.NumBlocks blocks long.
+func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, dst []byte) error {
+	fetchBlocks := int(cb.NumBlocks) + extra
+	length := utils.SafeIntToUint32(fetchBlocks) * vb.blockStride()
+
+	objectID := cb.ObjectID
+	if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, l uint32) ([]byte, error) {
+		return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, l)
+	}); err != nil {
+		return err
+	}
+
+	blockData, err := vb.Backend.ReadCtx(ctx, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, length)
+	if err != nil {
+		return err
+	}
+
+	// Without readahead the plaintext lands straight in the caller's buffer;
+	// with it, the widened run needs somewhere to put the blocks the caller
+	// did not ask for.
+	plain := dst
+	if extra > 0 {
+		plain = make([]byte, fetchBlocks*int(vb.BlockSize))
+	}
+
+	if vb.EncryptionEnabled {
+		wide := cb
+		wide.NumBlocks = utils.SafeIntToUint16(fetchBlocks)
+		if extra > 0 {
+			wide.SeqNums = append(slices.Clone(cb.SeqNums), extraSeqNums...)
+		}
+		if err := vb.openChunkRun(blockData, wide, vb.VolumeUUID, vb.volumeNameHash, plain); err != nil {
+			return err
+		}
+	} else {
+		// openChunkRun length-checks the encrypted path; the cleartext path
+		// must not be weaker. A short body here would leave the tail of dst
+		// zero-filled and then get cached as valid.
+		if len(blockData) != int(length) {
+			return fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
+				types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, fetchBlocks, len(blockData), length)
+		}
+		copy(plain, blockData)
+	}
+
+	if extra == 0 {
+		return nil
+	}
+
+	blockSize := int(vb.BlockSize)
+	copy(dst, plain[:int(cb.NumBlocks)*blockSize])
+
+	// Keyed by the SeqNum the block map held when the run was planned, so a
+	// block rewritten since this fetch simply misses rather than serving stale
+	// plaintext.
+	for k := range extra {
+		block := int(cb.NumBlocks) + k
+		vb.Cache.put(cb.StartBlock+utils.SafeIntToUint64(block), extraSeqNums[k], plain[block*blockSize:(block+1)*blockSize])
+	}
+	return nil
+}
+
 // checkChunkMagic preflights the first 4 bytes of a chunk file before the
 // body decrypt path runs, so a pre-encryption volume opened under
 // EncryptionEnabled=true fails with a dedicated, actionable
@@ -5729,50 +5839,27 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		i = j
 	}
 
-	// Per-block on-disk stride: encrypted chunks add a 16-byte GCM tag after
-	// each ciphertext block; unencrypted chunks stay at BlockSize.
-	stride := vb.BlockSize
-	if vb.EncryptionEnabled {
-		stride += 16
-	}
+	// Readahead applies to the final run only, and only when this request
+	// continues where the last one stopped. There is no point widening a fetch
+	// on a volume whose cache is disabled: the extra blocks would be read and
+	// then dropped.
+	readAhead := vb.Cache.Config.Size > 0 && vb.streamNextBlock.Load() == block
+	vb.streamNextBlock.Store(block + blockRequests)
 
 	// Next, read our consecutive blocks from the backend
-	for _, cb := range consecutiveBlocksToRead {
+	for idx, cb := range consecutiveBlocksToRead {
 		vb.logger().Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "offsetStart", cb.OffsetStart, "offsetEnd", cb.OffsetEnd, "objectID", cb.ObjectID, "objectOffset", cb.ObjectOffset)
-
-		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
-		objectID := cb.ObjectID
-		if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, length)
-		}); err != nil {
-			return nil, err
+		extra, extraSeqNums := 0, []uint64(nil)
+		if readAhead && idx == len(consecutiveBlocksToRead)-1 {
+			extra, extraSeqNums = vb.extendRunForReadahead(cb)
 		}
 
-		blockData, err := vb.Backend.ReadCtx(ctx, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
-		if err != nil {
+		if err := vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end]); err != nil {
 			return nil, err
-		}
-
-		vb.logger().DebugContext(ctx, "[READ] COPYING BLOCK DATA:", "start", start, "end", end)
-		vb.logger().DebugContext(ctx, "[READ] DATA:", "data len", len(data))
-
-		if vb.EncryptionEnabled {
-			if err := vb.openChunkRun(blockData, cb, vb.VolumeUUID, vb.volumeNameHash, data[start:end]); err != nil {
-				return nil, err
-			}
-		} else {
-			// openChunkRun length-checks the encrypted path; the cleartext
-			// path must not be weaker. A short body here would leave the tail
-			// of data[start:end] zero-filled and then get cached as valid.
-			if len(blockData) != int(consecutiveBlockOffset) {
-				return nil, fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
-					types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
-			}
-			copy(data[start:end], blockData)
 		}
 	}
 
@@ -6132,6 +6219,12 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 	data = make([]byte, blockLen)
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
+	// Readahead fires only where this request continues the previous one, and
+	// only where the extra blocks have somewhere to live. Recorded before any
+	// early return so a failed read still advances the stream position.
+	readAhead := vb.Cache.Config.Size > 0 && vb.streamNextBlock.Load() == block
+	vb.streamNextBlock.Store(block + blockRequests)
+
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
 	ancestorConsBlocks := make([]ConsecutiveBlocks, len(vb.ancestors))
@@ -6251,7 +6344,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 
 	// Fetch consecutive blocks from our own backend
 	if len(consecutiveBlocks) > 0 {
-		err = vb.fetchConsecutiveBlocksFromBackend(ctx, consecutiveBlocks, data)
+		err = vb.fetchConsecutiveBlocksFromBackend(ctx, consecutiveBlocks, data, readAhead)
 		if err != nil {
 			return nil, err
 		}
@@ -6283,7 +6376,10 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 
 // fetchConsecutiveBlocksFromBackend fetches blocks from backend storage
 // Used by both legacy and BlockStore read paths.
-func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte) error {
+// readAhead widens the final run past what was asked for; see readRun. Only
+// the own-volume fetch sets it — a snapshot base or ancestor layer is read
+// through the same helper but is not where a guest's stream lives.
+func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte, readAhead bool) error {
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	for i := 0; i < len(consecutiveBlocks); {
 		// Extend the run while blocks stay contiguous within one chunk, then
@@ -6318,42 +6414,19 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 		i = j
 	}
 
-	stride := vb.BlockSize
-	if vb.EncryptionEnabled {
-		stride += 16
-	}
-
-	for _, cb := range consecutiveBlocksToRead {
+	for idx, cb := range consecutiveBlocksToRead {
 		vb.logger().DebugContext(ctx, "[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
 
-		consecutiveBlockOffset := uint32(cb.NumBlocks) * stride
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
-		objectID := cb.ObjectID
-		if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, length)
-		}); err != nil {
-			return err
+		extra, extraSeqNums := 0, []uint64(nil)
+		if readAhead && idx == len(consecutiveBlocksToRead)-1 {
+			extra, extraSeqNums = vb.extendRunForReadahead(cb)
 		}
 
-		blockData, err := vb.Backend.ReadCtx(ctx, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
-		if err != nil {
+		if err := vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end]); err != nil {
 			return err
-		}
-
-		if vb.EncryptionEnabled {
-			if err := vb.openChunkRun(blockData, cb, vb.VolumeUUID, vb.volumeNameHash, data[start:end]); err != nil {
-				return err
-			}
-		} else {
-			// See vb.read: the cleartext path needs the same length check the
-			// encrypted path gets from openChunkRun.
-			if len(blockData) != int(consecutiveBlockOffset) {
-				return fmt.Errorf("%w: chunk %d offset %d run %d: got %d bytes, expected %d",
-					types.ErrShortRead, cb.ObjectID, cb.ObjectOffset, cb.NumBlocks, len(blockData), consecutiveBlockOffset)
-			}
-			copy(data[start:end], blockData)
 		}
 	}
 
