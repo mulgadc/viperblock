@@ -276,8 +276,14 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 		},
 	})
 
+	// Reachability probe: prove the bucket exists, the credentials sign and
+	// the endpoint answers. Scoped to this volume because an unscoped list is
+	// O(bucket) against predastore, which resolves object metadata per key and
+	// truncates only the reported count. An empty result is still a success.
 	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(backend.config.Bucket),
+		Bucket:  aws.String(backend.config.Bucket),
+		Prefix:  aws.String(backend.config.VolumeName + "/"),
+		MaxKeys: aws.Int32(1),
 	})
 
 	if err != nil {
