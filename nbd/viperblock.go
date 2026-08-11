@@ -50,6 +50,10 @@ type ViperBlockPlugin struct {
 type ViperBlockConnection struct {
 	nbdkit.Connection
 	vb *viperblock.VB
+	// readonly mirrors the flag nbdkit passes to Open (set by its -r). The
+	// write paths refuse when it is set, so a read-only export stays read-only
+	// even for a client that ignores the transmission flag.
+	readonly bool
 }
 
 // activeVB holds the VB for the current open connection. CanMultiConn returns
@@ -408,7 +412,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	activeVB = vb
 	snapshotListenerDone = startSnapshotListener(vb, filepath.Join(base_dir, volume, "snapshot.sock"))
 	success = true
-	return &ViperBlockConnection{vb: vb}, nil
+	return &ViperBlockConnection{vb: vb, readonly: readonly}, nil
 }
 
 // startSnapshotListener opens a unix socket that spinifex connects to before
@@ -504,13 +508,17 @@ func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) er
 // Note that CanWrite is required in golang plugins, otherwise PWrite
 // will never be called.
 func (c *ViperBlockConnection) CanWrite() (bool, error) {
-	return true, nil
+	return !c.readonly, nil
 }
 
 func (c *ViperBlockConnection) PWrite(buf []byte, offset uint64,
 	flags uint32) error {
 
 	//slog.Info("PWRITE:", "len", len(buf), "offset", offset)
+
+	if c.readonly {
+		return nbdkit.PluginError{Errmsg: "write to a read-only export", Errno: syscall.EROFS}
+	}
 
 	data := make([]byte, len(buf))
 
@@ -525,12 +533,16 @@ func (c *ViperBlockConnection) PWrite(buf []byte, offset uint64,
 }
 
 func (c *ViperBlockConnection) CanZero() (bool, error) {
-	return true, nil
+	return !c.readonly, nil
 }
 
 func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) error {
 
 	slog.Debug("ZERO:", "len", count, "offset", offset)
+
+	if c.readonly {
+		return nbdkit.PluginError{Errmsg: "zero on a read-only export", Errno: syscall.EROFS}
+	}
 
 	if count == 0 {
 		return nil
@@ -548,12 +560,16 @@ func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) e
 }
 
 func (c *ViperBlockConnection) CanTrim() (bool, error) {
-	return true, nil
+	return !c.readonly, nil
 }
 
 func (c *ViperBlockConnection) Trim(count uint32, offset uint64, flags uint32) error {
 
 	slog.Debug("TRIM:", "len", count, "offset", offset)
+
+	if c.readonly {
+		return nbdkit.PluginError{Errmsg: "trim on a read-only export", Errno: syscall.EROFS}
+	}
 
 	return nil
 }
