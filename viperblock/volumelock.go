@@ -13,10 +13,20 @@ import (
 // already holds the volume's exclusive lock.
 var ErrVolumeLocked = errors.New("viperblock: volume is locked by another opener")
 
-// volumeLockFileName is a fixed sibling of config.json under the volume's
-// local directory. Its only purpose is to be flock'd; contents are never
-// read or written.
-const volumeLockFileName = ".viperblock.lock"
+// volumeLockFilePrefix names the per-volume lock file, which sits in the base
+// directory rather than inside the volume's own. Close removes the volume
+// directory and only then releases, so a lock file inside it would be
+// unlinked while still held: the next opener would create a fresh file at the
+// same path and flock a different inode, and both would believe they held the
+// volume exclusively. Contents are never read or written.
+const volumeLockFilePrefix = ".viperblock-"
+
+const volumeLockFileSuffix = ".lock"
+
+// volumeLockPath is where the lock file for one volume lives.
+func volumeLockPath(baseDir, volume string) string {
+	return filepath.Join(baseDir, volumeLockFilePrefix+volume+volumeLockFileSuffix)
+}
 
 // AcquireVolumeLock takes an exclusive, non-blocking flock on a per-volume
 // lock file, admitting only one caller through New..OpenWAL at a time. This
@@ -56,12 +66,11 @@ func AcquireVolumeLockWait(baseDir, volume string, wait time.Duration) (*os.File
 }
 
 func tryAcquireVolumeLock(baseDir, volume string) (*os.File, error) {
-	dir := filepath.Join(baseDir, volume)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return nil, fmt.Errorf("AcquireVolumeLock: create volume dir %s: %w", dir, err)
+	if err := os.MkdirAll(baseDir, 0750); err != nil {
+		return nil, fmt.Errorf("AcquireVolumeLock: create base dir %s: %w", baseDir, err)
 	}
 
-	path := filepath.Join(dir, volumeLockFileName)
+	path := volumeLockPath(baseDir, volume)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("AcquireVolumeLock: open %s: %w", path, err)

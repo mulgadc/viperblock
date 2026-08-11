@@ -3,6 +3,7 @@ package viperblock
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -156,6 +157,27 @@ func TestAcquireVolumeLockWait_ExpiresWhileHeld(t *testing.T) {
 	require.Error(t, err, "a lock held for the whole wait must not be handed out")
 	assert.ErrorIs(t, err, ErrVolumeLocked)
 	assert.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond, "must have waited the full bound before giving up")
+}
+
+// TestAcquireVolumeLock_SurvivesTheHolderRemovingItsVolumeDirectory pins the
+// ordering that makes the lock mean anything during handover. Close removes
+// the volume's local directory and only then releases, so if the lock file
+// lived inside that directory the holder would unlink it mid-close, an
+// arriving opener would create a fresh file at the same path, and both would
+// hold an exclusive lock on different inodes.
+func TestAcquireVolumeLock_SurvivesTheHolderRemovingItsVolumeDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := AcquireVolumeLock(dir, "vol-1")
+	require.NoError(t, err)
+	defer func() { _ = ReleaseVolumeLock(first) }()
+
+	// What RemoveLocalFiles does at the end of Close, while the lock is held.
+	require.NoError(t, os.RemoveAll(filepath.Join(dir, "vol-1")))
+
+	_, err = AcquireVolumeLock(dir, "vol-1")
+	require.Error(t, err, "a second opener was admitted while the first still held the volume")
+	assert.ErrorIs(t, err, ErrVolumeLocked)
 }
 
 // TestReleaseVolumeLock_NilIsNoOp lets every call site defer
