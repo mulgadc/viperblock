@@ -3912,6 +3912,12 @@ func (vb *VB) numberedCheckpointHighWater(ctx context.Context) (highWater uint64
 		return 0, false, err
 	}
 
+	return vb.checkpointHighWater(data)
+}
+
+// checkpointHighWater returns the highest chunk ObjectID a serialised block
+// checkpoint references. ok is false when it references none.
+func (vb *VB) checkpointHighWater(data []byte) (highWater uint64, ok bool, err error) {
 	haveObject := false
 	walkErr := walkBlockCheckpoint(data, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
 		if !haveObject || block.ObjectID > highWater {
@@ -3925,11 +3931,31 @@ func (vb *VB) numberedCheckpointHighWater(ctx context.Context) (highWater uint64
 	return highWater, haveObject, nil
 }
 
+// primeGCFloor caches the GC floor from a numbered checkpoint the caller has
+// already fetched, sparing ensureGCFloor a second read of the same object.
+// Only ever called with bytes read from the backend: the local copy is not
+// guaranteed to match it, and a floor below the backend checkpoint's would
+// let GC delete a chunk that checkpoint depends on.
+func (vb *VB) primeGCFloor(data []byte) {
+	high, ok, err := vb.checkpointHighWater(data)
+	if err != nil {
+		// Leave it unprimed rather than cache a bad floor; ensureGCFloor
+		// re-reads and reports the failure itself.
+		return
+	}
+	floor := uint64(0)
+	if ok {
+		floor = high + 1
+	}
+	vb.gcFloor.Store(floor)
+	vb.gcFloorReady.Store(true)
+}
+
 // ensureGCFloor lazily computes and caches the GC floor: one past the
 // highest chunk ObjectID referenced by the current numbered checkpoint, so
 // GC never deletes an object that checkpoint depends on if the live
-// checkpoint becomes unreadable. Cached for the VB lifetime — numbered
-// checkpoints are only rewritten at Close/RecoverLocalWALs.
+// checkpoint becomes unreadable. Cached for the VB lifetime, and may already
+// have been primed by LoadBlockStateCtx from the same object.
 func (vb *VB) ensureGCFloor(ctx context.Context) uint64 {
 	if vb.gcFloorReady.Load() {
 		return vb.gcFloor.Load()
@@ -4310,17 +4336,22 @@ func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 	// Step 1. Validate the local persistent disk contains the state
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))
 
+	wallNum := vb.BlockToObjectWAL.WallNum.Load()
 	_, err = os.Stat(filename)
 	if err != nil {
 		vb.logger().InfoContext(ctx, "No state found in local file, using backend state", "error", err)
 
 		// Open the latest checkpoint from the backend
-		checkpoint, err = vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), 0, 0)
+		checkpoint, err = vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpoint, wallNum, 0, 0)
 
 		if err != nil {
 			// If no file found, volume is empty, return nil
 			return nil
 		}
+
+		// This is the same object, at the same WallNum, that the GC floor is
+		// derived from. Cache it now rather than fetch it again on the sweep.
+		vb.primeGCFloor(checkpoint)
 	} else {
 		checkpoint, err = os.ReadFile(filename)
 		if err != nil {
