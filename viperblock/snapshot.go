@@ -453,10 +453,8 @@ func (vb *VB) CopySnapshotMeta(srcSnapshotID, dstSnapshotID string) (*SnapshotSt
 		return nil, fmt.Errorf("copy snapshot: source %s config declares SnapshotID %q", srcSnapshotID, src.SnapshotID)
 	}
 
-	if vb.EncryptionEnabled {
-		if err := vb.checkSnapshotOwnership(srcSnapshotID, src); err != nil {
-			return nil, err
-		}
+	if err := vb.checkSnapshotOwnership(srcSnapshotID, src); err != nil {
+		return nil, err
 	}
 
 	// Read the source checkpoint before anything is minted or written, so a
@@ -537,7 +535,16 @@ func (vb *VB) CopySnapshotMeta(srcSnapshotID, dstSnapshotID string) (*SnapshotSt
 // of, by comparing the persisted source identity against our own. The copy
 // seals in that volume's nonce subspace under its nextStateSeqNum counter, so
 // sealing from any other volume risks reusing a nonce the owner has issued.
+// The name comparison holds either way: an unencrypted volume has no nonce to
+// reuse, but copying another volume's snapshot is still the wrong volume.
 func (vb *VB) checkSnapshotOwnership(snapshotID string, snap *SnapshotState) error {
+	if snap.SourceVolumeName != vb.VolumeName {
+		return fmt.Errorf("%w: copy snapshot: source %s belongs to volume %q, not %q — copy must run on the snapshot's own volume so StateSeqNum stays unique in its nonce subspace",
+			ErrSnapshotVolumeMismatch, snapshotID, snap.SourceVolumeName, vb.VolumeName)
+	}
+	if !vb.EncryptionEnabled {
+		return nil
+	}
 	uuid, err := hex.DecodeString(snap.SourceVolumeUUID)
 	if err != nil || len(uuid) != 4 {
 		return fmt.Errorf("copy snapshot: source %s has invalid SourceVolumeUUID %q", snapshotID, snap.SourceVolumeUUID)

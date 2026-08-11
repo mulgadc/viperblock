@@ -143,6 +143,24 @@ func TestCopySnapshotMeta_RejectsForeignVolume(t *testing.T) {
 	assert.ErrorIs(t, readErr, os.ErrNotExist, "a refused copy must not leave a partial destination behind")
 }
 
+// TestCopySnapshotMeta_RejectsForeignVolumeUnencrypted pins the same refusal
+// without encryption. There is no nonce subspace to protect here, but naming a
+// volume the snapshot never came from is still a caller error, and gating the
+// check on encryption left it unenforced for every unencrypted volume.
+func TestCopySnapshotMeta_RejectsForeignVolumeUnencrypted(t *testing.T) {
+	env := newSnapshotEnv(t, "src-copy-plain", nil)
+	seedSnapshot(t, env, "snap-copy-plain-src", 1)
+
+	other := openEncryptedVBInDir(t, env.dir, "other-copy-plain", nil)
+
+	_, err := other.CopySnapshotMeta("snap-copy-plain-src", "snap-copy-plain-dst")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSnapshotVolumeMismatch)
+
+	_, readErr := other.Backend.ReadFrom("snap-copy-plain-dst", types.FileTypeBlockCheckpoint, 0, 0, 0)
+	assert.ErrorIs(t, readErr, os.ErrNotExist, "a refused copy must not leave a partial destination behind")
+}
+
 // TestCopySnapshotMeta_RejectsExistingDestination gates against silently
 // replacing a snapshot that volumes may already be cloned from.
 func TestCopySnapshotMeta_RejectsExistingDestination(t *testing.T) {
