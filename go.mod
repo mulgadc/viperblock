@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.2
 	github.com/aws/smithy-go v1.27.5
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/predastore v1.15.1-0.20260810233220-6485a73ece26
+	github.com/mulgadc/predastore v1.15.1-0.20260811065833-4de8654e083d
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/btree v1.8.1
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.0
