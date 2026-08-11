@@ -47,6 +47,12 @@ func (p *probeServer) lastQuery(t *testing.T) map[string][]string {
 	return p.queries[len(p.queries)-1]
 }
 
+func (p *probeServer) requestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.queries)
+}
+
 func probeBackend(host string) *Backend {
 	return New(S3Config{
 		VolumeName: "vol-probe0000000001",
@@ -71,6 +77,17 @@ func TestInitProbeIsScopedToTheVolume(t *testing.T) {
 	require.Equal(t, []string{"vol-probe0000000001/"}, query["prefix"],
 		"the reachability probe listed the whole bucket")
 	require.Equal(t, []string{"1"}, query["max-keys"])
+}
+
+// TestInitReadOnlyIssuesNoProbe is the saving a read-only open exists for.
+// Even scoped, the probe is a full round trip and predastore answers it by
+// resolving metadata for every object under the volume's prefix — real work
+// to learn something the state read that follows would report anyway.
+func TestInitReadOnlyIssuesNoProbe(t *testing.T) {
+	server := newProbeServer(t, http.StatusOK)
+	backend := probeBackend(server.URL)
+	require.NoError(t, backend.InitReadOnlyCtx(context.Background()))
+	require.Zero(t, server.requestCount(), "a read-only init went to the backend")
 }
 
 // TestInitProbeStillFailsOnAnUnusableBackend keeps the probe worth issuing.

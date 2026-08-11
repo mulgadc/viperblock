@@ -1100,7 +1100,7 @@ func (vb *VB) SetCacheSystemMemory(percent int) error {
 	return vb.SetCacheSize(size, percent)
 }
 
-func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
+func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	var backend types.Backend
 
 	if config == nil {
@@ -1306,6 +1306,23 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	// Create the checkpoint directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750); err != nil {
 		return nil, fmt.Errorf("failed to create checkpoint directory: %w", err)
+	}
+
+	return vb, nil
+}
+
+// NewStateReader builds a VB that can read and verify this volume's persisted
+// state and nothing else. It starts no background goroutines and records no
+// volume-open event, because unlike New it does not make the caller a
+// potential writer of the volume. Use it with ReadState.
+func NewStateReader(config *VB, btype string, backendConfig any) (*VB, error) {
+	return newVB(config, btype, backendConfig)
+}
+
+func New(config *VB, btype string, backendConfig any) (*VB, error) {
+	vb, err := newVB(config, btype, backendConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	// Start background WAL syncer for periodic fsync (if interval > 0)
@@ -5091,14 +5108,16 @@ func (vb *VB) LoadState() error {
 	return vb.LoadStateCtx(context.Background())
 }
 
-// LoadStateCtx is LoadState with a caller-supplied context threaded through
-// the backend state fetch.
-func (vb *VB) LoadStateCtx(ctx context.Context) error {
+// selectPersistedState fetches both copies of the volume's persisted state,
+// picks the authoritative one and validates the encryption invariants against
+// it. It mutates nothing on the VB, so it is also the whole of a read-only
+// state load.
+func (vb *VB) selectPersistedState(ctx context.Context) (VBState, error) {
 	// Step 1. Query the state locally
 	localPath := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	state, localErr := vb.LoadStateRequestCtx(ctx, localPath)
 	if errors.Is(localErr, ErrIntegrity) || errors.Is(localErr, ErrEncryptionMismatch) {
-		return fmt.Errorf("LoadState: local %s: %w", localPath, localErr)
+		return VBState{}, fmt.Errorf("LoadState: local %s: %w", localPath, localErr)
 	}
 	if localErr != nil {
 		vb.logger().InfoContext(ctx, "No state found in local file, using backend state", "error", localErr)
@@ -5108,7 +5127,7 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	stateBackend, backendErr := vb.LoadStateRequestCtx(ctx, "")
 
 	if errors.Is(backendErr, ErrIntegrity) || errors.Is(backendErr, ErrEncryptionMismatch) {
-		return fmt.Errorf("LoadState: backend: %w", backendErr)
+		return VBState{}, fmt.Errorf("LoadState: backend: %w", backendErr)
 	}
 	if backendErr != nil {
 		vb.logger().WarnContext(ctx, "Failed to load state from backend", "error", backendErr)
@@ -5123,7 +5142,7 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 			vb.logger().DebugContext(ctx, "LoadState: no state in local or backend",
 				"volume", vb.GetVolume())
 		}
-		return classified
+		return VBState{}, classified
 	}
 
 	// Step 3. Compare the two states and select the authoritative copy.
@@ -5144,15 +5163,15 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	// that log the error and continue cannot operate on partially-loaded
 	// state derived from the rejected blob.
 	if vb.EncryptionEnabled != state.EncryptionEnabled {
-		return fmt.Errorf("%w: runtime EncryptionEnabled=%v, persisted=%v (volume %s)",
+		return VBState{}, fmt.Errorf("%w: runtime EncryptionEnabled=%v, persisted=%v (volume %s)",
 			ErrEncryptionMismatch, vb.EncryptionEnabled, state.EncryptionEnabled, vb.VolumeName)
 	}
 	if vb.EncryptionEnabled {
 		if vb.MasterKey == nil {
-			return fmt.Errorf("%w: volume %s requires master key", ErrEncryptionMismatch, vb.VolumeName)
+			return VBState{}, fmt.Errorf("%w: volume %s requires master key", ErrEncryptionMismatch, vb.VolumeName)
 		}
 		if state.KeyFingerprint != vb.MasterKey.Fingerprint {
-			return fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
+			return VBState{}, fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
 				ErrEncryptionMismatch, vb.VolumeName, state.KeyFingerprint, vb.MasterKey.Fingerprint)
 		}
 	}
@@ -5169,6 +5188,44 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	} else if configSizeBytes > 0 && configSizeBytes < state.VolumeSize {
 		vb.logger().Warn("LoadState: VolumeConfig.SizeGiB < VBState.VolumeSize (shrink not supported, keeping current size)",
 			"configSize", configSizeBytes, "stateSize", state.VolumeSize)
+	}
+
+	return state, nil
+}
+
+// ReadState fetches and verifies the volume's persisted state without opening
+// the volume. Same envelope verification and same local-vs-backend selection
+// as LoadState, but no VB field is set and no SeqNum window is claimed, so a
+// reader writes nothing.
+func (vb *VB) ReadState() (VBState, error) {
+	return vb.ReadStateCtx(context.Background())
+}
+
+// ReadStateCtx is ReadState with a caller-supplied context threaded through
+// the backend state fetch.
+func (vb *VB) ReadStateCtx(ctx context.Context) (VBState, error) {
+	return vb.selectPersistedState(ctx)
+}
+
+// InitBackendForRead prepares the backend for a read-only state fetch. Where
+// the backend supports it this skips the reachability probe a read-write open
+// pays for: the state read that follows fails the same way on an unusable
+// backend, so the probe would be a round trip spent to learn nothing.
+func (vb *VB) InitBackendForRead(ctx context.Context) error {
+	if ro, ok := vb.Backend.(interface {
+		InitReadOnlyCtx(context.Context) error
+	}); ok {
+		return ro.InitReadOnlyCtx(ctx)
+	}
+	return vb.Backend.InitCtx(ctx)
+}
+
+// LoadStateCtx is LoadState with a caller-supplied context threaded through
+// the backend state fetch.
+func (vb *VB) LoadStateCtx(ctx context.Context) error {
+	state, err := vb.selectPersistedState(ctx)
+	if err != nil {
+		return err
 	}
 
 	vb.VolumeName = state.VolumeName

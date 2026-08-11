@@ -199,6 +199,33 @@ func (backend *Backend) Init() error {
 }
 
 func (backend *Backend) InitCtx(ctx context.Context) error {
+	if err := backend.InitReadOnlyCtx(ctx); err != nil {
+		return err
+	}
+
+	// Reachability probe: prove the bucket exists, the credentials sign and
+	// the endpoint answers. Scoped to this volume because an unscoped list is
+	// O(bucket) against predastore, which resolves object metadata per key and
+	// truncates only the reported count. An empty result is still a success.
+	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(backend.config.Bucket),
+		Prefix:  aws.String(backend.config.VolumeName + "/"),
+		MaxKeys: aws.Int32(1),
+	})
+
+	if err != nil {
+		backend.log.ErrorContext(ctx, "Error listing objects", "error", err)
+		return err
+	}
+
+	return nil
+}
+
+// InitReadOnlyCtx builds the client without the reachability probe. A caller
+// that only reads state does not need it: the read that follows fails on an
+// unreachable or unauthorised backend just as the probe would, so paying for
+// a list as well is a round trip spent to learn nothing.
+func (backend *Backend) InitReadOnlyCtx(ctx context.Context) error {
 	// Log only the fields that identify the backend. S3Config carries the
 	// static credentials, so logging the struct wholesale would write the
 	// secret key in plaintext to wherever the embedder's logger points.
@@ -275,21 +302,6 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 			},
 		},
 	})
-
-	// Reachability probe: prove the bucket exists, the credentials sign and
-	// the endpoint answers. Scoped to this volume because an unscoped list is
-	// O(bucket) against predastore, which resolves object metadata per key and
-	// truncates only the reported count. An empty result is still a success.
-	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket:  aws.String(backend.config.Bucket),
-		Prefix:  aws.String(backend.config.VolumeName + "/"),
-		MaxKeys: aws.Int32(1),
-	})
-
-	if err != nil {
-		backend.log.ErrorContext(ctx, "Error listing objects", "error", err)
-		return err
-	}
 
 	return nil
 }
