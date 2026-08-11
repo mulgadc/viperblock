@@ -39,6 +39,11 @@ const serviceName = "viperblockd"
 // WAL and replay on the next attach.
 const shutdownDrainTimeout = 20 * time.Second
 
+// openLockWait bounds how long an arriving connection waits for the volume
+// lock. It covers a handover behind the previous connection's drain, whose
+// own bound is shutdownDrainTimeout.
+const openLockWait = shutdownDrainTimeout
+
 // otelShutdown flushes the OTLP exporters on Unload, if otelsetup.Init
 // configured real ones. nil (a no-op) when OTLP export is not configured.
 var otelShutdown func(context.Context) error
@@ -270,9 +275,12 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	// volume. Acquired before viperblock.New() so a second concurrent
 	// connection (nbdkit's parallel thread model) never races the first
 	// through LoadState/OpenWAL/persistStateLocal — the vector that tears
-	// config.json and corrupts WAL headers. Non-blocking: a losing opener
-	// fails fast with a clear error instead of queuing.
-	lock, err := viperblock.AcquireVolumeLock(base_dir, volume)
+	// config.json and corrupts WAL headers.
+	//
+	// Waits rather than failing fast, because the common case is handover:
+	// a reconnecting client arrives while the previous connection's Close is
+	// still draining. Genuine contention still fails, just later.
+	lock, err := viperblock.AcquireVolumeLockWait(base_dir, volume, openLockWait)
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open volume %q: %v", volume, err)}
 	}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -115,6 +116,46 @@ func TestAcquireVolumeLock_ConcurrentRace(t *testing.T) {
 	// ErrVolumeLocked, never anything else, and never silently double-opened.
 	assert.Equal(t, attempts, winners+busyErrs)
 	assert.Positive(t, winners, "at least one attempt must have won the lock")
+}
+
+// TestAcquireVolumeLockWait_AdmittedAfterHolderReleases models an NBD client
+// reconnecting while the previous connection's Close is still draining. The
+// arriving opener must be admitted once the drain finishes, not refused for
+// being a moment early.
+func TestAcquireVolumeLockWait_AdmittedAfterHolderReleases(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := AcquireVolumeLock(dir, "vol-1")
+	require.NoError(t, err)
+
+	const holdFor = 150 * time.Millisecond
+	go func() {
+		time.Sleep(holdFor)
+		_ = ReleaseVolumeLock(first)
+	}()
+
+	start := time.Now()
+	second, err := AcquireVolumeLockWait(dir, "vol-1", 5*time.Second)
+	require.NoError(t, err, "an opener must be admitted once the previous holder releases")
+	require.NoError(t, ReleaseVolumeLock(second))
+	assert.GreaterOrEqual(t, time.Since(start), holdFor, "must not have been admitted before the holder released")
+}
+
+// TestAcquireVolumeLockWait_ExpiresWhileHeld pins that waiting does not weaken
+// exclusion: a holder that never releases still keeps everyone else out, and
+// the waiter gives up with the same error the non-blocking form returns.
+func TestAcquireVolumeLockWait_ExpiresWhileHeld(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := AcquireVolumeLock(dir, "vol-1")
+	require.NoError(t, err)
+	defer func() { _ = ReleaseVolumeLock(first) }()
+
+	start := time.Now()
+	_, err = AcquireVolumeLockWait(dir, "vol-1", 100*time.Millisecond)
+	require.Error(t, err, "a lock held for the whole wait must not be handed out")
+	assert.ErrorIs(t, err, ErrVolumeLocked)
+	assert.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond, "must have waited the full bound before giving up")
 }
 
 // TestReleaseVolumeLock_NilIsNoOp lets every call site defer

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // ErrVolumeLocked is returned by AcquireVolumeLock when another opener
@@ -29,6 +30,32 @@ const volumeLockFileName = ".viperblock.lock"
 // Returns the open, locked file; caller releases it via ReleaseVolumeLock.
 // Non-blocking: a lock already held fails fast with ErrVolumeLocked.
 func AcquireVolumeLock(baseDir, volume string) (*os.File, error) {
+	return AcquireVolumeLockWait(baseDir, volume, 0)
+}
+
+// volumeLockPollInterval is how often AcquireVolumeLockWait retries. flock's
+// blocking mode cannot be cancelled once entered, so waiting is a poll.
+const volumeLockPollInterval = 20 * time.Millisecond
+
+// AcquireVolumeLockWait is AcquireVolumeLock with a bound on how long it will
+// wait for a lock another opener still holds. It exists for handover: the
+// previous holder releases only after its drain and close, so an arriving
+// opener that would succeed a moment later is otherwise refused outright.
+//
+// Exclusion is unchanged — only one caller ever holds the lock. wait <= 0 is
+// the non-blocking form. On expiry the error is still ErrVolumeLocked.
+func AcquireVolumeLockWait(baseDir, volume string, wait time.Duration) (*os.File, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		f, err := tryAcquireVolumeLock(baseDir, volume)
+		if err == nil || !errors.Is(err, ErrVolumeLocked) || !time.Now().Before(deadline) {
+			return f, err
+		}
+		time.Sleep(volumeLockPollInterval)
+	}
+}
+
+func tryAcquireVolumeLock(baseDir, volume string) (*os.File, error) {
 	dir := filepath.Join(baseDir, volume)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("AcquireVolumeLock: create volume dir %s: %w", dir, err)
