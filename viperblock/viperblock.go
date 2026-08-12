@@ -1377,6 +1377,22 @@ func (vb *VB) releaseEngine() {
 		"process", filepath.Base(os.Args[0]))
 }
 
+// Detach stops this engine's background goroutines and reports the volume
+// released, without Close's flush and state save. It is for the short-lived
+// engines a control plane opens for one operation and then abandons: those
+// stop the goroutines and never reach Close, so without this the engine count
+// only ever counts up and every volume eventually reads as permanently held.
+//
+// Unlike the hand-rolled stop pairs it replaces, this also stops the chunk GC
+// sweeper, which New starts and those callers left running on an engine they
+// had finished with.
+func (vb *VB) Detach() {
+	vb.StopChunkGC()
+	vb.StopChunkUploader()
+	vb.StopWALSyncer()
+	vb.releaseEngine()
+}
+
 // logger returns vb.log, falling back to slog.Default() for VB values
 // assembled without going through New() (e.g. spinifex's snapshotRunningVolume
 // path, which hand-builds a read-only VB sharing another instance's backend).

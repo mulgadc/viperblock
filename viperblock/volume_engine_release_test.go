@@ -107,6 +107,43 @@ func TestSecondCloseEmitsNothing(t *testing.T) {
 	assert.Equal(t, 1, capture.count(volumeClosedMsg), "a second release must not be reported")
 }
 
+// TestDetachEmitsOneVolumeClosed is the path that actually matters in the
+// control plane: an engine opened for one operation and abandoned. Most
+// callers stop the goroutines and never reach Close, so without a release here
+// the engine count only ever counts up.
+func TestDetachEmitsOneVolumeClosed(t *testing.T) {
+	vb, capture := newCapturedVB(t)
+	require.Equal(t, 1, capture.count(volumeOpenedMsg))
+
+	vb.Detach()
+	assert.Equal(t, 1, capture.count(volumeClosedMsg), "Detach must report the volume released")
+}
+
+// TestDetachStopsBackgroundGoroutines pins that Detach really is a teardown
+// and not just an event: an engine that keeps uploading chunks after being
+// reported as released is still a writer of the volume.
+func TestDetachStopsBackgroundGoroutines(t *testing.T) {
+	vb, _ := newCapturedVB(t)
+	require.NotNil(t, vb.chunkUploadStop, "the uploader must be running, or this passes vacuously")
+	require.NotNil(t, vb.walSyncStop, "the WAL syncer must be running, or this passes vacuously")
+
+	vb.Detach()
+	assert.Nil(t, vb.chunkUploadStop, "Detach must stop the chunk uploader")
+	assert.Nil(t, vb.walSyncStop, "Detach must stop the WAL syncer")
+}
+
+// TestDetachThenCloseEmitsOnce covers a caller that detaches and later closes
+// the same VB. Two releases for one open would read as fewer holders than
+// there are.
+func TestDetachThenCloseEmitsOnce(t *testing.T) {
+	vb, capture := newCapturedVB(t)
+	vb.Detach()
+	require.Equal(t, 1, capture.count(volumeClosedMsg))
+
+	require.NoError(t, vb.Close())
+	assert.Equal(t, 1, capture.count(volumeClosedMsg), "the close after a detach must not report a second release")
+}
+
 // TestHandBuiltVBEmitsNoClose covers a VB assembled as a struct literal rather
 // than through New — the read-only shapes that share another instance's
 // backend. Those record no open, so releasing one would decrement a count it
