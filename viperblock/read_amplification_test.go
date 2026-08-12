@@ -46,6 +46,13 @@ func (b *chunkReadCounter) ReadCtx(ctx context.Context, fileType types.FileType,
 // written, so a reader can be checked against them rather than only counted.
 func seedSequentialVolume(t *testing.T, volumeName string, key *masterkey.Key) (string, []byte) {
 	t.Helper()
+	return seedVolume(t, volumeName, key, readAmpVolumeBytes)
+}
+
+// seedVolume writes writeBytes of a readAmpVolumeBytes volume, leaving the
+// rest of it never written and so sparse.
+func seedVolume(t *testing.T, volumeName string, key *masterkey.Key, writeBytes uint64) (string, []byte) {
+	t.Helper()
 
 	root := t.TempDir()
 
@@ -71,9 +78,9 @@ func seedSequentialVolume(t *testing.T, volumeName string, key *masterkey.Key) (
 	require.NoError(t, writer.OpenWAL(&writer.WAL, filepath.Join(writer.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, writer.WAL.WallNum.Load(), writer.GetVolume()))))
 	require.NoError(t, writer.OpenWAL(&writer.BlockToObjectWAL, filepath.Join(writer.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, writer.BlockToObjectWAL.WallNum.Load(), writer.GetVolume()))))
 
-	written := make([]byte, 0, readAmpVolumeBytes)
+	written := make([]byte, 0, writeBytes)
 	blocksPerWrite := uint64(readAmpRequestBytes) / uint64(DefaultBlockSize)
-	for block := uint64(0); block < uint64(readAmpVolumeBytes)/uint64(DefaultBlockSize); block += blocksPerWrite {
+	for block := uint64(0); block < writeBytes/uint64(DefaultBlockSize); block += blocksPerWrite {
 		payload := randomBlockData(blocksPerWrite)
 		require.NoError(t, writer.Write(block, payload))
 		written = append(written, payload...)
@@ -258,6 +265,35 @@ func TestConcurrentSequentialRead_IsNotRefetchedByEveryRequest(t *testing.T) {
 	// alone in flight and is widened on that basis.
 	assert.LessOrEqual(t, backendBytes, int64(readAmpVolumeBytes*5/4),
 		"a queued guest is paying for readahead it already covers with its own queue")
+}
+
+// TestReadahead_StopsAtASparseRegion streams off the end of what was ever
+// written. Extending a run over unwritten blocks would cache zeroes against
+// block numbers that have no SeqNum, so a later write to one of them could be
+// answered from the cache with the zeroes that preceded it.
+func TestReadahead_StopsAtASparseRegion(t *testing.T) {
+	ctx := context.Background()
+	volumeName := "vol-readamp-sparse"
+	const writtenBytes = readAmpVolumeBytes / 2
+
+	root, written := seedVolume(t, volumeName, nil, writtenBytes)
+	reader, _ := coldReaderVB(t, root, volumeName, nil)
+
+	// Start well before the boundary so the reads are a stream by the time
+	// they reach it, then carry on past it into the hole.
+	for offset := uint64(writtenBytes - 4*readAmpRequestBytes); offset < writtenBytes+4*readAmpRequestBytes; offset += readAmpRequestBytes {
+		data, err := reader.ReadAtCtx(ctx, offset, readAmpRequestBytes)
+
+		want := make([]byte, readAmpRequestBytes)
+		if offset < writtenBytes {
+			want = written[offset : offset+readAmpRequestBytes]
+			require.NoErrorf(t, err, "read at offset %d", offset)
+		} else {
+			// A read wholly inside a hole reports it, and still returns zeroes.
+			require.ErrorIsf(t, err, ErrZeroBlock, "read at offset %d", offset)
+		}
+		require.Equalf(t, want, data, "wrong data at offset %d", offset)
+	}
 }
 
 // TestReadahead_StreamStartingAgainBehindItselfIsStillWidened covers what
