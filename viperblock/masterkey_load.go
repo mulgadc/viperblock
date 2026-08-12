@@ -3,7 +3,7 @@ package viperblock
 import (
 	"os"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
 
 // EncryptionKeyEnv names the environment variable that supplies the master

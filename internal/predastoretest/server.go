@@ -28,8 +28,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	pds "github.com/mulgadc/predastore"
-	"github.com/mulgadc/predastore/pkg/masterkey"
 )
 
 // Options configures a test predastore cluster. Required fields: DataDir,
