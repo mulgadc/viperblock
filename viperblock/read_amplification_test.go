@@ -3,6 +3,7 @@ package viperblock
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -27,6 +28,7 @@ type chunkReadCounter struct {
 	*file.Backend
 
 	reads atomic.Int64
+	bytes atomic.Int64
 }
 
 var _ types.Backend = (*chunkReadCounter)(nil)
@@ -34,6 +36,7 @@ var _ types.Backend = (*chunkReadCounter)(nil)
 func (b *chunkReadCounter) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) ([]byte, error) {
 	if fileType == types.FileTypeChunk {
 		b.reads.Add(1)
+		b.bytes.Add(int64(length))
 	}
 	return b.Backend.ReadCtx(ctx, fileType, objectId, offset, length)
 }
@@ -200,6 +203,85 @@ func TestSequentialRead_EncryptedStreamIsWidenedAndCorrect(t *testing.T) {
 	require.Equal(t, written, got, "an encrypted stream came back wrong once readahead widened it")
 	assert.Less(t, backendReads, int64(requests),
 		"an encrypted sequential stream was not widened")
+}
+
+// TestConcurrentSequentialRead_IsNotRefetchedByEveryRequest is what a guest
+// with a queue actually looks like: several sequential requests outstanding at
+// once. Each continues the stream, so readahead fires on all of them, and each
+// prefetch lands after the request that would have wanted it has already gone
+// to the backend itself — every widened byte is duplicate traffic.
+//
+// Bytes, not read counts, is the measure that catches it. Round trips fall
+// while traffic multiplies, and at depth the store is bound by the latter:
+// unguarded, this pattern cost 4.3x the volume in reads and took depth-16
+// sequential throughput on env19 from 66.6 MiB/s to 11.6.
+func TestConcurrentSequentialRead_IsNotRefetchedByEveryRequest(t *testing.T) {
+	const queueDepth = 16
+	volumeName := "vol-readamp-concurrent"
+
+	root, written := seedSequentialVolume(t, volumeName, nil)
+	reader, counter := coldReaderVB(t, root, volumeName, nil)
+
+	offsets := make(chan uint64)
+	got := make([][]byte, readAmpVolumeBytes/readAmpRequestBytes)
+
+	var wg sync.WaitGroup
+	for range queueDepth {
+		wg.Go(func() {
+			for offset := range offsets {
+				data, err := reader.ReadAtCtx(context.Background(), offset, readAmpRequestBytes)
+				assert.NoErrorf(t, err, "read at offset %d", offset)
+				got[offset/readAmpRequestBytes] = data
+			}
+		})
+	}
+	// Submitted in order, served out of order: the queue, not the stream, is
+	// what reorders them.
+	for offset := uint64(0); offset < readAmpVolumeBytes; offset += readAmpRequestBytes {
+		offsets <- offset
+	}
+	close(offsets)
+	wg.Wait()
+
+	stream := make([]byte, 0, readAmpVolumeBytes)
+	for _, data := range got {
+		stream = append(stream, data...)
+	}
+	require.Equal(t, written, stream, "a concurrent stream came back wrong")
+
+	backendBytes := counter.bytes.Load()
+	t.Logf("concurrent stream at depth %d: %d backend chunk reads, %d bytes for a %d byte volume",
+		queueDepth, counter.reads.Load(), backendBytes, readAmpVolumeBytes)
+
+	// A queued reader covers its own latency, so it should read the volume once
+	// and no more. The margin allows the odd request that finds itself briefly
+	// alone in flight and is widened on that basis.
+	assert.LessOrEqual(t, backendBytes, int64(readAmpVolumeBytes*5/4),
+		"a queued guest is paying for readahead it already covers with its own queue")
+}
+
+// TestReadahead_StreamStartingAgainBehindItselfIsStillWidened covers what
+// holding requests back against a window costs if the window is never given
+// up: a reader that seeks back to the start and streams again sits behind the
+// old window for its whole run and is never widened. A guest doing this looks
+// entirely ordinary — a second pass over a file, a reboot.
+func TestReadahead_StreamStartingAgainBehindItselfIsStillWidened(t *testing.T) {
+	volumeName := "vol-readamp-restart"
+
+	root, written := seedSequentialVolume(t, volumeName, nil)
+	reader, counter := coldReaderVB(t, root, volumeName, nil)
+
+	_, _ = readSequentially(t, reader)
+	// Cold again, so the second pass has to go to the backend to be counted.
+	reader.Cache.purge()
+	firstPass := counter.reads.Load()
+
+	got, requests := readSequentially(t, reader)
+	secondPass := counter.reads.Load() - firstPass
+
+	require.Equal(t, written, got, "the second pass over the volume came back wrong")
+	assert.Less(t, secondPass, int64(requests),
+		"a stream starting again behind the previous one was never widened")
 }
 
 // TestRandomRead_IsNotWidened is the regression that matters more than the

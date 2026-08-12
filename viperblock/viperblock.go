@@ -459,11 +459,12 @@ type VB struct {
 	gcFloor      atomic.Uint64
 	gcFloorReady atomic.Bool
 
-	// streamNextBlock is the block a purely sequential reader would ask for
-	// next. Readahead fires only on a request that starts exactly there, so a
-	// random reader never pays for it. Deliberately racy: a wrong guess costs
-	// a wider fetch, never a wrong answer.
-	streamNextBlock atomic.Uint64
+	// readAhead decides which reads are widened past what they asked for.
+	readAhead readAheadTracker
+
+	// readsInFlight counts reads currently being served, which is the guest's
+	// queue depth as seen from here.
+	readsInFlight atomic.Int64
 
 	// gcSnapshotSafe/gcSnapshotChecked cache ensureGCSnapshotSafe's result:
 	// whether any snapshot already references this volume. Cached for the
@@ -1314,7 +1315,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		return nil, fmt.Errorf("failed to create checkpoint directory: %w", err)
 	}
 
-	vb.streamNextBlock.Store(noStreamPosition)
+	vb.readAhead.nextBlock = noStreamPosition
 
 	return vb, nil
 }
@@ -4804,17 +4805,70 @@ const noStreamPosition = ^uint64(0)
 // too, so the widest possible fetch is one whole chunk.
 const readAheadBlocks = 256
 
-// extendRunForReadahead grows a run forward through the same chunk, returning
-// the trailing blocks that could be fetched in the same round trip and their
-// SeqNums. It stops at the first block that is unmapped, lands in a different
-// chunk, or is not contiguous within this one — a discontinuity means another
-// round trip, which is what readahead exists to avoid.
-func (vb *VB) extendRunForReadahead(cb ConsecutiveBlock) (extra int, seqNums []uint64) {
+// streamRequest is the guest request a backend fetch is serving, carried down
+// to where the coalesced runs are known.
+type streamRequest struct {
+	block         uint64
+	blockRequests uint64
+}
+
+// readAheadTracker follows where a reader has got to, so that a request
+// starting exactly where the last one ended can be recognised as continuing a
+// stream. One VB serves one NBD connection, so there is one position to keep.
+type readAheadTracker struct {
+	mu sync.Mutex
+
+	// nextBlock is where a purely sequential reader would go next.
+	nextBlock uint64
+}
+
+// begin records a request for blockRequests blocks from block and reports
+// whether it continues a stream and so may be widened. A limit of zero records
+// the position and widens nothing.
+func (t *readAheadTracker) begin(block, blockRequests uint64, limit int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	continues := block == t.nextBlock
+	t.nextBlock = block + blockRequests
+
+	return limit > 0 && continues
+}
+
+// planReadAhead records a request against the stream and returns the trailing
+// blocks its final run may carry with it, along with their SeqNums.
+func (vb *VB) planReadAhead(block, blockRequests uint64, runs []ConsecutiveBlock) (extra int, seqNums []uint64) {
 	// Never prefetch more than the cache can hold: blocks fetched only to be
 	// evicted before the request that wanted them are read, decrypted and
 	// thrown away. Volumes opened with a small cache get a small readahead.
 	limit := min(readAheadBlocks, vb.Cache.Config.Size)
 
+	// Readahead exists to fill the gap a reader leaves while it waits. A guest
+	// with several requests outstanding is already covering that gap itself,
+	// and prefetching under it only duplicates traffic it has in flight.
+	if vb.readsInFlight.Load() > 1 {
+		limit = 0
+	}
+
+	// Served entirely from cache. The position still has to advance, or the
+	// next request looks like the start of a new stream.
+	if len(runs) == 0 {
+		limit = 0
+	}
+
+	if !vb.readAhead.begin(block, blockRequests, limit) {
+		return 0, nil
+	}
+
+	return vb.extendRunForReadahead(runs[len(runs)-1], limit)
+}
+
+// extendRunForReadahead grows a run forward through the same chunk, returning
+// the trailing blocks that could be fetched in the same round trip and their
+// SeqNums. It stops at the first block that is unmapped, lands in a different
+// chunk, or is not contiguous within this one — a discontinuity means another
+// round trip, which is what readahead exists to avoid.
+func (vb *VB) extendRunForReadahead(cb ConsecutiveBlock, limit int) (extra int, seqNums []uint64) {
 	stride := vb.blockStride()
 	nextBlock := cb.StartBlock + uint64(cb.NumBlocks)
 	nextOffset := cb.ObjectOffset + uint32(cb.NumBlocks)*stride
@@ -5839,12 +5893,9 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		i = j
 	}
 
-	// Readahead applies to the final run only, and only when this request
-	// continues where the last one stopped. There is no point widening a fetch
-	// on a volume whose cache is disabled: the extra blocks would be read and
-	// then dropped.
-	readAhead := vb.Cache.Config.Size > 0 && vb.streamNextBlock.Load() == block
-	vb.streamNextBlock.Store(block + blockRequests)
+	// Readahead applies to the final run only, since that is the one a
+	// continuing stream reads off the end of.
+	readAheadExtra, readAheadSeqNums := vb.planReadAhead(block, blockRequests, consecutiveBlocksToRead)
 
 	// Next, read our consecutive blocks from the backend
 	for idx, cb := range consecutiveBlocksToRead {
@@ -5854,8 +5905,8 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
 		extra, extraSeqNums := 0, []uint64(nil)
-		if readAhead && idx == len(consecutiveBlocksToRead)-1 {
-			extra, extraSeqNums = vb.extendRunForReadahead(cb)
+		if idx == len(consecutiveBlocksToRead)-1 {
+			extra, extraSeqNums = readAheadExtra, readAheadSeqNums
 		}
 
 		if err := vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end]); err != nil {
@@ -5911,7 +5962,9 @@ func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]by
 	blockCount := lastBlock - firstBlock + 1
 
 	// Read entire range of needed blocks
+	vb.readsInFlight.Add(1)
 	fullData, err := vb.read(ctx, firstBlock, blockCount*blockSize)
+	vb.readsInFlight.Add(-1)
 
 	if err != nil && !errors.Is(err, ErrZeroBlock) {
 		return nil, err
@@ -6219,11 +6272,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 	data = make([]byte, blockLen)
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
-	// Readahead fires only where this request continues the previous one, and
-	// only where the extra blocks have somewhere to live. Recorded before any
-	// early return so a failed read still advances the stream position.
-	readAhead := vb.Cache.Config.Size > 0 && vb.streamNextBlock.Load() == block
-	vb.streamNextBlock.Store(block + blockRequests)
+	stream := &streamRequest{block: block, blockRequests: blockRequests}
 
 	var consecutiveBlocks ConsecutiveBlocks
 	var baseConsecutiveBlocks ConsecutiveBlocks
@@ -6344,10 +6393,15 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 
 	// Fetch consecutive blocks from our own backend
 	if len(consecutiveBlocks) > 0 {
-		err = vb.fetchConsecutiveBlocksFromBackend(ctx, consecutiveBlocks, data, readAhead)
+		err = vb.fetchConsecutiveBlocksFromBackend(ctx, consecutiveBlocks, data, stream)
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		// Served without touching the backend. The stream position still has to
+		// advance, or the cached stretch looks like the end of the stream and
+		// the request after it starts over.
+		vb.planReadAhead(stream.block, stream.blockRequests, nil)
 	}
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
@@ -6376,10 +6430,11 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 
 // fetchConsecutiveBlocksFromBackend fetches blocks from backend storage
 // Used by both legacy and BlockStore read paths.
-// readAhead widens the final run past what was asked for; see readRun. Only
-// the own-volume fetch sets it — a snapshot base or ancestor layer is read
-// through the same helper but is not where a guest's stream lives.
-func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte, readAhead bool) error {
+// stream, when set, names the guest request being served so the final run can
+// be widened; see planReadAhead. Only the own-volume fetch passes it — a
+// snapshot base or ancestor layer comes through here too, but is not where a
+// guest's stream lives.
+func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutiveBlocks ConsecutiveBlocks, data []byte, stream *streamRequest) error {
 	var consecutiveBlocksToRead ConsecutiveBlocks
 	for i := 0; i < len(consecutiveBlocks); {
 		// Extend the run while blocks stay contiguous within one chunk, then
@@ -6414,6 +6469,11 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 		i = j
 	}
 
+	readAheadExtra, readAheadSeqNums := 0, []uint64(nil)
+	if stream != nil {
+		readAheadExtra, readAheadSeqNums = vb.planReadAhead(stream.block, stream.blockRequests, consecutiveBlocksToRead)
+	}
+
 	for idx, cb := range consecutiveBlocksToRead {
 		vb.logger().DebugContext(ctx, "[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
 
@@ -6421,8 +6481,8 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
 		extra, extraSeqNums := 0, []uint64(nil)
-		if readAhead && idx == len(consecutiveBlocksToRead)-1 {
-			extra, extraSeqNums = vb.extendRunForReadahead(cb)
+		if idx == len(consecutiveBlocksToRead)-1 {
+			extra, extraSeqNums = readAheadExtra, readAheadSeqNums
 		}
 
 		if err := vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end]); err != nil {
