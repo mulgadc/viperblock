@@ -31,8 +31,9 @@ var (
 
 	cacheLookups metric.Int64Counter
 
-	rmwConflicts metric.Int64Counter
-	volumeOpens  metric.Int64Counter
+	rmwConflicts  metric.Int64Counter
+	volumeOpens   metric.Int64Counter
+	volumeEngines metric.Int64UpDownCounter
 
 	// cacheHitOpts/cacheMissOpts are pre-built as slices, not bare options, so
 	// the per-block cache lookup path (inside the read hot loop) allocates
@@ -114,6 +115,13 @@ func instruments() {
 		if err != nil {
 			otel.Handle(err)
 		}
+
+		volumeEngines, err = m.Int64UpDownCounter("viperblock.volume.engines",
+			metric.WithDescription("Engines currently holding a volume: incremented on open, decremented on close. Summed across pids for one volume, a value above 1 is a dual-open happening now, without reconstructing intervals from open events."),
+			metric.WithUnit("{engine}"))
+		if err != nil {
+			otel.Handle(err)
+		}
 	})
 }
 
@@ -138,19 +146,46 @@ func RecordRMWConflict(ctx context.Context, volume string) {
 // identity: role ("nbdkit" for the data-path plugin, "daemon" for a
 // control-plane import, or "" when unset), executable name and pid.
 //
-// viperblock currently runs as BOTH an nbdkit plugin and a Go module imported
-// into the spinifex daemon, so a volume can be held by more than one engine
-// with no arbitration between them. mulga-t1sch removes the second engine; the
-// invariant it establishes is "one owner per volume". This metric is how that
-// invariant is observed: opens for a single volume carrying two different pids
-// or roles are a dual-open. It is both the evidence for the current bug class
-// and the permanent regression alarm for the plan's end state -- after
-// t1sch lands, any such series is a regression.
+// viperblock runs as both an nbdkit plugin and a Go module importable by a
+// control plane, so a volume can be held by more than one engine. The
+// invariant is one owner per volume, and this is how it is observed: opens
+// for one volume carrying two pids or roles are a dual-open.
 func RecordVolumeOpen(ctx context.Context, volume, role string) {
 	instruments()
-	if volumeOpens == nil {
+	attrs := volumeIdentityAttrs(volume, role)
+	if volumeOpens != nil {
+		volumeOpens.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+	if volumeEngines != nil {
+		volumeEngines.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// RecordVolumeClose releases the volume-open recorded by RecordVolumeOpen,
+// decrementing the engine count under identical attributes so the two cancel.
+//
+// Without it, opens for one volume are indistinguishable from two engines
+// holding it at once: nbdkit opening after the control plane released is a
+// normal handover and produces the same two events as a genuine dual-open.
+// The engine count is what separates them, and it only means anything if
+// every open is eventually matched.
+//
+// A process that dies never gets here, so its open stays outstanding. That is
+// deliberate: the volume lock and the control-plane lease are what reclaim a
+// dead holder, and an unmatched open is a signal worth keeping rather than
+// papering over.
+func RecordVolumeClose(ctx context.Context, volume, role string) {
+	instruments()
+	if volumeEngines == nil {
 		return
 	}
+	volumeEngines.Add(ctx, -1, metric.WithAttributes(volumeIdentityAttrs(volume, role)...))
+}
+
+// volumeIdentityAttrs builds the attributes identifying which engine holds a
+// volume. Shared by open and close so the two carry an identical attribute
+// set; any divergence would leave the engine count unable to cancel them out.
+func volumeIdentityAttrs(volume, role string) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.Int("pid", os.Getpid()),
 		attribute.String("process", filepath.Base(os.Args[0])),
@@ -161,7 +196,7 @@ func RecordVolumeOpen(ctx context.Context, volume, role string) {
 	if role != "" {
 		attrs = append(attrs, attribute.String("role", role))
 	}
-	volumeOpens.Add(ctx, 1, metric.WithAttributes(attrs...))
+	return attrs
 }
 
 // RecordBackendIO records one backend chunk-object read or write: op count,

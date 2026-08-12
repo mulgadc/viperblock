@@ -489,6 +489,13 @@ type VB struct {
 	// reused" invariant GC's refcount/floor reasoning relies on). Checked
 	// by ensureGCSnapshotSafe.
 	gcLatchedOff atomic.Bool
+
+	// engineHeld is set by New once it records the volume open, and cleared by
+	// the close that reports the release. Only a VB that recorded an open may
+	// report a close, so a hand-built VB that never went through New cannot
+	// drive the engine count negative, and a second CloseCtx on an already
+	// closed VB cannot decrement twice.
+	engineHeld atomic.Bool
 }
 
 // CacheConfig holds configuration for the LRU cache.
@@ -1347,12 +1354,27 @@ func New(config *VB, btype string, backendConfig any) (*VB, error) {
 	// every construction is a potential WRITER of this volume, not a reader --
 	// which is why the open is worth recording with process identity. Opens
 	// for one volume carrying two pids/roles mean two engines hold it.
+	vb.engineHeld.Store(true)
 	telemetry.RecordVolumeOpen(context.Background(), vb.VolumeName, vb.Role)
 	vb.logger().Info("viperblock volume opened",
 		"volume", vb.VolumeName, "role", vb.Role, "pid", os.Getpid(),
 		"process", filepath.Base(os.Args[0]), "encrypted", vb.EncryptionEnabled)
 
 	return vb, nil
+}
+
+// releaseEngine reports that this VB no longer holds its volume, exactly once
+// and only if New recorded the open. Paired with the open event, this is what
+// makes two engines holding one volume at the same time distinguishable from
+// one engine handing the volume to another.
+func (vb *VB) releaseEngine() {
+	if !vb.engineHeld.CompareAndSwap(true, false) {
+		return
+	}
+	telemetry.RecordVolumeClose(context.Background(), vb.VolumeName, vb.Role)
+	vb.logger().Info("viperblock volume closed",
+		"volume", vb.VolumeName, "role", vb.Role, "pid", os.Getpid(),
+		"process", filepath.Base(os.Args[0]))
 }
 
 // logger returns vb.log, falling back to slog.Default() for VB values
@@ -5994,6 +6016,12 @@ func (vb *VB) Close() error {
 // cancellable, since it is what makes an aborted CloseCtx safe to recover from.
 func (vb *VB) CloseCtx(ctx context.Context) error {
 	vb.logger().Info("VB Close, flushing block state to disk")
+
+	// Deferred so a Close that fails still reports the release: the background
+	// goroutines are stopped either way, and callers release the volume lock
+	// regardless of the error. An engine still counted as holding a volume it
+	// has stopped writing to would read as a dual-open on the next opener.
+	defer vb.releaseEngine()
 
 	// Stop background goroutines before flushing
 	vb.StopChunkGC()
