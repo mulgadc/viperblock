@@ -1,3 +1,6 @@
+// Package telemetry holds viperblock's own OpenTelemetry instruments: backend
+// I/O, WAL, block cache, RMW conflicts and volume opens. The OTel bootstrap
+// itself lives in bluebottle/pkg/otelsetup, which entrypoints call directly.
 package telemetry
 
 import (
@@ -13,7 +16,7 @@ import (
 )
 
 // meterName identifies the viperblock meter, matching the package import
-// path convention used by predastore/otelsetup.
+// path convention used by bluebottle/pkg/otelsetup.
 const meterName = "github.com/mulgadc/viperblock/telemetry"
 
 var (

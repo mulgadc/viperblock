@@ -29,6 +29,7 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/utils"
@@ -1289,7 +1290,7 @@ func New(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	// lines go through vb.log (config.Logger, or slog.Default() when unset),
 	// so embedders keep whatever logger they already installed. Standalone
 	// entrypoints (nbdkit plugin bootstrap, viperblockd) opt into their own
-	// process-wide default explicitly via telemetry.SetDefaultJSONLogger.
+	// process-wide default explicitly via otelsetup.SetDefaultJSONLogger.
 
 	// Create the base directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume()), 0750); err != nil {
@@ -1332,8 +1333,8 @@ func (vb *VB) logger() *slog.Logger {
 	return vb.log
 }
 
-// SetDebug rebuilds this instance's logger (JSON to stdout, fanning out to
-// an OTLP bridge if telemetry.Init already configured one) at Debug or Error
+// SetDebug rebuilds this instance's logger (JSON to stderr, fanning out to
+// an OTLP bridge if otelsetup.Init already configured one) at Debug or Error
 // level. It only ever touches vb.log and the backend's logger — never the
 // process-wide slog default — so it is safe for an embedded caller to have
 // this called on its behalf.
@@ -1342,7 +1343,9 @@ func (vb *VB) SetDebug(debug bool) {
 	if debug {
 		level = slog.LevelDebug
 	}
-	vb.log = telemetry.NewJSONLogger("viperblock", level)
+	// Stderr, not stdout: as an nbdkit plugin viperblock's fd 1 is /dev/null
+	// while fd 2 still reaches the parent's journald socket.
+	vb.log = otelsetup.NewJSONLogger("viperblock", level, otelsetup.WithWriter(os.Stderr))
 	if vb.Backend != nil {
 		vb.Backend.SetLogger(vb.log)
 	}

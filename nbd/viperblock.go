@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
-	"github.com/mulgadc/viperblock/telemetry"
+	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -39,7 +39,7 @@ const serviceName = "viperblockd"
 // WAL and replay on the next attach.
 const shutdownDrainTimeout = 20 * time.Second
 
-// otelShutdown flushes the OTLP exporters on Unload, if telemetry.Init
+// otelShutdown flushes the OTLP exporters on Unload, if otelsetup.Init
 // configured real ones. nil (a no-op) when OTLP export is not configured.
 var otelShutdown func(context.Context) error
 
@@ -225,7 +225,11 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 	// are no-ops without OTEL_EXPORTER_OTLP_* configured. This is the only
 	// place viperblock's process-wide slog default is touched — never from
 	// viperblock.New, which would hijack an embedding process's logger.
-	shutdown, err := telemetry.Init(context.Background(), serviceName)
+	//
+	// No TracerProvider: the plugin has no server loop to root spans from, and
+	// when viperblock is embedded instead the host (spx) already owns tracing.
+	shutdown, err := otelsetup.Init(context.Background(), serviceName,
+		otelsetup.WithoutTracing(), otelsetup.WithoutRuntimeMetrics())
 	if err != nil {
 		slog.Error("otel telemetry init failed, continuing without OTLP export", "err", err)
 	} else {
@@ -235,7 +239,9 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 	if os.Getenv("VIPERBLOCK_DEBUG") == "1" {
 		level = slog.LevelDebug
 	}
-	telemetry.SetDefaultJSONLogger(serviceName, level)
+	// Stderr, not stdout: nbdkit repoints a plugin's fd 1 at /dev/null but
+	// leaves fd 2 on the parent's journald socket.
+	otelsetup.SetDefaultJSONLogger(serviceName, level, otelsetup.WithWriter(os.Stderr))
 
 	// Resolve and load the master key once at plugin startup so per-NBD-
 	// connection Open avoids a disk read + permission check on every attach.
@@ -327,7 +333,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	vb.UseShardedWAL = use_shardwal
 
 	// Debug logging is configured once for the whole process in
-	// ConfigComplete via telemetry.SetDefaultJSONLogger, not per-connection.
+	// ConfigComplete via otelsetup.SetDefaultJSONLogger, not per-connection.
 
 	// Set 20% LRU memory from host
 	//vb.SetCacheSize(0, 20)
