@@ -11,7 +11,7 @@ require (
 	github.com/aws/smithy-go v1.27.7
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mulgadc/bluebottle v1.16.0
-	github.com/mulgadc/predastore v1.16.0
+	github.com/mulgadc/predastore v1.16.1-0.20260812005040-fbf357226059
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/btree v1.8.1
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.0
@@ -44,7 +44,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/dgraph-io/badger/v4 v4.9.5 // indirect
+	github.com/dgraph-io/badger/v4 v4.9.6 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.19.0 // indirect
