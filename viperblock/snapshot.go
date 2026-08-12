@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"os"
 	"time"
 
 	"github.com/mulgadc/viperblock/types"
@@ -243,30 +245,25 @@ type SnapshotIdentity struct {
 	InheritedLayers      []InheritedLayer
 }
 
-// LoadSnapshotBlockMap reads a snapshot's frozen block-to-object map from the
-// backend and returns it along with the source volume's encryption identity.
-// The returned BlocksToObject is intended to be used as a read-only base map
-// for clone volumes.
-func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, SnapshotIdentity, error) {
-	var ident SnapshotIdentity
-
-	// 1. Read snapshot config
+// readSnapshotState reads a snapshot's config.json from the backend and, on
+// encrypted volumes, authenticates its metaEnvelope before unmarshalling.
+//
+// Two-stage parse: split the envelope, peek the verbatim payload for
+// SourceVolumeUUID + SourceVolumeNameHash + StateSeqNum (needed to reconstruct
+// nonce + AAD), verify, then unmarshal the verified bytes into the full
+// struct. The snapshotID parameter is the trusted external identity bound into
+// the AAD — splicing in another snapshot's blob fails because the literal
+// "snap:"||snapshotID differs from the seal-time value.
+func (vb *VB) readSnapshotState(snapshotID string) (*SnapshotState, error) {
 	configData, err := vb.Backend.ReadFrom(snapshotID, types.FileTypeConfig, 0, 0, 0)
 	if err != nil {
-		return nil, ident, fmt.Errorf("failed to read snapshot config %s: %w", snapshotID, err)
+		return nil, fmt.Errorf("failed to read snapshot config %s: %w", snapshotID, err)
 	}
 
-	// Encrypted snapshots wrap the JSON in a metaEnvelope. Two-stage parse:
-	// split the envelope, peek the verbatim payload for SourceVolumeUUID +
-	// SourceVolumeNameHash + StateSeqNum (needed to reconstruct nonce + AAD),
-	// verify, then unmarshal the verified bytes into the full struct. The
-	// snapshotID parameter is the trusted external identity bound into the
-	// AAD — splicing in another snapshot's blob fails because the literal
-	// "snap:"||snapshotID differs from the seal-time value.
 	if vb.EncryptionEnabled {
 		payload, tag, splitErr := splitEnvelope(configData)
 		if splitErr != nil {
-			return nil, ident, fmt.Errorf("%w: snapshot %s envelope: %w", ErrIntegrity, snapshotID, splitErr)
+			return nil, fmt.Errorf("%w: snapshot %s envelope: %w", ErrIntegrity, snapshotID, splitErr)
 		}
 		var peek struct {
 			SourceVolumeUUID     string `json:"SourceVolumeUUID"`
@@ -274,15 +271,15 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 			StateSeqNum          uint64 `json:"StateSeqNum"`
 		}
 		if err := json.Unmarshal(payload, &peek); err != nil {
-			return nil, ident, fmt.Errorf("%w: snapshot %s peek parse: %w", ErrIntegrity, snapshotID, err)
+			return nil, fmt.Errorf("%w: snapshot %s peek parse: %w", ErrIntegrity, snapshotID, err)
 		}
 		uuid, uuidErr := hex.DecodeString(peek.SourceVolumeUUID)
 		if uuidErr != nil || len(uuid) != 4 {
-			return nil, ident, fmt.Errorf("%w: snapshot %s SourceVolumeUUID invalid", ErrIntegrity, snapshotID)
+			return nil, fmt.Errorf("%w: snapshot %s SourceVolumeUUID invalid", ErrIntegrity, snapshotID)
 		}
 		nameHash, nhErr := hex.DecodeString(peek.SourceVolumeNameHash)
 		if nhErr != nil || len(nameHash) != 32 {
-			return nil, ident, fmt.Errorf("%w: snapshot %s SourceVolumeNameHash invalid", ErrIntegrity, snapshotID)
+			return nil, fmt.Errorf("%w: snapshot %s SourceVolumeNameHash invalid", ErrIntegrity, snapshotID)
 		}
 		var nonceUUID [4]byte
 		copy(nonceUUID[:], uuid)
@@ -291,15 +288,31 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		nonce := makeNonce(peek.StateSeqNum, nonceUUID, DomainSnapshotMeta)
 		aad := makeMetaAAD(aadNameHash, "snap:"+snapshotID, peek.StateSeqNum)
 		if err := verifyMeta(vb.aead, payload, tag, aad, nonce); err != nil {
-			return nil, ident, fmt.Errorf("%w: snapshot %s tag verify: %w", ErrIntegrity, snapshotID, err)
+			return nil, fmt.Errorf("%w: snapshot %s tag verify: %w", ErrIntegrity, snapshotID, err)
 		}
 		configData = payload
 	}
 
 	var snap SnapshotState
 	if err := json.Unmarshal(configData, &snap); err != nil {
-		return nil, ident, fmt.Errorf("failed to parse snapshot config %s: %w", snapshotID, err)
+		return nil, fmt.Errorf("failed to parse snapshot config %s: %w", snapshotID, err)
 	}
+	return &snap, nil
+}
+
+// LoadSnapshotBlockMap reads a snapshot's frozen block-to-object map from the
+// backend and returns it along with the source volume's encryption identity.
+// The returned BlocksToObject is intended to be used as a read-only base map
+// for clone volumes.
+func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, SnapshotIdentity, error) {
+	var ident SnapshotIdentity
+
+	// 1. Read and (for encrypted volumes) authenticate the snapshot config
+	snapPtr, err := vb.readSnapshotState(snapshotID)
+	if err != nil {
+		return nil, ident, err
+	}
+	snap := *snapPtr
 
 	ident.SourceVolumeName = snap.SourceVolumeName
 	if snap.SourceVolumeUUID != "" {
@@ -386,6 +399,165 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 		"inheritedLayers", len(ident.InheritedLayers))
 
 	return baseMap, ident, nil
+}
+
+// CopySnapshotMeta duplicates the snapshot at srcSnapshotID under
+// dstSnapshotID, producing a second, independently addressable snapshot over
+// the same frozen block map. No block data is copied — both snapshots
+// reference the source volume's existing chunk files.
+//
+// It must be called on a VB open over the snapshot's own source volume. The
+// destination is sealed in that volume's nonce subspace (its VolumeUUID),
+// because SourceVolumeUUID/SourceVolumeNameHash are carried across verbatim so
+// a clone of the copy still decrypts source chunks under the source identity.
+// Only a handle on that volume owns nextStateSeqNum, the counter that keeps
+// the snapshot-meta nonce unique within the subspace, so copying from any
+// other volume is refused rather than risking AES-GCM nonce reuse.
+//
+// The checkpoint object is copied byte-for-byte: it is plaintext block-map
+// metadata with no nonce or AAD of its own, and the identity a reader needs to
+// decrypt the chunks it points at comes from the (authenticated) config.
+func (vb *VB) CopySnapshotMeta(srcSnapshotID, dstSnapshotID string) (*SnapshotState, error) {
+	if srcSnapshotID == "" || dstSnapshotID == "" {
+		return nil, fmt.Errorf("copy snapshot: source and destination snapshot IDs must both be set")
+	}
+	if srcSnapshotID == dstSnapshotID {
+		return nil, fmt.Errorf("copy snapshot: destination %q must differ from the source", dstSnapshotID)
+	}
+
+	// Latch chunk GC off for the same reason CreateSnapshot does: the copy is
+	// a new snapshot pinning this volume's chunks, and a sweep already in
+	// flight cannot see it via its cached ancestry answer.
+	if vb.GCEnabled && vb.gcLatchedOff.CompareAndSwap(false, true) {
+		vb.logger().Warn("chunk GC: disabled permanently, CopySnapshotMeta called on this volume", "volume", vb.VolumeName, "snapshotID", dstSnapshotID)
+	}
+
+	// Refuse to clobber a committed destination. config.json is the commit
+	// point (it is written last, below), so a lone checkpoint is a torn prior
+	// attempt this call overwrites rather than a snapshot anything can read.
+	if _, err := vb.Backend.ReadFrom(dstSnapshotID, types.FileTypeConfig, 0, 0, 0); err == nil {
+		return nil, fmt.Errorf("copy snapshot: destination %s already exists", dstSnapshotID)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("copy snapshot: probe destination %s: %w", dstSnapshotID, err)
+	}
+
+	src, err := vb.readSnapshotState(srcSnapshotID)
+	if err != nil {
+		return nil, fmt.Errorf("copy snapshot: source %s: %w", srcSnapshotID, err)
+	}
+
+	// On an unencrypted volume nothing binds the blob to its key, so this is
+	// the only available check that the object read really is srcSnapshotID's
+	// state; it also catches an envelope parsed by a non-encrypted reader.
+	if src.SnapshotID != srcSnapshotID {
+		return nil, fmt.Errorf("copy snapshot: source %s config declares SnapshotID %q", srcSnapshotID, src.SnapshotID)
+	}
+
+	if err := vb.checkSnapshotOwnership(srcSnapshotID, src); err != nil {
+		return nil, err
+	}
+
+	// Read the source checkpoint before anything is minted or written, so a
+	// missing or unreadable source fails with no durable side effects.
+	checkpoint, err := vb.Backend.ReadFrom(srcSnapshotID, types.FileTypeBlockCheckpoint, 0, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("copy snapshot: read source checkpoint %s: %w", srcSnapshotID, err)
+	}
+
+	// Everything describing the frozen map (SeqNum, ObjectNum, block sizes,
+	// BlockCount, HasFlatSection) and the source's encryption identity is
+	// carried over unchanged — the copy freezes the same map, and BlockCount
+	// is cross-checked against the copied checkpoint on read. Only SnapshotID,
+	// CreatedAt and StateSeqNum are re-derived: the copy is a new object with
+	// its own creation time, and it must never re-seal under the source's
+	// StateSeqNum.
+	dst := &SnapshotState{
+		SnapshotID:           dstSnapshotID,
+		SourceVolumeName:     src.SourceVolumeName,
+		SeqNum:               src.SeqNum,
+		ObjectNum:            src.ObjectNum,
+		BlockSize:            src.BlockSize,
+		ObjBlockSize:         src.ObjBlockSize,
+		BlockCount:           src.BlockCount,
+		CreatedAt:            time.Now(),
+		SourceVolumeUUID:     src.SourceVolumeUUID,
+		SourceVolumeNameHash: src.SourceVolumeNameHash,
+		HasFlatSection:       src.HasFlatSection,
+	}
+
+	if vb.EncryptionEnabled {
+		dst.StateSeqNum = vb.nextStateSeqNum.Add(1)
+		// Persist the bumped counter before sealing under it, exactly as
+		// CreateSnapshot does: a crash between this Add and the next SaveState
+		// would reset nextStateSeqNum on restart and let a later seal re-issue
+		// dst.StateSeqNum, reusing this nonce under the same (key, VolumeUUID,
+		// domain=0x03) triple — catastrophic for AES-GCM.
+		if err := vb.SaveState(); err != nil {
+			return nil, fmt.Errorf("copy snapshot: StateSeqNum persist: %w", err)
+		}
+	}
+
+	dstJSON, err := json.Marshal(dst)
+	if err != nil {
+		return nil, fmt.Errorf("copy snapshot: marshal destination state: %w", err)
+	}
+
+	// The AAD's "snap:"||dstSnapshotID literal is what stops the copy being
+	// spliced back over the source (and vice versa) under the same key.
+	persisted := dstJSON
+	if vb.EncryptionEnabled {
+		nonce := makeNonce(dst.StateSeqNum, vb.VolumeUUID, DomainSnapshotMeta)
+		aad := makeMetaAAD(vb.volumeNameHash, "snap:"+dstSnapshotID, dst.StateSeqNum)
+		persisted = sealMeta(vb.aead, dstJSON, aad, nonce)
+	}
+
+	// Checkpoint first, config last — same order as CreateSnapshot. A failure
+	// between the two leaves an orphan checkpoint that no reader accepts as a
+	// snapshot (scanForOwnSnapshots skips a prefix with no config.json).
+	emptyHeaders := []byte{}
+	if err := vb.Backend.WriteTo(dstSnapshotID, types.FileTypeBlockCheckpoint, 0, &emptyHeaders, &checkpoint); err != nil {
+		return nil, fmt.Errorf("copy snapshot: write destination checkpoint %s: %w", dstSnapshotID, err)
+	}
+	if err := vb.Backend.WriteTo(dstSnapshotID, types.FileTypeConfig, 0, &emptyHeaders, &persisted); err != nil {
+		return nil, fmt.Errorf("copy snapshot: write destination config %s: %w", dstSnapshotID, err)
+	}
+
+	vb.logger().Info("CopySnapshotMeta: complete",
+		"srcSnapshotID", srcSnapshotID,
+		"dstSnapshotID", dstSnapshotID,
+		"sourceVolume", dst.SourceVolumeName,
+		"blocks", dst.BlockCount)
+
+	return dst, nil
+}
+
+// checkSnapshotOwnership verifies this VB is the volume the snapshot was taken
+// of, by comparing the persisted source identity against our own. The copy
+// seals in that volume's nonce subspace under its nextStateSeqNum counter, so
+// sealing from any other volume risks reusing a nonce the owner has issued.
+// The name comparison holds either way: an unencrypted volume has no nonce to
+// reuse, but copying another volume's snapshot is still the wrong volume.
+func (vb *VB) checkSnapshotOwnership(snapshotID string, snap *SnapshotState) error {
+	if snap.SourceVolumeName != vb.VolumeName {
+		return fmt.Errorf("%w: copy snapshot: source %s belongs to volume %q, not %q — copy must run on the snapshot's own volume so StateSeqNum stays unique in its nonce subspace",
+			ErrSnapshotVolumeMismatch, snapshotID, snap.SourceVolumeName, vb.VolumeName)
+	}
+	if !vb.EncryptionEnabled {
+		return nil
+	}
+	uuid, err := hex.DecodeString(snap.SourceVolumeUUID)
+	if err != nil || len(uuid) != 4 {
+		return fmt.Errorf("copy snapshot: source %s has invalid SourceVolumeUUID %q", snapshotID, snap.SourceVolumeUUID)
+	}
+	nameHash, err := hex.DecodeString(snap.SourceVolumeNameHash)
+	if err != nil || len(nameHash) != 32 {
+		return fmt.Errorf("copy snapshot: source %s has invalid SourceVolumeNameHash", snapshotID)
+	}
+	if !bytes.Equal(uuid, vb.VolumeUUID[:]) || !bytes.Equal(nameHash, vb.volumeNameHash[:]) {
+		return fmt.Errorf("%w: copy snapshot: source %s belongs to volume %q, not %q — copy must run on the snapshot's own volume so StateSeqNum stays unique in its nonce subspace",
+			ErrSnapshotVolumeMismatch, snapshotID, snap.SourceVolumeName, vb.VolumeName)
+	}
+	return nil
 }
 
 // OpenFromSnapshot loads the base block map from a snapshot and configures

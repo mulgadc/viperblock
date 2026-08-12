@@ -11,10 +11,6 @@ import (
 
 func TestBlockStore_NewUnifiedBlockStore(t *testing.T) {
 	bs := NewUnifiedBlockStore(4096)
-	if bs == nil {
-		t.Fatal("NewUnifiedBlockStore returned nil")
-	}
-
 	if bs.blockSize != 4096 {
 		t.Errorf("expected blockSize 4096, got %d", bs.blockSize)
 	}

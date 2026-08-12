@@ -199,6 +199,77 @@ func (backend *Backend) Init() error {
 }
 
 func (backend *Backend) InitCtx(ctx context.Context) error {
+	if err := backend.InitReadOnlyCtx(ctx); err != nil {
+		return err
+	}
+
+	// Reachability probe: prove the bucket exists, the credentials sign and
+	// the endpoint answers. Scoped to this volume because an unscoped list is
+	// O(bucket) against predastore, which resolves object metadata per key and
+	// truncates only the reported count. An empty result is still a success.
+	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(backend.config.Bucket),
+		Prefix:  aws.String(backend.config.VolumeName + "/"),
+		MaxKeys: aws.Int32(1),
+	})
+
+	if err != nil {
+		backend.log.ErrorContext(ctx, "Error listing objects", "error", err)
+		return err
+	}
+
+	return nil
+}
+
+// NewHTTPClient builds the HTTP client the S3 backend uses when S3Config
+// leaves one unset. A caller that opens many volumes against one endpoint
+// should build one of these and share it through S3Config.HTTPClient: each
+// client keeps its own connection pool, so a client per volume turns into a
+// TLS handshake per volume.
+func NewHTTPClient() *http.Client {
+	// HTTP/2 multiplexes requests over a single TCP connection, avoiding a
+	// TLS handshake per request. ForceAttemptHTTP2 enables stdlib ALPN h2
+	// negotiation against an h2-capable server
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			// Enable TLS session resumption for faster reconnects if HTTP/2 fails
+			ClientSessionCache: tls.NewLRUClientSessionCache(256),
+			// Ensure HTTP/2 ALPN is advertised
+			NextProtos: []string{"h2", "http/1.1"},
+		},
+
+		// Connection pool settings - still useful as HTTP/2 fallback
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		MaxConnsPerHost:     0,
+		IdleConnTimeout:     120 * time.Second,
+
+		// Keep-alive settings
+		DisableKeepAlives: false,
+		ForceAttemptHTTP2: true,
+
+		// Timeouts
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	return &http.Client{
+		// otelhttp emits a client span per S3 request, but only when the
+		// request context already carries a span: background chunk I/O and
+		// guest block reads would otherwise root a trace per S3 call.
+		Transport: otelhttp.NewTransport(tr, otelhttp.WithFilter(func(r *http.Request) bool {
+			return trace.SpanFromContext(r.Context()).SpanContext().IsValid()
+		})),
+		Timeout: 120 * time.Second,
+	}
+}
+
+// InitReadOnlyCtx builds the client without the reachability probe. A caller
+// that only reads state does not need it: the read that follows fails on an
+// unreachable or unauthorised backend just as the probe would, so paying for
+// a list as well is a round trip spent to learn nothing.
+func (backend *Backend) InitReadOnlyCtx(ctx context.Context) error {
 	// Log only the fields that identify the backend. S3Config carries the
 	// static credentials, so logging the struct wholesale would write the
 	// secret key in plaintext to wherever the embedder's logger points.
@@ -211,42 +282,7 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 
 	client := backend.config.HTTPClient
 	if client == nil {
-		// HTTP/2 multiplexes requests over a single TCP connection, avoiding a
-		// TLS handshake per request. ForceAttemptHTTP2 enables stdlib ALPN h2
-		// negotiation against an h2-capable server
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				// Enable TLS session resumption for faster reconnects if HTTP/2 fails
-				ClientSessionCache: tls.NewLRUClientSessionCache(256),
-				// Ensure HTTP/2 ALPN is advertised
-				NextProtos: []string{"h2", "http/1.1"},
-			},
-
-			// Connection pool settings - still useful as HTTP/2 fallback
-			MaxIdleConns:        200,
-			MaxIdleConnsPerHost: 200,
-			MaxConnsPerHost:     0,
-			IdleConnTimeout:     120 * time.Second,
-
-			// Keep-alive settings
-			DisableKeepAlives: false,
-			ForceAttemptHTTP2: true,
-
-			// Timeouts
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-
-		client = &http.Client{
-			// otelhttp emits a client span per S3 request, but only when the
-			// request context already carries a span: background chunk I/O and
-			// guest block reads would otherwise root a trace per S3 call.
-			Transport: otelhttp.NewTransport(tr, otelhttp.WithFilter(func(r *http.Request) bool {
-				return trace.SpanFromContext(r.Context()).SpanContext().IsValid()
-			})),
-			Timeout: 120 * time.Second,
-		}
+		client = NewHTTPClient()
 	}
 
 	// Use the AWS SDK to initialize the S3 backend.
@@ -275,15 +311,6 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 			},
 		},
 	})
-
-	_, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(backend.config.Bucket),
-	})
-
-	if err != nil {
-		backend.log.ErrorContext(ctx, "Error listing objects", "error", err)
-		return err
-	}
 
 	return nil
 }
