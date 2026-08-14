@@ -221,24 +221,77 @@ func (backend *Backend) InitCtx(ctx context.Context) error {
 	return nil
 }
 
+// http2Env opts the S3 transport back into HTTP/2 when set to "1". The data
+// path runs inside an nbdkit process that has no config file of its own, so an
+// environment variable is the only way to flip this without a rebuild.
+const http2Env = "VB_S3_HTTP2"
+
+// transferBufferSize sizes the transport's socket buffers. The stdlib default
+// is 4 KiB, which splits a 4 MiB chunk body across a thousand syscalls.
+const transferBufferSize = 256 << 10
+
 // NewHTTPClient builds the HTTP client the S3 backend uses when S3Config
 // leaves one unset. A caller that opens many volumes against one endpoint
 // should build one of these and share it through S3Config.HTTPClient: each
 // client keeps its own connection pool, so a client per volume turns into a
 // TLS handshake per volume.
 func NewHTTPClient() *http.Client {
-	// HTTP/2 multiplexes requests over a single TCP connection, avoiding a
-	// TLS handshake per request. ForceAttemptHTTP2 enables stdlib ALPN h2
-	// negotiation against an h2-capable server
+	return newHTTPClient(http2Enabled())
+}
+
+// http2Enabled reports whether the deployment has opted back into HTTP/2.
+func http2Enabled() bool {
+	return os.Getenv(http2Env) == "1"
+}
+
+// newHTTPClient wraps the transport for tracing. The otelhttp round tripper it
+// returns does not expose the transport underneath, so anything asserting on
+// the transport itself builds one with newS3Transport.
+func newHTTPClient(http2 bool) *http.Client {
+	return &http.Client{
+		// otelhttp emits a client span per S3 request, but only when the
+		// request context already carries a span: background chunk I/O and
+		// guest block reads would otherwise root a trace per S3 call.
+		Transport: otelhttp.NewTransport(newS3Transport(http2), otelhttp.WithFilter(func(r *http.Request) bool {
+			return trace.SpanFromContext(r.Context()).SpanContext().IsValid()
+		})),
+		Timeout: 120 * time.Second,
+	}
+}
+
+// newS3Transport builds the transport with HTTP/2 explicitly on or off, so a
+// test can exercise both without touching the environment.
+func newS3Transport(http2 bool) *http.Transport {
+	// HTTP/1.1 with a wide pool, not HTTP/2. The engine issues many small
+	// ranged GETs concurrently with 4 MiB chunk PUTs, and h2 funnels all of
+	// them onto one connection: a single chunk body exceeds the connection's
+	// flow-control window and every GET sharing it waits. Pooling gives each
+	// in-flight request its own socket, which is what this workload wants.
+	alpn := []string{"http/1.1"}
+	if http2 {
+		alpn = []string{"h2", "http/1.1"}
+	}
+
+	// Protocols governs the transport's own wiring; NextProtos governs what
+	// ALPN offers. Both derive from the same flag so they cannot disagree.
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(http2)
+
 	tr := &http.Transport{
+		Protocols: &protocols,
 		TLSClientConfig: &tls.Config{
-			// Enable TLS session resumption for faster reconnects if HTTP/2 fails
+			// Enable TLS session resumption for faster reconnects
 			ClientSessionCache: tls.NewLRUClientSessionCache(256),
-			// Ensure HTTP/2 ALPN is advertised
-			NextProtos: []string{"h2", "http/1.1"},
+			NextProtos:         alpn,
 		},
 
-		// Connection pool settings - still useful as HTTP/2 fallback
+		// Explicitly nil: the endpoint is reached directly, and a proxy
+		// inherited from the environment would capture it.
+		Proxy: nil,
+
+		// The pool is what provides concurrency without h2 multiplexing, so it
+		// must stay at least as wide as the caller's in-flight request count.
 		MaxIdleConns:        200,
 		MaxIdleConnsPerHost: 200,
 		MaxConnsPerHost:     0,
@@ -246,7 +299,9 @@ func NewHTTPClient() *http.Client {
 
 		// Keep-alive settings
 		DisableKeepAlives: false,
-		ForceAttemptHTTP2: true,
+
+		WriteBufferSize: transferBufferSize,
+		ReadBufferSize:  transferBufferSize,
 
 		// Timeouts
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -254,15 +309,7 @@ func NewHTTPClient() *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	return &http.Client{
-		// otelhttp emits a client span per S3 request, but only when the
-		// request context already carries a span: background chunk I/O and
-		// guest block reads would otherwise root a trace per S3 call.
-		Transport: otelhttp.NewTransport(tr, otelhttp.WithFilter(func(r *http.Request) bool {
-			return trace.SpanFromContext(r.Context()).SpanContext().IsValid()
-		})),
-		Timeout: 120 * time.Second,
-	}
+	return tr
 }
 
 // InitReadOnlyCtx builds the client without the reachability probe. A caller
@@ -290,12 +337,14 @@ func (backend *Backend) InitReadOnlyCtx(ctx context.Context) error {
 	// ContinueHeaderThresholdBytes: the SDK adds "Expect: 100-continue" to PUTs
 	// at or above this threshold, defaulting to 2 MiB when left zero
 	// (service/internal/s3shared/s3100continue.go). Chunk writes are 4 MiB, so
-	// every chunk PUT would qualify. Under HTTP/2 Go's server strips the Expect
-	// header before handlers see it (x/net/http2 server behavior) and
-	// canonicalizes "expect:" as empty, while the signer includes "expect" in
-	// SignedHeaders signed with value "100-continue" — a signature mismatch that
-	// surfaces as an AccessDenied 403 that is not retried. -1 skips the header
-	// entirely; it's a no-op under HTTP/2 anyway.
+	// every chunk PUT would qualify. -1 skips the header entirely, for two
+	// reasons. Under HTTP/2 Go's server strips it before handlers see it
+	// (x/net/http2 server behavior) and canonicalizes "expect:" as empty, while
+	// the signer includes "expect" in SignedHeaders signed with value
+	// "100-continue" — a signature mismatch surfacing as an unretried 403. Under
+	// HTTP/1.1, which is now the default, the header is honoured and costs a
+	// round trip ahead of every chunk body to guard against a rejection this
+	// backend does not expect.
 	backend.config.s3Client = s3.New(s3.Options{
 		BaseEndpoint:                 aws.String(normalizeEndpoint(backend.config.Host)),
 		UsePathStyle:                 true,
