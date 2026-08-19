@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	awsretry "github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
@@ -74,6 +76,50 @@ func wrapNotFound(err error) error {
 		case "NoSuchKey", "NoSuchBucket", "NotFound", "NoSuchVersion":
 			return fmt.Errorf("%w: %w", os.ErrNotExist, err)
 		}
+	}
+	return err
+}
+
+// isNonRetryableBackendError identifies failures that cannot recover without
+// changing the request or DNS configuration. Throttling remains retryable.
+func isNonRetryableBackendError(err error) bool {
+	var statusErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &statusErr) {
+		status := statusErr.HTTPStatusCode()
+		return status >= http.StatusBadRequest && status < http.StatusInternalServerError && status != http.StatusTooManyRequests
+	}
+
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
+}
+
+// newRetryer preserves the SDK retry policy while overriding deterministic
+// client and DNS failures before the default connection checks see them.
+func newRetryer() aws.Retryer {
+	return awsretry.NewStandard(func(options *awsretry.StandardOptions) {
+		classifier := awsretry.IsErrorRetryableFunc(func(err error) aws.Ternary {
+			var statusErr interface{ HTTPStatusCode() int }
+			if errors.As(err, &statusErr) && statusErr.HTTPStatusCode() == http.StatusTooManyRequests {
+				return aws.TrueTernary
+			}
+			if isNonRetryableBackendError(err) {
+				return aws.FalseTernary
+			}
+			return aws.UnknownTernary
+		})
+		options.Retryables = append([]awsretry.IsErrorRetryable{classifier}, options.Retryables...)
+	})
+}
+
+// classifyReadErr exposes deterministic failures to Viperblock's outer retry
+// loops while preserving the established object-not-found contract.
+func classifyReadErr(err error) error {
+	err = wrapNotFound(err)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if isNonRetryableBackendError(err) {
+		return fmt.Errorf("%w: %w", types.ErrBackendNonRetryable, err)
 	}
 	return err
 }
@@ -352,6 +398,7 @@ func (backend *Backend) InitReadOnlyCtx(ctx context.Context) error {
 		Region:                       backend.config.Region,
 		HTTPClient:                   client,
 		Credentials:                  credentials.NewStaticCredentialsProvider(backend.config.AccessKey, backend.config.SecretKey, ""),
+		Retryer:                      newRetryer(),
 		// Registers the pool-pressure observer after the SDK's own deserialize
 		// middleware, so RawResponse is already populated when it runs.
 		APIOptions: []func(*middleware.Stack) error{
@@ -405,11 +452,10 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 		backend.log.DebugContext(ctx, "[S3 READ] Reading entire file", "key", filename)
 	}
 
-	// TODO: Add retry from S3 timeout/500/etc
 	textResult, err := backend.config.s3Client.GetObject(ctx, requestObject)
 
 	if err != nil {
-		return nil, wrapNotFound(err)
+		return nil, classifyReadErr(err)
 	}
 	defer textResult.Body.Close()
 
@@ -524,7 +570,7 @@ func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, file
 
 	textResult, err := backend.config.s3Client.GetObject(ctx, requestObject)
 	if err != nil {
-		return nil, wrapNotFound(err)
+		return nil, classifyReadErr(err)
 	}
 	defer textResult.Body.Close()
 

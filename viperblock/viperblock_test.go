@@ -2604,6 +2604,14 @@ func TestClassifyStateLoad(t *testing.T) {
 	}
 }
 
+func TestClassifyStateLoad_NonRetryableBackendErrorPassesThrough(t *testing.T) {
+	rejected := fmt.Errorf("bad request: %w", types.ErrBackendNonRetryable)
+	got := classifyStateLoad(fmt.Errorf("local: %w", os.ErrNotExist), rejected)
+
+	assert.ErrorIs(t, got, types.ErrBackendNonRetryable)
+	assert.NotErrorIs(t, got, ErrStateBackendUnavailable)
+}
+
 // The sweep runs against a directory shared with other processes, so what it
 // declines to touch matters as much as what it reclaims: only a directory that
 // matches the prefix AND is far older than any live run may go.

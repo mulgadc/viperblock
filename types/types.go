@@ -29,6 +29,10 @@ var ErrShortRead = errors.New("viperblock: backend returned a short read")
 // operation instead of taking the process down.
 var ErrBackendConfig = errors.New("viperblock: backend config type mismatch")
 
+// ErrBackendNonRetryable marks a deterministic backend failure that another
+// attempt cannot fix, such as a rejected request or a missing DNS name.
+var ErrBackendNonRetryable = errors.New("viperblock: non-retryable backend error")
+
 type Backend interface {
 	Init() error
 	InitCtx(ctx context.Context) error
