@@ -507,6 +507,33 @@ func TestNewMismatchedBackendConfigReturnsError(t *testing.T) {
 	}
 }
 
+// TestNewNegativeCacheSizeReturnsError pins that a caller-supplied cache size
+// below zero fails this one call. It used to panic inside New, and viperblock
+// has no recover() barrier, so a bad volume config killed the process rather
+// than the volume open. Matches SetCacheSize, which already returns an error.
+func TestNewNegativeCacheSizeReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	var vb *VB
+	var err error
+	require.NotPanics(t, func() {
+		vb, err = New(&VB{
+			VolumeName: "test-negative-cache",
+			VolumeSize: 1024 * 1024,
+			BaseDir:    filepath.Join(tmpDir, "viperblock"),
+			Cache:      Cache{Config: CacheConfig{Size: -1}},
+		}, FileBackend, file.FileConfig{
+			BaseDir:    tmpDir,
+			VolumeName: "test-negative-cache",
+			VolumeSize: 1024 * 1024,
+		})
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to create LRU cache")
+	assert.Nil(t, vb)
+}
+
 // TestNewAndSetDebugDoNotMutateGlobalLogger guards against viperblock (a
 // library) hijacking its embedder's process-wide slog default: New must
 // default vb.log to slog.Default() without installing anything globally, and

@@ -1225,10 +1225,11 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.Cache.Config.UseSystemMemory = false
 		config.Cache.Config.SystemMemoryPercent = 0
 	} else {
-		// Create LRU cache with calculated size
+		// Create LRU cache with calculated size. lru.New only fails on a
+		// non-positive size, so this is a caller config error, not fatal.
 		lruCache, err = lru.New[uint64, cachedBlock](config.Cache.Config.Size)
 		if err != nil {
-			panic(fmt.Sprintf("failed to create LRU cache: %v", err))
+			return nil, fmt.Errorf("failed to create LRU cache: %w", err)
 		}
 	}
 
