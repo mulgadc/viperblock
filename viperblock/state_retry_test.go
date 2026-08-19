@@ -135,6 +135,20 @@ func TestLoadStateRequestCtx_ExhaustsRetriesOnPersistentTruncation(t *testing.T)
 	assert.Equal(t, stateReadMaxAttempts, flaky.callCount())
 }
 
+func TestLoadStateRequestCtx_NoRetryOnNonRetryableBackendError(t *testing.T) {
+	vb := newFileBackedVB(t, "vol-retry-rejected", nil)
+	flaky := &flakyConfigBackend{Backend: vb.Backend}
+	flaky.mutate = func(call int, data []byte, err error) ([]byte, error) {
+		return nil, fmt.Errorf("bad request: %w", types.ErrBackendNonRetryable)
+	}
+	vb.Backend = flaky
+
+	_, err := vb.LoadStateRequestCtx(context.Background(), "")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, types.ErrBackendNonRetryable)
+	assert.Equal(t, 1, flaky.callCount())
+}
+
 // TestLoadStateRequestCtx_NoRetryOnEncryptionMismatch pins that a wrong-key
 // open makes exactly one attempt: the key is wrong on every retry too, so
 // retrying only burns the recovery window for a deterministic failure.

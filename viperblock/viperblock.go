@@ -973,9 +973,8 @@ var ErrNoSpace = types.ErrNoSpace
 // volume).
 var ErrStateNotFound = errors.New("viperblock: state not found")
 
-// ErrStateBackendUnavailable is returned by LoadState when the backend Read
-// failed with a non-not-found error (timeout, network, 5xx). Callers should
-// retry with backoff; the state may become available shortly.
+// ErrStateBackendUnavailable is returned when a state read fails with a
+// transient backend error. Callers should retry with backoff.
 var ErrStateBackendUnavailable = errors.New("viperblock: state backend unavailable")
 
 // ErrSnapshotVolumeMismatch is returned when an operation that must run on a
@@ -1030,10 +1029,12 @@ var ErrWALHeaderShort = errors.New("viperblock: WAL file too short to contain a 
 // volume has no persisted state (genuine "new volume"), anything else means
 // the backend is transiently unreachable.
 //
-// Backends signal "object missing" by wrapping os.ErrNotExist (file backend
-// returns os.PathError directly; s3 backend's wrapNotFound translates
-// NoSuchKey/NoSuchBucket/etc.). Any other error is treated as transient.
+// Backends signal missing objects with os.ErrNotExist and deterministic
+// failures with types.ErrBackendNonRetryable. Other errors are transient.
 func classifyStateLoad(localErr, backendErr error) error {
+	if errors.Is(backendErr, types.ErrBackendNonRetryable) {
+		return backendErr
+	}
 	if backendErr != nil && !errors.Is(backendErr, os.ErrNotExist) {
 		return fmt.Errorf("%w: %w", ErrStateBackendUnavailable, backendErr)
 	}
@@ -5693,9 +5694,8 @@ func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state V
 	} else {
 		jsonData, err = vb.Backend.ReadCtx(ctx, types.FileTypeConfig, 0, 0, 0)
 		if err != nil {
-			// Object-not-found is genuinely missing state, not a transient
-			// backend hiccup — retrying it only burns the recovery window.
-			return state, !errors.Is(err, os.ErrNotExist), err
+			retryable = !errors.Is(err, os.ErrNotExist) && !errors.Is(err, types.ErrBackendNonRetryable)
+			return state, retryable, err
 		}
 	}
 

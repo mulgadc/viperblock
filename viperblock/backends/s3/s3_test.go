@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -77,6 +78,25 @@ func TestNormalizeEndpoint(t *testing.T) {
 // TestWrapNotFound pins the AWS-error → os.ErrNotExist mapping that callers
 // (e.g. viperblock.LoadState) rely on to tell "object missing" apart from
 // "backend unreachable". Required by the medium-term fix.
+func TestRetryerClassifiesHTTPStatus(t *testing.T) {
+	cases := []struct {
+		status    int
+		retryable bool
+	}{
+		{status: http.StatusBadRequest, retryable: false},
+		{status: http.StatusForbidden, retryable: false},
+		{status: http.StatusTooManyRequests, retryable: true},
+		{status: http.StatusInternalServerError, retryable: true},
+	}
+
+	retryer := newRetryer()
+	for _, tc := range cases {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			assert.Equal(t, tc.retryable, retryer.IsErrorRetryable(newResponseError(tc.status)))
+		})
+	}
+}
+
 func TestWrapNotFound(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -398,8 +418,27 @@ func newTestBackend(t *testing.T, rt http.RoundTripper) *Backend {
 		Region:       "us-east-1",
 		HTTPClient:   &http.Client{Transport: rt},
 		Credentials:  credentials.NewStaticCredentialsProvider("ak", "sk", ""),
+		Retryer:      newRetryer(),
 	})
 	return backend
+}
+
+func TestReadCtx_BadRequestIsNotRetried(t *testing.T) {
+	var requests atomic.Int32
+	backend := newTestBackend(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{},
+			Body:       io.NopCloser(bytes.NewReader(nil)),
+			Request:    req,
+		}, nil
+	}))
+
+	_, err := backend.ReadCtx(context.Background(), types.FileTypeConfig, 0, 0, 0)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, types.ErrBackendNonRetryable)
+	assert.Equal(t, int32(1), requests.Load())
 }
 
 // TestReadCtx_FullObjectShortBodyIsRefused pins that a full-object GET
