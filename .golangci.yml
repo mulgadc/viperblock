@@ -26,6 +26,7 @@ linters:
     - errorlint # catches ==/!= on errors, type assertions on errors, and %v instead of %w — all break on wrapped errors
     - exptostd # detects golang.org/x/exp/ functions replaceable by stdlib
     - fatcontext # detects nested contexts in loops
+    - forbidigo # blocks forbidden identifiers
     - gocheckcompilerdirectives # validates go compiler directive comments (//go:)
     - godot # checks that declaration comments end in a period
     - goprintffuncname # checks that printf-like functions are named with f at the end
@@ -73,6 +74,12 @@ linters:
 
     errcheck:
       check-type-assertions: true # replaces forcetypeassert
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^panic$'
+          msg: panic terminates the process; return an error or explicitly justify the panic.
 
     gosec:
       excludes:
@@ -141,6 +148,7 @@ linters:
           - bodyclose
           - errcheck
           - errchkjson
+          - forbidigo
           - gosec
 
       # viperblock-specific: nbd directory has cgo panic issues with gosec
