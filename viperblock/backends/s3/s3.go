@@ -696,12 +696,13 @@ func (backend *Backend) GetBackendType() string {
 	return "s3"
 }
 
-func (backend *Backend) SetConfig(config any) {
+func (backend *Backend) SetConfig(config any) error {
 	cfg, ok := config.(S3Config)
 	if !ok {
-		panic("s3 backend: expected S3Config")
+		return fmt.Errorf("%w: s3 backend expected S3Config, got %T", types.ErrBackendConfig, config)
 	}
 	backend.config = cfg
+	return nil
 }
 
 func (backend *Backend) GetHost() string {

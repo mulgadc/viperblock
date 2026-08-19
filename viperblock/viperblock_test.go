@@ -1474,7 +1474,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 		}
 
 		t.Run("Use Invalid S3 Bucket", func(t *testing.T) {
-			vb.Backend.SetConfig(s3.S3Config{
+			require.NoError(t, vb.Backend.SetConfig(s3.S3Config{
 				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
@@ -1483,7 +1483,7 @@ func TestInvalidS3Bucket(t *testing.T) {
 				SecretKey:  SecretKey,
 				Host:       vb.Backend.GetHost(),
 				HTTPClient: testHTTPClient,
-			})
+			}))
 
 			err := vb.Backend.Init()
 			assert.Error(t, err)
@@ -1527,7 +1527,7 @@ func TestInvalidS3Auth(t *testing.T) {
 		}
 
 		t.Run("Use Invalid S3 Auth", func(t *testing.T) {
-			vb.Backend.SetConfig(s3.S3Config{
+			require.NoError(t, vb.Backend.SetConfig(s3.S3Config{
 				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
@@ -1536,7 +1536,7 @@ func TestInvalidS3Auth(t *testing.T) {
 				SecretKey:  "BADSECRET/K7MDENG/bPxRfiCYEXAMPLEKEY",
 				Host:       vb.Backend.GetHost(),
 				HTTPClient: testHTTPClient,
-			})
+			}))
 
 			// Write a block
 			// Next, write a new block and flush

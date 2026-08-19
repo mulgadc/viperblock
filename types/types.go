@@ -59,7 +59,10 @@ type Backend interface {
 	Sync()
 	GetBackendType() string
 	GetHost() string
-	SetConfig(config any)
+	// SetConfig replaces the backend's config. It takes any, so a value of
+	// the wrong concrete type is only detectable at runtime and comes back
+	// as ErrBackendConfig rather than taking the process down.
+	SetConfig(config any) error
 	// SetLogger installs the logger the backend uses for its own log lines.
 	// Backends never call slog.SetDefault; the logger is scoped to the
 	// instance so an embedding process's global logger is left untouched.

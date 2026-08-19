@@ -27,7 +27,7 @@ func TestInvalidS3Host(t *testing.T) {
 			tempPort, err := FindFreePort()
 			assert.NoError(t, err)
 
-			vb.Backend.SetConfig(s3.S3Config{
+			require.NoError(t, vb.Backend.SetConfig(s3.S3Config{
 				VolumeName: vb.GetVolume(),
 				VolumeSize: volumeSize,
 				Region:     "ap-southeast-2",
@@ -36,7 +36,7 @@ func TestInvalidS3Host(t *testing.T) {
 				SecretKey:  SecretKey,
 				Host:       fmt.Sprintf("https://%s", tempPort),
 				HTTPClient: testHTTPClient,
-			})
+			}))
 
 			err = vb.Backend.Init()
 			assert.Error(t, err)

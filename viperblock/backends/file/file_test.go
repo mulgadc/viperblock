@@ -150,15 +150,22 @@ func TestMiscBackendMethods(t *testing.T) {
 	assert.NoError(t, backend.Open("ignored"))
 	backend.Sync() // no-op, just must not panic
 
-	backend.SetConfig(FileConfig{VolumeName: "renamed", VolumeSize: 2, BaseDir: t.TempDir()})
+	require.NoError(t, backend.SetConfig(FileConfig{VolumeName: "renamed", VolumeSize: 2, BaseDir: t.TempDir()}))
 	assert.Equal(t, "renamed", backend.config.VolumeName)
 }
 
-func TestSetConfigPanicsOnWrongConfigType(t *testing.T) {
+// TestSetConfigReturnsErrorOnWrongConfigType pins that a config value of the
+// wrong concrete type fails the one call. SetConfig takes any, so the mismatch
+// is only detectable at runtime; it used to panic, which would have handed the
+// first production caller a process kill as the method's only failure mode.
+func TestSetConfigReturnsErrorOnWrongConfigType(t *testing.T) {
 	backend := newTestBackend(t)
-	assert.Panics(t, func() {
-		backend.SetConfig("not-a-file-config")
+
+	var err error
+	require.NotPanics(t, func() {
+		err = backend.SetConfig("not-a-file-config")
 	})
+	require.ErrorIs(t, err, types.ErrBackendConfig)
 }
 
 func TestDeleteAndDeleteCtx(t *testing.T) {

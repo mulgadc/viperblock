@@ -255,12 +255,13 @@ func (backend *Backend) GetBackendType() string {
 	return "file"
 }
 
-func (backend *Backend) SetConfig(config any) {
+func (backend *Backend) SetConfig(config any) error {
 	cfg, ok := config.(FileConfig)
 	if !ok {
-		panic("file backend: expected FileConfig")
+		return fmt.Errorf("%w: file backend expected FileConfig, got %T", types.ErrBackendConfig, config)
 	}
 	backend.config = cfg
+	return nil
 }
 
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {

@@ -292,6 +292,22 @@ func TestNewWrongConfigTypeReturnsError(t *testing.T) {
 	assert.Nil(t, backend)
 }
 
+// TestSetConfigReturnsErrorOnWrongConfigType is the SetConfig counterpart:
+// the method takes any, so a mismatch is only detectable at runtime and comes
+// back as an error rather than panicking.
+func TestSetConfigReturnsErrorOnWrongConfigType(t *testing.T) {
+	backend, err := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		err = backend.SetConfig("not-an-s3-config")
+	})
+	require.ErrorIs(t, err, types.ErrBackendConfig)
+
+	require.NoError(t, backend.SetConfig(S3Config{VolumeName: "renamed", Bucket: "bucket"}))
+	assert.Equal(t, "renamed", backend.config.VolumeName)
+}
+
 // TestPoolPressureMiddlewareSetsNearFullOnHeader pins that
 // X-Predastore-Pool-Pressure: nearfull on a PutObject response sets NearFull().
 func TestPoolPressureMiddlewareSetsNearFullOnHeader(t *testing.T) {
