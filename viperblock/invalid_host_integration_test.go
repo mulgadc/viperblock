@@ -8,6 +8,7 @@ import (
 
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestInvalidS3Host drives the backend against a host that refuses every
