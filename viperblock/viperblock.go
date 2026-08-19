@@ -1153,11 +1153,19 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	case "file":
 		//volumeName = backendConfig.(file.FileConfig).VolumeName
 		//volumeSize = backendConfig.(file.FileConfig).VolumeSize
-		backend = file.New(backendConfig)
+		fileBackend, err := file.New(backendConfig)
+		if err != nil {
+			return nil, err
+		}
+		backend = fileBackend
 	case "s3":
 		//volumeName = backendConfig.(s3.S3Config).VolumeName
 		//volumeSize = backendConfig.(s3.S3Config).VolumeSize
-		backend = s3.New(backendConfig)
+		s3Backend, err := s3.New(backendConfig)
+		if err != nil {
+			return nil, err
+		}
+		backend = s3Backend
 	default:
 		return nil, fmt.Errorf("unsupported backend type %q", btype)
 	}

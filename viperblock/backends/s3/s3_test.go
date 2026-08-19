@@ -283,14 +283,24 @@ func responseWithPressureHeader(headerValue string) *smithyhttp.Response {
 	return &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusOK, Header: header}}
 }
 
+// TestNewWrongConfigTypeReturnsError pins that a backend type string that
+// disagrees with its config value fails the one volume operation rather than
+// taking the process down.
+func TestNewWrongConfigTypeReturnsError(t *testing.T) {
+	backend, err := New("not-an-s3-config")
+	require.ErrorIs(t, err, types.ErrBackendConfig)
+	assert.Nil(t, backend)
+}
+
 // TestPoolPressureMiddlewareSetsNearFullOnHeader pins that
 // X-Predastore-Pool-Pressure: nearfull on a PutObject response sets NearFull().
 func TestPoolPressureMiddlewareSetsNearFullOnHeader(t *testing.T) {
-	backend := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	backend, err := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	require.NoError(t, err)
 	mw := backend.newPoolPressureMiddleware()
 
 	ctx := ctxWithOperationName(t, putObjectOperationName)
-	_, _, err := mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
+	_, _, err = mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
 		out: middleware.DeserializeOutput{RawResponse: responseWithPressureHeader(poolPressureNearFull)},
 	})
 	require.NoError(t, err)
@@ -300,12 +310,13 @@ func TestPoolPressureMiddlewareSetsNearFullOnHeader(t *testing.T) {
 // TestPoolPressureMiddlewareClearsNearFullWhenHeaderAbsent pins the
 // self-clearing behavior the drain loop depends on.
 func TestPoolPressureMiddlewareClearsNearFullWhenHeaderAbsent(t *testing.T) {
-	backend := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	backend, err := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	require.NoError(t, err)
 	backend.backendNearFull.Store(true) // simulate a prior nearfull observation
 
 	mw := backend.newPoolPressureMiddleware()
 	ctx := ctxWithOperationName(t, putObjectOperationName)
-	_, _, err := mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
+	_, _, err = mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
 		out: middleware.DeserializeOutput{RawResponse: responseWithPressureHeader("")},
 	})
 	require.NoError(t, err)
@@ -315,12 +326,13 @@ func TestPoolPressureMiddlewareClearsNearFullWhenHeaderAbsent(t *testing.T) {
 // TestPoolPressureMiddlewareIgnoresNonPutObjectOperations pins that a
 // GET/List response never touches the flag.
 func TestPoolPressureMiddlewareIgnoresNonPutObjectOperations(t *testing.T) {
-	backend := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	backend, err := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	require.NoError(t, err)
 	backend.backendNearFull.Store(true)
 
 	mw := backend.newPoolPressureMiddleware()
 	ctx := ctxWithOperationName(t, "GetObject")
-	_, _, err := mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
+	_, _, err = mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
 		// Even if a GetObject response somehow carried the header, it must
 		// be ignored -- only PutObject responses carry pool-pressure meaning.
 		out: middleware.DeserializeOutput{RawResponse: responseWithPressureHeader("")},
@@ -333,13 +345,14 @@ func TestPoolPressureMiddlewareIgnoresNonPutObjectOperations(t *testing.T) {
 // PutObject (507, no pool-pressure header) resolves to "not nearfull" and
 // the underlying error passes through unchanged for classifyWriteErr.
 func TestPoolPressureMiddlewareClearsOnFailedPutObject(t *testing.T) {
-	backend := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	backend, err := New(S3Config{VolumeName: "vol", Bucket: "bucket"})
+	require.NoError(t, err)
 	backend.backendNearFull.Store(true)
 
 	mw := backend.newPoolPressureMiddleware()
 	ctx := ctxWithOperationName(t, putObjectOperationName)
 	wantErr := newResponseError(http.StatusInsufficientStorage)
-	_, _, err := mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
+	_, _, err = mw.HandleDeserialize(ctx, middleware.DeserializeInput{}, fakeDeserializeHandler{
 		out: middleware.DeserializeOutput{RawResponse: responseWithPressureHeader("")},
 		err: wantErr,
 	})
@@ -359,8 +372,10 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 // of a real network. It bypasses InitCtx (which issues a ListObjectsV2
 // existence check the fake transport does not model) and constructs the SDK
 // client directly, mirroring InitCtx's own s3.New call.
-func newTestBackend(rt http.RoundTripper) *Backend {
-	backend := New(S3Config{VolumeName: "vol", Bucket: "bucket", Region: "us-east-1"})
+func newTestBackend(t *testing.T, rt http.RoundTripper) *Backend {
+	t.Helper()
+	backend, err := New(S3Config{VolumeName: "vol", Bucket: "bucket", Region: "us-east-1"})
+	require.NoError(t, err)
 	backend.config.s3Client = s3.New(s3.Options{
 		BaseEndpoint: aws.String("https://s3.test"),
 		UsePathStyle: true,
@@ -381,7 +396,7 @@ func TestReadCtx_FullObjectShortBodyIsRefused(t *testing.T) {
 	full := []byte("this is the complete config.json body")
 	short := full[:len(full)-10]
 
-	backend := newTestBackend(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	backend := newTestBackend(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		header := http.Header{}
 		header.Set("Content-Length", strconv.Itoa(len(full)))
 		return &http.Response{
@@ -404,7 +419,7 @@ func TestReadCtx_FullObjectShortBodyIsRefused(t *testing.T) {
 func TestReadCtx_FullObjectChunkedResponseSkipsGuard(t *testing.T) {
 	full := []byte("this is the complete config.json body")
 
-	backend := newTestBackend(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	backend := newTestBackend(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{},
@@ -424,7 +439,7 @@ func TestReadCtx_FullObjectChunkedResponseSkipsGuard(t *testing.T) {
 func TestReadCtx_FullObjectMatchingContentLengthSucceeds(t *testing.T) {
 	full := []byte("this is the complete config.json body")
 
-	backend := newTestBackend(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	backend := newTestBackend(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		header := http.Header{}
 		header.Set("Content-Length", strconv.Itoa(len(full)))
 		return &http.Response{

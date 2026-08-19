@@ -56,7 +56,7 @@ func (s *connCountingServer) count() int {
 func openBackends(t *testing.T, host string, client *http.Client, n int) {
 	t.Helper()
 	for i := range n {
-		backend := New(S3Config{
+		backend, err := New(S3Config{
 			VolumeName: "vol-reuse000000000" + string(rune('0'+i)),
 			Bucket:     "bucket",
 			Region:     "us-east-1",
@@ -65,6 +65,7 @@ func openBackends(t *testing.T, host string, client *http.Client, n int) {
 			Host:       host,
 			HTTPClient: client,
 		})
+		require.NoError(t, err)
 		require.NoError(t, backend.InitCtx(context.Background()))
 	}
 }

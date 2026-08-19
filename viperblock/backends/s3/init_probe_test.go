@@ -53,8 +53,9 @@ func (p *probeServer) requestCount() int {
 	return len(p.queries)
 }
 
-func probeBackend(host string) *Backend {
-	return New(S3Config{
+func probeBackend(t *testing.T, host string) *Backend {
+	t.Helper()
+	backend, err := New(S3Config{
 		VolumeName: "vol-probe0000000001",
 		Bucket:     "bucket",
 		Region:     "us-east-1",
@@ -62,6 +63,8 @@ func probeBackend(host string) *Backend {
 		SecretKey:  "probe-secret",
 		Host:       host,
 	})
+	require.NoError(t, err)
+	return backend
 }
 
 // TestInitProbeIsScopedToTheVolume is the whole point of the probe's shape.
@@ -70,7 +73,7 @@ func probeBackend(host string) *Backend {
 // fills and takes every engine open with it.
 func TestInitProbeIsScopedToTheVolume(t *testing.T) {
 	server := newProbeServer(t, http.StatusOK)
-	backend := probeBackend(server.URL)
+	backend := probeBackend(t, server.URL)
 	require.NoError(t, backend.InitCtx(context.Background()))
 
 	query := server.lastQuery(t)
@@ -85,7 +88,7 @@ func TestInitProbeIsScopedToTheVolume(t *testing.T) {
 // to learn something the state read that follows would report anyway.
 func TestInitReadOnlyIssuesNoProbe(t *testing.T) {
 	server := newProbeServer(t, http.StatusOK)
-	backend := probeBackend(server.URL)
+	backend := probeBackend(t, server.URL)
 	require.NoError(t, backend.InitReadOnlyCtx(context.Background()))
 	require.Zero(t, server.requestCount(), "a read-only init went to the backend")
 }
@@ -95,6 +98,6 @@ func TestInitReadOnlyIssuesNoProbe(t *testing.T) {
 // successful open that fails later, somewhere less obvious.
 func TestInitProbeStillFailsOnAnUnusableBackend(t *testing.T) {
 	server := newProbeServer(t, http.StatusForbidden)
-	backend := probeBackend(server.URL)
+	backend := probeBackend(t, server.URL)
 	require.Error(t, backend.InitCtx(context.Background()))
 }

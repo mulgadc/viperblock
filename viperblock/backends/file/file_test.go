@@ -16,23 +16,32 @@ import (
 
 func newTestBackend(t *testing.T) *Backend {
 	t.Helper()
-	backend := New(FileConfig{
+	backend, err := New(FileConfig{
 		VolumeName: "test-vol",
 		VolumeSize: 1024 * 1024,
 		BaseDir:    t.TempDir(),
 	})
+	require.NoError(t, err)
 	require.NoError(t, backend.Init())
 	return backend
 }
 
 func TestNewDefaultsLogger(t *testing.T) {
-	backend := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: t.TempDir()})
+	backend, err := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: t.TempDir()})
+	require.NoError(t, err)
 	assert.NotNil(t, backend.log, "New must default the instance logger")
 	assert.Same(t, slog.Default(), backend.log)
 }
 
+func TestNewWrongConfigTypeReturnsError(t *testing.T) {
+	backend, err := New("not-a-file-config")
+	require.ErrorIs(t, err, types.ErrBackendConfig)
+	assert.Nil(t, backend)
+}
+
 func TestSetLogger(t *testing.T) {
-	backend := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: t.TempDir()})
+	backend, err := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: t.TempDir()})
+	require.NoError(t, err)
 
 	var buf bytes.Buffer
 	custom := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -45,15 +54,18 @@ func TestSetLogger(t *testing.T) {
 }
 
 func TestInitAndInitCtx(t *testing.T) {
-	backend := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: t.TempDir()})
+	backend, err := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: t.TempDir()})
+	require.NoError(t, err)
 	require.NoError(t, backend.Init())
 
-	backend2 := New(FileConfig{VolumeName: "v2", VolumeSize: 1, BaseDir: t.TempDir()})
+	backend2, err := New(FileConfig{VolumeName: "v2", VolumeSize: 1, BaseDir: t.TempDir()})
+	require.NoError(t, err)
 	require.NoError(t, backend2.InitCtx(context.Background()))
 }
 
 func TestInitMissingBaseDirFails(t *testing.T) {
-	backend := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: "/nonexistent/base/dir"})
+	backend, err := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: "/nonexistent/base/dir"})
+	require.NoError(t, err)
 	assert.Error(t, backend.Init())
 }
 
@@ -142,12 +154,6 @@ func TestMiscBackendMethods(t *testing.T) {
 	assert.Equal(t, "renamed", backend.config.VolumeName)
 }
 
-func TestNewPanicsOnWrongConfigType(t *testing.T) {
-	assert.Panics(t, func() {
-		New("not-a-file-config")
-	})
-}
-
 func TestSetConfigPanicsOnWrongConfigType(t *testing.T) {
 	backend := newTestBackend(t)
 	assert.Panics(t, func() {
@@ -216,7 +222,8 @@ func TestListPrefixesAndListPrefixesCtx(t *testing.T) {
 }
 
 func TestListPrefixesMissingBaseDirIsEmptyNotError(t *testing.T) {
-	backend := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: filepath.Join(t.TempDir(), "does-not-exist")})
+	backend, err := New(FileConfig{VolumeName: "v", VolumeSize: 1, BaseDir: filepath.Join(t.TempDir(), "does-not-exist")})
+	require.NoError(t, err)
 
 	names, err := backend.ListPrefixes("snap-")
 	require.NoError(t, err)
@@ -329,11 +336,12 @@ func TestWriteRealDiskFullMapsToNoSpace(t *testing.T) {
 		_ = syscall.Unmount(mountPoint, 0)
 	})
 
-	backend := New(FileConfig{
+	backend, err := New(FileConfig{
 		VolumeName: "enospc-vol",
 		VolumeSize: 1024 * 1024 * 1024,
 		BaseDir:    mountPoint,
 	})
+	require.NoError(t, err)
 	require.NoError(t, backend.Init())
 
 	headers := []byte("hdr")

@@ -26,7 +26,7 @@ func TestInitDoesNotLogCredentials(t *testing.T) {
 	server := newProbeServer(t, http.StatusOK)
 
 	var logged bytes.Buffer
-	backend := New(S3Config{
+	backend, err := New(S3Config{
 		VolumeName: "vol-logging00000001",
 		Bucket:     "bucket",
 		Region:     "us-east-1",
@@ -34,6 +34,7 @@ func TestInitDoesNotLogCredentials(t *testing.T) {
 		SecretKey:  fakeSecretKey,
 		Host:       server.URL,
 	})
+	require.NoError(t, err)
 	backend.SetLogger(slog.New(slog.NewJSONHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	require.NoError(t, backend.InitCtx(context.Background()))

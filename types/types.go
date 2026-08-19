@@ -22,6 +22,13 @@ var ErrNoSpace = errors.New("viperblock: backend out of space")
 // cache the zero-filled tail as though it were real data.
 var ErrShortRead = errors.New("viperblock: backend returned a short read")
 
+// ErrBackendConfig is returned by a backend constructor when the config value
+// it was handed is not the type that backend expects. The constructors take
+// any, so a backend-type string that disagrees with its config value is only
+// detectable at runtime; reporting it lets the caller fail one volume
+// operation instead of taking the process down.
+var ErrBackendConfig = errors.New("viperblock: backend config type mismatch")
+
 type Backend interface {
 	Init() error
 	InitCtx(ctx context.Context) error

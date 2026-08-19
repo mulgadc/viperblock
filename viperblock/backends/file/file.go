@@ -97,12 +97,12 @@ func (backend *Backend) WriteToCtx(_ context.Context, volumeName string, fileTyp
 }
 
 // 3. Implement WithConfig for each backend.
-func New(config any) (backend *Backend) {
+func New(config any) (backend *Backend, err error) {
 	cfg, ok := config.(FileConfig)
 	if !ok {
-		panic("file backend: expected FileConfig")
+		return nil, fmt.Errorf("%w: file backend expected FileConfig, got %T", types.ErrBackendConfig, config)
 	}
-	return &Backend{FileBackend: FileBackend{config: cfg, log: slog.Default()}}
+	return &Backend{FileBackend: FileBackend{config: cfg, log: slog.Default()}}, nil
 }
 
 // SetLogger installs the logger this backend uses for its own log lines.

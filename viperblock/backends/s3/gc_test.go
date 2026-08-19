@@ -92,7 +92,7 @@ var insecureTestHTTPClient = &http.Client{
 func newGCTestBackend(t *testing.T, volumeName string) *Backend {
 	t.Helper()
 
-	backend := New(S3Config{
+	backend, err := New(S3Config{
 		VolumeName: volumeName,
 		VolumeSize: 8 * 1024 * 1024,
 		Bucket:     sharedTestServer.Bucket,
@@ -102,6 +102,7 @@ func newGCTestBackend(t *testing.T, volumeName string) *Backend {
 		Host:       sharedTestServer.Endpoint,
 		HTTPClient: insecureTestHTTPClient,
 	})
+	require.NoError(t, err)
 	require.NoError(t, backend.Init())
 	return backend
 }
@@ -222,9 +223,10 @@ func TestS3ListObjectsMissingPrefixIsEmptyNotError(t *testing.T) {
 // method fails closed with a clear error when Init/InitCtx was never called,
 // rather than a nil pointer panic.
 func TestS3DeleteAndListRequireInitializedClient(t *testing.T) {
-	backend := New(S3Config{VolumeName: "uninitialized", Bucket: "predastore"})
+	backend, err := New(S3Config{VolumeName: "uninitialized", Bucket: "predastore"})
+	require.NoError(t, err)
 
-	err := backend.Delete(types.FileTypeChunk, 0)
+	err = backend.Delete(types.FileTypeChunk, 0)
 	require.Error(t, err)
 
 	err = backend.DeleteCtx(context.Background(), types.FileTypeChunk, 0)

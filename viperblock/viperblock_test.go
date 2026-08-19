@@ -481,6 +481,32 @@ func TestNew(t *testing.T) {
 	}
 }
 
+// TestNewMismatchedBackendConfigReturnsError pins that a backend type string
+// carrying the other backend's config fails this one call. A volume record
+// naming "s3" while holding a FileConfig used to panic inside the backend
+// constructor, and viperblock has no recover() barrier, so it killed the
+// process instead of the volume operation.
+func TestNewMismatchedBackendConfigReturnsError(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testCases := []struct {
+		name   string
+		btype  string
+		config any
+	}{
+		{name: "file backend handed an S3Config", btype: "file", config: s3.S3Config{VolumeName: "v", VolumeSize: volumeSize}},
+		{name: "s3 backend handed a FileConfig", btype: "s3", config: file.FileConfig{VolumeName: "v", VolumeSize: volumeSize, BaseDir: tmpDir}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			vb, err := New(&VB{VolumeName: "test", VolumeSize: 1024 * 1024, BaseDir: tmpDir}, tc.btype, tc.config)
+			require.ErrorIs(t, err, types.ErrBackendConfig)
+			assert.Nil(t, vb)
+		})
+	}
+}
+
 // TestNewAndSetDebugDoNotMutateGlobalLogger guards against viperblock (a
 // library) hijacking its embedder's process-wide slog default: New must
 // default vb.log to slog.Default() without installing anything globally, and

@@ -142,12 +142,12 @@ type Backend struct {
 
 var _ types.Backend = (*Backend)(nil)
 
-func New(config any) (backend *Backend) {
+func New(config any) (backend *Backend, err error) {
 	cfg, ok := config.(S3Config)
 	if !ok {
-		panic("s3 backend: expected S3Config")
+		return nil, fmt.Errorf("%w: s3 backend expected S3Config, got %T", types.ErrBackendConfig, config)
 	}
-	return &Backend{S3Backend: S3Backend{config: cfg, log: slog.Default()}}
+	return &Backend{S3Backend: S3Backend{config: cfg, log: slog.Default()}}, nil
 }
 
 // SetLogger installs the logger this backend uses for its own log lines.
