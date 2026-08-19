@@ -2,6 +2,7 @@ package v_utils
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -153,16 +154,11 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		return fmt.Errorf("failed to initialize backend: %w", err)
 	}
 
-	//var walNum uint64
-
-	// First, fetch the state from the remote backend
-	_ = vb.LoadState()
-	// err = vb.LoadState()
-
-	// if err != nil {
-	// 	// Soft error, since volume may be new
-	// 	//return fmt.Errorf("failed to load state: %v", err)
-	// }
+	// A missing state object is expected for a new import. Every other error
+	// means an existing volume could not be inspected and must fail closed.
+	if err := vb.LoadState(); err != nil && !errors.Is(err, viperblock.ErrStateNotFound) {
+		return fmt.Errorf("failed to load state: %w", err)
+	}
 
 	err = vb.LoadBlockState()
 

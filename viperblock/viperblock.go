@@ -4400,10 +4400,11 @@ func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 
 		// Open the latest checkpoint from the backend
 		checkpoint, err = vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpoint, wallNum, 0, 0)
-
 		if err != nil {
-			// If no file found, volume is empty, return nil
-			return nil
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("read block checkpoint %d: %w", wallNum, err)
 		}
 
 		// This is the same object, at the same WallNum, that the GC floor is

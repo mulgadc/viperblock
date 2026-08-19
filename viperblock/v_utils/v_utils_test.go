@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/viperblock/internal/predastoretest"
+	backendtypes "github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/stretchr/testify/assert"
@@ -66,6 +68,42 @@ func TestImportDiskImage(t *testing.T) {
 	assert.NotEmpty(t, vbConfig.VolumeConfig.AMIMetadata.RootDeviceType)
 	assert.NotEmpty(t, vbConfig.VolumeConfig.AMIMetadata.Virtualization)
 	assert.NotEmpty(t, vbConfig.VolumeConfig.AMIMetadata.ImageOwnerAlias)
+}
+
+func TestImportDiskImage_ExistingStateReadErrorFailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("list-type") == "2" {
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bucket</Name><KeyCount>0</KeyCount><MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(srv.Close)
+
+	imagePath := filepath.Join(t.TempDir(), "disk.raw")
+	require.NoError(t, os.WriteFile(imagePath, bytes.Repeat([]byte{0xAB}, int(viperblock.DefaultBlockSize)), 0o600))
+
+	volumeName := "vol-import-rejected"
+	vbConfig := &viperblock.VB{
+		VolumeName: volumeName,
+		VolumeSize: uint64(viperblock.DefaultBlockSize),
+		BaseDir:    t.TempDir(),
+	}
+	s3Config := &s3.S3Config{
+		VolumeName: volumeName,
+		VolumeSize: uint64(viperblock.DefaultBlockSize),
+		Region:     "us-east-1",
+		Bucket:     "bucket",
+		AccessKey:  "access-key",
+		SecretKey:  "secret-key",
+		Host:       srv.URL,
+	}
+
+	err := ImportDiskImage(s3Config, vbConfig, imagePath, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "failed to load state")
+	assert.ErrorIs(t, err, backendtypes.ErrBackendNonRetryable)
 }
 
 // TestProgressReporterThrottlesToPercent drives the reporter over a simulated
