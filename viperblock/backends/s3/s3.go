@@ -70,8 +70,7 @@ func wrapNotFound(err error) error {
 	// NoSuchVersion and a bodyless 404 have no modeled type at all. The modeled
 	// types report these same codes via ErrorCode(), so matching the code
 	// covers both shapes.
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		switch apiErr.ErrorCode() {
 		case "NoSuchKey", "NoSuchBucket", "NotFound", "NoSuchVersion":
 			return fmt.Errorf("%w: %w", os.ErrNotExist, err)
@@ -142,8 +141,7 @@ func classifyWriteErr(err error) error {
 		return nil
 	}
 
-	var respErr *smithyhttp.ResponseError
-	if errors.As(err, &respErr) {
+	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
 		if respErr.HTTPStatusCode() == http.StatusInsufficientStorage {
 			return fmt.Errorf("%w: %w", types.ErrNoSpace, err)
 		}
