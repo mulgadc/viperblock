@@ -225,9 +225,7 @@ func TestArena_ConcurrentAllocsAreDisjoint(t *testing.T) {
 	bufs := make([][][]byte, workers)
 	var wg sync.WaitGroup
 	for w := range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			bufs[w] = make([][]byte, perWorker)
 			for i := range perWorker {
 				buf := a.Alloc()
@@ -236,7 +234,7 @@ func TestArena_ConcurrentAllocsAreDisjoint(t *testing.T) {
 				}
 				bufs[w][i] = buf
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
