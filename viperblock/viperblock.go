@@ -997,6 +997,14 @@ var ErrEncryptionMismatch = errors.New("viperblock: encryption configuration mis
 // ciphertext at the same offset. Callers must fail-closed on any wrap.
 var ErrIntegrity = errors.New("viperblock: integrity check failed")
 
+// ErrStateTorn wraps the VBState read failures whose shape is a partial write
+// rather than tampering: a split envelope, an unparseable payload, or a JSON
+// body that ends early. It always accompanies ErrIntegrity, so callers that
+// fail-closed on ErrIntegrity keep doing so unless they opt in. A failed AEAD
+// tag over a well-formed envelope is never torn — those bytes arrived whole
+// and did not verify, which is tampering and stays fatal.
+var ErrStateTorn = errors.New("viperblock: state copy is torn")
+
 // ErrPreEncryptionFormat is returned when an encrypted runtime
 // (EncryptionEnabled=true) encounters an on-disk artifact that still carries
 // the pre-encryption magic — VBCH for chunks, VBWL for the single-file WAL.
@@ -5370,7 +5378,17 @@ func (vb *VB) selectPersistedState(ctx context.Context) (VBState, error) {
 	// Step 2. Query the state from the backend
 	stateBackend, backendErr := vb.LoadStateRequestCtx(ctx, "")
 
-	if errors.Is(backendErr, ErrIntegrity) || errors.Is(backendErr, ErrEncryptionMismatch) {
+	// A torn backend copy is a partial write, not tampering, and the local
+	// copy is written first and fsynced (persistStateLocal) — so when local
+	// loaded cleanly it is at least as new and is the authority. Failing the
+	// open here instead is what makes an interrupted seal unrecoverable.
+	// Tamper-shaped failures stay fatal, as does a torn copy with no local
+	// fallback to fall back to.
+	if errors.Is(backendErr, ErrStateTorn) && localErr == nil {
+		vb.logger().WarnContext(ctx, "Backend state is torn, using the local copy",
+			"volume", vb.GetVolume(), "local_state_seq", state.StateSeqNum, "err", backendErr)
+		stateBackend, backendErr = VBState{}, nil
+	} else if errors.Is(backendErr, ErrIntegrity) || errors.Is(backendErr, ErrEncryptionMismatch) {
 		return VBState{}, fmt.Errorf("LoadState: backend: %w", backendErr)
 	}
 	if backendErr != nil {
@@ -5717,7 +5735,7 @@ func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state V
 		if splitErr != nil {
 			// A malformed envelope is what a partially-served/truncated blob
 			// looks like from here, not necessarily tampering — retryable.
-			return state, true, fmt.Errorf("%w: VBState envelope: %w", ErrIntegrity, splitErr)
+			return state, true, fmt.Errorf("%w: %w: VBState envelope: %w", ErrIntegrity, ErrStateTorn, splitErr)
 		}
 		var peek struct {
 			VolumeUUID     [4]byte `json:"VolumeUUID"`
@@ -5726,7 +5744,7 @@ func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state V
 		}
 		if err := json.Unmarshal(payload, &peek); err != nil {
 			// Same reasoning as the envelope split above: truncation-shaped.
-			return state, true, fmt.Errorf("%w: VBState peek parse: %w", ErrIntegrity, err)
+			return state, true, fmt.Errorf("%w: %w: VBState peek parse: %w", ErrIntegrity, ErrStateTorn, err)
 		}
 		if peek.KeyFingerprint != vb.MasterKey.Fingerprint {
 			return state, false, fmt.Errorf("%w: volume %s sealed under key %s, supplied key is %s",
@@ -5752,7 +5770,12 @@ func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state V
 	// On a plain volume nothing above inspects the payload, so a truncated
 	// blob first surfaces here as a JSON error — the same truncation shape
 	// the envelope split catches for encrypted volumes, so retry it too.
-	return state, err != nil, err
+	// Deliberately not wrapped in ErrIntegrity: there is no tag to fail, and
+	// promoting a plain decode error to an integrity fault would make it fatal.
+	if err != nil {
+		return state, true, fmt.Errorf("%w: VBState body: %w", ErrStateTorn, err)
+	}
+	return state, false, nil
 }
 
 // Private function to read a block from the storage backend, use ReadAt for public access.
