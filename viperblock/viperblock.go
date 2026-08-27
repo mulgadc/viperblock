@@ -30,9 +30,9 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
-	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 )
@@ -658,7 +658,7 @@ func (bl BlockLookup) seqNumAt(i int) uint64 {
 // position i within this entry's run, given the chunk's per-block byte
 // stride (BlockSize, or BlockSize+16 on encrypted volumes).
 func (bl BlockLookup) offsetAt(i int, stride uint32) uint32 {
-	return bl.ObjectOffset + utils.SafeIntToUint32(i)*stride
+	return bl.ObjectOffset + safecast.IntToUint32(i)*stride
 }
 
 // sliceSeqNums returns the SeqNums for block positions [from, to) within
@@ -724,7 +724,7 @@ func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, boo
 	if !ok {
 		return BlockLookup{}, 0, false
 	}
-	return bl, utils.SafeUint64ToInt(block - bl.StartBlock), true
+	return bl, safecast.Uint64ToInt(block - bl.StartBlock), true
 }
 
 // insertCoalescedLocked inserts newEntry into BlockLookup, fracturing any
@@ -755,10 +755,10 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 
 		// Surviving head: [exStart, newStart)
 		if exStart < newStart {
-			headLen := utils.SafeUint64ToInt(newStart - exStart)
+			headLen := safecast.Uint64ToInt(newStart - exStart)
 			head := BlockLookup{
 				StartBlock:   exStart,
-				NumBlocks:    utils.SafeIntToUint16(headLen),
+				NumBlocks:    safecast.IntToUint16(headLen),
 				ObjectID:     existing.ObjectID,
 				ObjectOffset: existing.ObjectOffset,
 				SeqNum:       existing.seqNumAt(0),
@@ -773,11 +773,11 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 		// Surviving tail: [newEnd, exEnd)
 		if exEnd > newEnd {
 			tailStart := newEnd
-			tailOffset := utils.SafeUint64ToInt(tailStart - exStart)
-			tailLen := utils.SafeUint64ToInt(exEnd - tailStart)
+			tailOffset := safecast.Uint64ToInt(tailStart - exStart)
+			tailLen := safecast.Uint64ToInt(exEnd - tailStart)
 			tail := BlockLookup{
 				StartBlock:   tailStart,
-				NumBlocks:    utils.SafeIntToUint16(tailLen),
+				NumBlocks:    safecast.IntToUint16(tailLen),
 				ObjectID:     existing.ObjectID,
 				ObjectOffset: existing.offsetAt(tailOffset, stride),
 				SeqNum:       existing.seqNumAt(tailOffset),
@@ -839,7 +839,7 @@ func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]
 
 		merged := BlockLookup{
 			StartBlock:   first.StartBlock,
-			NumBlocks:    utils.SafeIntToUint16(len(seqNums)),
+			NumBlocks:    safecast.IntToUint16(len(seqNums)),
 			ObjectID:     first.ObjectID,
 			ObjectOffset: first.ObjectOffset,
 			SeqNum:       first.SeqNum,
@@ -1069,9 +1069,9 @@ func calculateCacheSize(blockSize uint32, percent int) int {
 	}
 
 	systemMemory := getSystemMemory()
-	cacheMemory := (systemMemory * utils.SafeIntToUint64(percent)) / 100
+	cacheMemory := (systemMemory * safecast.IntToUint64(percent)) / 100
 
-	return utils.SafeUint64ToInt(cacheMemory / uint64(blockSize))
+	return safecast.Uint64ToInt(cacheMemory / uint64(blockSize))
 }
 
 // SetCacheSize sets the size of the LRU cache in number of blocks.
@@ -2761,7 +2761,7 @@ func (vb *VB) ReadWAL() (err error) {
 		var n int
 		n, err = currentWAL.Read(block.Data)
 
-		if n != utils.SafeUint64ToInt(block.Len) {
+		if n != safecast.Uint64ToInt(block.Len) {
 			return fmt.Errorf("incomplete read: got %d bytes, expected %d", n, block.Len)
 		}
 
@@ -3659,9 +3659,9 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 		newBlock := BlockLookup{
 			StartBlock:   first.Block,
-			NumBlocks:    utils.SafeIntToUint16(numBlocks),
+			NumBlocks:    safecast.IntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
-			ObjectOffset: utils.SafeIntToUint32(headerLen + (runStart * stride)),
+			ObjectOffset: safecast.IntToUint32(headerLen + (runStart * stride)),
 			SeqNum:       first.SeqNum,
 			SeqNums:      seqNums,
 		}
@@ -4948,7 +4948,7 @@ func (vb *VB) extendRunForReadahead(cb ConsecutiveBlock, limit int) (extra int, 
 // cb.NumBlocks blocks long.
 func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, dst []byte) error {
 	fetchBlocks := int(cb.NumBlocks) + extra
-	length := utils.SafeIntToUint32(fetchBlocks) * vb.blockStride()
+	length := safecast.IntToUint32(fetchBlocks) * vb.blockStride()
 
 	objectID := cb.ObjectID
 	if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, l uint32) ([]byte, error) {
@@ -4972,7 +4972,7 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 
 	if vb.EncryptionEnabled {
 		wide := cb
-		wide.NumBlocks = utils.SafeIntToUint16(fetchBlocks)
+		wide.NumBlocks = safecast.IntToUint16(fetchBlocks)
 		if extra > 0 {
 			wide.SeqNums = append(slices.Clone(cb.SeqNums), extraSeqNums...)
 		}
@@ -5002,7 +5002,7 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 	// plaintext.
 	for k := range extra {
 		block := int(cb.NumBlocks) + k
-		vb.Cache.put(cb.StartBlock+utils.SafeIntToUint64(block), extraSeqNums[k], plain[block*blockSize:(block+1)*blockSize])
+		vb.Cache.put(cb.StartBlock+safecast.IntToUint64(block), extraSeqNums[k], plain[block*blockSize:(block+1)*blockSize])
 	}
 	return nil
 }
@@ -5954,7 +5954,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
-			NumBlocks:     utils.SafeIntToUint16(numBlocks),
+			NumBlocks:     safecast.IntToUint16(numBlocks),
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
@@ -6265,7 +6265,7 @@ func (vb *VB) WALHeader() []byte {
 	copy(header[:len(vb.WAL.WALMagic)], vb.WAL.WALMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
 	binary.BigEndian.PutUint32(header[6:10], vb.BlockSize)
-	binary.BigEndian.PutUint64(header[10:18], utils.SafeInt64ToUint64(time.Now().Unix()))
+	binary.BigEndian.PutUint64(header[10:18], safecast.Int64ToUint64(time.Now().Unix()))
 	return header
 }
 
@@ -6281,7 +6281,7 @@ func (vb *VB) BlockToObjectWALHeader() []byte {
 	vb.logger().Debug("Writing BlockToObjectWALHeader", "header", header, "size", vb.BlockToObjectWALHeaderSize())
 	copy(header[:len(vb.BlockToObjectWAL.WALMagic)], vb.BlockToObjectWAL.WALMagic[:])
 	binary.BigEndian.PutUint16(header[4:6], vb.Version)
-	binary.BigEndian.PutUint64(header[6:14], utils.SafeInt64ToUint64(time.Now().Unix()))
+	binary.BigEndian.PutUint64(header[6:14], safecast.Int64ToUint64(time.Now().Unix()))
 	return header
 }
 
@@ -6536,7 +6536,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
-			NumBlocks:     utils.SafeIntToUint16(numBlocks),
+			NumBlocks:     safecast.IntToUint16(numBlocks),
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
@@ -6602,7 +6602,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 		consecutiveBlocksToRead = append(consecutiveBlocksToRead, ConsecutiveBlock{
 			BlockPosition: consecutiveBlocks[i].BlockPosition,
 			StartBlock:    consecutiveBlocks[i].StartBlock,
-			NumBlocks:     utils.SafeIntToUint16(numBlocks),
+			NumBlocks:     safecast.IntToUint16(numBlocks),
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,

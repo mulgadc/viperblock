@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/mulgadc/viperblock/utils"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/viperblock/viperblock"
 )
 
@@ -87,11 +87,11 @@ func (sfs *SimpleFS) AllocateBlocks(size uint64) (blocks []uint64, err error) {
 
 	// First, error if there are not enough free blocks
 	//fmt.Println("Allocating blocks", len(sfs.Volume.Free), size)
-	if len(sfs.Volume.Free) < utils.SafeUint64ToInt(size) {
+	if len(sfs.Volume.Free) < safecast.Uint64ToInt(size) {
 		return nil, fmt.Errorf("not enough free blocks")
 	}
 
-	for i := 0; i < utils.SafeUint64ToInt(size); i++ {
+	for i := 0; i < safecast.Uint64ToInt(size); i++ {
 		blocks[i] = sfs.Volume.Free[i]
 		sfs.Volume.Used[sfs.Volume.Free[i]] = true
 		sfs.Volume.Free[i] = 0

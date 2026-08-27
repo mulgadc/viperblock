@@ -13,6 +13,7 @@ import (
 	"github.com/mulgadc/viperblock/viperblock/v_utils"
 
 	_ "github.com/mulgadc/bluebottle/pkg/fipsboot"
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 )
 
 func main() {
@@ -115,7 +116,7 @@ func main() {
 
 	s3Config := s3.S3Config{
 		VolumeName: volID,
-		VolumeSize: utils.SafeIntToUint64(*size),
+		VolumeSize: safecast.IntToUint64(*size),
 		Bucket:     *bucket,
 		Region:     *region,
 		AccessKey:  *access_key,
@@ -131,7 +132,7 @@ func main() {
 
 	vbConfig := viperblock.VB{
 		VolumeName: volID,
-		VolumeSize: utils.SafeIntToUint64(*size),
+		VolumeSize: safecast.IntToUint64(*size),
 		BaseDir:    *base_dir,
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
