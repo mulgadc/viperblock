@@ -1,6 +1,8 @@
 GO_PROJECT_NAME := viperblock
 SHELL := /bin/bash
 
+export GOFIPS140 := v1.0.0
+
 # Quiet-mode filters (active when QUIET=1, set by preflight via recursive make)
 # Note: grep pipelines use PIPESTATUS[0] so the exit status of `go test`
 # propagates through the filter — otherwise a test failure is swallowed by
@@ -22,12 +24,12 @@ build:
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/sfs cmd/sfs/sfs.go
-	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/vblock cmd/vblock/main.go
+	go build -ldflags "-s -w" -o ./bin/sfs cmd/sfs/sfs.go
+	go build -ldflags "-s -w" -o ./bin/vblock cmd/vblock/main.go
 
 go_build_nbd:
 	@echo -e "\n....Building NBD plugin"
-	GOFIPS140=v1.0.0 go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
+	go build -o lib/nbdkit-viperblock-plugin.so -buildmode=c-shared nbd/viperblock.go
 
 # Preflight — the pre-commit gate: lint + vuln + the unit and race tiers.
 #
