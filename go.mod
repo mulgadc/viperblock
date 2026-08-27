@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.2
 	github.com/aws/smithy-go v1.27.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/bluebottle v1.18.0
+	github.com/mulgadc/bluebottle v1.18.1-0.20260827043632-fca81ec29266
 	github.com/mulgadc/predastore v1.18.0
 	github.com/stretchr/testify v1.12.1
 	github.com/tidwall/btree v1.8.1
