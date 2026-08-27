@@ -11,7 +11,7 @@ require (
 	github.com/aws/smithy-go v1.27.8
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mulgadc/bluebottle v1.18.1-0.20260827045410-e7d5cf022748
-	github.com/mulgadc/predastore v1.18.0
+	github.com/mulgadc/predastore v1.18.1-0.20260827052505-8a7f36b10271
 	github.com/stretchr/testify v1.12.1
 	github.com/tidwall/btree v1.8.1
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0
