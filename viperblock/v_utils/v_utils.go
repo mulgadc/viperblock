@@ -8,8 +8,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/viperblock/types"
-	"github.com/mulgadc/viperblock/utils"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 )
@@ -41,7 +41,7 @@ func (p *progressReporter) report(current uint64) {
 	if p.progress == nil || p.total == 0 {
 		return
 	}
-	pct := utils.SafeUint64ToInt(current * 100 / p.total)
+	pct := safecast.Uint64ToInt(current * 100 / p.total)
 	if pct > p.lastPct {
 		p.lastPct = pct
 		p.progress(current, p.total)
@@ -89,7 +89,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 	}
 
 	if vbConfig.VolumeConfig.VolumeMetadata.SizeGiB == 0 {
-		vbConfig.VolumeConfig.VolumeMetadata.SizeGiB = utils.SafeInt64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
+		vbConfig.VolumeConfig.VolumeMetadata.SizeGiB = safecast.Int64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
 	}
 
 	if vbConfig.VolumeConfig.VolumeMetadata.State == "" {
@@ -137,7 +137,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 		if vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB == 0 {
 			// Convert from bytes to GiB
-			vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB = utils.SafeInt64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
+			vbConfig.VolumeConfig.AMIMetadata.VolumeSizeGiB = safecast.Int64ToUint64(fileInfo.Size()) / 1024 / 1024 / 1024
 		}
 	}
 
@@ -208,7 +208,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 
 	// Progress is measured in bytes so callers render a unit that matches the
 	// download bar; the reporter throttles rendering to percentage steps.
-	reporter := newProgressReporter(progress, utils.SafeInt64ToUint64(totalBytes))
+	reporter := newProgressReporter(progress, safecast.Int64ToUint64(totalBytes))
 	var current uint64
 
 	buf := make([]byte, vb.BlockSize)
@@ -222,7 +222,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		if bytes.Equal(buf[:n], nullBlock) {
 			//fmt.Printf("Null block found at %d, skipping\n", block)
 			block++
-			current += utils.SafeIntToUint64(n)
+			current += safecast.IntToUint64(n)
 			reporter.report(current)
 			continue
 		}
@@ -243,7 +243,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		//fmt.Println("Write", "block", hex.EncodeToString(buf[:n]))
 
 		block++
-		current += utils.SafeIntToUint64(n)
+		current += safecast.IntToUint64(n)
 		reporter.report(current)
 
 		// Flush every 4MB

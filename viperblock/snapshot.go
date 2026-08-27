@@ -12,8 +12,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/viperblock/types"
-	"github.com/mulgadc/viperblock/utils"
 )
 
 // SnapshotState holds metadata for a frozen snapshot stored on the backend.
@@ -379,7 +379,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	}
 
 	// 6. Validate block count against metadata
-	if snap.BlockCount > 0 && utils.SafeIntToUint64(baseMap.lookup.len()) != snap.BlockCount {
+	if snap.BlockCount > 0 && safecast.IntToUint64(baseMap.lookup.len()) != snap.BlockCount {
 		return nil, ident, fmt.Errorf("snapshot block count mismatch: metadata says %d, checkpoint has %d", snap.BlockCount, baseMap.lookup.len())
 	}
 

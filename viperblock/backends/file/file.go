@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
-	"github.com/mulgadc/viperblock/utils"
 )
 
 // 2. Define config structs.
@@ -188,7 +188,7 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 		if err != nil {
 			return nil, err
 		}
-		length = utils.SafeInt64ToUint32(stat.Size())
+		length = safecast.Int64ToUint32(stat.Size())
 	}
 
 	// Read the specified block for the length
@@ -278,7 +278,7 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 		if err != nil {
 			return nil, err
 		}
-		length = utils.SafeInt64ToUint32(stat.Size())
+		length = safecast.Int64ToUint32(stat.Size())
 	}
 
 	data = make([]byte, length)
