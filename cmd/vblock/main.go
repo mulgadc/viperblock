@@ -12,7 +12,7 @@ import (
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/mulgadc/viperblock/viperblock/v_utils"
 
-	_ "github.com/mulgadc/viperblock/internal/fipsboot"
+	_ "github.com/mulgadc/bluebottle/pkg/fipsboot"
 )
 
 func main() {
