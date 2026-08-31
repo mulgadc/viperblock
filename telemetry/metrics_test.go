@@ -192,3 +192,42 @@ func TestRecordFunctionsAreNoopWithoutRealProvider(t *testing.T) {
 	RecordWALOp(context.Background(), "flush", "vol-1", "success", time.Millisecond)
 	RecordCacheLookup(context.Background(), true)
 }
+
+func TestRecordReadEmitsOpsDurationAndInflight(t *testing.T) {
+	reader := withManualReader(t)
+
+	RecordRead(context.Background(), 1, 10*time.Millisecond)
+	RecordRead(context.Background(), 15, 30*time.Millisecond)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	metrics := collectMetrics(t, rm)
+
+	ops, ok := metrics["viperblock.read.ops"].(metricdata.Sum[int64])
+	if !ok || len(ops.DataPoints) != 1 {
+		t.Fatalf("viperblock.read.ops = %#v, want one int64 sum point", metrics["viperblock.read.ops"])
+	}
+	if ops.DataPoints[0].Value != 2 {
+		t.Errorf("read ops = %d, want 2", ops.DataPoints[0].Value)
+	}
+
+	dur, ok := metrics["viperblock.read.duration.sum"].(metricdata.Sum[float64])
+	if !ok || len(dur.DataPoints) != 1 {
+		t.Fatalf("viperblock.read.duration.sum = %#v, want one float64 sum point", metrics["viperblock.read.duration.sum"])
+	}
+	if got := dur.DataPoints[0].Value; got < 0.039 || got > 0.041 {
+		t.Errorf("read duration sum = %v, want ~0.04s", got)
+	}
+
+	// The point of this series: sum/ops is mean concurrency, so 1 and 15 must
+	// total 16 rather than being counted as two reads.
+	inflight, ok := metrics["viperblock.read.inflight.sum"].(metricdata.Sum[int64])
+	if !ok || len(inflight.DataPoints) != 1 {
+		t.Fatalf("viperblock.read.inflight.sum = %#v, want one int64 sum point", metrics["viperblock.read.inflight.sum"])
+	}
+	if inflight.DataPoints[0].Value != 16 {
+		t.Errorf("inflight sum = %d, want 16", inflight.DataPoints[0].Value)
+	}
+}

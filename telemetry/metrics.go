@@ -31,6 +31,10 @@ var (
 
 	cacheLookups metric.Int64Counter
 
+	readOps         metric.Int64Counter
+	readDurationSum metric.Float64Counter
+	readInflightSum metric.Int64Counter
+
 	rmwConflicts  metric.Int64Counter
 	volumeOpens   metric.Int64Counter
 	volumeEngines metric.Int64UpDownCounter
@@ -100,6 +104,29 @@ func instruments() {
 		}
 		cacheMissOpts = []metric.AddOption{
 			metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "miss"))),
+		}
+
+		// A guest read is the only latency the guest actually experiences, and
+		// nothing measured it: backend.io covers the S3 round trip alone, so a
+		// read spending its time above that -- queued, or waiting on a lock --
+		// was invisible. The difference between these two means is that time.
+		readOps, err = m.Int64Counter("viperblock.read.ops",
+			metric.WithDescription("Count of guest block reads served."),
+			metric.WithUnit("{operation}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		readDurationSum, err = m.Float64Counter("viperblock.read.duration.sum",
+			metric.WithDescription("Cumulative seconds spent serving guest block reads, measured end to end. Divided by read.ops this is mean guest read latency; compare against backend.io.duration.sum/ops to separate storage from everything above it."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		readInflightSum, err = m.Int64Counter("viperblock.read.inflight.sum",
+			metric.WithDescription("Cumulative count of reads already in flight when each read began. Divided by read.ops this is mean read concurrency, which is what separates a slow backend from a serialised one: the same throughput loss looks identical from latency alone."),
+			metric.WithUnit("{read}"))
+		if err != nil {
+			otel.Handle(err)
 		}
 
 		rmwConflicts, err = m.Int64Counter("viperblock.write.rmw_conflicts",
@@ -245,6 +272,24 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 	}
 	if walOpDurationSum != nil {
 		walOpDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+}
+
+// RecordRead records one guest block read: how long it took end to end, and
+// how many other reads were already in flight when it started. Attribute-free
+// on purpose -- it is called once per guest I/O, so a per-volume attribute set
+// would allocate on the hottest path there is, and the volume is already the
+// dimension the process itself is scoped to.
+func RecordRead(ctx context.Context, inflight int64, elapsed time.Duration) {
+	instruments()
+	if readOps != nil {
+		readOps.Add(ctx, 1)
+	}
+	if readDurationSum != nil {
+		readDurationSum.Add(ctx, elapsed.Seconds())
+	}
+	if readInflightSum != nil {
+		readInflightSum.Add(ctx, inflight)
 	}
 }
 

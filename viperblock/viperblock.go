@@ -6032,10 +6032,14 @@ func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]by
 	lastBlock := (offset + length - 1) / blockSize
 	blockCount := lastBlock - firstBlock + 1
 
-	// Read entire range of needed blocks
-	vb.readsInFlight.Add(1)
+	// Read entire range of needed blocks. The in-flight count is sampled after
+	// this read joins it, so a read with the path to itself reports 1 -- the
+	// mean is then read directly as concurrency rather than off by one.
+	inflight := vb.readsInFlight.Add(1)
+	started := time.Now()
 	fullData, err := vb.read(ctx, firstBlock, blockCount*blockSize)
 	vb.readsInFlight.Add(-1)
+	telemetry.RecordRead(ctx, inflight, time.Since(started))
 
 	if err != nil && !errors.Is(err, ErrZeroBlock) {
 		return nil, err
