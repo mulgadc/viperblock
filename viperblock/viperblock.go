@@ -77,6 +77,16 @@ const DefaultMaxPendingBytes uint64 = 256 * 1024 * 1024
 // still well above the 4MB chunk size so drains stay chunk-sized.
 const nearFullPendingDivisor uint64 = 8
 
+// DefaultBackpressureStallTimeout bounds how long a volume tolerates a backend
+// that will not drain before it fails the blocked write. A duration, not an
+// attempt count: ten fast failures and ten slow ones mean different things.
+//
+// The value sits between multipath's common 30s and VMware's 140s all-paths-down
+// declaration, and inside the 5 minutes EBS takes to raise volume status. It is
+// far longer than any internal retry chain, so reaching it means the backend is
+// genuinely gone rather than slow.
+const DefaultBackpressureStallTimeout time.Duration = 150 * time.Second
+
 // The backpressure budget is a bound on unflushed bytes, so it is meaningless
 // above what the WAL device can actually hold. The budget is clamped to
 // walFreeFraction of the free space, sampled at most once per
@@ -230,6 +240,17 @@ type VB struct {
 	// active drain each at a time; other callers fail fast or poll instead of
 	// launching redundant drains. drainMu below is the real exclusion guarantee.
 	drainInFlight atomic.Bool
+
+	// BackpressureStallTimeout bounds how long this volume waits on a backend
+	// that will not drain. 0 uses DefaultBackpressureStallTimeout. Per-volume
+	// because a read-only root is terminal where a read-only data mount is not.
+	BackpressureStallTimeout time.Duration
+
+	// drainStall is how long the backend has been failing to drain, held on the
+	// volume rather than in each blocked writer. Only one writer at a time wins
+	// the drainInFlight CAS, so a per-writer count divides the real tolerance by
+	// the number of writers and never bounds anything.
+	drainStall drainStall
 
 	// Last sampled free space on the WAL device, and when it was taken, so
 	// maxPendingBytes can clamp without a statfs per call.
@@ -2018,15 +2039,20 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	// adds latency after the drain that unblocked the writer has finished.
 	const maxBackoff = 50 * time.Millisecond
 
-	// Bound consecutive non-ErrNoSpace drain failures so a persistently
-	// failing drain doesn't spin here forever; a single success resets the
-	// count so transient backend slowness doesn't trip it.
-	const maxDrainFailures = 10
-	drainFailures := 0
+	// Bound a persistently failing drain by how long it has been failing, on
+	// the volume. A single success clears it, so transient backend slowness
+	// does not accumulate toward the deadline.
+	budget := vb.backpressureStallTimeout()
 
 	for vb.PendingBytes() > low {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		// Checked by every blocked writer, not only the one driving the drain:
+		// that is what makes the bound independent of how many are waiting.
+		if stalled, lastErr := vb.drainStall.elapsed(); stalled > budget {
+			return stalledDrainErr(stalled, lastErr)
 		}
 
 		if vb.drainInFlight.CompareAndSwap(false, true) {
@@ -2036,13 +2062,14 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 				if errors.Is(err, ErrNoSpace) {
 					return err
 				}
-				drainFailures++
-				vb.logger().Warn("write backpressure: drain failed, retrying", "err", err, "consecutiveFailures", drainFailures)
-				if drainFailures >= maxDrainFailures {
-					return fmt.Errorf("write backpressure: %d consecutive drains failed, aborting: %w", drainFailures, err)
+				stalled := vb.drainStall.fail(err)
+				vb.logger().Warn("write backpressure: drain failed, retrying",
+					"err", err, "stalled_ms", stalled.Milliseconds())
+				if stalled > budget {
+					return stalledDrainErr(stalled, err)
 				}
 			} else {
-				drainFailures = 0
+				vb.drainStall.clear()
 			}
 			if vb.PendingBytes() <= low {
 				break
@@ -2060,6 +2087,62 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// drainStall records how long the backend has been failing to drain and what
+// the last failure was. Volume-scoped, so every writer blocked in
+// awaitBackpressure shares one deadline instead of holding its own count.
+type drainStall struct {
+	mu    sync.Mutex
+	since time.Time
+	err   error
+}
+
+// fail records a drain failure and returns how long the current run of them has
+// lasted. The first failure of a run returns zero, so one failure never trips a
+// deadline on its own.
+func (s *drainStall) fail(err error) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+	if s.since.IsZero() {
+		s.since = time.Now()
+		return 0
+	}
+	return time.Since(s.since)
+}
+
+// clear ends the current run of failures. A drain that succeeds means the
+// backend is answering, whatever it did before.
+func (s *drainStall) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.since, s.err = time.Time{}, nil
+}
+
+// elapsed reports the current run's duration and its last error, or zero when
+// the backend last drained cleanly.
+func (s *drainStall) elapsed() (time.Duration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.since.IsZero() {
+		return 0, nil
+	}
+	return time.Since(s.since), s.err
+}
+
+func stalledDrainErr(stalled time.Duration, cause error) error {
+	return fmt.Errorf("write backpressure: backend has not drained for %s, aborting: %w",
+		stalled.Round(time.Millisecond), cause)
+}
+
+// backpressureStallTimeout is how long this volume tolerates a backend that
+// will not drain.
+func (vb *VB) backpressureStallTimeout() time.Duration {
+	if vb.BackpressureStallTimeout > 0 {
+		return vb.BackpressureStallTimeout
+	}
+	return DefaultBackpressureStallTimeout
 }
 
 // backendNearFuller lets a backend report pre-full backpressure out-of-band

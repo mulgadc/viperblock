@@ -586,14 +586,15 @@ func TestWriteAtRecoveryProbeDoesNotHangAgainstUnresponsiveBackend(t *testing.T)
 
 // TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures pins that a
 // backend persistently rejecting the checkpoint write with a non-ErrNoSpace
-// error does not keep awaitBackpressure spinning indefinitely:
-// maxDrainFailures bounds it after 10 consecutive failed drains.
+// error does not keep awaitBackpressure spinning indefinitely: the volume's
+// stall deadline bounds it.
 func TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures(t *testing.T) {
 	vb, backend := newEnospcTestVB(t)
 	blockSize := uint64(vb.BlockSize)
 
 	// Force the backpressure gate to engage on the very next write.
 	vb.MaxPendingBytes = blockSize
+	vb.BackpressureStallTimeout = 500 * time.Millisecond
 	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
 
 	// Every checkpoint write fails from here on. Pin pendingBytes back
@@ -608,23 +609,22 @@ func TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures(t *testing.T) {
 	}
 
 	start := time.Now()
-	// newEnospcTestVB shrinks SaveLiveCheckpointCtx's retry backoff, so the 10
-	// bounded rounds cost microseconds rather than ~3s each. The timeout is a
-	// hang detector with generous headroom, not an expected duration.
+	// The timeout is a hang detector with generous headroom over the 500ms
+	// stall deadline set above, not an expected duration.
 	err := runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 30*time.Second)
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "a backend that never recovers must eventually surface an error instead of hanging")
 	assert.NotErrorIs(t, err, ErrNoSpace, "a generic, non-out-of-space drain failure must not be misreported as ErrNoSpace")
-	assert.Contains(t, err.Error(), "consecutive drains failed", "error must be the maxDrainFailures-bounded error, not some other failure")
+	assert.Contains(t, err.Error(), "has not drained for", "error must be the stall-deadline error, not some other failure")
 	assert.False(t, vb.backendFull.Load(), "a generic drain failure must not latch backendFull -- that latch is reserved for real out-of-space errors")
 	assert.Less(t, elapsed, 30*time.Second, "must return once the bound trips, not hang until the test's own safety-net timeout")
 }
 
 // TestAwaitBackpressureFailureCounterResetsAfterInterleavedSuccess pins that
-// a single successful drain resets the consecutive-failure counter, so
-// failures separated by a success (1 + 9, both under the cap of 10) don't
-// accumulate and trip maxDrainFailures.
+// a single successful drain ends the current run of failures, so failures
+// separated by a success don't accumulate toward the stall deadline and a
+// backend that is merely slow still completes the write.
 func TestAwaitBackpressureFailureCounterResetsAfterInterleavedSuccess(t *testing.T) {
 	vb, backend := newEnospcTestVB(t)
 	blockSize := uint64(vb.BlockSize)
@@ -679,7 +679,7 @@ func TestAwaitBackpressureFailureCounterResetsAfterInterleavedSuccess(t *testing
 	err := runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 90*time.Second)
 	elapsed := time.Since(start)
 
-	assert.NoError(t, err, "an interleaved success must reset the consecutive-failure counter so 9 more failures (well under the cap of 10) do not trip it")
+	assert.NoError(t, err, "an interleaved success must end the run of failures so the ones after it start a fresh deadline")
 	assert.False(t, vb.backendFull.Load())
 	assert.Less(t, elapsed, 90*time.Second, "must complete once the script settles, not hang")
 }
