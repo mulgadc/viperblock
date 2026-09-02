@@ -420,6 +420,11 @@ type VB struct {
 	// fake backend times out in microseconds instead of the production bound.
 	backendRecoveryProbeTimeout time.Duration
 
+	// stateReadRetryBackoff is the first inter-attempt sleep in
+	// LoadStateRequestCtx (0 uses stateReadInitialBackoff). Only tests set it,
+	// so exhausting the retry budget costs microseconds, not the full 1.5s.
+	stateReadRetryBackoff time.Duration
+
 	// GCEnabled turns on chunk garbage collection: deleting superseded chunk
 	// objects no live block references. Default false — opt-in, since a
 	// volume that is swept must satisfy the snapshot-ancestry rules in
@@ -1954,6 +1959,15 @@ func (vb *VB) recoveryProbeTimeout() time.Duration {
 		return DefaultBackendRecoveryProbeTimeout
 	}
 	return vb.backendRecoveryProbeTimeout
+}
+
+// stateReadBackoff returns the configured first retry sleep for the VBState
+// backend read, or the default if unset.
+func (vb *VB) stateReadBackoff() time.Duration {
+	if vb.stateReadRetryBackoff <= 0 {
+		return stateReadInitialBackoff
+	}
+	return vb.stateReadRetryBackoff
 }
 
 // signalSizeTrigger asks the background chunk uploader to drain now, once
@@ -5649,7 +5663,8 @@ func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 
 // stateReadMaxAttempts and stateReadInitialBackoff bound the backend-path
 // retry in LoadStateRequestCtx: 5 attempts over ~1.5s of backoff, covering an
-// observed ~1s backend warm-up with margin.
+// observed ~1s backend warm-up with margin. The backoff is the default for
+// vb.stateReadBackoff(), which tests override.
 const stateReadMaxAttempts = 5
 
 const stateReadInitialBackoff = 100 * time.Millisecond
@@ -5668,7 +5683,7 @@ func (vb *VB) LoadStateRequestCtx(ctx context.Context, filename string) (state V
 		return state, err
 	}
 
-	backoff := stateReadInitialBackoff
+	backoff := vb.stateReadBackoff()
 	var retryable bool
 	for attempt := 1; attempt <= stateReadMaxAttempts; attempt++ {
 		state, retryable, err = vb.loadStateAttemptCtx(ctx, "")

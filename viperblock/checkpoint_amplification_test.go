@@ -148,6 +148,7 @@ func TestCheckpointRetryOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	vb := openEncryptedVBInDir(t, dir, "retry-test", nil)
 	vb.StopChunkUploader()
+	vb.checkpointRetryBackoff = time.Microsecond
 	t.Cleanup(func() { vb.StopWALSyncer() })
 
 	// Inject a single failure on the first checkpoint write, then succeed.
@@ -162,7 +163,7 @@ func TestCheckpointRetryOnFailure(t *testing.T) {
 	// a chunk. We skip createChunkFile here to isolate the retry path.
 	vb.BlocksToObject.dirty.Store(true)
 
-	// SaveLiveCheckpointCtx: attempt 1 fails (injected), waits 1s backoff,
+	// SaveLiveCheckpointCtx: attempt 1 fails (injected), waits out the backoff,
 	// attempt 2 succeeds. Dirty must be clear on return.
 	require.NoError(t, vb.SaveLiveCheckpointCtx(context.Background()),
 		"SaveLiveCheckpointCtx must succeed after one transient failure")

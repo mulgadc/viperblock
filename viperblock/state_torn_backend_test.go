@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/viperblock/types"
 	"github.com/stretchr/testify/assert"
@@ -69,6 +70,7 @@ func TestLoadState_TornBackendFallsBackToLocalCopy(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-torn-backend", key)
 	vb.BlockSize = DefaultBlockSize
+	vb.stateReadRetryBackoff = time.Microsecond
 	require.NoError(t, vb.SaveState())
 	require.FileExists(t, localStatePath(vb))
 
@@ -85,6 +87,7 @@ func TestLoadState_TornBackendFallsBackToLocalCopy(t *testing.T) {
 func TestLoadState_TornPlainBackendFallsBackToLocalCopy(t *testing.T) {
 	vb := newFileBackedVB(t, "vol-torn-plain", nil)
 	vb.BlockSize = DefaultBlockSize
+	vb.stateReadRetryBackoff = time.Microsecond
 	require.NoError(t, vb.SaveState())
 
 	truncateConfigReads(vb)
@@ -116,6 +119,7 @@ func TestLoadState_TornBackendWithoutLocalCopyIsFatal(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-torn-no-local", key)
 	vb.BlockSize = DefaultBlockSize
+	vb.stateReadRetryBackoff = time.Microsecond
 	require.NoError(t, vb.SaveState())
 	require.NoError(t, os.Remove(localStatePath(vb)))
 

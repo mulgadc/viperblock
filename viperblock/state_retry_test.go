@@ -68,6 +68,7 @@ func TestLoadStateRequestCtx_RetriesTruncatedBackendRead(t *testing.T) {
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-retry-succeed", key)
 	vb.BlockSize = DefaultBlockSize
+	vb.stateReadRetryBackoff = time.Microsecond
 	require.NoError(t, vb.SaveState())
 
 	flaky := &flakyConfigBackend{Backend: vb.Backend}
@@ -93,6 +94,7 @@ func TestLoadStateRequestCtx_RetriesTruncatedBackendRead(t *testing.T) {
 func TestLoadStateRequestCtx_RetriesTruncatedPlainBackendRead(t *testing.T) {
 	vb := newFileBackedVB(t, "vol-retry-plain", nil)
 	vb.BlockSize = DefaultBlockSize
+	vb.stateReadRetryBackoff = time.Microsecond
 	require.NoError(t, vb.SaveState())
 
 	flaky := &flakyConfigBackend{Backend: vb.Backend}
@@ -118,6 +120,7 @@ func TestLoadStateRequestCtx_ExhaustsRetriesOnPersistentTruncation(t *testing.T)
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-retry-exhaust", key)
 	vb.BlockSize = DefaultBlockSize
+	vb.stateReadRetryBackoff = time.Microsecond
 	require.NoError(t, vb.SaveState())
 
 	flaky := &flakyConfigBackend{Backend: vb.Backend}
@@ -217,6 +220,8 @@ func TestLoadStateRequestCtx_ContextCancelledDuringBackoffAbortsPromptly(t *test
 	key := testKey(t, 0x42)
 	vb := newFileBackedVB(t, "vol-retry-cancel", key)
 	vb.BlockSize = DefaultBlockSize
+	// Deliberately left on the default backoff: the deadline below must expire
+	// mid-sleep, which a shrunk backoff would race past into a second attempt.
 	require.NoError(t, vb.SaveState())
 
 	flaky := &flakyConfigBackend{Backend: vb.Backend}
