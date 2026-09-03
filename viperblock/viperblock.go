@@ -2062,6 +2062,12 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 				if errors.Is(err, ErrNoSpace) {
 					return err
 				}
+				// A caller that gave up is not the backend failing, and the
+				// stall deadline is shared by every writer on this volume: one
+				// cancelled request must not push the others toward it.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				stalled := vb.drainStall.fail(err)
 				vb.logger().Warn("write backpressure: drain failed, retrying",
 					"err", err, "stalled_ms", stalled.Milliseconds())
