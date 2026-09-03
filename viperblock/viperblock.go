@@ -252,6 +252,13 @@ type VB struct {
 	// the number of writers and never bounds anything.
 	drainStall drainStall
 
+	// chunkRunsFastPath and chunkRunsClassified count how createChunkFile
+	// resolved each consecutive run: accepted whole on one range query, or
+	// classified block by block. Tests and benchmarks read them to confirm
+	// which path a workload takes; nothing in production does.
+	chunkRunsFastPath   atomic.Uint64
+	chunkRunsClassified atomic.Uint64
+
 	// Last sampled free space on the WAL device, and when it was taken, so
 	// maxPendingBytes can clamp without a statfs per call.
 	walFreeBytes     atomic.Uint64
@@ -765,6 +772,33 @@ func (b *BlocksToObject) resolveBlockLookup(block uint64) (BlockLookup, int, boo
 func (vb *VB) supersedesLocked(candidate Block) bool {
 	existing, index, found := vb.BlocksToObject.resolveBlockLookup(candidate.Block)
 	return !found || existing.seqNumAt(index) < candidate.SeqNum
+}
+
+// classifyRun gives the same verdict as supersedesLocked for each candidate in
+// run, reached by merging two ordered sequences rather than descending the tree
+// once per block. Verdicts are appended to dst.
+//
+// run must be consecutive and ascending, and overlaps must be exactly the
+// extents intersecting it, in ascending start order -- which is what
+// collectOverlaps returns. Extents are disjoint but need not be contiguous: a
+// candidate falling in a gap between two of them is mapped by neither.
+func classifyRun(overlaps []BlockLookup, run []Block, dst []bool) []bool {
+	ext := 0
+	for _, candidate := range run {
+		// Both inputs ascend, so the cursor only ever moves forward: the whole
+		// run costs one pass over the overlaps rather than a descent per block.
+		for ext < len(overlaps) && overlaps[ext].end() <= candidate.Block {
+			ext++
+		}
+		if ext == len(overlaps) || overlaps[ext].StartBlock > candidate.Block {
+			dst = append(dst, true) // nothing maps this block
+			continue
+		}
+		existing := overlaps[ext]
+		mapped := existing.seqNumAt(safecast.Uint64ToInt(candidate.Block - existing.StartBlock))
+		dst = append(dst, mapped < candidate.SeqNum)
+	}
+	return dst
 }
 
 // insertCoalescedLocked inserts newEntry into BlockLookup, fracturing any
@@ -3755,17 +3789,84 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	stride := int(strideU32)
 
 	vb.BlocksToObject.mu.Lock()
+	// installSegment maps [segStart, segEnd) of matchedBlocks -- which the
+	// caller guarantees is one consecutive, superseding run -- onto this chunk.
+	installSegment := func(segStart, segEnd int) {
+		numBlocks := segEnd - segStart
+		first := (*matchedBlocks)[segStart]
+
+		seqNums := make([]uint64, numBlocks)
+		for i := segStart; i < segEnd; i++ {
+			seqNums[i-segStart] = (*matchedBlocks)[i].SeqNum
+		}
+
+		newBlock := BlockLookup{
+			StartBlock:   first.Block,
+			NumBlocks:    safecast.IntToUint16(numBlocks),
+			ObjectID:     chunkIndex,
+			ObjectOffset: safecast.IntToUint32(headerLen + (segStart * stride)),
+			SeqNum:       first.SeqNum,
+			SeqNums:      seqNums,
+		}
+
+		// Fracture any existing entry this run overwrites (e.g. a prior
+		// persisted extent partially rewritten) into its surviving head/tail
+		// before inserting the new run. gcRefcount is passed through so
+		// surviving fragments keep their share of the old chunk's refcount,
+		// rather than always dropping it by exactly one.
+		var gcRefcount map[uint64]uint64
+		if vb.GCEnabled {
+			gcRefcount = vb.gcRefcount
+		}
+		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32, gcRefcount)
+
+		// Transition from Pending to Persisted, one range op per run. Per-block
+		// SeqNums keep the location/seqNum binding atomic per block; a stale
+		// block is rejected per-block inside MarkPersistedRange, same as the
+		// single-block MarkPersisted guard.
+		if vb.UseBlockStore && vb.BlockStore != nil {
+			blocks := make([]uint64, numBlocks)
+			for i := range blocks {
+				blocks[i] = first.Block + uint64(i)
+			}
+			vb.BlockStore.MarkPersistedRange(blocks, chunkIndex, newBlock.ObjectOffset, strideU32, seqNums)
+		}
+	}
+
 	// matchedBlocks is sorted by Block ascending (see caller). Coalesce each
 	// maximal consecutive run into a single BlockLookup entry instead of one
 	// entry per block: an uncoalesced map grows unboundedly with total bytes
 	// ever written, not with live data, which is what drove nbdkit RSS up on
 	// long-running volumes.
+	// Reused across this chunk's runs. Locals rather than scratch on vb: chunk
+	// uploads run on parallel workers, and only the map lock is shared.
+	var (
+		runOverlaps []BlockLookup
+		supersedes  []bool
+	)
+
 	runStart := 0
 	for runStart < len(*matchedBlocks) {
 		runEnd := runStart + 1
 		for runEnd < len(*matchedBlocks) && (*matchedBlocks)[runEnd].Block == (*matchedBlocks)[runEnd-1].Block+1 {
 			runEnd++
 		}
+
+		run := (*matchedBlocks)[runStart:runEnd]
+		runOverlaps = vb.BlocksToObject.lookup.collectOverlaps(runOverlaps[:0], run[0].Block, run[len(run)-1].Block+1)
+
+		// A run the map does not cover at all is necessarily all-new, so the one
+		// range query above settles every block in it. Reaching that verdict a
+		// block at a time costs a tree descent each -- 1,024 per 4 MiB chunk --
+		// and a fresh or sparse volume takes this path throughout.
+		if len(runOverlaps) == 0 {
+			vb.chunkRunsFastPath.Add(1)
+			installSegment(runStart, runEnd)
+			runStart = runEnd
+			continue
+		}
+		vb.chunkRunsClassified.Add(1)
+
 		// Reject a stale drain: an older WAL segment landing here last would
 		// otherwise overwrite the newer, live chunk and drop its refcount to
 		// zero, letting the next sweep delete a still-referenced chunk. Only
@@ -3778,8 +3879,15 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		// from the WAL routinely straddles blocks with opposite verdicts. One
 		// verdict for the whole run drops newer writes or installs superseded
 		// ones, and the wrong bytes then persist into the checkpoint.
+		//
+		// Classified up front against the overlaps collected above, which stay
+		// valid as segments are installed below: insertCoalescedLocked touches
+		// only the segment's own blocks, and the head/tail it leaves behind
+		// carry the same per-block SeqNums the snapshot holds.
+		supersedes = classifyRun(runOverlaps, run, supersedes[:0])
+
 		for segStart := runStart; segStart < runEnd; {
-			if !vb.supersedesLocked((*matchedBlocks)[segStart]) {
+			if !supersedes[segStart-runStart] {
 				if vb.GCEnabled {
 					if _, tracked := vb.gcRefcount[chunkIndex]; !tracked {
 						vb.gcRefcount[chunkIndex] = 0
@@ -3790,49 +3898,11 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			}
 
 			segEnd := segStart + 1
-			for segEnd < runEnd && vb.supersedesLocked((*matchedBlocks)[segEnd]) {
+			for segEnd < runEnd && supersedes[segEnd-runStart] {
 				segEnd++
 			}
 
-			numBlocks := segEnd - segStart
-			first := (*matchedBlocks)[segStart]
-
-			seqNums := make([]uint64, numBlocks)
-			for i := segStart; i < segEnd; i++ {
-				seqNums[i-segStart] = (*matchedBlocks)[i].SeqNum
-			}
-
-			newBlock := BlockLookup{
-				StartBlock:   first.Block,
-				NumBlocks:    safecast.IntToUint16(numBlocks),
-				ObjectID:     chunkIndex,
-				ObjectOffset: safecast.IntToUint32(headerLen + (segStart * stride)),
-				SeqNum:       first.SeqNum,
-				SeqNums:      seqNums,
-			}
-
-			// Fracture any existing entry this run overwrites (e.g. a prior
-			// persisted extent partially rewritten) into its surviving
-			// head/tail before inserting the new run. gcRefcount is passed
-			// through so surviving fragments keep their share of the old
-			// chunk's refcount, rather than always dropping it by exactly one.
-			var gcRefcount map[uint64]uint64
-			if vb.GCEnabled {
-				gcRefcount = vb.gcRefcount
-			}
-			vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32, gcRefcount)
-
-			// Transition from Pending to Persisted, one range op per run.
-			// Per-block SeqNums keep the location/seqNum binding atomic per
-			// block; a stale block is rejected per-block inside
-			// MarkPersistedRange, same as the single-block MarkPersisted guard.
-			if vb.UseBlockStore && vb.BlockStore != nil {
-				blocks := make([]uint64, numBlocks)
-				for i := range blocks {
-					blocks[i] = first.Block + uint64(i)
-				}
-				vb.BlockStore.MarkPersistedRange(blocks, chunkIndex, newBlock.ObjectOffset, strideU32, seqNums)
-			}
+			installSegment(segStart, segEnd)
 
 			segStart = segEnd
 		}
