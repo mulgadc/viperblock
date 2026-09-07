@@ -28,15 +28,18 @@ var (
 
 	walOpCount       metric.Int64Counter
 	walOpDurationSum metric.Float64Counter
+	walOpLatency     metric.Float64Histogram
 
 	guestIOOps         metric.Int64Counter
 	guestIOBytes       metric.Int64Counter
 	guestIODurationSum metric.Float64Counter
+	guestIOLatency     metric.Float64Histogram
 
 	cacheLookups metric.Int64Counter
 
 	backpressureWaits       metric.Int64Counter
 	backpressureDurationSum metric.Float64Counter
+	backpressureLatency     metric.Float64Histogram
 
 	rmwConflicts  metric.Int64Counter
 	volumeOpens   metric.Int64Counter
@@ -61,8 +64,13 @@ func instruments() {
 
 		// "io" is a namespace (ops/bytes/duration.sum siblings), not a leaf,
 		// to avoid an ES leaf-vs-object mapping collision. Durations are
-		// recorded as seconds-sum counters (not histograms) so avg latency
-		// = sum/ops is computable in ES|QL; native ES histograms aren't.
+		// recorded as seconds-sum counters so avg latency = sum/ops is
+		// computable in ES|QL, which cannot read a histogram field.
+		//
+		// The ".latency" histograms alongside them are for percentiles,
+		// which a sum cannot produce at all. They are named "latency" and
+		// not "duration" for the same mapping reason: "duration" is already
+		// an object here because "duration.sum" is a leaf under it.
 		backendIOOps, err = m.Int64Counter("viperblock.backend.io.ops",
 			metric.WithDescription("Count of block-storage backend read/write operations."),
 			metric.WithUnit("{operation}"))
@@ -94,6 +102,12 @@ func instruments() {
 		if err != nil {
 			otel.Handle(err)
 		}
+		walOpLatency, err = m.Float64Histogram("viperblock.wal.operation.latency",
+			metric.WithDescription("Distribution of WAL flush/replay/consolidate operation latency."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
 
 		// The guest boundary, as distinct from the WAL and backend instruments
 		// below and above it. A guest fsync is a write followed by a flush, two
@@ -113,6 +127,15 @@ func instruments() {
 		}
 		guestIODurationSum, err = m.Float64Counter("viperblock.guest.io.duration.sum",
 			metric.WithDescription("Cumulative seconds the guest spent waiting on NBD requests. Divided by ops this is the latency the guest observes, which for a flush is what a datastore's commit latency is made of."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		// The p99 an etcd-class guest is actually specified against. A sum
+		// cannot produce it, and the tail is the whole question: a mean that
+		// sits under the target says nothing about the writes that miss it.
+		guestIOLatency, err = m.Float64Histogram("viperblock.guest.io.latency",
+			metric.WithDescription("Distribution of the latency the guest observes per NBD request, by op."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -144,6 +167,14 @@ func instruments() {
 		}
 		backpressureDurationSum, err = m.Float64Counter("viperblock.write.backpressure.duration.sum",
 			metric.WithDescription("Cumulative seconds guest writes spent blocked on backpressure, waiting for the backend to drain."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		// The sum counts one stall once per blocked writer, so it is not wall
+		// clock and its mean is not a stall duration. This is.
+		backpressureLatency, err = m.Float64Histogram("viperblock.write.backpressure.latency",
+			metric.WithDescription("Distribution of how long a blocked guest write waited on backpressure."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -293,6 +324,9 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 	if walOpDurationSum != nil {
 		walOpDurationSum.Add(ctx, elapsed.Seconds(), opt)
 	}
+	if walOpLatency != nil {
+		walOpLatency.Record(ctx, elapsed.Seconds(), opt)
+	}
 }
 
 // RecordWriteBackpressure records one guest write that blocked waiting for the
@@ -312,6 +346,9 @@ func RecordWriteBackpressure(ctx context.Context, volume string, elapsed time.Du
 	}
 	if backpressureDurationSum != nil {
 		backpressureDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+	if backpressureLatency != nil {
+		backpressureLatency.Record(ctx, elapsed.Seconds(), opt)
 	}
 }
 
@@ -341,6 +378,9 @@ func RecordGuestIO(ctx context.Context, op, volume, outcome string, bytesTransfe
 	}
 	if guestIODurationSum != nil {
 		guestIODurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+	if guestIOLatency != nil {
+		guestIOLatency.Record(ctx, elapsed.Seconds(), opt)
 	}
 }
 
