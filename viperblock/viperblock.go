@@ -2678,6 +2678,15 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 	return nil
 }
 
+// outcomeOf maps an error to the "success"/"error" label the telemetry
+// attributes carry.
+func outcomeOf(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "success"
+}
+
 // Flush writes buffered blocks to the WAL and fsyncs it. On success every
 // write acknowledged before the call is on stable storage on this host —
 // which is what a guest barrier promises. It does NOT mean the data has
@@ -2685,11 +2694,7 @@ func (vb *VB) Write(block uint64, data []byte) (err error) {
 func (vb *VB) Flush() (err error) {
 	start := time.Now()
 	defer func() {
-		outcome := "success"
-		if err != nil {
-			outcome = "error"
-		}
-		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
+		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcomeOf(err), time.Since(start))
 	}()
 
 	// Bracket the append stage so an fsync leader can tell the difference
@@ -2697,11 +2702,23 @@ func (vb *VB) Flush() (err error) {
 	// appended yet". Counted even when the append fails, or a leader would
 	// wait out the bound for a record that is never coming.
 	vb.WAL.commit.entering()
+	appendStart := time.Now()
 	err = vb.flushWrites()
 	vb.WAL.commit.stagedOne()
+
+	// Split so the guest's flush tail is attributable. These two contend on
+	// different things -- the append on flushMu, Writes.mu and WAL.mu, the
+	// commit on the device -- and a p99 built from their sum names neither.
+	telemetry.RecordWALOp(context.Background(), "flush.append", vb.VolumeName,
+		outcomeOf(err), time.Since(appendStart))
 	if err != nil {
 		return err
 	}
+	commitStart := time.Now()
+	defer func() {
+		telemetry.RecordWALOp(context.Background(), "flush.commit", vb.VolumeName,
+			outcomeOf(err), time.Since(commitStart))
+	}()
 
 	// Sync outside Writes.mu so a slow fsync does not stall writers. Safe: the
 	// records being synced are already in the file, and a write landing after
@@ -3658,6 +3675,18 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		return err
 	}
 
+	// The lock below is exclusive and every guest flush needs it shared to
+	// reach the active WAL, so whatever this window costs is paid by every
+	// fsync running concurrently with it. Timed on its own rather than buried
+	// in the consolidation around it, which is mostly backend upload.
+	rotateStart := time.Now()
+	rotated := false
+	defer func() {
+		if rotated {
+			telemetry.RecordWALOp(ctx, "rotate", vb.VolumeName, "success", time.Since(rotateStart))
+		}
+	}()
+
 	// First, lock, and close the current WAL file
 	vb.WAL.mu.Lock()
 	if len(vb.WAL.DB) == 0 {
@@ -3702,6 +3731,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	nextWalNum := vb.WAL.WallNum.Add(1)
 	err = vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
 	vb.WAL.mu.Unlock()
+	rotated = true
 	if err != nil {
 		return err
 	}
