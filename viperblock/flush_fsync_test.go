@@ -13,12 +13,12 @@ import (
 func TestFlushSyncsWAL(t *testing.T) {
 	vb, _ := newEnospcTestVB(t)
 
-	// The write only reaches the WAL during the flush, which is what marks it
-	// dirty — so a clear flag afterwards means the flush also synced it.
+	// The write only reaches the WAL during the flush, so nothing outstanding
+	// afterwards means the flush also synced what it appended.
 	require.NoError(t, vb.WriteAt(0, make([]byte, vb.BlockSize)))
 	require.NoError(t, vb.Flush())
 
-	assert.False(t, vb.WAL.dirty.Load(), "Flush must fsync the WAL, not leave it for the syncer tick")
+	assert.False(t, vb.WAL.commit.pending(), "Flush must fsync the WAL, not leave it for the syncer tick")
 }
 
 // TestFlushReturnsSyncFailure pins that a failed fsync fails the barrier. A
@@ -33,26 +33,26 @@ func TestFlushReturnsSyncFailure(t *testing.T) {
 
 	require.NotEmpty(t, vb.WAL.DB)
 	require.NoError(t, vb.WAL.DB[len(vb.WAL.DB)-1].Close())
-	vb.WAL.dirty.Store(true)
+	vb.WAL.commit.appended()
 
 	err := vb.Flush()
 	require.Error(t, err, "Flush must report a failed fsync rather than swallowing it")
 	assert.Contains(t, err.Error(), "WAL sync")
-	assert.True(t, vb.WAL.dirty.Load(), "a failed sync must leave the WAL dirty so the syncer retries")
+	assert.True(t, vb.WAL.commit.pending(), "a failed sync must leave the record outstanding so the syncer retries")
 }
 
-// TestSyncWALIfDirtySwallowsFailure pins that the periodic syncer keeps the
-// old behaviour: one bad fsync logs and re-marks dirty rather than
-// propagating out of a background tick.
-func TestSyncWALIfDirtySwallowsFailure(t *testing.T) {
+// TestSyncWALBackgroundSwallowsFailure pins that the periodic syncer keeps the
+// old behaviour: one bad fsync logs and leaves the record outstanding rather
+// than propagating out of a background tick.
+func TestSyncWALBackgroundSwallowsFailure(t *testing.T) {
 	vb, _ := newEnospcTestVB(t)
 
 	require.NotEmpty(t, vb.WAL.DB)
 	require.NoError(t, vb.WAL.DB[len(vb.WAL.DB)-1].Close())
-	vb.WAL.dirty.Store(true)
+	vb.WAL.commit.appended()
 
-	vb.syncWALIfDirty()
-	assert.True(t, vb.WAL.dirty.Load(), "the syncer must re-mark the WAL dirty so the next tick retries")
+	vb.syncWALBackground()
+	assert.True(t, vb.WAL.commit.pending(), "the syncer must leave the record outstanding so the next tick retries")
 }
 
 // TestFlushSyncsShardedWAL is TestFlushSyncsWAL for the sharded WAL, which

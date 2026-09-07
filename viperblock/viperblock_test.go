@@ -1175,7 +1175,7 @@ func TestWALPeriodicSync(t *testing.T) {
 						}
 						assert.True(t, anyDirty, "at least one shard dirty flag should be set after write")
 					} else {
-						assert.True(t, vb.WAL.dirty.Load(), "dirty flag should be set after write")
+						assert.True(t, vb.WAL.commit.pending(), "the record should be outstanding after a write")
 					}
 				}
 
@@ -1192,7 +1192,7 @@ func TestWALPeriodicSync(t *testing.T) {
 						assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d dirty flag should be cleared after sync", i)
 					}
 				} else {
-					assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after sync")
+					assert.False(t, vb.WAL.commit.pending(), "the syncer should leave nothing outstanding")
 				}
 			}
 
@@ -1281,7 +1281,7 @@ func TestWALSyncerConcurrency(t *testing.T) {
 			assert.False(t, vb.ShardedWAL.Shards[i].dirty.Load(), "shard %d dirty flag should be cleared after all syncs", i)
 		}
 	} else {
-		assert.False(t, vb.WAL.dirty.Load(), "dirty flag should be cleared after all syncs")
+		assert.False(t, vb.WAL.commit.pending(), "no record should be outstanding after all syncs")
 	}
 
 	// Verify writes are readable

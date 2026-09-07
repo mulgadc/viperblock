@@ -935,11 +935,120 @@ type WAL struct {
 	BaseDir  string
 	WALMagic [4]byte
 
-	// dirty tracks whether there are unflushed writes since last sync
-	// Uses atomic for lock-free access from write path and sync goroutine
-	dirty atomic.Bool
+	// commit is the group commit. It subsumes the dirty flag this type used
+	// to carry: "nothing to sync" is durable >= queued.
+	commit walCommit
 
 	mu sync.RWMutex
+}
+
+// walBatch is one in-flight fsync. target is the value of walCommit.queued
+// when the fsync began, so the batch covers every record numbered up to it
+// and no more. err is written before done closes and read only after.
+type walBatch struct {
+	target uint64
+	done   chan struct{}
+	err    error
+}
+
+// walCommit is the WAL's group commit: one fsync serves every flush already
+// queued behind it, instead of each flush paying for its own. A single fsync
+// costs milliseconds and that cost does not grow with the batch, so this is
+// what keeps flush latency flat as guest concurrency rises.
+//
+// A dirty flag cannot express this. It answers "has anything been written",
+// but a flush needs "has an fsync that covers MY record completed" — and a
+// flag is already clear while the fsync that cleared it is still in flight.
+type walCommit struct {
+	// queued counts records appended to the WAL. Incremented under WAL.mu
+	// after the write lands, so the append that a given value refers to is
+	// always already in the page cache.
+	queued atomic.Uint64
+
+	// batches counts fsyncs actually issued. Against queued it is the group
+	// commit's batch factor, which is the only way to tell a working batch
+	// from a queue of one-record fsyncs.
+	batches atomic.Uint64
+
+	mu      sync.Mutex
+	durable uint64    // records covered by an fsync that has completed
+	cur     *walBatch // fsync in flight, nil when none
+}
+
+// appended records that one more WAL record has reached the page cache.
+// Caller must hold WAL.mu so the count stays ordered with the appends.
+func (c *walCommit) appended() {
+	c.queued.Add(1)
+}
+
+// await blocks until an fsync covering every record appended before the call
+// has completed, running that fsync itself if nobody else is. It returns the
+// error of the fsync that covered the caller.
+//
+// An fsync already in flight is not trusted blindly: it covers the caller
+// only if it started after the caller's record was appended, which is what
+// comparing the batch's target against the caller's sequence tests.
+func (c *walCommit) await(sync func() error) error {
+	c.mu.Lock()
+	mine := c.queued.Load()
+
+	for {
+		if c.durable >= mine {
+			c.mu.Unlock()
+			return nil
+		}
+
+		if b := c.cur; b != nil {
+			c.mu.Unlock()
+			<-b.done
+			if b.target >= mine {
+				return b.err
+			}
+			// That fsync began before our record landed. Re-test: by now
+			// another caller may have started one that does cover us.
+			c.mu.Lock()
+			continue
+		}
+
+		b := &walBatch{target: c.queued.Load(), done: make(chan struct{})}
+		c.cur = b
+		c.batches.Add(1)
+		c.mu.Unlock()
+
+		b.err = sync()
+
+		c.mu.Lock()
+		c.cur = nil
+		if b.err == nil {
+			c.durable = b.target
+		}
+		c.mu.Unlock()
+		close(b.done)
+
+		// A batch we started targets our own record or a later one, so it
+		// always covers us and the loop cannot spin.
+		return b.err
+	}
+}
+
+// pending reports whether any appended record is not yet covered by a
+// completed fsync.
+func (c *walCommit) pending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.durable < c.queued.Load()
+}
+
+// rotated marks every record counted so far durable, for a caller that has
+// just fsynced the generation holding them. Caller must hold WAL.mu, so no
+// append can slip in between the fsync and the count read here.
+func (c *walCommit) rotated() {
+	target := c.queued.Load()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if target > c.durable {
+		c.durable = target
+	}
 }
 
 // WALShard represents a single shard of a sharded WAL.
@@ -1521,12 +1630,13 @@ func (vb *VB) SetBlockWALBaseDir(baseDir string) {
 	vb.BlockToObjectWAL.BaseDir = baseDir
 }
 
-// StartWALSyncer starts a background goroutine that periodically fsyncs the WAL to disk.
-// This implements the "group commit" pattern used by PostgreSQL (wal_writer_delay),
-// BadgerDB (SyncWrites with ticker), and MongoDB (journalCommitInterval).
+// StartWALSyncer starts a background goroutine that periodically fsyncs the
+// WAL, bounding how long a write that nobody is waiting on can sit unsynced.
+// It is the background half of the durability story, not the group commit --
+// that is walCommit, which batches the flushes that ARE being waited on.
 //
-// The syncer only performs fsync when there are dirty (unflushed) writes,
-// avoiding unnecessary disk I/O when the system is idle.
+// It goes through the same walCommit, so an idle volume costs no fsync and a
+// tick that lands mid-batch joins that batch instead of queueing behind it.
 func (vb *VB) StartWALSyncer() {
 	if vb.WALSyncInterval <= 0 {
 		vb.logger().Debug("WAL syncer disabled (interval <= 0)")
@@ -1561,14 +1671,14 @@ func (vb *VB) StartWALSyncer() {
 				if vb.UseShardedWAL {
 					vb.syncShardedWALIfDirty()
 				} else {
-					vb.syncWALIfDirty()
+					vb.syncWALBackground()
 				}
 			case <-stop:
 				// Final sync before shutdown
 				if vb.UseShardedWAL {
 					vb.syncShardedWALIfDirty()
 				} else {
-					vb.syncWALIfDirty()
+					vb.syncWALBackground()
 				}
 				return
 			}
@@ -1744,43 +1854,40 @@ func (vb *VB) StopChunkUploader() {
 	vb.logger().Debug("chunk uploader stopped")
 }
 
-// syncWALIfDirty is syncWAL for the periodic syncer, which has no caller to
+// syncWALBackground is syncWAL for the periodic syncer, which has no caller to
 // report to and must not stop ticking on one bad fsync.
-func (vb *VB) syncWALIfDirty() {
+func (vb *VB) syncWALBackground() {
 	if err := vb.syncWAL(); err != nil {
 		vb.logger().Error("WAL sync failed", "error", err)
 	}
 }
 
-// syncWAL performs fsync on the active WAL file if there are pending writes,
-// returning the fsync error so a barrier can refuse to report success on a
-// WAL that never reached stable storage.
+// syncWAL returns once an fsync covering every record appended before the
+// call has completed, so a barrier cannot report success on a WAL that never
+// reached stable storage. Concurrent callers share one fsync.
 //
 // Note: Only the last file in vb.WAL.DB is the active WAL being written to.
 // Previous files are closed after WriteWALToChunk processes them.
 func (vb *VB) syncWAL() error {
-	// Fast path: check dirty flag without lock
-	if !vb.WAL.dirty.Load() {
-		return nil
-	}
+	return vb.WAL.commit.await(vb.fsyncActiveWAL)
+}
 
-	// Clear dirty flag before sync (writes during sync will re-set it)
-	vb.WAL.dirty.Store(false)
-
+// fsyncActiveWAL fsyncs the WAL generation currently being appended to. A
+// rotated generation is synced and closed by WriteWALToChunkCtx before it
+// leaves vb.WAL.DB, so it is never this function's responsibility.
+func (vb *VB) fsyncActiveWAL() error {
 	vb.WAL.mu.RLock()
 	defer vb.WAL.mu.RUnlock()
 
-	// Only sync the current active WAL (last in slice)
-	// Previous WAL files are already closed after chunking
-	if len(vb.WAL.DB) > 0 {
-		activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
-		if activeWAL != nil {
-			if err := activeWAL.Sync(); err != nil {
-				// Re-mark as dirty so the next tick retries
-				vb.WAL.dirty.Store(true)
-				return fmt.Errorf("WAL sync: %w", err)
-			}
-		}
+	if len(vb.WAL.DB) == 0 {
+		return nil
+	}
+	activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
+	if activeWAL == nil {
+		return nil
+	}
+	if err := activeWAL.Sync(); err != nil {
+		return fmt.Errorf("WAL sync: %w", err)
 	}
 	return nil
 }
@@ -2828,7 +2935,6 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 	}
 	preSize := preStat.Size()
 	n, err := currentWAL.Write(record)
-	vb.WAL.dirty.Store(true)
 
 	if err != nil || n != len(record) {
 		// Torn write: roll back to the last record boundary so future appends
@@ -2846,6 +2952,10 @@ func (vb *VB) WriteWAL(block Block) (err error) {
 		vb.logger().Error("WAL incomplete write, truncated to last boundary", "n", n, "expected", len(record), "preSize", preSize)
 		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes (truncated to %d)", n, len(record), preSize)
 	}
+
+	// Counted only once the record is whole and staying: a torn write is
+	// truncated away above and must not make a later fsync look sufficient.
+	vb.WAL.commit.appended()
 
 	vb.WAL.mu.Unlock()
 	return nil
@@ -3517,12 +3627,18 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		vb.WAL.mu.Unlock()
 		return fmt.Errorf("failed to sync WAL before chunking: %w", err)
 	}
+
+	// WAL.mu is held, so no append can race this: every record counted so far
+	// is in the generation just synced. Without this the next flush would
+	// fsync the empty successor to satisfy a debt already paid.
+	vb.WAL.commit.rotated()
+
 	if err := pendingWAL.Close(); err != nil {
 		vb.logger().Warn("failed to close pending WAL", "error", err)
 	}
 
 	// Open the next WAL file while still holding the lock so there is no
-	// window where syncWALIfDirty or WriteWAL can see a closed DB entry.
+	// window where syncWALBackground or WriteWAL can see a closed DB entry.
 	nextWalNum := vb.WAL.WallNum.Add(1)
 	err = vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
 	vb.WAL.mu.Unlock()
