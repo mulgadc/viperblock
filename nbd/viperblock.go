@@ -20,6 +20,7 @@ import (
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
+	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/s3"
@@ -502,11 +503,25 @@ func (c *ViperBlockConnection) CanMultiConn() (bool, error) {
 
 }
 
-func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) error {
+// recordGuest reports one served NBD request. Deferred by each handler so the
+// timing covers the whole call including any error return, and so a handler
+// that grows an early return cannot silently stop being measured.
+func (c *ViperBlockConnection) recordGuest(op string, bytes int, start time.Time, err *error) {
+	outcome := "success"
+	if *err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordGuestIO(context.Background(), op, c.vb.VolumeName, outcome, bytes, time.Since(start))
+}
+
+func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) (err error) {
+	defer c.recordGuest("read", len(buf), time.Now(), &err)
+
 	slog.Debug("PREAD:", "offset", offset, "len", len(buf))
-	data, err := c.vb.ReadAt(offset, uint64(len(buf)))
-	if err != nil && err != viperblock.ErrZeroBlock {
-		return nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", err)}
+	data, readErr := c.vb.ReadAt(offset, uint64(len(buf)))
+	if readErr != nil && readErr != viperblock.ErrZeroBlock {
+		err = nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", readErr)}
+		return err
 	}
 
 	copy(buf, data)
@@ -520,21 +535,23 @@ func (c *ViperBlockConnection) CanWrite() (bool, error) {
 }
 
 func (c *ViperBlockConnection) PWrite(buf []byte, offset uint64,
-	flags uint32) error {
+	flags uint32) (err error) {
+	defer c.recordGuest("write", len(buf), time.Now(), &err)
 
 	//slog.Info("PWRITE:", "len", len(buf), "offset", offset)
 
 	if c.readonly {
-		return nbdkit.PluginError{Errmsg: "write to a read-only export", Errno: syscall.EROFS}
+		err = nbdkit.PluginError{Errmsg: "write to a read-only export", Errno: syscall.EROFS}
+		return err
 	}
 
 	data := make([]byte, len(buf))
 
 	copy(data, buf)
-	err := c.vb.WriteAt(offset, data)
 
-	if err != nil {
-		return backendErrToPluginError("Could not write data", err)
+	if writeErr := c.vb.WriteAt(offset, data); writeErr != nil {
+		err = backendErrToPluginError("Could not write data", writeErr)
+		return err
 	}
 
 	return nil
@@ -593,9 +610,12 @@ func (c *ViperBlockConnection) CanFlush() (bool, error) {
 // fsynced to the local WAL and survives host crash or power loss. It does not
 // wait for the data to reach predastore, so it does not survive loss of the
 // node itself.
-func (c *ViperBlockConnection) Flush(flags uint32) error {
-	if err := c.vb.Flush(); err != nil {
-		return backendErrToPluginError("Flush failed", err)
+func (c *ViperBlockConnection) Flush(flags uint32) (err error) {
+	defer c.recordGuest("flush", 0, time.Now(), &err)
+
+	if flushErr := c.vb.Flush(); flushErr != nil {
+		err = backendErrToPluginError("Flush failed", flushErr)
+		return err
 	}
 	return nil
 }
