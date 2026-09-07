@@ -32,6 +32,7 @@ var (
 	guestIOOps         metric.Int64Counter
 	guestIOBytes       metric.Int64Counter
 	guestIODurationSum metric.Float64Counter
+	guestIOLatency     metric.Float64Histogram
 
 	cacheLookups metric.Int64Counter
 
@@ -113,6 +114,15 @@ func instruments() {
 		}
 		guestIODurationSum, err = m.Float64Counter("viperblock.guest.io.duration.sum",
 			metric.WithDescription("Cumulative seconds the guest spent waiting on NBD requests. Divided by ops this is the latency the guest observes, which for a flush is what a datastore's commit latency is made of."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		// A sum yields a mean and nothing else, and a datastore specifies its
+		// disk as a p99. Named ".latency" because "duration" is already an
+		// object in Elasticsearch, with "duration.sum" a leaf under it.
+		guestIOLatency, err = m.Float64Histogram("viperblock.guest.io.latency",
+			metric.WithDescription("Distribution of the wall time the guest waited on each NBD request. The flush percentiles are what an etcd-class guest is specified against."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -341,6 +351,9 @@ func RecordGuestIO(ctx context.Context, op, volume, outcome string, bytesTransfe
 	}
 	if guestIODurationSum != nil {
 		guestIODurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+	if guestIOLatency != nil {
+		guestIOLatency.Record(ctx, elapsed.Seconds(), opt)
 	}
 }
 
