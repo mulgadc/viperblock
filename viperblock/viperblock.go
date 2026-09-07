@@ -3679,13 +3679,10 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	// reach the active WAL, so whatever this window costs is paid by every
 	// fsync running concurrently with it. Timed on its own rather than buried
 	// in the consolidation around it, which is mostly backend upload.
+	// Recorded at the unlock rather than deferred: a deferred record fires at
+	// function return, which is after the backend upload and would time the
+	// consolidation over again under a second name.
 	rotateStart := time.Now()
-	rotated := false
-	defer func() {
-		if rotated {
-			telemetry.RecordWALOp(ctx, "rotate", vb.VolumeName, "success", time.Since(rotateStart))
-		}
-	}()
 
 	// First, lock, and close the current WAL file
 	vb.WAL.mu.Lock()
@@ -3731,7 +3728,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	nextWalNum := vb.WAL.WallNum.Add(1)
 	err = vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
 	vb.WAL.mu.Unlock()
-	rotated = true
+	telemetry.RecordWALOp(ctx, "rotate", vb.VolumeName, outcomeOf(err), time.Since(rotateStart))
 	if err != nil {
 		return err
 	}
