@@ -29,6 +29,10 @@ var (
 	walOpCount       metric.Int64Counter
 	walOpDurationSum metric.Float64Counter
 
+	guestIOOps         metric.Int64Counter
+	guestIOBytes       metric.Int64Counter
+	guestIODurationSum metric.Float64Counter
+
 	cacheLookups metric.Int64Counter
 
 	rmwConflicts  metric.Int64Counter
@@ -83,6 +87,29 @@ func instruments() {
 		}
 		walOpDurationSum, err = m.Float64Counter("viperblock.wal.operation.duration.sum",
 			metric.WithDescription("Cumulative seconds spent in WAL flush/replay/consolidate operations."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// The guest boundary, as distinct from the WAL and backend instruments
+		// below and above it. A guest fsync is a write followed by a flush, two
+		// separate NBD requests, and only the flush reaches the WAL timer — so
+		// without these the cost the guest actually waits on is unattributable.
+		guestIOOps, err = m.Int64Counter("viperblock.guest.io.ops",
+			metric.WithDescription("Count of NBD requests served to the guest, by op."),
+			metric.WithUnit("{operation}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		guestIOBytes, err = m.Int64Counter("viperblock.guest.io.bytes",
+			metric.WithDescription("Bytes transferred by NBD requests served to the guest."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		guestIODurationSum, err = m.Float64Counter("viperblock.guest.io.duration.sum",
+			metric.WithDescription("Cumulative seconds the guest spent waiting on NBD requests. Divided by ops this is the latency the guest observes, which for a flush is what a datastore's commit latency is made of."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -245,6 +272,35 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 	}
 	if walOpDurationSum != nil {
 		walOpDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+}
+
+// RecordGuestIO records one NBD request served to the guest: op count, bytes
+// and the wall time the guest waited. op is "read"/"write"/"flush"/"zero"/
+// "trim", outcome is "success"/"error". bytesTransferred is 0 for a flush.
+//
+// This is the only measurement taken where the guest feels it. Everything else
+// times an internal stage, and a stage that looks fast can still leave the
+// guest waiting on queueing or lock contention in front of it.
+func RecordGuestIO(ctx context.Context, op, volume, outcome string, bytesTransferred int, elapsed time.Duration) {
+	instruments()
+	attrs := []attribute.KeyValue{
+		attribute.String("op", op),
+		attribute.String("outcome", outcome),
+	}
+	if volume != "" {
+		attrs = append(attrs, attribute.String("volume.name", volume))
+	}
+	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
+
+	if guestIOOps != nil {
+		guestIOOps.Add(ctx, 1, opt)
+	}
+	if guestIOBytes != nil && bytesTransferred > 0 {
+		guestIOBytes.Add(ctx, int64(bytesTransferred), opt)
+	}
+	if guestIODurationSum != nil {
+		guestIODurationSum.Add(ctx, elapsed.Seconds(), opt)
 	}
 }
 
