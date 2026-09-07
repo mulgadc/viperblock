@@ -2101,8 +2101,12 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	// than function entry: recording the unblocked case would leave a mean
 	// dominated by zeros and hide the stall it exists to show.
 	stalledSince := time.Now()
+	releaseWaiter := telemetry.BackpressureWaiterScope(ctx, vb.VolumeName)
 	defer func() {
-		telemetry.RecordWriteBackpressure(context.Background(), vb.VolumeName, time.Since(stalledSince))
+		releaseWaiter()
+		waited := time.Since(stalledSince)
+		telemetry.RecordWriteBackpressure(context.Background(), vb.VolumeName, waited)
+		telemetry.RecordBackpressureTail(context.Background(), vb.VolumeName, waited)
 	}()
 
 	low := high - high/backpressureLowFraction
@@ -2131,8 +2135,21 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			// Chunks only: the checkpoint and the sweep do not lower
 			// pendingBytes, so charging them to a stalled guest write buys
 			// nothing and costs most of the wait.
+			drainStarted := time.Now()
+			pendingBefore := vb.PendingBytes()
 			err := vb.DrainChunksCtx(ctx)
+			pendingAfter := vb.PendingBytes()
 			vb.drainInFlight.Store(false)
+
+			// Guest writes keep arriving during the drain, so this is the NET
+			// fall in pendingBytes, not the bytes uploaded. That is the rate
+			// the watermark gap is really divided by.
+			var freed int64
+			if pendingAfter < pendingBefore {
+				freed = safecast.Uint64ToInt64(pendingBefore - pendingAfter)
+			}
+			telemetry.RecordBackpressurePhase(ctx, vb.VolumeName, "drain",
+				time.Since(drainStarted), freed)
 			if err != nil {
 				if errors.Is(err, ErrNoSpace) {
 					return err
@@ -2157,11 +2174,14 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			}
 		}
 
+		pollStarted := time.Now()
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+		telemetry.RecordBackpressurePhase(ctx, vb.VolumeName, "poll", time.Since(pollStarted), 0)
+
 		if backoff < maxBackoff {
 			backoff *= 2
 		}
