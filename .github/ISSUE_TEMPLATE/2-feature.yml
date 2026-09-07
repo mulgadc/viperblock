@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest something new.
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - NBD server
+        - WAL / durability
+        - Block store / cache
+        - Storage backends (S3, file)
+        - Snapshots
+        - Encryption
+        - QEMU / KVM integration
+        - Configuration / deployment
+        - Observability / telemetry
+        - Documentation
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+      description: What you are trying to do, and what stops you today.
+    validations:
+      required: true
