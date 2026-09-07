@@ -358,6 +358,11 @@ type VB struct {
 
 	BaseDir string
 
+	// WALBaseDir, when set, is where WAL, BlockToObjectWAL, and ShardedWAL
+	// files live instead of BaseDir. A node-local deployment choice (e.g. a
+	// separate fsync-friendly device), never persisted to config.json.
+	WALBaseDir string
+
 	VolumeConfig VolumeConfig
 
 	// Logger, if set, is used for this instance's log lines instead of
@@ -1266,6 +1271,13 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.BaseDir = "/tmp/viperblock"
 	}
 
+	// walBaseDir defaults to BaseDir so an unset WALBaseDir is a no-op: WAL,
+	// BlockToObjectWAL, and ShardedWAL land under BaseDir exactly as before.
+	walBaseDir := config.BaseDir
+	if config.WALBaseDir != "" {
+		walBaseDir = config.WALBaseDir
+	}
+
 	if config.FlushInterval == 0 {
 		config.FlushInterval = DefaultFlushInterval
 	}
@@ -1345,8 +1357,8 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		GCEnabled:           config.GCEnabled,
 		GCInterval:          config.GCInterval,
 		Writes:              Blocks{},
-		WAL:                 WAL{BaseDir: config.BaseDir, WALMagic: walMagic},
-		BlockToObjectWAL:    WAL{BaseDir: config.BaseDir, WALMagic: blockToObjectWALMagic},
+		WAL:                 WAL{BaseDir: walBaseDir, WALMagic: walMagic},
+		BlockToObjectWAL:    WAL{BaseDir: walBaseDir, WALMagic: blockToObjectWALMagic},
 		Cache: Cache{
 			lru: lruCache,
 			Config: CacheConfig{
@@ -1370,7 +1382,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		Role: config.Role,
 
 		UseShardedWAL: false,
-		ShardedWAL:    NewShardedWAL(config.BaseDir, [4]byte{'V', 'B', 'W', 'L'}),
+		ShardedWAL:    NewShardedWAL(walBaseDir, [4]byte{'V', 'B', 'W', 'L'}),
 
 		chunkUploadTrigger: make(chan struct{}, 1),
 
@@ -1412,6 +1424,15 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	// Create the checkpoint directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Join(vb.BaseDir, vb.GetVolume(), "checkpoints"), 0750); err != nil {
 		return nil, fmt.Errorf("failed to create checkpoint directory: %w", err)
+	}
+
+	// When WALBaseDir puts the WAL on a separate device, its volume
+	// directory needs to exist before any WAL open, not just the ones that
+	// already MkdirAll their own target file.
+	if walBaseDir != vb.BaseDir {
+		if err := os.MkdirAll(filepath.Join(walBaseDir, vb.GetVolume()), 0750); err != nil {
+			return nil, fmt.Errorf("failed to create WAL base directory: %w", err)
+		}
 	}
 
 	vb.readAhead.nextBlock = noStreamPosition
@@ -4846,7 +4867,7 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		telemetry.RecordWALOp(context.Background(), "replay", vb.VolumeName, outcome, time.Since(start))
 	}()
 
-	walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
+	walDir := filepath.Join(vb.WAL.BaseDir, vb.GetVolume(), "wal", "chunks")
 
 	entries, err := os.ReadDir(walDir)
 	if err != nil {
@@ -5709,7 +5730,7 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	if state.ShardedWAL {
 		vb.UseShardedWAL = true
 		if vb.ShardedWAL == nil {
-			vb.ShardedWAL = NewShardedWAL(vb.BaseDir, vb.WAL.WALMagic)
+			vb.ShardedWAL = NewShardedWAL(vb.WAL.BaseDir, vb.WAL.WALMagic)
 		}
 		vb.ShardedWAL.WallNum.Store(state.WALNum)
 	}
@@ -6370,6 +6391,16 @@ func (vb *VB) RemoveLocalFiles() (err error) {
 	vb.WAL.mu.Lock()
 	err = os.RemoveAll(localPath)
 	vb.WAL.mu.Unlock()
+
+	// WAL, BlockToObjectWAL, and ShardedWAL all resolve to the same base dir
+	// (see New), which may live on a device separate from BaseDir. Its
+	// volume tree is otherwise never cleaned up.
+	if vb.WAL.BaseDir != "" && vb.WAL.BaseDir != vb.BaseDir {
+		walPath := filepath.Join(vb.WAL.BaseDir, vb.GetVolume())
+		if rmErr := os.RemoveAll(walPath); rmErr != nil && err == nil {
+			err = rmErr
+		}
+	}
 
 	return err
 }
