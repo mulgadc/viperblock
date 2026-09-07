@@ -91,6 +91,11 @@ var access_key string
 var secret_key string
 var host string
 var base_dir string
+
+// wal_base_dir mirrors viperblock.VB.WALBaseDir. Optional: empty routes the
+// WAL back onto base_dir, the same as before this parameter existed.
+var wal_base_dir string
+
 var cache_size int = viperblock.DefaultCacheBlocks
 var max_pending_bytes uint64 = 0
 var upload_workers int = 16
@@ -168,6 +173,9 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "base_dir" {
 		base_dir = value
+		return nil
+	} else if key == "wal_base_dir" {
+		wal_base_dir = value
 		return nil
 	} else if key == "cache_size" {
 		var err error
@@ -317,6 +325,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		VolumeName: volume,
 		VolumeSize: size,
 		BaseDir:    base_dir,
+		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
 		Role: "nbdkit",
