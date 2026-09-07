@@ -2081,6 +2081,14 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 		return nil
 	}
 
+	// Past the fast path the guest write is stalled, so time from here rather
+	// than function entry: recording the unblocked case would leave a mean
+	// dominated by zeros and hide the stall it exists to show.
+	stalledSince := time.Now()
+	defer func() {
+		telemetry.RecordWriteBackpressure(context.Background(), vb.VolumeName, time.Since(stalledSince))
+	}()
+
 	low := high - high/backpressureLowFraction
 	backoff := 10 * time.Millisecond
 	// The loop re-checks pendingBytes on every wake, so a long backoff only
