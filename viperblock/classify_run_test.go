@@ -1,7 +1,7 @@
 package viperblock
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,17 +97,17 @@ func TestClassifyRun(t *testing.T) {
 // merge: against a randomly fragmented index it must give the identical verdict
 // to supersedesLocked, which reaches it with one tree descent per block.
 func TestClassifyRunMatchesPerBlockLookup(t *testing.T) {
-	rng := rand.New(rand.NewSource(20260904))
+	rng := rand.New(rand.NewPCG(20260904, 0))
 	vb := &VB{}
 
 	// A fragmented map: extents of random length with random gaps between
 	// them, and per-block sequence numbers that rise and fall within each.
 	for block := uint64(0); block < 4096; {
-		block += uint64(rng.Intn(4)) // gap, sometimes zero
-		n := 1 + rng.Intn(12)
+		block += uint64(rng.IntN(4)) // gap, sometimes zero
+		n := 1 + rng.IntN(12)
 		seqNums := make([]uint64, n)
 		for i := range seqNums {
-			seqNums[i] = uint64(rng.Intn(2000))
+			seqNums[i] = uint64(rng.IntN(2000))
 		}
 		vb.BlocksToObject.lookup.set(BlockLookup{
 			StartBlock: block,
@@ -119,10 +119,10 @@ func TestClassifyRunMatchesPerBlockLookup(t *testing.T) {
 	require.NotZero(t, vb.BlocksToObject.lookup.len())
 
 	for range 500 {
-		start := uint64(rng.Intn(4096))
-		run := make([]Block, 1+rng.Intn(64))
+		start := uint64(rng.IntN(4096))
+		run := make([]Block, 1+rng.IntN(64))
 		for i := range run {
-			run[i] = Block{Block: start + uint64(i), SeqNum: uint64(rng.Intn(2000))}
+			run[i] = Block{Block: start + uint64(i), SeqNum: uint64(rng.IntN(2000))}
 		}
 
 		overlaps := vb.BlocksToObject.lookup.collectOverlaps(nil, run[0].Block, run[len(run)-1].Block+1)

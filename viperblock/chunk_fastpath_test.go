@@ -37,7 +37,7 @@ func assertBlocks(t *testing.T, vb *VB, base uint64, count int, fill byte) {
 	blockSize := uint64(vb.BlockSize)
 	want := bytes.Repeat([]byte{fill}, int(blockSize))
 	for i := range count {
-		got, err := vb.ReadAt((base+uint64(i))*blockSize, uint64(blockSize))
+		got, err := vb.ReadAt((base+uint64(i))*blockSize, blockSize)
 		require.NoError(t, err, "block %d", base+uint64(i))
 		assert.Equal(t, want, got, "block %d", base+uint64(i))
 	}

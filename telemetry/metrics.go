@@ -35,6 +35,9 @@ var (
 
 	cacheLookups metric.Int64Counter
 
+	backpressureWaits       metric.Int64Counter
+	backpressureDurationSum metric.Float64Counter
+
 	rmwConflicts  metric.Int64Counter
 	volumeOpens   metric.Int64Counter
 	volumeEngines metric.Int64UpDownCounter
@@ -127,6 +130,23 @@ func instruments() {
 		}
 		cacheMissOpts = []metric.AddOption{
 			metric.WithAttributeSet(attribute.NewSet(attribute.String("result", "miss"))),
+		}
+
+		// Counted only when a write actually blocked, so waits/guest-write-ops
+		// is the fraction of writes that stalled and duration.sum against the
+		// guest write duration is how much of guest write latency is this and
+		// not the write itself.
+		backpressureWaits, err = m.Int64Counter("viperblock.write.backpressure.waits",
+			metric.WithDescription("Guest writes that blocked because buffered bytes crossed the high-watermark. Zero means the backend kept up."),
+			metric.WithUnit("{wait}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureDurationSum, err = m.Float64Counter("viperblock.write.backpressure.duration.sum",
+			metric.WithDescription("Cumulative seconds guest writes spent blocked on backpressure, waiting for the backend to drain."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
 		}
 
 		rmwConflicts, err = m.Int64Counter("viperblock.write.rmw_conflicts",
@@ -272,6 +292,26 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 	}
 	if walOpDurationSum != nil {
 		walOpDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+}
+
+// RecordWriteBackpressure records one guest write that blocked waiting for the
+// backend to drain, and how long it waited. Only blocked writes are recorded:
+// the unblocked path is the common case, and counting it would bury the stalls
+// this exists to surface in a mean dominated by zeros.
+func RecordWriteBackpressure(ctx context.Context, volume string, elapsed time.Duration) {
+	instruments()
+	var attrs []attribute.KeyValue
+	if volume != "" {
+		attrs = append(attrs, attribute.String("volume.name", volume))
+	}
+	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
+
+	if backpressureWaits != nil {
+		backpressureWaits.Add(ctx, 1, opt)
+	}
+	if backpressureDurationSum != nil {
+		backpressureDurationSum.Add(ctx, elapsed.Seconds(), opt)
 	}
 }
 
