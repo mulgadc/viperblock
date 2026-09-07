@@ -197,3 +197,74 @@ func TestFlushIsDurableUnderConcurrentWriters(t *testing.T) {
 
 	assert.False(t, vb.WAL.commit.pending(), "no record may be left unsynced once every Flush has returned")
 }
+
+// TestGroupCommitLeaderWaitsForFlushesStillAppending is what makes the batch
+// a batch. Without it the leader starts its fsync while other flushes are
+// between entering Flush and appending, excludes them, and each then needs an
+// fsync of its own -- a queue wearing a group commit's name.
+func TestGroupCommitLeaderWaitsForFlushesStillAppending(t *testing.T) {
+	// Widened so the hand-off is observable; at the production bound the
+	// leader would rightly stop waiting long before a test could look.
+	restore := walStagingWait
+	walStagingWait = 2 * time.Second
+	t.Cleanup(func() { walStagingWait = restore })
+
+	var c walCommit
+
+	claimed := make(chan uint64, 1)
+	fsync := func() error { return nil }
+
+	// One flush has arrived and appended; a second has arrived and has not.
+	c.entering()
+	c.appended()
+	c.stagedOne()
+	c.entering()
+
+	go func() {
+		assert.NoError(t, c.await(fsync))
+		claimed <- c.queued.Load()
+	}()
+
+	// The leader must still be holding off for the second flush.
+	select {
+	case <-claimed:
+		t.Fatal("leader fsynced without the flush still in its append stage")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	c.appended()
+	c.stagedOne()
+
+	select {
+	case <-claimed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader never fsynced after the append stage drained")
+	}
+
+	assert.False(t, c.pending(), "both records must be covered by the one fsync")
+	assert.Equal(t, uint64(1), c.batches.Load(), "both flushes must share one fsync")
+}
+
+// TestGroupCommitLeaderGivesUpOnAStalledAppender pins the bound: one flush
+// stuck in its append stage delays the batch, it does not hold everyone
+// else's durability hostage.
+func TestGroupCommitLeaderGivesUpOnAStalledAppender(t *testing.T) {
+	var c walCommit
+
+	fsync := func() error { return nil }
+
+	c.entering()
+	c.appended()
+	c.stagedOne()
+
+	// A flush that arrives and never stages.
+	c.entering()
+
+	start := time.Now()
+	require.NoError(t, c.await(fsync))
+	waited := time.Since(start)
+
+	assert.False(t, c.pending(), "the record that did append must still be synced")
+	assert.GreaterOrEqual(t, waited, walStagingWait, "the leader should have held off for the bound")
+	assert.Less(t, waited, time.Second, "the bound must not be open-ended")
+}

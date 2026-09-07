@@ -970,6 +970,14 @@ type walCommit struct {
 	// from a queue of one-record fsyncs.
 	batches atomic.Uint64
 
+	// arrived counts flushes that have entered Flush; staged counts those
+	// that have finished appending. A leader that starts its fsync while a
+	// flush sits between the two excludes it, and that flush then needs an
+	// fsync of its own -- which is how a group commit degenerates into a
+	// queue. Waiting for the gap to close is what makes the batch a batch.
+	arrived atomic.Uint64
+	staged  atomic.Uint64
+
 	mu      sync.Mutex
 	durable uint64    // records covered by an fsync that has completed
 	cur     *walBatch // fsync in flight, nil when none
@@ -1010,6 +1018,15 @@ func (c *walCommit) await(sync func() error) error {
 			continue
 		}
 
+		// Let every flush already inside Flush finish appending before
+		// claiming, then re-test: one of them may have claimed meanwhile.
+		c.mu.Unlock()
+		c.awaitStaging()
+		c.mu.Lock()
+		if c.durable >= mine || c.cur != nil {
+			continue
+		}
+
 		b := &walBatch{target: c.queued.Load(), done: make(chan struct{})}
 		c.cur = b
 		c.batches.Add(1)
@@ -1028,6 +1045,42 @@ func (c *walCommit) await(sync func() error) error {
 		// A batch we started targets our own record or a later one, so it
 		// always covers us and the loop cannot spin.
 		return b.err
+	}
+}
+
+// walStagingWait bounds how long an fsync leader will hold off for flushes
+// still appending. An append is microseconds against a millisecond fsync, so
+// the wait normally ends immediately; the bound only stops one stalled
+// appender from holding everyone else's durability back. A var only so a
+// test can widen it; nothing changes it at runtime.
+var walStagingWait = 500 * time.Microsecond
+
+// entering marks a flush as arrived, before its append stage.
+func (c *walCommit) entering() {
+	c.arrived.Add(1)
+}
+
+// stagedOne marks a flush's append stage complete, whether or not it wrote
+// any records. A flush that appended nothing still has to be counted or a
+// leader would wait out the full bound for a record that is never coming.
+func (c *walCommit) stagedOne() {
+	c.staged.Add(1)
+}
+
+// awaitStaging blocks until every flush that had entered Flush when it was
+// called has finished appending, or the bound elapses.
+func (c *walCommit) awaitStaging() {
+	want := c.arrived.Load()
+	if c.staged.Load() >= want {
+		return
+	}
+
+	deadline := time.Now().Add(walStagingWait)
+	for c.staged.Load() < want {
+		if time.Now().After(deadline) {
+			return
+		}
+		runtime.Gosched()
 	}
 }
 
@@ -2639,7 +2692,14 @@ func (vb *VB) Flush() (err error) {
 		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
 	}()
 
-	if err = vb.flushWrites(); err != nil {
+	// Bracket the append stage so an fsync leader can tell the difference
+	// between "nobody else is flushing" and "others are, but have not
+	// appended yet". Counted even when the append fails, or a leader would
+	// wait out the bound for a record that is never coming.
+	vb.WAL.commit.entering()
+	err = vb.flushWrites()
+	vb.WAL.commit.stagedOne()
+	if err != nil {
 		return err
 	}
 
