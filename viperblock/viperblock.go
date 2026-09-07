@@ -269,6 +269,11 @@ type VB struct {
 	// DrainToBackendCtx's deferred handler for where it is set and cleared.
 	backendFull atomic.Bool
 
+	// bpWaiters counts guest writes currently blocked in awaitBackpressure.
+	// Non-zero closes the gate's fast path, which is what stops an arriving
+	// write from overtaking one already queued. See awaitBackpressure.
+	bpWaiters atomic.Int64
+
 	// pendingWALChunks holds WAL generations that were rotated out but whose
 	// chunk upload failed. Retried at the head of the next consolidation so
 	// the data is not stranded in-process until the next restart.
@@ -2093,9 +2098,20 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
 	pending := vb.PendingBytes()
 	telemetry.RecordBackpressureLevels(ctx, vb.VolumeName, pending, high)
-	if pending <= high {
+
+	// The fast path is closed while anyone is queued. WriteAtCtx buffers
+	// before it gets here, so an arriving write has already pushed
+	// pendingBytes back up; letting it through would refill what a waiter is
+	// waiting to see fall, and the waiter loses its place to a later arrival.
+	// That starvation, not backend throughput, is what makes the tail: at a
+	// fixed drain rate, going from 1 to 16 writers left throughput unchanged
+	// and multiplied p99 stall by ten.
+	if pending <= high && vb.bpWaiters.Load() == 0 {
 		return nil
 	}
+
+	vb.bpWaiters.Add(1)
+	defer vb.bpWaiters.Add(-1)
 
 	// Past the fast path the guest write is stalled, so time from here rather
 	// than function entry: recording the unblocked case would leave a mean
@@ -2110,10 +2126,12 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	}()
 
 	low := high - high/backpressureLowFraction
-	backoff := 10 * time.Millisecond
-	// The loop re-checks pendingBytes on every wake, so a long backoff only
-	// adds latency after the drain that unblocked the writer has finished.
-	const maxBackoff = 50 * time.Millisecond
+	backoff := time.Millisecond
+	// Capped low and reset after every drain. The old 10-50ms doubling was
+	// pure latency added after the drain that released the writer had already
+	// finished, and it never reset within a wait, so a writer that lost one
+	// race waited longer on each subsequent one.
+	const maxBackoff = 5 * time.Millisecond
 
 	// Bound a persistently failing drain by how long it has been failing, on
 	// the volume. A single success clears it, so transient backend slowness
@@ -2172,6 +2190,9 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			if vb.PendingBytes() <= low {
 				break
 			}
+			// A drain just ran, so the next re-check is worth making promptly
+			// rather than at whatever the backoff had grown to.
+			backoff = time.Millisecond
 		}
 
 		pollStarted := time.Now()
