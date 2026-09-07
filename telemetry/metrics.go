@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -37,6 +38,8 @@ var (
 
 	backpressureWaits       metric.Int64Counter
 	backpressureDurationSum metric.Float64Counter
+	backpressurePending     metric.Int64Gauge
+	backpressureHigh        metric.Int64Gauge
 
 	rmwConflicts  metric.Int64Counter
 	volumeOpens   metric.Int64Counter
@@ -145,6 +148,22 @@ func instruments() {
 		backpressureDurationSum, err = m.Float64Counter("viperblock.write.backpressure.duration.sum",
 			metric.WithDescription("Cumulative seconds guest writes spent blocked on backpressure, waiting for the backend to drain."),
 			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// The two levels the gate compares. Both were previously inferable only
+		// from a wait count, which is how a wrong watermark went unnoticed
+		// across three runs; the gap between them is what a stalled write pays.
+		backpressurePending, err = m.Int64Gauge("viperblock.write.backpressure.pending_bytes",
+			metric.WithDescription("Buffered bytes not yet durable in a backend chunk, as the backpressure gate sees them. Approaching the high-watermark means the background uploader is not keeping up with the guest."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureHigh, err = m.Int64Gauge("viperblock.write.backpressure.high_watermark_bytes",
+			metric.WithDescription("Runtime high-watermark the gate blocks at, after the WAL-device free-space clamp. Not the 256MB default unless the device has room, so it must be read rather than assumed."),
+			metric.WithUnit("By"))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -312,6 +331,26 @@ func RecordWriteBackpressure(ctx context.Context, volume string, elapsed time.Du
 	}
 	if backpressureDurationSum != nil {
 		backpressureDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+}
+
+// RecordBackpressureLevels samples the two levels the gate compares: the
+// buffered bytes it watches and the runtime high-watermark it blocks at.
+// Sampled on the write path whether or not the write blocked, so a volume
+// tracking just under the watermark is visible before it starts stalling.
+func RecordBackpressureLevels(ctx context.Context, volume string, pending, high uint64) {
+	instruments()
+	var attrs []attribute.KeyValue
+	if volume != "" {
+		attrs = append(attrs, attribute.String("volume.name", volume))
+	}
+	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
+
+	if backpressurePending != nil {
+		backpressurePending.Record(ctx, safecast.Uint64ToInt64(pending), opt)
+	}
+	if backpressureHigh != nil {
+		backpressureHigh.Record(ctx, safecast.Uint64ToInt64(high), opt)
 	}
 }
 
