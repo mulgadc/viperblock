@@ -944,6 +944,11 @@ type WAL struct {
 	// Uses atomic for lock-free access from write path and sync goroutine
 	dirty atomic.Bool
 
+	// syncMu serialises the fsync. A caller arriving while one is in flight
+	// must wait for it rather than read the cleared dirty flag and conclude
+	// its own record is already durable.
+	syncMu sync.Mutex
+
 	mu sync.RWMutex
 }
 
@@ -951,8 +956,11 @@ type WAL struct {
 // Each shard has its own file and mutex, so writes to different shards
 // have zero lock contention.
 type WALShard struct {
-	DB      *os.File
-	dirty   atomic.Bool
+	DB    *os.File
+	dirty atomic.Bool
+
+	// syncMu serialises this shard's fsync, for the same reason as WAL.syncMu.
+	syncMu  sync.Mutex
 	mu      sync.RWMutex
 	shardID int
 }
@@ -1780,12 +1788,18 @@ func (vb *VB) syncWALIfDirty() {
 // Note: Only the last file in vb.WAL.DB is the active WAL being written to.
 // Previous files are closed after WriteWALToChunk processes them.
 func (vb *VB) syncWAL() error {
-	// Fast path: check dirty flag without lock
+	// Held across the check and the fsync. Without it a caller that appended
+	// before this fsync began would see the cleared flag mid-flight and report
+	// its write durable while the only fsync covering it was still running.
+	vb.WAL.syncMu.Lock()
+	defer vb.WAL.syncMu.Unlock()
+
 	if !vb.WAL.dirty.Load() {
 		return nil
 	}
 
-	// Clear dirty flag before sync (writes during sync will re-set it)
+	// Cleared before the fsync so a write arriving during it re-marks the WAL
+	// and the next caller syncs again rather than trusting this one.
 	vb.WAL.dirty.Store(false)
 
 	vb.WAL.mu.RLock()
@@ -1802,6 +1816,34 @@ func (vb *VB) syncWAL() error {
 				return fmt.Errorf("WAL sync: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+// sync fsyncs this shard if it has unflushed writes, serialised so a caller
+// arriving mid-fsync waits for it instead of reading the cleared dirty flag
+// and reporting its own record durable.
+func (s *WALShard) sync() error {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
+	if !s.dirty.Load() {
+		return nil
+	}
+
+	// Cleared before the fsync so a write arriving during it re-marks the
+	// shard and the next caller syncs again rather than trusting this one.
+	s.dirty.Store(false)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.DB == nil {
+		return nil
+	}
+	if err := s.DB.Sync(); err != nil {
+		s.dirty.Store(true)
+		return err
 	}
 	return nil
 }
@@ -1827,23 +1869,9 @@ func (vb *VB) syncShardedWAL() error {
 	for i := range NumShards {
 		shard := sw.Shards[i]
 
-		// Fast path: skip clean shards
-		if !shard.dirty.Load() {
-			continue
+		if err := shard.sync(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
 		}
-
-		shard.dirty.Store(false)
-
-		shard.mu.RLock()
-		if shard.DB != nil {
-			if err := shard.DB.Sync(); err != nil {
-				shard.dirty.Store(true)
-				if firstErr == nil {
-					firstErr = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
-				}
-			}
-		}
-		shard.mu.RUnlock()
 	}
 	return firstErr
 }
