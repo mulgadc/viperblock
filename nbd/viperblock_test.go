@@ -23,8 +23,34 @@ func resetPluginConfigState() {
 	secret_key = ""
 	host = ""
 	base_dir = ""
+	wal_base_dir = ""
 	encryption_key_file = ""
 	loadedMasterKey = nil
+}
+
+// TestConfig_WalBaseDirRoundTrips pins that the "wal_base_dir" nbdkit param
+// sets the package var Open() reads into viperblock.VB.WALBaseDir, and that
+// leaving it unset does not trip ConfigComplete's required-param checks.
+func TestConfig_WalBaseDirRoundTrips(t *testing.T) {
+	resetPluginConfigState()
+	defer resetPluginConfigState()
+
+	p := &ViperBlockPlugin{}
+	err := p.Config("wal_base_dir", "/mnt/wal-device")
+	assert.NoError(t, err)
+	assert.Equal(t, "/mnt/wal-device", wal_base_dir)
+
+	size = 1
+	volume = "vol-1"
+	bucket = "bucket-1"
+	region = "region-1"
+	access_key = "argv-access-key"
+	secret_key = "argv-secret-key"
+	base_dir = "/data"
+	host = "localhost:9000"
+
+	err = p.ConfigComplete()
+	assert.NoError(t, err, "wal_base_dir must stay optional")
 }
 
 // TestCredentialFromArgOrEnv_ArgvTakesPriority pins that a non-empty argv
