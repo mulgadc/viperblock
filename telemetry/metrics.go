@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -38,6 +39,14 @@ var (
 
 	backpressureWaits       metric.Int64Counter
 	backpressureDurationSum metric.Float64Counter
+	backpressurePending     metric.Int64Gauge
+	backpressureHigh        metric.Int64Gauge
+	backpressureWaiters     metric.Int64UpDownCounter
+	backpressureSlowWaits   metric.Int64Counter
+
+	backpressurePhaseOps         metric.Int64Counter
+	backpressurePhaseDurationSum metric.Float64Counter
+	backpressureDrainedBytes     metric.Int64Counter
 
 	rmwConflicts  metric.Int64Counter
 	volumeOpens   metric.Int64Counter
@@ -155,6 +164,65 @@ func instruments() {
 		backpressureDurationSum, err = m.Float64Counter("viperblock.write.backpressure.duration.sum",
 			metric.WithDescription("Cumulative seconds guest writes spent blocked on backpressure, waiting for the backend to drain."),
 			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// The two levels the gate compares. Both were previously inferable only
+		// from a wait count, which is how a wrong watermark went unnoticed
+		// across three runs; the gap between them is what a stalled write pays.
+		backpressurePending, err = m.Int64Gauge("viperblock.write.backpressure.pending_bytes",
+			metric.WithDescription("Buffered bytes not yet durable in a backend chunk, as the backpressure gate sees them. Approaching the high-watermark means the background uploader is not keeping up with the guest."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureHigh, err = m.Int64Gauge("viperblock.write.backpressure.high_watermark_bytes",
+			metric.WithDescription("Runtime high-watermark the gate blocks at, after the WAL-device free-space clamp. Not the 256MB default unless the device has room, so it must be read rather than assumed."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// Waits are recorded per blocked writer, so duration.sum counts one
+		// stall once per writer that sat through it. Without this, N writers
+		// blocked on a single event are indistinguishable from N events.
+		backpressureWaiters, err = m.Int64UpDownCounter("viperblock.write.backpressure.waiters",
+			metric.WithDescription("Guest writes currently blocked on backpressure for this volume. A value above 1 means duration.sum is counting one stall several times over."),
+			metric.WithUnit("{writer}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// A mean cannot show a tail, and the tail is the failure: etcd loses
+		// its leader on one stall over the election timeout, however good the
+		// average was.
+		backpressureSlowWaits, err = m.Int64Counter("viperblock.write.backpressure.slow_waits",
+			metric.WithDescription("Guest writes that blocked for longer than the bucket's lower bound, by threshold. The 1s bucket is the one that costs a datastore its leader."),
+			metric.WithUnit("{wait}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// Splits a wait into the part this writer spent driving a drain and
+		// the part it spent polling while another writer drove one. Phase sums
+		// on the drain itself cannot do this: the guest flush path calls the
+		// same Flush(), so those counters mix both callers.
+		backpressurePhaseOps, err = m.Int64Counter("viperblock.write.backpressure.phase.ops",
+			metric.WithDescription("Occurrences of each phase within a backpressure wait: drain (this writer drove one) or poll (it waited on another writer's)."),
+			metric.WithUnit("{operation}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressurePhaseDurationSum, err = m.Float64Counter("viperblock.write.backpressure.phase.duration.sum",
+			metric.WithDescription("Cumulative seconds spent in each phase within a backpressure wait. Against waits.duration.sum this is where a stall actually goes."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureDrainedBytes, err = m.Int64Counter("viperblock.write.backpressure.drained_bytes",
+			metric.WithDescription("Bytes pendingBytes fell by during drains driven from the stall path. Divided by the drain phase duration this is the net drain rate under guest load, which is what the watermark gap is actually divided by."),
+			metric.WithUnit("By"))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -322,6 +390,99 @@ func RecordWriteBackpressure(ctx context.Context, volume string, elapsed time.Du
 	}
 	if backpressureDurationSum != nil {
 		backpressureDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+}
+
+// backpressureSlowThresholds are the tail buckets a wait is counted into. A
+// wait longer than several of them is counted in each, so a bucket reads as
+// "waits at least this long".
+var backpressureSlowThresholds = []struct {
+	label string
+	limit time.Duration
+}{
+	{"100ms", 100 * time.Millisecond},
+	{"1s", time.Second},
+	{"5s", 5 * time.Second},
+}
+
+// BackpressureWaiterScope marks a writer as blocked for as long as the
+// returned function is uncalled, so concurrent waiters are countable. Call the
+// returned function once, on the way out of the wait.
+func BackpressureWaiterScope(ctx context.Context, volume string) func() {
+	instruments()
+	if backpressureWaiters == nil {
+		return func() {}
+	}
+	opt := metric.WithAttributeSet(attribute.NewSet(volumeAttrs(volume)...))
+	backpressureWaiters.Add(ctx, 1, opt)
+	return func() { backpressureWaiters.Add(ctx, -1, opt) }
+}
+
+// RecordBackpressurePhase records one phase within a backpressure wait: phase
+// is "drain" when this writer drove one itself, "poll" when it slept while
+// another writer's drain ran. drainedBytes is how far pendingBytes fell, and
+// is meaningful for the drain phase only.
+func RecordBackpressurePhase(ctx context.Context, volume, phase string, elapsed time.Duration, drainedBytes int64) {
+	instruments()
+	attrs := volumeAttrs(volume)
+	attrs = append(attrs, attribute.String("phase", phase))
+	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
+
+	if backpressurePhaseOps != nil {
+		backpressurePhaseOps.Add(ctx, 1, opt)
+	}
+	if backpressurePhaseDurationSum != nil {
+		backpressurePhaseDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+	if backpressureDrainedBytes != nil && drainedBytes > 0 {
+		backpressureDrainedBytes.Add(ctx, drainedBytes, opt)
+	}
+}
+
+// RecordBackpressureTail counts one completed wait into every tail bucket it
+// exceeds, so the shape of the tail is readable without percentiles, which
+// counter sums cannot express.
+func RecordBackpressureTail(ctx context.Context, volume string, elapsed time.Duration) {
+	instruments()
+	if backpressureSlowWaits == nil {
+		return
+	}
+	for _, t := range backpressureSlowThresholds {
+		if elapsed < t.limit {
+			continue
+		}
+		attrs := volumeAttrs(volume)
+		attrs = append(attrs, attribute.String("threshold", t.label))
+		backpressureSlowWaits.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(attrs...)))
+	}
+}
+
+// volumeAttrs builds the common per-volume attribute slice, omitting the
+// attribute entirely when the volume is unnamed.
+func volumeAttrs(volume string) []attribute.KeyValue {
+	if volume == "" {
+		return nil
+	}
+	return []attribute.KeyValue{attribute.String("volume.name", volume)}
+}
+
+// RecordBackpressureLevels samples the two levels the gate compares: the
+// buffered bytes it watches and the runtime high-watermark it blocks at.
+// Sampled on the write path whether or not the write blocked, so a volume
+// tracking just under the watermark is visible before it starts stalling.
+func RecordBackpressureLevels(ctx context.Context, volume string, pending, high uint64) {
+	instruments()
+	var attrs []attribute.KeyValue
+	if volume != "" {
+		attrs = append(attrs, attribute.String("volume.name", volume))
+	}
+	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
+
+	if backpressurePending != nil {
+		backpressurePending.Record(ctx, safecast.Uint64ToInt64(pending), opt)
+	}
+	if backpressureHigh != nil {
+		backpressureHigh.Record(ctx, safecast.Uint64ToInt64(high), opt)
 	}
 }
 
