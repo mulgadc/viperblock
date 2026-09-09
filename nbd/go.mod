@@ -2,15 +2,15 @@ module main
 
 go 1.27.0
 
-replace libguestfs.org/nbdkit => ./libguestfs.org/nbdkit
-
 replace github.com/mulgadc/viperblock => ../
+
+replace libguestfs.org/nbdkit => ./libguestfs.org/nbdkit
 
 require (
 	github.com/mulgadc/bluebottle v1.19.0
-	github.com/mulgadc/viperblock v1.12.1
+	github.com/mulgadc/viperblock v0.0.0-00010101000000-000000000000
 	github.com/stretchr/testify v1.12.1
-	libguestfs.org/nbdkit v1.0.0
+	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000
 )
 
 require (
