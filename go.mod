@@ -10,8 +10,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.0
 	github.com/aws/smithy-go v1.28.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/bluebottle v1.19.0
-	github.com/mulgadc/predastore v1.19.0
+	github.com/mulgadc/bluebottle v1.20.0
+	github.com/mulgadc/predastore v1.20.0
 	github.com/stretchr/testify v1.12.1
 	github.com/tidwall/btree v1.8.1
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
@@ -87,7 +87,7 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260811182544-a038080d80e5 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
 	golang.org/x/vuln v1.6.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
