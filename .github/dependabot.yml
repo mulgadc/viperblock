@@ -2,7 +2,9 @@ version: 2
 updates:
   - package-ecosystem: gomod
     target-branch: dev
-    directory: /
+    directories:
+      - /
+      - /nbd
     schedule:
       interval: weekly
       day: sunday
