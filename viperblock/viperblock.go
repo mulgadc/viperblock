@@ -273,6 +273,11 @@ type VB struct {
 	// chunk upload failed. Retried at the head of the next consolidation so
 	// the data is not stranded in-process until the next restart.
 	pendingWALChunks []uint64
+
+	// consolidatedWALs holds generations whose blocks are durable as backend
+	// chunks but are not yet named by a persisted checkpoint. Until one lands
+	// the local WAL is the only record that maps them, so they stay on disk.
+	consolidatedWALs []uint64
 	pendingWALMu     sync.Mutex
 
 	// drainMu serializes DrainToBackendCtx across all its triggers. Two
@@ -2695,6 +2700,12 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
+
+	// The checkpoint naming these generations' blocks is now durable, so their
+	// local WAL files are redundant. A no-op checkpoint (nothing dirty) still
+	// means the persisted one is current, so it releases them too.
+	vb.reclaimConsolidatedWALs()
+
 	return nil
 }
 
@@ -3333,6 +3344,7 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 		vb.pendingWALMu.Unlock()
 		return err
 	}
+	vb.markWALConsolidated(currentWALNum)
 
 	return nil
 }
@@ -3501,6 +3513,7 @@ func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(contex
 		if err := consolidate(ctx, walNum); err != nil {
 			return err
 		}
+		vb.markWALConsolidated(walNum)
 
 		// Drop the entry only after a successful consolidation. Re-check the
 		// head in case a concurrent caller already removed it.
@@ -3509,6 +3522,51 @@ func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(contex
 			vb.pendingWALChunks = vb.pendingWALChunks[1:]
 		}
 		vb.pendingWALMu.Unlock()
+	}
+}
+
+// markWALConsolidated records a generation whose blocks are now durable as
+// backend chunks. It becomes reclaimable once a checkpoint naming them lands.
+func (vb *VB) markWALConsolidated(walNum uint64) {
+	vb.pendingWALMu.Lock()
+	vb.consolidatedWALs = append(vb.consolidatedWALs, walNum)
+	vb.pendingWALMu.Unlock()
+}
+
+// walGenerationFiles returns the local files holding generation walNum: one on
+// the single-file WAL, one per shard on the sharded WAL.
+func (vb *VB) walGenerationFiles(walNum uint64) []string {
+	if vb.UseShardedWAL && vb.ShardedWAL != nil {
+		paths := make([]string, 0, NumShards)
+		for shardID := range NumShards {
+			paths = append(paths, filepath.Join(vb.ShardedWAL.BaseDir,
+				types.GetShardedWALPath(vb.GetVolume(), walNum, shardID)))
+		}
+		return paths
+	}
+	return []string{filepath.Join(vb.WAL.BaseDir,
+		types.GetFilePath(types.FileTypeWALChunk, walNum, vb.GetVolume()))}
+}
+
+// reclaimConsolidatedWALs deletes the local WAL files of every generation
+// consolidated since the last checkpoint. Call only once SaveLiveCheckpointCtx
+// has succeeded: before that the WAL is the only record mapping those blocks.
+//
+// A failed unlink is logged, not returned. RecoverLocalWALs replays a leftover
+// harmlessly on the next open, so it costs space rather than correctness, and
+// failing an otherwise clean drain over it would be the worse trade.
+func (vb *VB) reclaimConsolidatedWALs() {
+	vb.pendingWALMu.Lock()
+	reclaim := vb.consolidatedWALs
+	vb.consolidatedWALs = nil
+	vb.pendingWALMu.Unlock()
+
+	for _, walNum := range reclaim {
+		for _, path := range vb.walGenerationFiles(walNum) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				vb.logger().Warn("failed to reclaim consolidated WAL file", "file", path, "error", err)
+			}
+		}
 	}
 }
 
@@ -3585,6 +3643,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		vb.pendingWALMu.Unlock()
 		return err
 	}
+	vb.markWALConsolidated(currentWALNum)
 
 	return nil
 }
