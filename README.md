@@ -94,7 +94,7 @@ Plugin parameters:
   <img src=".github/assets/platform.svg" alt="Viperblock: QEMU and KVM workloads on top, fast block I/O through NBD and an NVMe-backed write-ahead log, with durable volumes stored locally or in S3-compatible object storage." width="900">
 </p>
 
-See [DESIGN.md](DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
+See [DESIGN.md](docs/DESIGN.md) for detailed write path, read path, WAL format, chunk format, and block mapping internals.
 
 ## Storage Backends
 
@@ -133,7 +133,7 @@ AWS_SECRET_KEY="EXAMPLEKEY" \
 
 ## Design Decisions
 
-A summary of the key design choices. See [DESIGN.md](DESIGN.md) for the full treatment.
+A summary of the key design choices. See [DESIGN.md](docs/DESIGN.md) for the full treatment.
 
 **WAL on fast local storage, chunks on S3.** Writes are acknowledged from memory and durably flushed to a local WAL (NVMe recommended). WAL entries are then consolidated into 4 MB chunks and uploaded to the backend. This separates write latency (local NVMe speed) from storage durability (S3 replication).
 
