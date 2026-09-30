@@ -269,10 +269,20 @@ type VB struct {
 	// DrainToBackendCtx's deferred handler for where it is set and cleared.
 	backendFull atomic.Bool
 
+	// bpWaiters counts guest writes currently blocked in awaitBackpressure.
+	// Non-zero closes the gate's fast path, which is what stops an arriving
+	// write from overtaking one already queued. See awaitBackpressure.
+	bpWaiters atomic.Int64
+
 	// pendingWALChunks holds WAL generations that were rotated out but whose
 	// chunk upload failed. Retried at the head of the next consolidation so
 	// the data is not stranded in-process until the next restart.
 	pendingWALChunks []uint64
+
+	// consolidatedWALs holds generations whose blocks are durable as backend
+	// chunks but are not yet named by a persisted checkpoint. Until one lands
+	// the local WAL is the only record that maps them, so they stay on disk.
+	consolidatedWALs []uint64
 	pendingWALMu     sync.Mutex
 
 	// drainMu serializes DrainToBackendCtx across all its triggers. Two
@@ -280,7 +290,16 @@ type VB struct {
 	// createChunkFile, where an older segment landing last can clobber a
 	// newer chunk's live pointer and let GC delete a still-referenced chunk.
 	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
+	//
+	// It covers WAL rotation and chunk upload only. The checkpoint is under
+	// checkpointMu instead, so a guest write blocked on backpressure never
+	// queues behind one.
 	drainMu sync.Mutex
+
+	// checkpointMu serializes the live checkpoint and the WAL reclaim gated on
+	// it. Held for the whole map serialization and backend write, which is
+	// long, so it deliberately does not overlap drainMu.
+	checkpointMu sync.Mutex
 
 	// flushMu serialises flushWrites. Writes.mu used to do this implicitly by
 	// being held across the whole WAL write, which also blocked every guest
@@ -2126,23 +2145,42 @@ func (vb *VB) signalSizeTrigger() {
 // triggered this wait.
 func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
-	if vb.PendingBytes() <= high {
+	pending := vb.PendingBytes()
+	telemetry.RecordBackpressureLevels(ctx, vb.VolumeName, pending, high)
+
+	// The fast path is closed while anyone is queued. WriteAtCtx buffers
+	// before it gets here, so an arriving write has already pushed
+	// pendingBytes back up; letting it through would refill what a waiter is
+	// waiting to see fall, and the waiter loses its place to a later arrival.
+	// That starvation, not backend throughput, is what makes the tail: at a
+	// fixed drain rate, going from 1 to 16 writers left throughput unchanged
+	// and multiplied p99 stall by ten.
+	if pending <= high && vb.bpWaiters.Load() == 0 {
 		return nil
 	}
+
+	vb.bpWaiters.Add(1)
+	defer vb.bpWaiters.Add(-1)
 
 	// Past the fast path the guest write is stalled, so time from here rather
 	// than function entry: recording the unblocked case would leave a mean
 	// dominated by zeros and hide the stall it exists to show.
 	stalledSince := time.Now()
+	releaseWaiter := telemetry.BackpressureWaiterScope(ctx, vb.VolumeName)
 	defer func() {
-		telemetry.RecordWriteBackpressure(context.Background(), vb.VolumeName, time.Since(stalledSince))
+		releaseWaiter()
+		waited := time.Since(stalledSince)
+		telemetry.RecordWriteBackpressure(context.Background(), vb.VolumeName, waited)
+		telemetry.RecordBackpressureTail(context.Background(), vb.VolumeName, waited)
 	}()
 
 	low := high - high/backpressureLowFraction
-	backoff := 10 * time.Millisecond
-	// The loop re-checks pendingBytes on every wake, so a long backoff only
-	// adds latency after the drain that unblocked the writer has finished.
-	const maxBackoff = 50 * time.Millisecond
+	backoff := time.Millisecond
+	// Capped low and reset after every drain. The old 10-50ms doubling was
+	// pure latency added after the drain that released the writer had already
+	// finished, and it never reset within a wait, so a writer that lost one
+	// race waited longer on each subsequent one.
+	const maxBackoff = 5 * time.Millisecond
 
 	// Bound a persistently failing drain by how long it has been failing, on
 	// the volume. A single success clears it, so transient backend slowness
@@ -2161,8 +2199,24 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 		}
 
 		if vb.drainInFlight.CompareAndSwap(false, true) {
-			err := vb.DrainToBackendCtx(ctx)
+			// Chunks only: the checkpoint and the sweep do not lower
+			// pendingBytes, so charging them to a stalled guest write buys
+			// nothing and costs most of the wait.
+			drainStarted := time.Now()
+			pendingBefore := vb.PendingBytes()
+			err := vb.DrainChunksCtx(ctx)
+			pendingAfter := vb.PendingBytes()
 			vb.drainInFlight.Store(false)
+
+			// Guest writes keep arriving during the drain, so this is the NET
+			// fall in pendingBytes, not the bytes uploaded. That is the rate
+			// the watermark gap is really divided by.
+			var freed int64
+			if pendingAfter < pendingBefore {
+				freed = safecast.Uint64ToInt64(pendingBefore - pendingAfter)
+			}
+			telemetry.RecordBackpressurePhase(ctx, vb.VolumeName, "drain",
+				time.Since(drainStarted), freed)
 			if err != nil {
 				if errors.Is(err, ErrNoSpace) {
 					return err
@@ -2185,13 +2239,19 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			if vb.PendingBytes() <= low {
 				break
 			}
+			// A drain just ran, so the next re-check is worth making promptly
+			// rather than at whatever the backoff had grown to.
+			backoff = time.Millisecond
 		}
 
+		pollStarted := time.Now()
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+		telemetry.RecordBackpressurePhase(ctx, vb.VolumeName, "poll", time.Since(pollStarted), 0)
+
 		if backoff < maxBackoff {
 			backoff *= 2
 		}
@@ -2275,9 +2335,9 @@ func (vb *VB) isBackendNearFull() bool {
 	return ok && nf.NearFull()
 }
 
-// probeBackendRecovery drives a real DrainToBackendCtx while backendFull is
-// latched and reports whether the latch cleared, so a retried write can
-// observe recovery immediately instead of waiting for the next drain tick.
+// probeBackendRecovery drives a real chunk drain while backendFull is latched
+// and reports whether the latch cleared, so a retried write can observe
+// recovery immediately instead of waiting for the next drain tick.
 func (vb *VB) probeBackendRecovery(ctx context.Context) bool {
 	// One write drives the probe at a time; concurrent writers fail fast
 	// rather than queuing on drainMu behind a possibly slow backend.
@@ -2292,10 +2352,11 @@ func (vb *VB) probeBackendRecovery(ctx context.Context) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, vb.recoveryProbeTimeout())
 	defer cancel()
 
-	// Gated on a real upload+checkpoint round trip, not a cached threshold,
-	// so a clean result can't flap: it reports exactly what the backend just
-	// did. A timed-out or failed probe leaves the latch set.
-	if err := vb.DrainToBackendCtx(probeCtx); err != nil {
+	// Gated on a real chunk upload, not a cached threshold, so a clean result
+	// can't flap: it reports exactly what the backend just did. The checkpoint
+	// would add no signal, since ErrNoSpace latches on the chunk write either
+	// way. A timed-out or failed probe leaves the latch set.
+	if err := vb.DrainChunksCtx(probeCtx); err != nil {
 		return false
 	}
 	return !vb.backendFull.Load()
@@ -2655,35 +2716,93 @@ func (vb *VB) DrainToBackend() error {
 // DrainToBackendCtx is DrainToBackend with a caller-supplied context threaded
 // through the chunk-upload and checkpoint S3 writes.
 func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
+	// Every drain path funnels through here, so this is the single choke
+	// point for the backendFull latch: an out-of-space error anywhere in
+	// the drain sets it, and a clean completion clears it.
+	defer vb.latchBackendFull(&err)
+
+	// The two halves take different locks and are no longer one critical
+	// section. That is the point: a guest write blocked on backpressure needs
+	// only the first, and must not queue behind the second.
+	if err = vb.drainChunks(ctx); err != nil {
+		return err
+	}
+	if err = vb.checkpointAndReclaim(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// latchBackendFull sets or clears the out-of-space latch from a drain's
+// outcome. Deferred with a pointer to the caller's named error return.
+func (vb *VB) latchBackendFull(err *error) {
+	if *err != nil {
+		if errors.Is(*err, ErrNoSpace) {
+			// Log only the false→true edge (Swap returns the prior value) so a
+			// persistently full backend does not repeat the line on every drain
+			// attempt. This is the signal that guest writes are now failing fast.
+			if !vb.backendFull.Swap(true) {
+				vb.logger().Warn("backend out of space: latching writes off until a drain succeeds", "err", *err)
+			}
+		}
+		return
+	}
+	// A clean drain clears the latch; log only the true→false recovery edge.
+	if vb.backendFull.Swap(false) {
+		vb.logger().Info("backend space recovered: drain succeeded, writes re-enabled")
+	}
+}
+
+// drainChunks runs the chunk half under drainMu.
+func (vb *VB) drainChunks(ctx context.Context) error {
 	// Serialize every drain trigger — see drainMu's doc comment for why
 	// overlapping drains are unsafe.
 	vb.drainMu.Lock()
 	defer vb.drainMu.Unlock()
 
-	// Every drain path funnels through here, so this is the single choke
-	// point for the backendFull latch: an out-of-space error anywhere in
-	// the drain sets it, and a clean completion clears it.
-	defer func() {
-		if err != nil {
-			if errors.Is(err, ErrNoSpace) {
-				// Log only the false→true edge (Swap returns the prior value) so a
-				// persistently full backend does not repeat the line on every drain
-				// attempt. This is the signal that guest writes are now failing fast.
-				if !vb.backendFull.Swap(true) {
-					vb.logger().Warn("backend out of space: latching writes off until a drain succeeds", "err", err)
-				}
-			}
-			return
-		}
-		// A clean drain clears the latch; log only the true→false recovery edge.
-		if vb.backendFull.Swap(false) {
-			vb.logger().Info("backend space recovered: drain succeeded, writes re-enabled")
-		}
-	}()
+	return vb.drainChunksLocked(ctx)
+}
 
-	if err = vb.Flush(); err != nil {
+// checkpointAndReclaim persists the block map, then deletes the local WAL
+// generations that map is now responsible for. Under checkpointMu, not
+// drainMu, so a concurrent chunk drain is free to proceed.
+//
+// The reclaim candidates are taken before the checkpoint reads the map, so a
+// generation consolidated while the checkpoint is in flight is held back for
+// the next one rather than deleted by a checkpoint that never named it. On
+// failure they go back on the list.
+func (vb *VB) checkpointAndReclaim(ctx context.Context) error {
+	vb.checkpointMu.Lock()
+	defer vb.checkpointMu.Unlock()
+
+	reclaim := vb.takeConsolidatedWALs()
+
+	if err := vb.SaveLiveCheckpointCtx(ctx); err != nil {
+		vb.restoreConsolidatedWALs(reclaim)
+		return fmt.Errorf("drain live checkpoint: %w", err)
+	}
+
+	// The checkpoint naming these generations' blocks is now durable, so their
+	// local WAL files are redundant. A no-op checkpoint (nothing dirty) still
+	// means the persisted one is current, so it releases them too.
+	vb.reclaimWALGenerations(reclaim)
+
+	return nil
+}
+
+// drainChunksLocked is the half of the drain that lowers pendingBytes: flush
+// the write buffer into the WAL, then consolidate WAL generations into backend
+// chunks. createChunkFile is what decrements the counter, so this alone is
+// enough to release a writer blocked on backpressure.
+//
+// Caller must hold drainMu.
+func (vb *VB) drainChunksLocked(ctx context.Context) error {
+	if err := vb.Flush(); err != nil {
 		return fmt.Errorf("drain flush: %w", err)
 	}
+
+	var err error
 	if vb.UseShardedWAL {
 		err = vb.WriteShardedWALToChunkCtx(ctx, true)
 	} else {
@@ -2692,10 +2811,23 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("drain chunk upload: %w", err)
 	}
-	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
-		return fmt.Errorf("drain live checkpoint: %w", err)
-	}
 	return nil
+}
+
+// DrainChunksCtx is DrainToBackendCtx without the checkpoint, the GC sweep or
+// the WAL reclaim that depends on the checkpoint. It exists for the guest
+// stall path: a blocked write only needs pendingBytes to fall, and rebuilding
+// the whole block map is the most expensive phase of the drain by a wide
+// margin, so making the guest wait on it is the stall.
+//
+// Blocks stay durable throughout. Their bytes are in a backend chunk and the
+// local WAL generation naming them is still on disk, because reclaim is gated
+// on the checkpoint that has not run yet. RecoverLocalWALs replays exactly
+// those generations, so a crash here loses nothing.
+func (vb *VB) DrainChunksCtx(ctx context.Context) (err error) {
+	defer vb.latchBackendFull(&err)
+
+	return vb.drainChunks(ctx)
 }
 
 // flushSnapshot flushes a snapshot of the hot writes to the WAL. It does not
@@ -3333,6 +3465,7 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 		vb.pendingWALMu.Unlock()
 		return err
 	}
+	vb.markWALConsolidated(currentWALNum)
 
 	return nil
 }
@@ -3501,6 +3634,7 @@ func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(contex
 		if err := consolidate(ctx, walNum); err != nil {
 			return err
 		}
+		vb.markWALConsolidated(walNum)
 
 		// Drop the entry only after a successful consolidation. Re-check the
 		// head in case a concurrent caller already removed it.
@@ -3509,6 +3643,71 @@ func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(contex
 			vb.pendingWALChunks = vb.pendingWALChunks[1:]
 		}
 		vb.pendingWALMu.Unlock()
+	}
+}
+
+// markWALConsolidated records a generation whose blocks are now durable as
+// backend chunks. It becomes reclaimable once a checkpoint naming them lands.
+func (vb *VB) markWALConsolidated(walNum uint64) {
+	vb.pendingWALMu.Lock()
+	vb.consolidatedWALs = append(vb.consolidatedWALs, walNum)
+	vb.pendingWALMu.Unlock()
+}
+
+// walGenerationFiles returns the local files holding generation walNum: one on
+// the single-file WAL, one per shard on the sharded WAL.
+func (vb *VB) walGenerationFiles(walNum uint64) []string {
+	if vb.UseShardedWAL && vb.ShardedWAL != nil {
+		paths := make([]string, 0, NumShards)
+		for shardID := range NumShards {
+			paths = append(paths, filepath.Join(vb.ShardedWAL.BaseDir,
+				types.GetShardedWALPath(vb.GetVolume(), walNum, shardID)))
+		}
+		return paths
+	}
+	return []string{filepath.Join(vb.WAL.BaseDir,
+		types.GetFilePath(types.FileTypeWALChunk, walNum, vb.GetVolume()))}
+}
+
+// takeConsolidatedWALs removes and returns the generations consolidated since
+// the last checkpoint. Called before the checkpoint reads the block map, so
+// everything it returns is already mapped in what that checkpoint will write.
+func (vb *VB) takeConsolidatedWALs() []uint64 {
+	vb.pendingWALMu.Lock()
+	defer vb.pendingWALMu.Unlock()
+
+	reclaim := vb.consolidatedWALs
+	vb.consolidatedWALs = nil
+	return reclaim
+}
+
+// restoreConsolidatedWALs puts candidates back after a failed checkpoint,
+// ahead of anything consolidated since, so generation order is preserved.
+func (vb *VB) restoreConsolidatedWALs(reclaim []uint64) {
+	if len(reclaim) == 0 {
+		return
+	}
+
+	vb.pendingWALMu.Lock()
+	defer vb.pendingWALMu.Unlock()
+
+	vb.consolidatedWALs = append(reclaim, vb.consolidatedWALs...)
+}
+
+// reclaimWALGenerations deletes the local WAL files of the given generations.
+// Call only once SaveLiveCheckpointCtx has succeeded: before that the WAL is
+// the only record mapping those blocks.
+//
+// A failed unlink is logged, not returned. RecoverLocalWALs replays a leftover
+// harmlessly on the next open, so it costs space rather than correctness, and
+// failing an otherwise clean drain over it would be the worse trade.
+func (vb *VB) reclaimWALGenerations(reclaim []uint64) {
+	for _, walNum := range reclaim {
+		for _, path := range vb.walGenerationFiles(walNum) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				vb.logger().Warn("failed to reclaim consolidated WAL file", "file", path, "error", err)
+			}
+		}
 	}
 }
 
@@ -3585,6 +3784,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		vb.pendingWALMu.Unlock()
 		return err
 	}
+	vb.markWALConsolidated(currentWALNum)
 
 	return nil
 }
@@ -4694,10 +4894,33 @@ func (vb *VB) SaveLiveCheckpoint() error {
 }
 
 // SaveLiveCheckpointCtx is SaveLiveCheckpoint with a caller-supplied context.
-func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
+func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) (err error) {
 	if !vb.BlocksToObject.dirty.Load() {
 		return nil
 	}
+
+	// Timed as a WAL phase alongside flush and consolidate. Without this the
+	// third phase of the drain is invisible, and a stall it dominates gets
+	// attributed to whichever phase happens to be measured.
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordWALOp(context.Background(), "checkpoint", vb.VolumeName, outcome, time.Since(start))
+	}()
+
+	// Cleared before the snapshot, not after the write. This no longer runs
+	// under drainMu, so a chunk upload can install new mappings while the write
+	// is in flight; clearing afterwards would mark those persisted when they
+	// are not. Clearing first can only cost a redundant checkpoint next drain.
+	vb.BlocksToObject.dirty.Store(false)
+	defer func() {
+		if err != nil {
+			vb.BlocksToObject.dirty.Store(true)
+		}
+	}()
 
 	// Serialize the map under the read lock, then release before doing I/O so
 	// the lock is not held across network writes or retry sleeps.
@@ -4714,25 +4937,25 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 
 	headers := []byte{}
 	backoff := vb.checkpointBackoff()
-	var err error
 	for attempt := range 3 {
 		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
 		if err == nil {
-			vb.BlocksToObject.dirty.Store(false)
 			return nil
 		}
 		if attempt < 2 {
 			slog.WarnContext(ctx, "SaveLiveCheckpoint: write failed, retrying",
-				"attempt", attempt+1, "backoff", backoff, "err", err)
+				"attempt", attempt+1, "backoff_ms", backoff.Milliseconds(), "err", err)
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
-				return ctx.Err()
+				err = ctx.Err()
+				return err
 			}
 			backoff *= 2
 		}
 	}
-	return fmt.Errorf("SaveLiveCheckpoint: failed after retries: %w", err)
+	err = fmt.Errorf("SaveLiveCheckpoint: failed after retries: %w", err)
+	return err
 }
 
 // LoadLiveCheckpoint reads the live checkpoint written by SaveLiveCheckpoint. If no
