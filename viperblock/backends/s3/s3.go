@@ -1,3 +1,5 @@
+// Package s3 is a viperblock backend that stores volume objects in an
+// S3-compatible bucket such as predastore, and reports storage pool pressure.
 package s3
 
 import (

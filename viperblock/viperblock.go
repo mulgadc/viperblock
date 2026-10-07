@@ -1,3 +1,6 @@
+// Package viperblock implements WAL-backed block volumes: writes land in a local
+// write-ahead log and are flushed into chunk objects on a pluggable backend,
+// with a block cache, snapshots and encryption at rest.
 package viperblock
 
 import (

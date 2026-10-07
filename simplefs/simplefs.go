@@ -1,3 +1,5 @@
+// Package simplefs is a minimal block-allocating file store over a viperblock
+// volume, tracking used and free blocks and persisting its state as JSON.
 package simplefs
 
 import (

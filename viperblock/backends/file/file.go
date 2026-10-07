@@ -1,3 +1,5 @@
+// Package file is a viperblock backend that stores volume objects as files
+// under a local base directory.
 package file
 
 import (

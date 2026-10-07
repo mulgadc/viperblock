@@ -1,3 +1,5 @@
+// Package utils holds small dependency-free helpers shared across viperblock,
+// such as human-readable byte formatting.
 package utils
 
 import (

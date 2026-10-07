@@ -1,3 +1,5 @@
+// Package types defines the Backend interface every viperblock storage backend
+// implements, with the object file types, paths and errors they share.
 package types
 
 import (

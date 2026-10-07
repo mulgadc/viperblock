@@ -1,3 +1,5 @@
+// Package v_utils imports disk images into viperblock volumes, reporting
+// throttled progress to the caller.
 package v_utils
 
 import (
