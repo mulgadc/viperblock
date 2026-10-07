@@ -7,7 +7,7 @@ replace github.com/mulgadc/viperblock => ../
 replace libguestfs.org/nbdkit => ./libguestfs.org/nbdkit
 
 require (
-	github.com/mulgadc/bluebottle v1.21.0
+	github.com/mulgadc/bluebottle v1.22.0
 	github.com/mulgadc/viperblock v0.0.0-00010101000000-000000000000
 	github.com/stretchr/testify v1.12.1
 	libguestfs.org/nbdkit v0.0.0-00010101000000-000000000000

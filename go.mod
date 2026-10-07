@@ -10,8 +10,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.0
 	github.com/aws/smithy-go v1.28.2
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/mulgadc/bluebottle v1.21.0
-	github.com/mulgadc/predastore v1.21.0
+	github.com/mulgadc/bluebottle v1.22.0
+	github.com/mulgadc/predastore v1.22.0
 	github.com/stretchr/testify v1.12.1
 	github.com/tidwall/btree v1.8.2
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
