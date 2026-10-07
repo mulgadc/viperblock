@@ -59,7 +59,7 @@ func (p *progressReporter) finish() {
 	p.progress(p.total, p.total)
 }
 
-// Helper function to import disk image to S3 backend. progress, when non-nil,
+// ImportDiskImage imports a disk image to the S3 backend. progress, when non-nil,
 // receives throttled byte-count updates so each caller can render its own way.
 func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename string, progress ProgressFunc) error {
 	// Confirm filename can be opened

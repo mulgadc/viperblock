@@ -54,7 +54,7 @@ import (
 	"unsafe"
 )
 
-// The plugin may raise errors by returning this struct (instead of nil).
+// PluginError is returned by the plugin (instead of nil) to raise an error.
 type PluginError struct {
 	Errmsg string        // string (passed to nbdkit_error)
 	Errno  syscall.Errno // errno (optional, use 0 if not available)
@@ -102,7 +102,7 @@ const (
 	APIVersion = uint32(C.NBDKIT_API_VERSION)
 )
 
-// The plugin interface.
+// PluginInterface is the plugin interface.
 type PluginInterface interface {
 	Load()
 	Unload()
@@ -117,7 +117,7 @@ type PluginInterface interface {
 	Open(readonly bool) (ConnectionInterface, error) // required
 }
 
-// The client connection interface.
+// ConnectionInterface is the client connection interface.
 type ConnectionInterface interface {
 	GetSize() (uint64, error) // required
 	IsRotational() (bool, error)
@@ -144,7 +144,7 @@ type ConnectionInterface interface {
 	Close()
 }
 
-// Default implementations for plugin interface methods.
+// Plugin provides default implementations for plugin interface methods.
 type Plugin struct{}
 type Connection struct{}
 
@@ -516,7 +516,7 @@ func implZero(handle unsafe.Pointer,
 	return 0
 }
 
-// Called from C plugin_init function.
+// PluginInitialize is called from the C plugin_init function.
 func PluginInitialize(name string, impl PluginInterface) unsafe.Pointer {
 	// Initialize the connection map.  Note that connection IDs
 	// must start counting from 1 since we must never return what

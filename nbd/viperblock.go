@@ -505,7 +505,7 @@ func (c *ViperBlockConnection) GetSize() (uint64, error) {
 
 }
 
-// Clients are allowed to make multiple connections safely.
+// CanMultiConn reports whether clients may safely make multiple connections.
 // TODO: confirm changes
 func (c *ViperBlockConnection) CanMultiConn() (bool, error) {
 	return false, nil
@@ -537,7 +537,7 @@ func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) (e
 	return nil
 }
 
-// Note that CanWrite is required in golang plugins, otherwise PWrite
+// CanWrite is required in golang plugins, otherwise PWrite
 // will never be called.
 func (c *ViperBlockConnection) CanWrite() (bool, error) {
 	return !c.readonly, nil
@@ -608,7 +608,7 @@ func (c *ViperBlockConnection) Trim(count uint32, offset uint64, flags uint32) e
 	return nil
 }
 
-// Note that CanFlush() is required in golang plugins that implement
+// CanFlush is required in golang plugins that implement
 // Flush(), otherwise Flush() will never be called.
 func (c *ViperBlockConnection) CanFlush() (bool, error) {
 	return true, nil

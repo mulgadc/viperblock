@@ -61,14 +61,14 @@ func Debug(s string) {
 	C._nbdkit_debug(C.CString(s))
 }
 
-// This function is provided but plugins would rarely need to call
-// this explicitly since returning an error from a plugin callback
+// Error is provided but plugins would rarely need to call it
+// explicitly since returning an error from a plugin callback
 // will call it implicitly.
 func Error(s string) {
 	C._nbdkit_error(C.CString(s))
 }
 
-// Same applies as for Error().  Callers should not usually need to
+// SetError is like Error().  Callers should not usually need to
 // call this.
 func SetError(err syscall.Errno) {
 	C.nbdkit_set_error(C.int(err))

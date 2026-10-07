@@ -88,7 +88,7 @@ const (
 	FileTypeSnapshotMarker
 )
 
-// getFilePath returns the appropriate S3 path based on file type and objectId.
+// GetFilePath returns the appropriate S3 path based on file type and objectId.
 func GetFilePath(fileType FileType, objectId uint64, volumeName string) string {
 	switch fileType {
 	case FileTypeConfig:

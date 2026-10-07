@@ -1000,7 +1000,7 @@ type VolumeModification struct {
 	EndTime            time.Time `json:"EndTime,omitzero"`
 }
 
-// Meta-data.
+// VolumeMetadata is a volume's meta-data.
 type VolumeMetadata struct {
 	VolumeID            string            `json:"VolumeID"`   // e.g. "vol-0abcd1234ef567890"
 	VolumeName          string            `json:"VolumeName"` // Optional name for UI or tagging
@@ -1876,7 +1876,7 @@ func (vb *VB) syncShardedWAL() error {
 	return firstErr
 }
 
-// WAL functions.
+// OpenWAL creates and opens a new WAL file.
 func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 	// Lock operations on the WAL
 	wal.mu.Lock()
@@ -4643,7 +4643,7 @@ func (vb *VB) runGCSweep(ctx context.Context) {
 	vb.sweepChunks(ctx)
 }
 
-// Load the previous blockstate from disk.
+// LoadBlockState loads the previous blockstate from disk.
 func (vb *VB) LoadBlockState() (err error) {
 	return vb.LoadBlockStateCtx(context.Background())
 }
@@ -5610,7 +5610,7 @@ func fsyncDir(dir string) error {
 	return d.Close()
 }
 
-// Load the block tracking state from disk.
+// LoadState loads the block tracking state from disk.
 func (vb *VB) LoadState() error {
 	return vb.LoadStateCtx(context.Background())
 }
@@ -5897,7 +5897,7 @@ func (vb *VB) bumpSeqNumHighWater(ctx context.Context) error {
 	return nil
 }
 
-// Query the local state from file or the backend.
+// LoadStateRequest queries the local state from file or the backend.
 func (vb *VB) LoadStateRequest(filename string) (state VBState, err error) {
 	return vb.LoadStateRequestCtx(context.Background(), filename)
 }
@@ -6410,7 +6410,7 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 	return nil
 }
 
-// Remove local WAL and block state files, connection must be closed first.
+// RemoveLocalFiles removes local WAL and block state files; close the connection first.
 func (vb *VB) RemoveLocalFiles() (err error) {
 	localPath := filepath.Join(vb.BaseDir, vb.GetVolume())
 

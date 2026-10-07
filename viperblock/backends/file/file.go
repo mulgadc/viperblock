@@ -16,7 +16,7 @@ import (
 	"github.com/mulgadc/viperblock/types"
 )
 
-// 2. Define config structs.
+// FileConfig is the file backend configuration.
 type FileConfig struct {
 	VolumeName string
 	VolumeSize uint64
@@ -34,8 +34,8 @@ type Backend struct {
 
 var _ types.Backend = (*Backend)(nil)
 
-// Ctx variants satisfy the context-aware half of types.Backend; local file
-// I/O has no cancellation points so they delegate to the plain methods.
+// InitCtx and the other Ctx variants satisfy types.Backend's context-aware half;
+// local file I/O has no cancellation points so they delegate to the plain methods.
 func (backend *Backend) InitCtx(_ context.Context) error {
 	return backend.Init()
 }
@@ -96,7 +96,7 @@ func (backend *Backend) WriteToCtx(_ context.Context, volumeName string, fileTyp
 	return backend.WriteTo(volumeName, fileType, objectId, headers, data)
 }
 
-// 3. Implement WithConfig for each backend.
+// New returns a file backend configured from a FileConfig.
 func New(config any) (backend *Backend, err error) {
 	cfg, ok := config.(FileConfig)
 	if !ok {

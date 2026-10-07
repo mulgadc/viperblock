@@ -150,7 +150,7 @@ func classifyWriteErr(err error) error {
 	return err
 }
 
-// 2. Define config structs.
+// S3Config is the S3 backend configuration.
 type S3Config struct {
 	VolumeName string
 	VolumeSize uint64
