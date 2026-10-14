@@ -23,6 +23,7 @@ import (
 )
 
 func TestConcurrentRMWWriteVsDrainAEAD(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	key := testKey(t, 0x42)
 	volName := "aead-race"

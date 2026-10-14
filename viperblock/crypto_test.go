@@ -348,19 +348,18 @@ func TestMakeNonce_UniquenessSweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping million-triple nonce sweep in short mode")
 	}
+	t.Parallel()
 	const N = 1_000_000
+	const tripleLen = 8 + 4 + 1 // seqNum, volumeUUID, domain
+	entropy := make([]byte, N*tripleLen)
+	_, err := rand.Read(entropy)
+	require.NoError(t, err)
 	seen := make(map[[12]byte]struct{}, N)
-	var buf [8]byte
 	for i := range N {
-		_, err := rand.Read(buf[:])
-		require.NoError(t, err)
-		seqNum := binary.BigEndian.Uint64(buf[:]) & MaxSeqNum
-		var uuid [4]byte
-		_, err = rand.Read(uuid[:])
-		require.NoError(t, err)
-		_, err = rand.Read(buf[:1])
-		require.NoError(t, err)
-		domain := buf[0]
+		triple := entropy[i*tripleLen : (i+1)*tripleLen]
+		seqNum := binary.BigEndian.Uint64(triple[:8]) & MaxSeqNum
+		uuid := [4]byte(triple[8:12])
+		domain := triple[12]
 		n := makeNonce(seqNum, uuid, domain)
 		if _, dup := seen[n]; dup {
 			t.Fatalf("nonce collision at iteration %d: %x (seqNum=%d uuid=%x domain=%#x)", i, n, seqNum, uuid, domain)

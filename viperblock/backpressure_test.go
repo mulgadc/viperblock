@@ -92,6 +92,7 @@ func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time
 // growing to the full amount written — the core guest-write-balloons-memory
 // regression this backpressure gate fixes.
 func TestWriteAtBackpressureBoundsPendingBytes(t *testing.T) {
+	t.Parallel()
 	const maxPendingBytes = 256 * 1024 // 64 blocks @ 4KB
 	const numBlocks = 2000             // 2000 * 4KB ~= 8MB total written
 

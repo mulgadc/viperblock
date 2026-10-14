@@ -75,6 +75,7 @@ func TestStaleDrain_ColdReopenPreservesNewestBytes(t *testing.T) {
 // otherwise whatever the superseded chunk held at that offset — which is how
 // deleted-file contents leaked back into readable data).
 func TestSequentialPartialWrites_ColdReopenByteExact(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("skipping multi-megabyte durability round-trip in -short mode")
 	}

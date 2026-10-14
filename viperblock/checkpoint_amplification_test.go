@@ -95,6 +95,7 @@ func openFastVBWithCounting(t *testing.T, dir, name string, interval time.Durati
 // 4 volumes that produced 3,650 PUTs in 8.5h. Here we run 10 ticks in 600ms
 // and assert zero checkpoint writes when no blocks have changed.
 func TestCheckpointIdleGating(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	_, cb := openFastVBWithCounting(t, dir, "idle-gating", 50*time.Millisecond)
 
@@ -112,6 +113,7 @@ func TestCheckpointIdleGating(t *testing.T) {
 // PUTs from the parallel upload pool could land out of snapshot order and
 // leave a stale seqNum in the checkpoint (encrypted reattach bad superblock).
 func TestCheckpointWriteProportionality(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Slow ticker so it does not fire during the explicit drain below.
 	vb, cb := openFastVBWithCounting(t, dir, "proportionality", 10*time.Second)

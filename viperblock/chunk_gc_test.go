@@ -646,6 +646,7 @@ func TestChunkGC_NoDeleteBeforeCheckpointDurability(t *testing.T) {
 	require.True(t, ok)
 	wrapped := &failingCheckpointBackend{Backend: fb}
 	vb.Backend = wrapped
+	vb.checkpointRetryBackoff = time.Microsecond
 
 	original := randomBlockData(4)
 	writeAndChunk(t, vb, 0, original)
