@@ -40,6 +40,11 @@ type enospcBackend struct {
 	// being retried every drain round.
 	genericFail atomic.Bool
 
+	// chunkFail is the same idea scoped to FileTypeChunk. The guest stall
+	// path drains chunks only, so this is what makes a drain it drives fail
+	// persistently.
+	chunkFail atomic.Bool
+
 	// mu guards checkpointScript/checkpointScriptIdx below.
 	mu sync.Mutex
 
@@ -49,6 +54,11 @@ type enospcBackend struct {
 	// exhausted, checkpoint writes fall back to the genericFail toggle.
 	checkpointScript    []error
 	checkpointScriptIdx int
+
+	// chunkScript is the same mechanism for FileTypeChunk writes, which is
+	// what the guest stall path drives.
+	chunkScript    []error
+	chunkScriptIdx int
 
 	// afterWrite, if set, runs after every Write/WriteCtx call returns.
 	// Tests use it to pin vb.pendingBytes above the low-watermark so an
@@ -99,6 +109,27 @@ func (b *enospcBackend) dispatch(fileType types.FileType, doWrite func() error) 
 			return doWrite()
 		}
 		if b.genericFail.Load() {
+			return genericBackendErr()
+		}
+	}
+
+	if fileType == types.FileTypeChunk {
+		b.mu.Lock()
+		var scriptedErr error
+		scripted := b.chunkScriptIdx < len(b.chunkScript)
+		if scripted {
+			scriptedErr = b.chunkScript[b.chunkScriptIdx]
+			b.chunkScriptIdx++
+		}
+		b.mu.Unlock()
+
+		if scripted {
+			if scriptedErr != nil {
+				return scriptedErr
+			}
+			return doWrite()
+		}
+		if b.chunkFail.Load() {
 			return genericBackendErr()
 		}
 	}
@@ -585,9 +616,10 @@ func TestWriteAtRecoveryProbeDoesNotHangAgainstUnresponsiveBackend(t *testing.T)
 }
 
 // TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures pins that a
-// backend persistently rejecting the checkpoint write with a non-ErrNoSpace
-// error does not keep awaitBackpressure spinning indefinitely: the volume's
-// stall deadline bounds it.
+// backend persistently rejecting the chunk write with a non-ErrNoSpace error
+// does not keep awaitBackpressure spinning indefinitely: the volume's stall
+// deadline bounds it. The chunk write is the backend write the guest stall
+// path drives, now that the checkpoint has moved off it.
 func TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures(t *testing.T) {
 	vb, backend := newEnospcTestVB(t)
 	blockSize := uint64(vb.BlockSize)
@@ -597,13 +629,12 @@ func TestAwaitBackpressureBoundsConsecutiveNonNoSpaceFailures(t *testing.T) {
 	vb.BackpressureStallTimeout = 500 * time.Millisecond
 	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
 
-	// Every checkpoint write fails from here on. Pin pendingBytes back
-	// above the low-watermark after each attempt so it can't fall under it
-	// and let awaitBackpressure return nil, silently swallowing the
-	// checkpoint failure.
-	backend.genericFail.Store(true)
+	// Every chunk write fails from here on. Pin pendingBytes back above the
+	// low-watermark after each attempt so it can't fall under it and let
+	// awaitBackpressure return nil, silently swallowing the drain failure.
+	backend.chunkFail.Store(true)
 	backend.afterWrite = func(fileType types.FileType, err error) {
-		if fileType == types.FileTypeBlockCheckpointLive {
+		if fileType == types.FileTypeChunk {
 			vb.pendingBytes.Store(int64(vb.maxPendingBytes()) * 4)
 		}
 	}
@@ -640,31 +671,53 @@ func TestAwaitBackpressureFailureCounterResetsAfterInterleavedSuccess(t *testing
 	for range 27 {
 		script = append(script, genericBackendErr())
 	}
-	backend.checkpointScript = script
+	// Scripted on the chunk write: that is the backend write the guest stall
+	// path drives, so it is what decides whether a drain the blocked writer
+	// runs succeeds or fails.
+	backend.chunkScript = script
 
-	// Drive dirty/pendingBytes from an independent goroutine rather than the
-	// backend's afterWrite hook: SaveLiveCheckpointCtx clears
-	// BlocksToObject.dirty right after a successful write returns, which
-	// would clobber a redirty attempted from inside that same call. Ticking
-	// out-of-band mimics a concurrent guest write instead.
+	// Drive the volume from an independent goroutine rather than the backend's
+	// afterWrite hook, so it mimics concurrent guest writes rather than
+	// mutations made from inside the drain they are meant to outlive.
+	//
+	// Buffering a real block each tick is what keeps the script advancing: a
+	// chunk write only happens when a drain has something to consolidate, so
+	// pinning pendingBytes alone would leave the drain a no-op and the run of
+	// failures would never resume after the scripted success.
 	stop := make(chan struct{})
 	driverDone := make(chan struct{})
 	go func() {
 		defer close(driverDone)
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
+		var block uint64 = 1024
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
 				backend.mu.Lock()
-				exhausted := backend.checkpointScriptIdx >= len(backend.checkpointScript)
+				exhausted := backend.chunkScriptIdx >= len(backend.chunkScript)
 				backend.mu.Unlock()
 				if exhausted {
 					vb.pendingBytes.Store(0)
 					return
 				}
+
+				block++
+				seq, err := vb.reserveSeqNum(context.Background(), 1)
+				if err != nil {
+					return
+				}
+				vb.Writes.mu.Lock()
+				vb.Writes.Blocks = append(vb.Writes.Blocks, Block{
+					SeqNum: seq + 1,
+					Block:  block,
+					Len:    uint64(vb.BlockSize),
+					Data:   make([]byte, vb.BlockSize),
+				})
+				vb.Writes.mu.Unlock()
+
 				vb.BlocksToObject.dirty.Store(true)
 				vb.pendingBytes.Store(int64(vb.maxPendingBytes()) * 4)
 			}
