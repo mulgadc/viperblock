@@ -46,7 +46,7 @@ const (
 	FileBackend string = "file"
 	S3Backend   string = "s3"
 
-	// Default test credentials for local predastore test server (matches tests/config/server.toml).
+	// Default test credentials for the in-process predastore test server.
 	DefaultTestAccessKey string = "AKIAIOSFODNN7EXAMPLE"
 	DefaultTestSecretKey string = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 

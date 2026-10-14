@@ -1,4 +1,5 @@
 lib/nbdkit-viperblock-plugin.so
+lib/*.h
 
 # Build outputs
 bin/
@@ -15,4 +16,3 @@ Thumbs.db
 
 # Test reports
 *-report.txt
-viperblock/tests/data/
