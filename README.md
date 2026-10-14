@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#run-an-nbd-volume">NBD usage</a> ·
+  <a href="#run-an-nbd-volume">NBD Usage</a> ·
   <a href="#capabilities">Capabilities</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#storage-backends">Storage Backends</a> ·
