@@ -85,14 +85,12 @@ func TestAwaitBackpressureDeadlineHoldsWithConcurrentWriters(t *testing.T) {
 	vb.BackpressureStallTimeout = 500 * time.Millisecond
 	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
 
-	// Every checkpoint write fails from here on, and pendingBytes is pinned
-	// back above the low-watermark so no writer can escape by the gate
-	// releasing rather than by the deadline.
+	// Every checkpoint write fails from here on. Chunk writes still succeed and
+	// release their bytes before the checkpoint fails, so pin pendingBytes after
+	// every write, far enough above the watermark that no writer escapes early.
 	backend.genericFail.Store(true)
-	backend.afterWrite = func(fileType types.FileType, _ error) {
-		if fileType == types.FileTypeBlockCheckpointLive {
-			vb.pendingBytes.Store(int64(vb.maxPendingBytes()) * 4)
-		}
+	backend.afterWrite = func(types.FileType, error) {
+		vb.pendingBytes.Store(int64(vb.maxPendingBytes()) * 64)
 	}
 
 	const writers = 8
