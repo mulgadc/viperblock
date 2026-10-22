@@ -1,5 +1,5 @@
 ----------------------------------------------------- MODULE Base -----------------------------------------------------
-EXTENDS Naturals, Sequences, FiniteSets, TLC
+EXTENDS Naturals, Sequences, FiniteSets, TLC, Functions
 
 -----------------------------------------------------------------------------------------------------------------------
 \* Constants
@@ -28,7 +28,7 @@ vars == <<history, usedIds>>
 -----------------------------------------------------------------------------------------------------------------------
 \* Miscellaneous
 
-Partial(F) == {[x \in D |-> f[x]] : f \in F, D \in SUBSET DOMAIN f}
+Partial(F) == UNION {{Restrict(f, D) : D \in SUBSET DOMAIN f} : f \in F}
 
 Merged(A, B) == {a @@ b : a \in A, b \in B}
 
