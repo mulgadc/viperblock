@@ -5649,8 +5649,17 @@ func (vb *VB) selectPersistedState(ctx context.Context) (VBState, error) {
 	} else if errors.Is(backendErr, ErrIntegrity) || errors.Is(backendErr, ErrEncryptionMismatch) {
 		return VBState{}, fmt.Errorf("LoadState: backend: %w", backendErr)
 	}
+	// A volume opened for the first time has no state object yet, which the
+	// classifier below reports on its own. Naming the volume matters either
+	// way: without it a 404 cannot be tied to one.
 	if backendErr != nil {
-		vb.logger().WarnContext(ctx, "Failed to load state from backend", "error", backendErr)
+		if errors.Is(backendErr, os.ErrNotExist) {
+			vb.logger().DebugContext(ctx, "No state in backend yet",
+				"volume", vb.GetVolume(), "err", backendErr)
+		} else {
+			vb.logger().WarnContext(ctx, "Failed to load state from backend",
+				"volume", vb.GetVolume(), "err", backendErr)
+		}
 	}
 
 	if stateBackend.BlockSize == 0 && state.BlockSize == 0 {
