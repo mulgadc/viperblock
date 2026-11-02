@@ -91,11 +91,12 @@ wrapper_get_ready (void)
   return implGetReady ();
 }
 
-// As the name suggests, this is not a wrapper around a golang
-// function.  There is no need for it since golang plugins must
-// not fork.
+// nbdkit calls this once it has finished resetting stdio and is about
+// to serve, which is the documented place to start background work.
+// golang plugins must not fork, so a changed PID is only reported.
+extern int implAfterFork (void);
 int
-nonwrapper_after_fork (void)
+wrapper_after_fork (void)
 {
   if (original_pid > 0 && getpid () != original_pid) {
     nbdkit_error ("detected fork in golang plugin!  The plugin will "
@@ -103,7 +104,7 @@ nonwrapper_after_fork (void)
                   "\"IMPORTANT NOTE\" in nbdkit-golang-plugin(3) man page");
     //return -1;
   }
-  return 0;
+  return implAfterFork ();
 }
 
 extern int implPreConnect (int readonly);

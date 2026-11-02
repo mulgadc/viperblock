@@ -36,7 +36,7 @@ extern void    wrapper_dump_plugin (void);
 extern int     wrapper_config (const char *key, const char *value);
 extern int     wrapper_config_complete (void);
 extern int     wrapper_get_ready (void);
-extern int     nonwrapper_after_fork (void);
+extern int     wrapper_after_fork (void);
 extern int     wrapper_preconnect (int readonly);
 extern void *  wrapper_open (int readonly);
 extern void    wrapper_close (void *handle);
