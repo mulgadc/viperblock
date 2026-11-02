@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"runtime"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/stretchr/testify/assert"
@@ -180,4 +183,42 @@ func TestPluginErrorErrnoPropagatesAsError(t *testing.T) {
 	if assert.True(t, ok, "backendErrToPluginError must return a value assignable to error via nbdkit.PluginError") {
 		assert.Equal(t, syscall.ENOSPC, perr.Errno)
 	}
+}
+
+// nbdkit closes and reopens stdio between GetReady and AfterFork, which fails
+// if another thread allocates a descriptor meanwhile. With OTLP configured the
+// plugin must therefore start no goroutines before AfterFork.
+func TestConfigComplete_StartsNoBackgroundWorkBeforeAfterFork(t *testing.T) {
+	resetPluginConfigState()
+	defer resetPluginConfigState()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Cleanup(func() {
+		if otelShutdown != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			_ = otelShutdown(ctx)
+			otelShutdown = nil
+		}
+	})
+
+	size = 1
+	volume = "vol-1"
+	bucket = "bucket-1"
+	region = "region-1"
+	access_key = "argv-access-key"
+	secret_key = "argv-secret-key"
+	base_dir = t.TempDir()
+	host = "localhost:9000"
+
+	p := &ViperBlockPlugin{}
+	before := runtime.NumGoroutine()
+	assert.NoError(t, p.ConfigComplete())
+	assert.NoError(t, p.GetReady())
+	assert.Equal(t, before, runtime.NumGoroutine(),
+		"ConfigComplete/GetReady must not start goroutines: nbdkit resets stdio after them")
+	assert.Nil(t, otelShutdown, "OTLP export must not start before AfterFork")
+
+	assert.NoError(t, p.AfterFork())
+	assert.NotNil(t, otelShutdown, "AfterFork must start OTLP export when an endpoint is configured")
+	assert.Greater(t, runtime.NumGoroutine(), before, "OTLP exporters run in background goroutines")
 }

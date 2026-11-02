@@ -46,6 +46,9 @@ jobs:
       - name: Run Tests with Coverage
         run: make test-cover
 
+      - name: Run NBD Plugin Tests
+        run: make test-nbd
+
       - name: Check Diff Coverage
         run: scripts/diff-coverage.sh coverage.out --base HEAD~1
 

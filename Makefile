@@ -39,7 +39,7 @@ go_build_nbd:
 # still gated before merge — run `make test-integration` directly when a change
 # touches the multi-engine or network-failure paths it covers.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage
+	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-nbd
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
@@ -53,6 +53,13 @@ test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
+
+# NBD plugin and nbdkit binding tests. Both live in their own modules, and the
+# plugin is package main built from a single file, so ./... never reaches them.
+test-nbd:
+	@echo -e "\n....Running NBD plugin tests for $(GO_PROJECT_NAME)...."
+	$(_Q)cd nbd/libguestfs.org/nbdkit && LOG_IGNORE=1 go test -count=1 -timeout 120s . $(_RACEQ)
+	$(_Q)cd nbd && LOG_IGNORE=1 go test -count=1 -timeout 120s ./viperblock.go ./viperblock_test.go $(_RACEQ)
 
 # Integration tier: tests that stand up a second VB engine over one volume, or
 # drive real network-failure behaviour against a dead host. They are gated
@@ -113,5 +120,5 @@ nilaway:
 	$(_Q)go tool nilaway -include-pkgs=github.com/mulgadc/viperblock -exclude-test-files ./...
 	@echo "  nilaway ok"
 
-.PHONY: build go_build go_build_nbd preflight test test-cover test-race test-integration diff-coverage bench run clean \
+.PHONY: build go_build go_build_nbd preflight test test-cover test-nbd test-race test-integration diff-coverage bench run clean \
 	lint fix govulncheck nilaway

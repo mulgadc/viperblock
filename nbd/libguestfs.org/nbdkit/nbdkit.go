@@ -112,6 +112,7 @@ type PluginInterface interface {
 	Config(key string, value string) error
 	ConfigComplete() error
 	GetReady() error
+	AfterFork() error
 
 	PreConnect(readonly bool) error
 	Open(readonly bool) (ConnectionInterface, error) // required
@@ -166,6 +167,10 @@ func (p *Plugin) ConfigComplete() error {
 }
 
 func (p *Plugin) GetReady() error {
+	return nil
+}
+
+func (p *Plugin) AfterFork() error {
 	return nil
 }
 
@@ -285,6 +290,16 @@ func implConfigComplete() C.int {
 //export implGetReady
 func implGetReady() C.int {
 	err := pluginImpl.GetReady()
+	if err != nil {
+		set_error(err)
+		return -1
+	}
+	return 0
+}
+
+//export implAfterFork
+func implAfterFork() C.int {
+	err := pluginImpl.AfterFork()
 	if err != nil {
 		set_error(err)
 		return -1
@@ -542,7 +557,7 @@ func PluginInitialize(name string, impl PluginInterface) unsafe.Pointer {
 	plugin.config = (*[0]byte)(C.wrapper_config)
 	plugin.config_complete = (*[0]byte)(C.wrapper_config_complete)
 	plugin.get_ready = (*[0]byte)(C.wrapper_get_ready)
-	plugin.after_fork = (*[0]byte)(C.nonwrapper_after_fork)
+	plugin.after_fork = (*[0]byte)(C.wrapper_after_fork)
 	plugin.preconnect = (*[0]byte)(C.wrapper_preconnect)
 	plugin.open = (*[0]byte)(C.wrapper_open)
 	plugin.close = (*[0]byte)(C.wrapper_close)

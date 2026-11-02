@@ -53,6 +53,8 @@ type ViperBlockPlugin struct {
 	nbdkit.Plugin
 }
 
+var _ nbdkit.PluginInterface = (*ViperBlockPlugin)(nil)
+
 type ViperBlockConnection struct {
 	nbdkit.Connection
 	vb *viperblock.VB
@@ -238,21 +240,9 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 		return nbdkit.PluginError{Errmsg: "host parameter is required"}
 	}
 
-	// Wire OTLP export + the slog bridge before anything else logs, so
-	// standalone (nbdkit) logs reach ES via OTLP, not only journald. Both
-	// are no-ops without OTEL_EXPORTER_OTLP_* configured. This is the only
-	// place viperblock's process-wide slog default is touched — never from
-	// viperblock.New, which would hijack an embedding process's logger.
-	//
-	// No TracerProvider: the plugin has no server loop to root spans from, and
-	// when viperblock is embedded instead the host (spx) already owns tracing.
-	shutdown, err := otelsetup.Init(context.Background(), serviceName,
-		otelsetup.WithoutTracing(), otelsetup.WithoutRuntimeMetrics())
-	if err != nil {
-		slog.Error("otel telemetry init failed, continuing without OTLP export", "err", err)
-	} else {
-		otelShutdown = shutdown
-	}
+	// OTLP export starts in AfterFork, not here: its exporters run background
+	// goroutines, and nbdkit resets stdio after this returns on the assumption
+	// that nothing else is allocating descriptors.
 	level := slog.LevelInfo
 	if os.Getenv("VIPERBLOCK_DEBUG") == "1" {
 		level = slog.LevelDebug
@@ -275,6 +265,22 @@ func (p *ViperBlockPlugin) ConfigComplete() error {
 }
 
 func (p *ViperBlockPlugin) GetReady() error {
+	return nil
+}
+
+// AfterFork wires OTLP export and the slog bridge, both no-ops without
+// OTEL_EXPORTER_OTLP_* configured. This is the only place viperblock's
+// process-wide telemetry is touched, never viperblock.New, which an embedder calls.
+func (p *ViperBlockPlugin) AfterFork() error {
+	// No TracerProvider: the plugin has no server loop to root spans from, and
+	// when viperblock is embedded instead the host (spx) already owns tracing.
+	shutdown, err := otelsetup.Init(context.Background(), serviceName,
+		otelsetup.WithoutTracing(), otelsetup.WithoutRuntimeMetrics())
+	if err != nil {
+		slog.Error("otel telemetry init failed, continuing without OTLP export", "err", err)
+		return nil
+	}
+	otelShutdown = shutdown
 	return nil
 }
 
