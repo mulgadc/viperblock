@@ -40,6 +40,10 @@ type enospcBackend struct {
 	// being retried every drain round.
 	genericFail atomic.Bool
 
+	// unreachable, when true, fails every write of every type, as a backend
+	// that is down does: chunk uploads fail too, so pendingBytes stays real.
+	unreachable atomic.Bool
+
 	// mu guards checkpointScript/checkpointScriptIdx below.
 	mu sync.Mutex
 
@@ -80,6 +84,9 @@ func genericBackendErr() error {
 func (b *enospcBackend) dispatch(fileType types.FileType, doWrite func() error) error {
 	if b.full.Load() {
 		return enospcErr()
+	}
+	if b.unreachable.Load() {
+		return genericBackendErr()
 	}
 
 	if fileType == types.FileTypeBlockCheckpointLive {

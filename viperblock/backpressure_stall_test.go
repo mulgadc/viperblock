@@ -1,6 +1,7 @@
 package viperblock
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -119,4 +120,80 @@ func TestAwaitBackpressureDeadlineHoldsWithConcurrentWriters(t *testing.T) {
 	}
 	assert.Less(t, elapsed, 15*time.Second,
 		"the deadline is on the volume, so %d writers must not take %d times as long to reach it", writers, writers)
+}
+
+// stallPastBudget takes the backend down until a write fails on the volume's
+// stall deadline, leaving the stall recorded and past its budget.
+func stallPastBudget(t *testing.T) (*VB, *enospcBackend) {
+	t.Helper()
+	vb, backend := newEnospcTestVB(t)
+	blockSize := uint64(vb.BlockSize)
+
+	vb.MaxPendingBytes = blockSize
+	vb.BackpressureStallTimeout = 100 * time.Millisecond
+	require.NoError(t, vb.WriteAt(0, make([]byte, blockSize)))
+
+	backend.unreachable.Store(true)
+	err := runBlockingWriteWithHangTimeout(t, vb, blockSize, make([]byte, blockSize), 30*time.Second)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "has not drained for")
+	return vb, backend
+}
+
+// A backend that comes back after an outage longer than the budget must be
+// found by the next write. Every write used to fail on the stale stall before
+// any writer tried to drain, so nothing ever ended it.
+func TestWriteSucceedsOnceTheBackendRecoversPastTheStallBudget(t *testing.T) {
+	vb, backend := stallPastBudget(t)
+	blockSize := uint64(vb.BlockSize)
+
+	backend.unreachable.Store(false)
+	err := runBlockingWriteWithHangTimeout(t, vb, 2*blockSize, make([]byte, blockSize), 30*time.Second)
+	require.NoError(t, err, "the backend is answering again, so the write must drain and succeed")
+
+	stalled, lastErr := vb.drainStall.elapsed()
+	assert.Zero(t, stalled, "the successful drain must end the stall")
+	assert.NoError(t, lastErr)
+}
+
+// The chunk uploader and GC drain through DrainToBackendCtx, not through
+// awaitBackpressure, so a clean drain there must end the stall too.
+func TestCleanDrainOutsideBackpressureEndsTheStall(t *testing.T) {
+	vb, backend := stallPastBudget(t)
+
+	backend.unreachable.Store(false)
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+
+	stalled, lastErr := vb.drainStall.elapsed()
+	assert.Zero(t, stalled, "a clean drain on any path must end the stall")
+	assert.NoError(t, lastErr)
+}
+
+// Past the budget the writer driving the drain probes with its own deadline,
+// since the guest write path has none: a backend that never answers must fail
+// the write on the stall, not hang it.
+func TestDrainPastTheStallBudgetIsBounded(t *testing.T) {
+	vb, backend := stallPastBudget(t)
+	blockSize := uint64(vb.BlockSize)
+	vb.backendRecoveryProbeTimeout = 10 * time.Millisecond
+
+	backend.unreachable.Store(false)
+	backend.blockUntilCancelled.Store(true)
+	err := runBlockingWriteWithHangTimeout(t, vb, 2*blockSize, make([]byte, blockSize), 5*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has not drained for", "a probe that times out must fail on the stall")
+	assert.False(t, vb.drainInFlight.Load(), "a timed-out probe must release drainInFlight")
+}
+
+// A writer that cannot drive the drain still fails on the volume's deadline,
+// so writers queued behind a blocked drain are bounded too.
+func TestWaitingWriterFailsOnTheStallWhileAnotherDrains(t *testing.T) {
+	vb, _ := stallPastBudget(t)
+	blockSize := uint64(vb.BlockSize)
+
+	vb.drainInFlight.Store(true)
+	defer vb.drainInFlight.Store(false)
+	err := runBlockingWriteWithHangTimeout(t, vb, 2*blockSize, make([]byte, blockSize), 5*time.Second)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has not drained for")
 }

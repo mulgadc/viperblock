@@ -2157,14 +2157,15 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			return err
 		}
 
-		// Checked by every blocked writer, not only the one driving the drain:
-		// that is what makes the bound independent of how many are waiting.
-		if stalled, lastErr := vb.drainStall.elapsed(); stalled > budget {
-			return stalledDrainErr(stalled, lastErr)
-		}
-
 		if vb.drainInFlight.CompareAndSwap(false, true) {
-			err := vb.DrainToBackendCtx(ctx)
+			// Past the budget the drain is a bounded probe, so a backend that
+			// has recovered is found by the next write rather than never.
+			drainCtx, cancel := ctx, context.CancelFunc(func() {})
+			if stalled, _ := vb.drainStall.elapsed(); stalled > budget {
+				drainCtx, cancel = context.WithTimeout(ctx, vb.recoveryProbeTimeout())
+			}
+			err := vb.DrainToBackendCtx(drainCtx)
+			cancel()
 			vb.drainInFlight.Store(false)
 			if err != nil {
 				if errors.Is(err, ErrNoSpace) {
@@ -2182,12 +2183,14 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 				if stalled > budget {
 					return stalledDrainErr(stalled, err)
 				}
-			} else {
-				vb.drainStall.clear()
 			}
 			if vb.PendingBytes() <= low {
 				break
 			}
+		} else if stalled, lastErr := vb.drainStall.elapsed(); stalled > budget {
+			// Checked by every waiting writer, so the bound holds however many
+			// are blocked behind the one driving the drain.
+			return stalledDrainErr(stalled, lastErr)
 		}
 
 		select {
@@ -2226,12 +2229,17 @@ func (s *drainStall) fail(err error) time.Duration {
 	return time.Since(s.since)
 }
 
-// clear ends the current run of failures. A drain that succeeds means the
-// backend is answering, whatever it did before.
-func (s *drainStall) clear() {
+// clear ends the current run of failures and returns how long it lasted. A
+// drain that succeeds means the backend is answering, whatever it did before.
+func (s *drainStall) clear() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var stalled time.Duration
+	if !s.since.IsZero() {
+		stalled = time.Since(s.since)
+	}
 	s.since, s.err = time.Time{}, nil
+	return stalled
 }
 
 // elapsed reports the current run's duration and its last error, or zero when
@@ -2681,6 +2689,11 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		// A clean drain clears the latch; log only the true→false recovery edge.
 		if vb.backendFull.Swap(false) {
 			vb.logger().Info("backend space recovered: drain succeeded, writes re-enabled")
+		}
+		// Any clean drain, on any path, ends a run of drain failures.
+		if stalled := vb.drainStall.clear(); stalled > 0 {
+			vb.logger().Info("write backpressure: backend drained again",
+				"stalled_ms", stalled.Milliseconds())
 		}
 	}()
 
