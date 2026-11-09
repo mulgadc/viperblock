@@ -91,7 +91,7 @@ func countRevertedBlocks(t *testing.T, want, got []byte, bs int) (int, string) {
 	return bad, detail
 }
 
-// TestDualOpen_DaemonSideInstanceDuringGuestWrites models the ebs.mount
+// TestDualOpen_DaemonSideInstanceDuringGuestWrites models the PublishVolume
 // topology: the daemon holds a second VB on the volume for the lifetime of the
 // mount ("tracks state only"), while nbdkit serves guest writes. The daemon VB
 // stops its chunk uploader -- viperblockd does this deliberately, with the
@@ -335,7 +335,7 @@ func TestDualOpen_LaunchClonePathDoesNotDirtyCheckpoint(t *testing.T) {
 	// the stop, so it is live for the whole body.
 	daemon := dualOpenVB(t, cloneVol, volSize, shared, key, time.Millisecond, 0)
 	// New() has ALREADY started a chunk uploader at this point. Stopping it
-	// before LoadState mirrors what viperblockd's ebs.mount path does
+	// before LoadState mirrors what viperblockd's PublishVolume path does
 	// (viperblockd.go:773) and, separately, avoids a PRE-EXISTING data race:
 	// the uploader's DrainToBackendCtx reads VB fields that LoadStateCtx
 	// concurrently writes. The five control-plane call sites the EBSProvider
@@ -388,7 +388,7 @@ func TestDualOpen_LaunchClonePathDoesNotDirtyCheckpoint(t *testing.T) {
 //	  Previous read ...DrainToBackendCtx() <- StartChunkUploader.func1()
 //
 // This is direct evidence for mulga-t1sch's thesis that every viperblock.New()
-// is a WRITER, not a reader. viperblockd's ebs.mount path happens to be safe
+// is a WRITER, not a reader. viperblockd's PublishVolume path happens to be safe
 // because it calls StopChunkUploader() BEFORE loading state; the five
 // control-plane handlers the plan deletes only DEFER the stop, so they hold a
 // live uploader across their whole body.

@@ -611,18 +611,14 @@ The plugin implements the full nbdkit interface:
 
 # 13. NATS Integration
 
-When deployed with [Spinifex](https://github.com/mulgadc/spinifex), Viperblock subscribes to NATS topics for EBS-compatible volume lifecycle management:
+When deployed with [Spinifex](https://github.com/mulgadc/spinifex), Viperblock is served by viperblockd, Spinifex's EBS provider, which lives in `spinifex/providers/ebs/viperblock`.
+Viperblock itself subscribes to no NATS subject.
 
-| Topic | Purpose |
-|-------|---------|
-| `ebs.createvolume` | Create a new volume |
-| `ebs.describevolumes` | List volume metadata |
-| `ebs.attachvolume` | Attach volume to an instance |
-| `ebs.detachvolume` | Detach volume from an instance |
-| `ebs.mount` | Mount volume via NBD — returns NBD URI for QEMU |
-| `ebs.unmount` | Unmount volume, flush, and close |
+viperblockd serves the versioned `ebs.provider.v1.*` provider contract defined in `spinifex/providers/ebs`.
+Volume lifecycle requests (create, describe, expand, delete, snapshot) arrive on that contract, and the node-addressed `ebs.provider.v1.<node>.mount` and `ebs.provider.v1.<node>.unmount` subjects carry `PublishVolume` and `UnpublishVolume`.
 
-The Spinifex daemon sends a mount request over NATS; Viperblock starts an nbdkit process with the plugin and returns the NBD URI. QEMU uses this URI to back a virtual disk.
+On `PublishVolume`, viperblockd starts an nbdkit process with the plugin and replies with the NBD export, whose URI QEMU uses to back a virtual disk.
+On `UnpublishVolume`, it stops nbdkit and seals the volume's state to the backend, or drops the export unsealed when the request sets `no_seal`.
 
 ---
 
