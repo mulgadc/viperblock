@@ -309,6 +309,8 @@ func (ubs *UnifiedBlockStore) ReadSingle(blockNum uint64) ([]byte, BlockState, e
 	case BlockStatePersisted:
 		ubs.stats.BackendReads.Add(1)
 		return nil, BlockStatePersisted, nil // Caller fetches from backend
+	case BlockStateEmpty:
+		// An empty slot is a cache miss, counted below.
 	}
 
 	ubs.stats.CacheMiss.Add(1)
