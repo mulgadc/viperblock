@@ -264,18 +264,24 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	return backend.syncDir(filepath.Dir(filename))
 }
 
-// syncDir fsyncs a directory so a rename into it survives a power cut. A
-// failure to open the directory is not fatal: the rename itself succeeded, and
-// the bytes it published are already on the device.
+// syncDir fsyncs a directory so a rename into it survives a power cut.
+//
+// Both failures are returned rather than logged. The object is visible either
+// way, so this reads like an over-strict error, but a caller that reclaims its
+// local WAL on a successful Write has no second copy: reporting success for a
+// rename that is not yet on the device is how both copies are lost at once.
 func (backend *Backend) syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		backend.log.Warn("Failed to open directory for sync", "dir", dir, "error", err)
-		return nil
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to open directory for sync", "dir", dir, "error", err)
+		return err
 	}
 	defer d.Close()
 	if err := d.Sync(); err != nil {
-		backend.log.Warn("Failed to sync directory", "dir", dir, "error", err)
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to sync directory", "dir", dir, "error", err)
+		return err
 	}
 	return nil
 }

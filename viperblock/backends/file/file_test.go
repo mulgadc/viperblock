@@ -406,3 +406,23 @@ func TestWriteReplacesTheObjectAtomically(t *testing.T) {
 		assert.NotContains(t, e.Name(), ".tmp", "a successful write must leave no temporary file behind")
 	}
 }
+
+// TestWriteFailsWhenTheDirectorySyncFails covers the error reclaim depends on
+// being propagated. The object is visible after the rename whether or not the
+// directory fsync lands, so swallowing the failure returns success for a write
+// that is not yet on the device. The caller then deletes its local WAL, and a
+// power cut takes both copies.
+func TestWriteFailsWhenTheDirectorySyncFails(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte("hdr!")
+	data := []byte("payload")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 3, &headers, &data))
+
+	// Remove the directory out from under the next write so the post-rename
+	// open cannot succeed. The rename itself still resolves through the
+	// handle the temporary file was created in.
+	dir := filepath.Dir(filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 3, backend.config.VolumeName)))
+	require.Error(t, backend.syncDir(filepath.Join(dir, "definitely-not-a-directory")),
+		"a directory that cannot be opened must fail the write, not be logged and ignored")
+}
