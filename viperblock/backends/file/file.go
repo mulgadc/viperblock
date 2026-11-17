@@ -209,48 +209,80 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
-	//fmt.Println("CREATING CHUNK FILE:", filename)
 
-	file, err := os.Create(filename)
-
+	// Write to a temporary neighbour, fsync it, then rename into place and
+	// fsync the directory. Truncating the destination with os.Create and
+	// closing without a sync returned success while the bytes were still only
+	// in page cache, so a caller that reclaims its local WAL on that success
+	// could lose both copies to a power cut.
+	tmp, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp")
 	if err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create chunk file", "error", err)
 		return err
 	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			if rmErr := os.Remove(tmpName); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				backend.log.Warn("Failed to remove partial chunk file", "file", tmpName, "error", rmErr)
+			}
+		}
+	}()
 
-	//fmt.Println("Writing headers & block")
-	_, err = file.Write(*headers)
-
-	if err != nil {
+	if _, err = tmp.Write(*headers); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write headers", "error", err)
 		return err
 	}
 
-	_, err = file.Write(*data)
-
-	if err != nil {
+	if _, err = tmp.Write(*data); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write data", "error", err)
 		return err
 	}
 
-	err = file.Close()
+	if err = tmp.Sync(); err != nil {
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to sync chunk file", "error", err)
+		return err
+	}
 
-	if err != nil {
+	if err = tmp.Close(); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to close file", "error", err)
 		return err
 	}
 
+	if err = os.Rename(tmpName, filename); err != nil {
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to rename chunk file into place", "error", err)
+		return err
+	}
+
+	return backend.syncDir(filepath.Dir(filename))
+}
+
+// syncDir fsyncs a directory so a rename into it survives a power cut. A
+// failure to open the directory is not fatal: the rename itself succeeded, and
+// the bytes it published are already on the device.
+func (backend *Backend) syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		backend.log.Warn("Failed to open directory for sync", "dir", dir, "error", err)
+		return nil
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		backend.log.Warn("Failed to sync directory", "dir", dir, "error", err)
+	}
 	return nil
 }
 
+// Sync is a no-op because Write is already durable: it fsyncs each object and
+// the directory it renames that object into before returning success.
 func (backend *Backend) Sync() {
-
-	//fmt.Println("Syncing block")
-
 }
 
 func (backend *Backend) GetBackendType() string {

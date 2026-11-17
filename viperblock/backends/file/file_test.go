@@ -367,3 +367,42 @@ func TestWriteRealDiskFullMapsToNoSpace(t *testing.T) {
 	assert.ErrorIs(t, writeErr, syscall.ENOSPC,
 		"classification must preserve the underlying syscall.ENOSPC")
 }
+
+// TestWriteReplacesTheObjectAtomically covers the property reclaim depends on.
+// The previous path truncated the destination with os.Create and wrote into
+// it, so between the truncate and the last write the object at that key was
+// short, and a failure there left it that way. A caller that deletes its local
+// WAL on a successful Write has no second copy to fall back on.
+//
+// Replacement by rename is observable as a change of inode; truncate in place
+// is not. fsync itself is not observable without a power cut, so this gates
+// the atomicity and the write path carries the sync alongside it.
+func TestWriteReplacesTheObjectAtomically(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte("hdr!")
+	first := []byte("the original object")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 7, &headers, &first))
+
+	name := filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 7, backend.config.VolumeName))
+	before, err := os.Stat(name)
+	require.NoError(t, err)
+
+	second := []byte("the replacement object, longer than the first")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 7, &headers, &second))
+
+	after, err := os.Stat(name)
+	require.NoError(t, err)
+	assert.False(t, os.SameFile(before, after),
+		"a rewrite must publish a new file by rename: truncating the destination in place leaves the object short until the last write lands")
+
+	got, err := backend.Read(types.FileTypeChunk, 7, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, append(append([]byte{}, headers...), second...), got)
+
+	entries, err := os.ReadDir(filepath.Dir(name))
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp", "a successful write must leave no temporary file behind")
+	}
+}

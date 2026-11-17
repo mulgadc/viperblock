@@ -2,12 +2,14 @@ package viperblock
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mulgadc/viperblock/types"
+	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -288,4 +290,134 @@ func TestUnlinkBeforeCheckpointLosesAcknowledgedWrites(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, recovered,
 		"once the checkpoint names the block, the chunk is reachable without the WAL")
+}
+
+// reopenAfterCrash opens a second VB over the same directory and backend the
+// way a restarted process does: persisted state, then the live checkpoint,
+// then whatever local WAL survived. No Close ran, so the state file holds the
+// counters from the last SaveState rather than the volume's true high-water.
+func reopenAfterCrash(t *testing.T, vb *VB) *VB {
+	t.Helper()
+	cfg := file.FileConfig{BaseDir: vb.BaseDir, VolumeName: vb.VolumeName}
+	reopened, err := New(&VB{
+		VolumeName:      vb.VolumeName,
+		VolumeSize:      vb.VolumeSize,
+		BaseDir:         vb.BaseDir,
+		WALSyncInterval: -1,
+	}, FileBackend, cfg)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Backend.Init())
+	require.NoError(t, reopened.LoadState())
+	require.NoError(t, reopened.LoadLiveCheckpoint())
+	require.NoError(t, reopened.RecoverLocalWALs())
+	require.NoError(t, reopened.OpenWAL(&reopened.WAL,
+		fmt.Sprintf("%s/%s", reopened.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, reopened.WAL.WallNum.Load(), reopened.GetVolume()))))
+	require.NoError(t, reopened.OpenWAL(&reopened.BlockToObjectWAL,
+		fmt.Sprintf("%s/%s", reopened.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, reopened.BlockToObjectWAL.WallNum.Load(), reopened.GetVolume()))))
+	reopened.StopChunkUploader()
+	t.Cleanup(func() { reopened.StopWALSyncer() })
+	return reopened
+}
+
+// TestReclaimKeepsSeqNumMonotonicOnAnUnencryptedVolume covers what reclaim
+// takes away. RecoverLocalWALs used to raise SeqNum past a stale persisted
+// state by replaying every file on disk; reclaim deletes those files, and only
+// encrypted volumes persist a high-water reservation to stand in for them.
+//
+// Without the checkpoint reconciliation, the reopened volume hands out
+// sequence numbers it has already used, and classifyRun then discards the new
+// write as superseded by the old one. The guest is told the write succeeded.
+func TestReclaimKeepsSeqNumMonotonicOnAnUnencryptedVolume(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "seqnum-after-reclaim", nil)
+	require.False(t, vb.EncryptionEnabled, "this test is about the path with no persisted high-water")
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	first := make([]byte, vb.BlockSize)
+	for i := range first {
+		first[i] = 0x11
+	}
+	for i := range 48 {
+		require.NoError(t, vb.WriteAt(uint64(i)*uint64(vb.BlockSize), first))
+	}
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+
+	count, _ := walDirBytes(t, vb)
+	require.LessOrEqual(t, count, 1, "the drain must have reclaimed its generations, leaving only the open one")
+
+	reopened := reopenAfterCrash(t, vb)
+	require.GreaterOrEqual(t, reopened.SeqNum.Load(), vb.SeqNum.Load(),
+		"a reopen must not hand out a sequence number the reclaimed generations already used")
+
+	second := make([]byte, vb.BlockSize)
+	for i := range second {
+		second[i] = 0x22
+	}
+	require.NoError(t, reopened.WriteAt(0, second))
+	require.NoError(t, reopened.DrainToBackendCtx(context.Background()))
+
+	final := reopenAfterCrash(t, reopened)
+	got, err := final.ReadAt(0, uint64(final.BlockSize))
+	require.NoError(t, err)
+	assert.Equal(t, second, got,
+		"the overwrite after the reopen must win: a reused sequence number makes classifyRun treat it as superseded and silently keep the old block")
+}
+
+// TestReclaimRetriesAFailedUnlink covers the other way lifetime growth comes
+// back. A generation dropped from the list on a transient unlink failure is
+// never attempted again, so its bytes are held until detach even though every
+// drain afterwards succeeds.
+func TestReclaimRetriesAFailedUnlink(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "reclaim-unlink-retry", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	buf := make([]byte, vb.BlockSize)
+	for i := range buf {
+		buf[i] = 0x33
+	}
+	for i := range 32 {
+		require.NoError(t, vb.WriteAt(uint64(i)*uint64(vb.BlockSize), buf))
+	}
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	vb.pendingWALMu.Lock()
+	pending := len(vb.consolidatedWALs)
+	vb.pendingWALMu.Unlock()
+	require.Positive(t, pending, "a consolidated generation must be waiting to be reclaimed")
+
+	// Deny the unlink by taking write permission off the directory holding it.
+	walDir := filepath.Join(vb.WAL.BaseDir, vb.GetVolume(), "wal", "chunks")
+	info, err := os.Stat(walDir)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(walDir, 0o500))
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			assert.NoError(t, os.Chmod(walDir, info.Mode()))
+		}
+	})
+
+	before, _ := walDirBytes(t, vb)
+	vb.reclaimConsolidatedWALs()
+	after, _ := walDirBytes(t, vb)
+	require.Equal(t, before, after, "the unlink must actually have failed for this test to mean anything")
+
+	vb.pendingWALMu.Lock()
+	heldForRetry := len(vb.consolidatedWALs)
+	vb.pendingWALMu.Unlock()
+	require.Equal(t, pending, heldForRetry,
+		"a generation whose unlink failed must stay on the list: dropping it holds those bytes for the life of the volume")
+
+	require.NoError(t, os.Chmod(walDir, info.Mode()))
+	restored = true
+
+	vb.reclaimConsolidatedWALs()
+	vb.pendingWALMu.Lock()
+	remaining := len(vb.consolidatedWALs)
+	vb.pendingWALMu.Unlock()
+	assert.Equal(t, 0, remaining, "the retry must reclaim the generation once the unlink can succeed")
 }

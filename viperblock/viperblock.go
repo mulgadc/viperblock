@@ -3570,20 +3570,38 @@ func (vb *VB) walGenerationFiles(walNum uint64) []string {
 //
 // A failed unlink is logged, not returned. RecoverLocalWALs replays a leftover
 // harmlessly on the next open, so it costs space rather than correctness, and
-// failing an otherwise clean drain over it would be the worse trade.
+// failing an otherwise clean drain over it would be the worse trade. The
+// generation does go back on the list, because a transient failure that dropped
+// it would leave those bytes held for the life of the volume, which is the
+// growth this exists to stop.
 func (vb *VB) reclaimConsolidatedWALs() {
 	vb.pendingWALMu.Lock()
 	reclaim := vb.consolidatedWALs
 	vb.consolidatedWALs = nil
 	vb.pendingWALMu.Unlock()
 
+	var retry []uint64
 	for _, walNum := range reclaim {
+		failed := false
 		for _, path := range vb.walGenerationFiles(walNum) {
 			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				vb.logger().Warn("failed to reclaim consolidated WAL file", "file", path, "error", err)
+				failed = true
 			}
 		}
+		if failed {
+			retry = append(retry, walNum)
+		}
 	}
+	if len(retry) == 0 {
+		return
+	}
+
+	// Ahead of anything consolidated while the unlinks ran: these generations
+	// are older and are already covered by a durable checkpoint.
+	vb.pendingWALMu.Lock()
+	vb.consolidatedWALs = append(retry, vb.consolidatedWALs...)
+	vb.pendingWALMu.Unlock()
 }
 
 // WriteWALToChunkCtx is WriteWALToChunk with a caller-supplied context
@@ -4229,9 +4247,10 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// of a large volume would revert straight back to one entry per block.
 	flat := make(map[uint64]BlockLookup)
 
-	// Track the highest chunk ObjectID the map references so ObjectNum can be
-	// reconciled to max+1 below, mirroring SeqNum -> maxSeqNum in RecoverLocalWALs.
-	var maxObjectID uint64
+	// Track the highest chunk ObjectID and block SeqNum the map references so
+	// both counters can be reconciled below. The flat decode is one record per
+	// physical block, so block.SeqNum here is that block's own value.
+	var maxObjectID, maxSeqNum uint64
 	haveObject := false
 
 	err := walkBlockCheckpoint(checkpoint, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
@@ -4240,6 +4259,7 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 			maxObjectID = block.ObjectID
 			haveObject = true
 		}
+		maxSeqNum = max(maxSeqNum, block.SeqNum)
 	})
 	if err != nil {
 		vb.logger().Error("Error reading checkpoint", "error", err)
@@ -4279,19 +4299,30 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// load a stale-low ObjectNum. Force it past every referenced chunk ID here so
 	// createChunkFile cannot reuse a live ID and cause a durable AEAD tag failure.
 	if haveObject {
-		next := maxObjectID + 1
-		for {
-			current := vb.ObjectNum.Load()
-			if next <= current {
-				break
-			}
-			if vb.ObjectNum.CompareAndSwap(current, next) {
-				break
-			}
-		}
+		advanceAtomicTo(&vb.ObjectNum, maxObjectID+1)
 	}
 
+	// Reclaiming a consolidated WAL removes the file RecoverLocalWALs used to
+	// raise SeqNum past a stale persisted state, and only encrypted volumes
+	// persist a high-water reservation. Without this, an unencrypted volume
+	// reopened after a crash reuses sequence numbers and classifyRun then
+	// discards the new acknowledged writes as superseded.
+	advanceAtomicTo(&vb.SeqNum, maxSeqNum)
+
 	return nil
+}
+
+// advanceAtomicTo raises n to want, leaving it alone if it is already higher.
+func advanceAtomicTo(n *atomic.Uint64, want uint64) {
+	for {
+		current := n.Load()
+		if want <= current {
+			return
+		}
+		if n.CompareAndSwap(current, want) {
+			return
+		}
+	}
 }
 
 // numberedCheckpointHighWater reads the current WallNum's numbered
