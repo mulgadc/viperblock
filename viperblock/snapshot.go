@@ -96,7 +96,13 @@ func (vb *VB) drainForSnapshot() error {
 	// Non-fatal: a stale live checkpoint self-heals on the next drain.
 	if err := vb.SaveLiveCheckpoint(); err != nil {
 		vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
+		return nil
 	}
+
+	// Only on the success path. A failed checkpoint leaves the local WAL as
+	// the sole record mapping these blocks, which is the ordering reclaim
+	// depends on.
+	vb.reclaimConsolidatedWALs()
 
 	return nil
 }

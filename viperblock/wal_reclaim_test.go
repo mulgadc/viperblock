@@ -201,3 +201,91 @@ func TestReclaimedWALStillReadsFromCheckpoint(t *testing.T) {
 		assert.Equal(t, written[i], got, "block %d must be byte-identical after reclaim", i)
 	}
 }
+
+// TestUnlinkBeforeCheckpointLosesAcknowledgedWrites is the reason reclaim
+// waits for a checkpoint instead of unlinking as soon as the upload succeeds.
+// The chunk upload makes the block DATA durable; it does not make the block
+// MAP durable. Between the two the local WAL is the only record that says
+// which chunk holds the block, so unlinking there loses an acknowledged write
+// with no error anywhere.
+func TestUnlinkBeforeCheckpointLosesAcknowledgedWrites(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "unlink-too-early", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	want := make([]byte, vb.BlockSize)
+	for i := range want {
+		want[i] = 0xAB
+	}
+	require.NoError(t, vb.WriteAt(0, want))
+
+	// Upload the chunk and nothing else. This is the point the "just rm it
+	// once it is in S3" shortcut would delete the file.
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	walDir := filepath.Join(vb.WAL.BaseDir, vb.GetVolume(), "wal", "chunks")
+	entries, err := os.ReadDir(walDir)
+	require.NoError(t, err)
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		// Keep the open generation, delete every consolidated one, exactly
+		// what an unlink-on-upload-success implementation would do.
+		if e.Name() == types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()) {
+			continue
+		}
+		require.NoError(t, os.Remove(filepath.Join(walDir, e.Name())))
+		removed++
+	}
+	require.Positive(t, removed, "the consolidated generation must exist to be deleted")
+
+	// A restarted process: backend state only, no in-memory map, and no WAL
+	// left to replay because the shortcut deleted it.
+	reader := &VB{
+		VolumeName:   vb.VolumeName,
+		VolumeSize:   vb.VolumeSize,
+		BlockSize:    vb.BlockSize,
+		ObjBlockSize: vb.ObjBlockSize,
+		Version:      vb.Version,
+		BaseDir:      vb.BaseDir,
+		Backend:      vb.Backend,
+		BlockToObjectWAL: WAL{
+			WALMagic: vb.BlockToObjectWAL.WALMagic,
+		},
+		BlocksToObject: BlocksToObject{},
+	}
+	require.NoError(t, reader.LoadLiveCheckpoint())
+
+	// ErrZeroBlock means "never written". The chunk holding this block is
+	// still in the backend, intact; nothing points at it any more. nbd treats
+	// ErrZeroBlock as a hole rather than an error (nbd/viperblock.go:537), so
+	// the guest is handed zeros for a write it was told had succeeded.
+	_, err = reader.ReadAt(0, uint64(vb.BlockSize))
+	require.ErrorIs(t, err, ErrZeroBlock,
+		"unlinking on upload success must lose the write: if this passes, the chunk upload alone made the map durable and the checkpoint ordering could be dropped")
+
+	// The same volume, with the ordering honoured, keeps the data.
+	require.NoError(t, vb.SaveLiveCheckpoint())
+	after := &VB{
+		VolumeName:   vb.VolumeName,
+		VolumeSize:   vb.VolumeSize,
+		BlockSize:    vb.BlockSize,
+		ObjBlockSize: vb.ObjBlockSize,
+		Version:      vb.Version,
+		BaseDir:      vb.BaseDir,
+		Backend:      vb.Backend,
+		BlockToObjectWAL: WAL{
+			WALMagic: vb.BlockToObjectWAL.WALMagic,
+		},
+		BlocksToObject: BlocksToObject{},
+	}
+	require.NoError(t, after.LoadLiveCheckpoint())
+	recovered, err := after.ReadAt(0, uint64(vb.BlockSize))
+	require.NoError(t, err)
+	assert.Equal(t, want, recovered,
+		"once the checkpoint names the block, the chunk is reachable without the WAL")
+}

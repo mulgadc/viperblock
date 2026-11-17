@@ -245,6 +245,11 @@ All multi-byte fields are big-endian. Each block record includes a CRC32 checksu
 3. **Sync**: A background goroutine calls `fsync` every 200ms if the dirty flag is set
 4. **Consolidate**: `WriteWALToChunk()` reads the WAL, deduplicates, and packs blocks into chunks
 5. **Rotate**: After consolidation, WALNum increments and a new WAL file is opened
+6. **Reclaim**: Once a checkpoint naming the generation's blocks is durable, its local file is unlinked
+
+Step 6 waits for the checkpoint rather than following the upload directly.
+Consolidation makes a block's *data* durable as a backend chunk; it does not make the *map* from logical block to chunk durable, and during normal operation the live checkpoint is the only durable copy of that map.
+Between the two the local WAL is the only record of where the block went, so unlinking there leaves the chunk intact on the backend with nothing pointing at it, and the block reads back as never written.
 
 ## WAL Recovery
 
