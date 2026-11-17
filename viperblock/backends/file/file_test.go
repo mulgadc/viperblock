@@ -3,6 +3,7 @@ package file
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -407,22 +408,41 @@ func TestWriteReplacesTheObjectAtomically(t *testing.T) {
 	}
 }
 
-// TestWriteFailsWhenTheDirectorySyncFails covers the error reclaim depends on
-// being propagated. The object is visible after the rename whether or not the
-// directory fsync lands, so swallowing the failure returns success for a write
-// that is not yet on the device. The caller then deletes its local WAL, and a
-// power cut takes both copies.
+// TestWriteFailsWhenTheDirectorySyncFails is the gate on Write propagating
+// that failure rather than logging it. The object is visible after the rename
+// whether or not the directory fsync lands, so a Write that returns success
+// there tells its caller the bytes are durable when they are not. The caller
+// then deletes its local WAL, and a power cut takes both copies.
+//
+// Injected, because a healthy filesystem does not fail this call.
 func TestWriteFailsWhenTheDirectorySyncFails(t *testing.T) {
 	backend := newTestBackend(t)
 
 	headers := []byte("hdr!")
-	data := []byte("payload")
-	require.NoError(t, backend.Write(types.FileTypeChunk, 3, &headers, &data))
+	original := []byte("the durable original")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 3, &headers, &original))
 
-	// Remove the directory out from under the next write so the post-rename
-	// open cannot succeed. The rename itself still resolves through the
-	// handle the temporary file was created in.
-	dir := filepath.Dir(filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 3, backend.config.VolumeName)))
-	require.Error(t, backend.syncDir(filepath.Join(dir, "definitely-not-a-directory")),
-		"a directory that cannot be opened must fail the write, not be logged and ignored")
+	injected := errors.New("injected directory sync failure")
+	restore := syncDirectory
+	syncDirectory = func(string) error { return injected }
+	t.Cleanup(func() { syncDirectory = restore })
+
+	replacement := []byte("a write whose rename is not on the device")
+	err := backend.Write(types.FileTypeChunk, 3, &headers, &replacement)
+	require.Error(t, err, "a failed directory fsync must fail the write: reporting success is what lets the caller delete its only other copy")
+	assert.ErrorIs(t, err, injected)
+
+	// No temporary file is left behind, and the object that was already
+	// durable is still readable.
+	syncDirectory = restore
+	name := filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 3, backend.config.VolumeName))
+	entries, readErr := os.ReadDir(filepath.Dir(name))
+	require.NoError(t, readErr)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp", "a failed write must not leave a temporary file behind")
+	}
+	got, readErr := backend.Read(types.FileTypeChunk, 3, 0, 0)
+	require.NoError(t, readErr)
+	assert.Equal(t, append(append([]byte{}, headers...), replacement...), got,
+		"the rename itself succeeded, so the new bytes are visible; what failed is the promise that they are on the device")
 }

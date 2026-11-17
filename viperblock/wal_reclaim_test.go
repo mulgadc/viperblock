@@ -421,3 +421,60 @@ func TestReclaimRetriesAFailedUnlink(t *testing.T) {
 	vb.pendingWALMu.Unlock()
 	assert.Equal(t, 0, remaining, "the retry must reclaim the generation once the unlink can succeed")
 }
+
+// TestRecoveryWithASurvivingWALReadsByteIdentical covers the crash window
+// reclaim leaves open: the checkpoint is durable and the unlink has not
+// happened yet, so the next open sees both. RecoverLocalWALs replays the
+// generation whose blocks that checkpoint already names.
+//
+// The overwrite matters. Replaying a generation that carries an older version
+// of a block must not reinstate it over the newer one the checkpoint maps,
+// which is the way a harmless replay turns into silent corruption.
+func TestRecoveryWithASurvivingWALReadsByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "reclaim-crash-window", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	blocks := 16
+	old := make([][]byte, blocks)
+	for i := range blocks {
+		buf := make([]byte, vb.BlockSize)
+		for j := range buf {
+			buf[j] = byte(i + 1)
+		}
+		old[i] = buf
+		require.NoError(t, vb.WriteAt(uint64(i)*uint64(vb.BlockSize), buf))
+	}
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	// Overwrite the first half, so the generation holding the old bytes is
+	// still on disk when the newer one is consolidated over it.
+	want := make([][]byte, blocks)
+	copy(want, old)
+	for i := range blocks / 2 {
+		buf := make([]byte, vb.BlockSize)
+		for j := range buf {
+			buf[j] = byte(0xF0 + i)
+		}
+		want[i] = buf
+		require.NoError(t, vb.WriteAt(uint64(i)*uint64(vb.BlockSize), buf))
+	}
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+	require.NoError(t, vb.SaveLiveCheckpoint())
+
+	// The crash lands here: the checkpoint is durable and reclaim has not run,
+	// so every consolidated generation is still on disk.
+	count, _ := walDirBytes(t, vb)
+	require.Positive(t, count, "the generations must still be present for this to be the crash window")
+
+	reopened := reopenAfterCrash(t, vb)
+	for i := range blocks {
+		got, err := reopened.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+		require.NoError(t, err, "block %d must be readable with both a checkpoint and an un-reclaimed WAL present", i)
+		assert.Equal(t, want[i], got,
+			"block %d must read as its latest version: replaying a surviving generation must not reinstate the bytes the checkpoint already superseded", i)
+	}
+}

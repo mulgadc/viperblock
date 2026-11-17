@@ -261,29 +261,32 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 		return err
 	}
 
-	return backend.syncDir(filepath.Dir(filename))
+	dir := filepath.Dir(filename)
+	if err = syncDirectory(dir); err != nil {
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to sync directory after rename", "dir", dir, "error", err)
+		return err
+	}
+
+	return nil
 }
 
-// syncDir fsyncs a directory so a rename into it survives a power cut.
+// syncDirectory fsyncs a directory so a rename into it survives a power cut.
 //
 // Both failures are returned rather than logged. The object is visible either
 // way, so this reads like an over-strict error, but a caller that reclaims its
 // local WAL on a successful Write has no second copy: reporting success for a
 // rename that is not yet on the device is how both copies are lost at once.
-func (backend *Backend) syncDir(dir string) error {
+//
+// A variable so a test can inject the I/O failure a healthy filesystem does
+// not produce, which is the only way to prove Write propagates it.
+var syncDirectory = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		err = classifyWriteErr(err)
-		backend.log.Error("Failed to open directory for sync", "dir", dir, "error", err)
 		return err
 	}
 	defer d.Close()
-	if err := d.Sync(); err != nil {
-		err = classifyWriteErr(err)
-		backend.log.Error("Failed to sync directory", "dir", dir, "error", err)
-		return err
-	}
-	return nil
+	return d.Sync()
 }
 
 // Sync is a no-op because Write is already durable: it fsyncs each object and
