@@ -544,3 +544,32 @@ func TestListObjectsSkipsStagingFiles(t *testing.T) {
 			"a staging file must not be listed as an object: %s", key)
 	}
 }
+
+// TestInitSyncsBothChainsWhenTheBaseIsASymlink covers a base that provisioning
+// reached through a link. The target's ancestors hold the objects, and the
+// ancestors of the link are what keep the base reachable, so losing an entry
+// on either chain loses the volume after reclaim has removed the local WAL.
+func TestInitSyncsBothChainsWhenTheBaseIsASymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "real", "data")
+	require.NoError(t, os.MkdirAll(target, 0750))
+	link := filepath.Join(root, "link")
+	require.NoError(t, os.Symlink(target, link))
+
+	synced := []string{}
+	original := syncDirectory
+	syncDirectory = func(dir string) error {
+		synced = append(synced, dir)
+		return original(dir)
+	}
+	t.Cleanup(func() { syncDirectory = original })
+
+	backend, err := New(FileConfig{BaseDir: link, VolumeName: "symlinked", VolumeSize: 1})
+	require.NoError(t, err)
+	require.NoError(t, backend.Init())
+
+	assert.Contains(t, synced, root, "the directory holding the link must be synced")
+	assert.Contains(t, synced, filepath.Join(root, "real"),
+		"the directory holding the target must be synced, not only the link's parent")
+	assert.Contains(t, synced, link, "the base itself must still be synced")
+}

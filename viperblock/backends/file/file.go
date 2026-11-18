@@ -162,9 +162,23 @@ func (backend *Backend) Init() error {
 	// Provisioning may have created the base directory and some of its
 	// ancestors together without syncing any of them, and an entry lost
 	// anywhere on that chain takes everything below it.
-	if err := syncAncestry(filepath.Dir(backend.config.BaseDir)); err != nil {
-		backend.log.Error("Failed to sync the base directory's ancestry", "dir", backend.config.BaseDir, "error", err)
-		return classifyWriteErr(err)
+	// A symlinked base has two chains that matter: the target's ancestors hold
+	// the objects, and the ancestors of the link itself are what keep the base
+	// reachable at all.
+	chains := []string{filepath.Dir(backend.config.BaseDir)}
+	resolved, resolveErr := filepath.EvalSymlinks(backend.config.BaseDir)
+	if resolveErr != nil {
+		backend.log.Error("Failed to resolve the base directory", "dir", backend.config.BaseDir, "error", resolveErr)
+		return classifyWriteErr(resolveErr)
+	}
+	if resolvedParent := filepath.Dir(resolved); resolvedParent != chains[0] {
+		chains = append(chains, resolvedParent)
+	}
+	for _, chain := range chains {
+		if err := syncAncestry(chain); err != nil {
+			backend.log.Error("Failed to sync the base directory's ancestry", "dir", chain, "error", err)
+			return classifyWriteErr(err)
+		}
 	}
 
 	for _, dir := range []string{
