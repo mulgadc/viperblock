@@ -3,6 +3,7 @@ package file
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -366,4 +367,209 @@ func TestWriteRealDiskFullMapsToNoSpace(t *testing.T) {
 		"a real disk-full write error must classify as types.ErrNoSpace, got: %v", writeErr)
 	assert.ErrorIs(t, writeErr, syscall.ENOSPC,
 		"classification must preserve the underlying syscall.ENOSPC")
+}
+
+// TestWriteReplacesTheObjectAtomically covers the property reclaim depends on.
+// The previous path truncated the destination with os.Create and wrote into
+// it, so between the truncate and the last write the object at that key was
+// short, and a failure there left it that way. A caller that deletes its local
+// WAL on a successful Write has no second copy to fall back on.
+//
+// Replacement by rename is observable as a change of inode; truncate in place
+// is not. fsync itself is not observable without a power cut, so this gates
+// the atomicity and the write path carries the sync alongside it.
+func TestWriteReplacesTheObjectAtomically(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte("hdr!")
+	first := []byte("the original object")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 7, &headers, &first))
+
+	name := filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 7, backend.config.VolumeName))
+	before, err := os.Stat(name)
+	require.NoError(t, err)
+
+	second := []byte("the replacement object, longer than the first")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 7, &headers, &second))
+
+	after, err := os.Stat(name)
+	require.NoError(t, err)
+	assert.False(t, os.SameFile(before, after),
+		"a rewrite must publish a new file by rename: truncating the destination in place leaves the object short until the last write lands")
+
+	got, err := backend.Read(types.FileTypeChunk, 7, 0, 0)
+	require.NoError(t, err)
+	assert.Equal(t, append(append([]byte{}, headers...), second...), got)
+
+	entries, err := os.ReadDir(filepath.Dir(name))
+	require.NoError(t, err)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp", "a successful write must leave no temporary file behind")
+	}
+}
+
+// TestWriteFailsWhenTheDirectorySyncFails is the gate on Write propagating
+// that failure rather than logging it. The object is visible after the rename
+// whether or not the directory fsync lands, so a Write that returns success
+// there tells its caller the bytes are durable when they are not. The caller
+// then deletes its local WAL, and a power cut takes both copies.
+//
+// Injected, because a healthy filesystem does not fail this call.
+func TestWriteFailsWhenTheDirectorySyncFails(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte("hdr!")
+	original := []byte("the durable original")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 3, &headers, &original))
+
+	injected := errors.New("injected directory sync failure")
+	restore := syncDirectory
+	syncDirectory = func(string) error { return injected }
+	t.Cleanup(func() { syncDirectory = restore })
+
+	replacement := []byte("a write whose rename is not on the device")
+	err := backend.Write(types.FileTypeChunk, 3, &headers, &replacement)
+	require.Error(t, err, "a failed directory fsync must fail the write: reporting success is what lets the caller delete its only other copy")
+	assert.ErrorIs(t, err, injected)
+
+	// No temporary file is left behind, and the object that was already
+	// durable is still readable.
+	syncDirectory = restore
+	name := filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 3, backend.config.VolumeName))
+	entries, readErr := os.ReadDir(filepath.Dir(name))
+	require.NoError(t, readErr)
+	for _, e := range entries {
+		assert.NotContains(t, e.Name(), ".tmp", "a failed write must not leave a temporary file behind")
+	}
+	got, readErr := backend.Read(types.FileTypeChunk, 3, 0, 0)
+	require.NoError(t, readErr)
+	assert.Equal(t, append(append([]byte{}, headers...), replacement...), got,
+		"the rename itself succeeded, so the new bytes are visible; what failed is the promise that they are on the device")
+}
+
+// TestInitFailsWhenADirectorySyncFails gates the directory entries Init
+// creates being durable before anything writes into them. Write fsyncs the
+// directory it renames an object into, which is no help if that directory's
+// own entry is still only in page cache: a power cut takes the subtree, and
+// the caller has already reclaimed its local WAL on Write's success.
+//
+// The injection is the only way to produce the failure, since a healthy
+// filesystem does not fail fsync on a directory it just created.
+func TestInitFailsWhenADirectorySyncFails(t *testing.T) {
+	base := t.TempDir()
+	injected := errors.New("injected directory sync failure")
+
+	synced := []string{}
+	original := syncDirectory
+	syncDirectory = func(dir string) error {
+		synced = append(synced, dir)
+		return injected
+	}
+	t.Cleanup(func() { syncDirectory = original })
+
+	backend, err := New(FileConfig{BaseDir: base, VolumeName: "init-sync", VolumeSize: 1})
+	require.NoError(t, err)
+
+	err = backend.Init()
+	assert.ErrorIs(t, err, injected,
+		"a directory whose entry is not durable must fail Init rather than let a volume open on it")
+	assert.Equal(t, []string{filepath.Dir(base)}, synced,
+		"the first failure must stop Init rather than continue past it")
+}
+
+// TestInitSyncsTheParentOfEveryDirectoryItCreates covers both halves of the
+// chain whose entries hold the rest: the ancestors above the base, which
+// provisioning created and may never have synced, and then the base holding
+// the volume, the volume holding chunks, checkpoints and wal, and wal holding
+// its own two.
+func TestInitSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
+	base := t.TempDir()
+
+	synced := []string{}
+	original := syncDirectory
+	syncDirectory = func(dir string) error {
+		synced = append(synced, dir)
+		return original(dir)
+	}
+	t.Cleanup(func() { syncDirectory = original })
+
+	backend, err := New(FileConfig{BaseDir: base, VolumeName: "init-sync-all", VolumeSize: 1})
+	require.NoError(t, err)
+	require.NoError(t, backend.Init())
+
+	vol := filepath.Join(base, "init-sync-all")
+	require.GreaterOrEqual(t, len(synced), 4)
+	assert.Equal(t, []string{base, vol, filepath.Join(vol, "wal")}, synced[len(synced)-3:],
+		"the three directories Init creates must be synced in parent-first order")
+
+	// The chain above the base is machine-dependent, so assert its shape: it
+	// starts at the base's parent, each step is the parent of the last, and it
+	// stops where the filesystem does.
+	chain := synced[:len(synced)-3]
+	assert.Equal(t, filepath.Dir(base), chain[0])
+	for i := 1; i < len(chain); i++ {
+		assert.Equal(t, filepath.Dir(chain[i-1]), chain[i])
+	}
+	last := chain[len(chain)-1]
+	parent := filepath.Dir(last)
+	if parent != last {
+		same, err := sameFilesystem(last, parent)
+		require.NoError(t, err)
+		assert.False(t, same, "the chain must stop at a mount point or the root, not short of one")
+	}
+}
+
+// TestListObjectsSkipsStagingFiles keeps a write in flight, and one a crash
+// abandoned, out of the object list. RecoverLocalWALs takes every entry a
+// listing returns with no name filter, so a staging neighbour there is read as
+// a WAL generation and fails integrity on an encrypted volume.
+func TestListObjectsSkipsStagingFiles(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte("hdr!")
+	data := []byte("a durable object")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 7, &headers, &data))
+
+	object := filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 7, backend.config.VolumeName))
+	abandoned := filepath.Join(filepath.Dir(object), "."+filepath.Base(object)+".tmp1234")
+	require.NoError(t, os.WriteFile(abandoned, []byte("half a write"), 0600))
+
+	keys, err := backend.ListObjects(backend.config.VolumeName)
+	require.NoError(t, err)
+
+	require.Contains(t, keys, filepath.ToSlash(types.GetFilePath(types.FileTypeChunk, 7, backend.config.VolumeName)),
+		"the renamed object must still be listed")
+	for _, key := range keys {
+		assert.False(t, isStagingName(filepath.Base(key)),
+			"a staging file must not be listed as an object: %s", key)
+	}
+}
+
+// TestInitSyncsBothChainsWhenTheBaseIsASymlink covers a base that provisioning
+// reached through a link. The target's ancestors hold the objects, and the
+// ancestors of the link are what keep the base reachable, so losing an entry
+// on either chain loses the volume after reclaim has removed the local WAL.
+func TestInitSyncsBothChainsWhenTheBaseIsASymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "real", "data")
+	require.NoError(t, os.MkdirAll(target, 0750))
+	link := filepath.Join(root, "link")
+	require.NoError(t, os.Symlink(target, link))
+
+	synced := []string{}
+	original := syncDirectory
+	syncDirectory = func(dir string) error {
+		synced = append(synced, dir)
+		return original(dir)
+	}
+	t.Cleanup(func() { syncDirectory = original })
+
+	backend, err := New(FileConfig{BaseDir: link, VolumeName: "symlinked", VolumeSize: 1})
+	require.NoError(t, err)
+	require.NoError(t, backend.Init())
+
+	assert.Contains(t, synced, root, "the directory holding the link must be synced")
+	assert.Contains(t, synced, filepath.Join(root, "real"),
+		"the directory holding the target must be synced, not only the link's parent")
+	assert.Contains(t, synced, link, "the base itself must still be synced")
 }

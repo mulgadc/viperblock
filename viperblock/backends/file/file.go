@@ -155,6 +155,43 @@ func (backend *Backend) Init() error {
 		}
 	}
 
+	// MkdirAll leaves each new directory entry only in its parent's page
+	// cache. Write fsyncs the directory it renames an object into, which does
+	// not help if that directory's own entry is lost, so a power cut could
+	// take the whole subtree after reclaim had deleted the local WAL.
+	// Provisioning may have created the base directory and some of its
+	// ancestors together without syncing any of them, and an entry lost
+	// anywhere on that chain takes everything below it.
+	// A symlinked base has two chains that matter: the target's ancestors hold
+	// the objects, and the ancestors of the link itself are what keep the base
+	// reachable at all.
+	chains := []string{filepath.Dir(backend.config.BaseDir)}
+	resolved, resolveErr := filepath.EvalSymlinks(backend.config.BaseDir)
+	if resolveErr != nil {
+		backend.log.Error("Failed to resolve the base directory", "dir", backend.config.BaseDir, "error", resolveErr)
+		return classifyWriteErr(resolveErr)
+	}
+	if resolvedParent := filepath.Dir(resolved); resolvedParent != chains[0] {
+		chains = append(chains, resolvedParent)
+	}
+	for _, chain := range chains {
+		if err := syncAncestry(chain); err != nil {
+			backend.log.Error("Failed to sync the base directory's ancestry", "dir", chain, "error", err)
+			return classifyWriteErr(err)
+		}
+	}
+
+	for _, dir := range []string{
+		backend.config.BaseDir,
+		filepath.Join(backend.config.BaseDir, backend.config.VolumeName),
+		filepath.Join(backend.config.BaseDir, backend.config.VolumeName, "wal"),
+	} {
+		if err := syncDirectory(dir); err != nil {
+			backend.log.Error("Failed to sync directory after create", "dir", dir, "error", err)
+			return classifyWriteErr(err)
+		}
+	}
+
 	return nil
 }
 
@@ -209,48 +246,148 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
-	//fmt.Println("CREATING CHUNK FILE:", filename)
 
-	file, err := os.Create(filename)
-
+	// Write to a temporary neighbour, fsync it, then rename into place and
+	// fsync the directory. Truncating the destination with os.Create and
+	// closing without a sync returned success while the bytes were still only
+	// in page cache, so a caller that reclaims its local WAL on that success
+	// could lose both copies to a power cut.
+	tmp, err := os.CreateTemp(filepath.Dir(filename), stagingPrefix+filepath.Base(filename)+stagingSuffix)
 	if err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create chunk file", "error", err)
 		return err
 	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			if rmErr := os.Remove(tmpName); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				backend.log.Warn("Failed to remove partial chunk file", "file", tmpName, "error", rmErr)
+			}
+		}
+	}()
 
-	//fmt.Println("Writing headers & block")
-	_, err = file.Write(*headers)
-
-	if err != nil {
+	if _, err = tmp.Write(*headers); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write headers", "error", err)
 		return err
 	}
 
-	_, err = file.Write(*data)
-
-	if err != nil {
+	if _, err = tmp.Write(*data); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write data", "error", err)
 		return err
 	}
 
-	err = file.Close()
+	if err = tmp.Sync(); err != nil {
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to sync chunk file", "error", err)
+		return err
+	}
 
-	if err != nil {
+	if err = tmp.Close(); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to close file", "error", err)
+		return err
+	}
+
+	if err = os.Rename(tmpName, filename); err != nil {
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to rename chunk file into place", "error", err)
+		return err
+	}
+
+	dir := filepath.Dir(filename)
+	if err = syncDirectory(dir); err != nil {
+		err = classifyWriteErr(err)
+		backend.log.Error("Failed to sync directory after rename", "dir", dir, "error", err)
 		return err
 	}
 
 	return nil
 }
 
+// A staging file is named so it is recognisable without knowing the object it
+// is becoming: dot-prefixed to keep it out of a casual listing, and carrying
+// the marker ListObjects filters on.
+const (
+	stagingPrefix = "."
+	stagingSuffix = ".tmp"
+)
+
+// isStagingName reports whether a directory entry is one of Write's in-flight
+// neighbours rather than an object.
+func isStagingName(name string) bool {
+	return strings.HasPrefix(name, stagingPrefix) && strings.Contains(name, stagingSuffix)
+}
+
+// syncAncestry fsyncs dir and each ancestor above it, stopping at the
+// filesystem boundary. An fsync cannot make an entry durable in a filesystem
+// it does not reach, so the mount point is where the chain genuinely ends.
+func syncAncestry(dir string) error {
+	for {
+		if err := syncDirectory(dir); err != nil {
+			return err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		same, err := sameFilesystem(dir, parent)
+		if err != nil || !same {
+			return err
+		}
+		dir = parent
+	}
+}
+
+// sameFilesystem reports whether two paths live on one device, which is how a
+// mount point is recognised without parsing the mount table.
+func sameFilesystem(a, b string) (bool, error) {
+	devOf := func(path string) (uint64, error) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return 0, fmt.Errorf("stat %s: no device number available", path)
+		}
+		return st.Dev, nil
+	}
+	devA, err := devOf(a)
+	if err != nil {
+		return false, err
+	}
+	devB, err := devOf(b)
+	if err != nil {
+		return false, err
+	}
+	return devA == devB, nil
+}
+
+// syncDirectory fsyncs a directory so a rename into it survives a power cut.
+//
+// Both failures are returned rather than logged. The object is visible either
+// way, so this reads like an over-strict error, but a caller that reclaims its
+// local WAL on a successful Write has no second copy: reporting success for a
+// rename that is not yet on the device is how both copies are lost at once.
+//
+// A variable so a test can inject the I/O failure a healthy filesystem does
+// not produce, which is the only way to prove Write propagates it.
+var syncDirectory = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// Sync is a no-op because Write is already durable: it fsyncs each object and
+// the directory it renames that object into before returning success.
 func (backend *Backend) Sync() {
-
-	//fmt.Println("Syncing block")
-
 }
 
 func (backend *Backend) GetBackendType() string {
@@ -387,6 +524,12 @@ func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
 			return walkErr
 		}
 		if entry.IsDir() {
+			return nil
+		}
+		// A staging file is a write in flight or one a crash abandoned, never
+		// an object. Listing it invites a caller to read a partial write or to
+		// treat it as a WAL generation.
+		if isStagingName(entry.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(backend.config.BaseDir, path)

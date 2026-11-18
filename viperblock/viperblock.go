@@ -276,6 +276,11 @@ type VB struct {
 	// chunk upload failed. Retried at the head of the next consolidation so
 	// the data is not stranded in-process until the next restart.
 	pendingWALChunks []uint64
+
+	// consolidatedWALs holds generations whose blocks are durable as backend
+	// chunks but are not yet named by a persisted checkpoint. Until one lands
+	// the local WAL is the only record that maps them, so they stay on disk.
+	consolidatedWALs []uint64
 	pendingWALMu     sync.Mutex
 
 	// drainMu serializes DrainToBackendCtx across all its triggers. Two
@@ -284,6 +289,11 @@ type VB struct {
 	// newer chunk's live pointer and let GC delete a still-referenced chunk.
 	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
 	drainMu sync.Mutex
+
+	// checkpointMu serialises SaveLiveCheckpointCtx. Every writer PUTs the
+	// same key, so two of them can land out of order and leave the durable
+	// checkpoint behind the map while the dirty flag says it is current.
+	checkpointMu sync.Mutex
 
 	// flushMu serialises flushWrites. Writes.mu used to do this implicitly by
 	// being held across the whole WAL write, which also blocked every guest
@@ -429,6 +439,19 @@ type VB struct {
 	// advances by seqNumReservation, and SaveStates before releasing.
 	seqNumHighWater   atomic.Uint64
 	seqNumHighWaterMu sync.Mutex
+
+	// afterTakeConsolidatedWALs runs between the drain taking its batch and
+	// writing the checkpoint that covers it. Set only by tests, which have no
+	// other way to consolidate a generation inside that window and prove it is
+	// not reclaimed. Per-VB rather than package-level so one test's hook is
+	// not read by another's chunk uploader.
+	afterTakeConsolidatedWALs func()
+
+	// statePersistedSeqNum is the SeqNum carried by the last VBState that
+	// reached both the local file and the backend. It lets the drain skip its
+	// pre-reclaim state write when the counter has not moved, so an idle drain
+	// rotating an empty generation costs nothing.
+	statePersistedSeqNum atomic.Uint64
 
 	// nextStateSeqNum is the monotonic SaveState generation counter mirrored
 	// from VBState.StateSeqNum. Each SaveState increments it before marshal;
@@ -2708,10 +2731,56 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("drain chunk upload: %w", err)
 	}
+	// Taken before the checkpoint so the batch can only hold generations the
+	// checkpoint about to be written covers. One consolidated after this point
+	// stays on the list for the next drain.
+	reclaim := vb.takeConsolidatedWALs()
+	if vb.afterTakeConsolidatedWALs != nil {
+		vb.afterTakeConsolidatedWALs()
+	}
+
 	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
+		vb.returnConsolidatedWALs(reclaim)
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
+
+	if err = vb.persistCountersBeforeReclaim(ctx, reclaim); err != nil {
+		vb.returnConsolidatedWALs(reclaim)
+		return fmt.Errorf("drain persist state: %w", err)
+	}
+
+	// The checkpoint naming these generations' blocks is now durable, so their
+	// local WAL files are redundant. A no-op checkpoint (nothing dirty) still
+	// means the persisted one is current, so it releases them too.
+	vb.reclaimConsolidatedWALs(reclaim)
+
 	return nil
+}
+
+// persistCountersBeforeReclaim makes the sequence counter durable before the
+// generations that recorded it are unlinked. A binary that recovers SeqNum
+// only from config.json otherwise reopens with a stale counter and reissues
+// numbers, and classifyRun discards the re-numbered writes as superseded.
+//
+// Encrypted volumes are excluded: LoadState restarts them at the persisted
+// high-water and reserveSeqNum commits each new window durably before it is
+// published, so they already survive this. Writing here would also sample that
+// high-water outside the lock persistStateLocal takes and could persist a
+// value older than a reservation that landed in between.
+//
+// Skipped when the counter has not moved since the last state that reached
+// both copies. A forced drain rotates a generation even with nothing to
+// consolidate, so without that check an idle volume would write config.json on
+// every tick. A failed backend push leaves the marker behind, so the next
+// drain writes again rather than reclaiming on a local-only copy.
+func (vb *VB) persistCountersBeforeReclaim(ctx context.Context, reclaim []uint64) error {
+	if len(reclaim) == 0 || vb.EncryptionEnabled {
+		return nil
+	}
+	if vb.SeqNum.Load() <= vb.statePersistedSeqNum.Load() {
+		return nil
+	}
+	return vb.SaveStateCtx(ctx)
 }
 
 // flushSnapshot flushes a snapshot of the hot writes to the WAL. It does not
@@ -3349,6 +3418,7 @@ func (vb *VB) WriteShardedWALToChunkCtx(ctx context.Context, force bool) error {
 		vb.pendingWALMu.Unlock()
 		return err
 	}
+	vb.markWALConsolidated(currentWALNum)
 
 	return nil
 }
@@ -3517,6 +3587,7 @@ func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(contex
 		if err := consolidate(ctx, walNum); err != nil {
 			return err
 		}
+		vb.markWALConsolidated(walNum)
 
 		// Drop the entry only after a successful consolidation. Re-check the
 		// head in case a concurrent caller already removed it.
@@ -3526,6 +3597,78 @@ func (vb *VB) retryPendingWALChunks(ctx context.Context, consolidate func(contex
 		}
 		vb.pendingWALMu.Unlock()
 	}
+}
+
+// markWALConsolidated records a generation whose blocks are now durable as
+// backend chunks. It becomes reclaimable once a checkpoint naming them lands.
+func (vb *VB) markWALConsolidated(walNum uint64) {
+	vb.pendingWALMu.Lock()
+	vb.consolidatedWALs = append(vb.consolidatedWALs, walNum)
+	vb.pendingWALMu.Unlock()
+}
+
+// walGenerationFiles returns the local files holding generation walNum: one on
+// the single-file WAL, one per shard on the sharded WAL.
+func (vb *VB) walGenerationFiles(walNum uint64) []string {
+	if vb.UseShardedWAL && vb.ShardedWAL != nil {
+		paths := make([]string, 0, NumShards)
+		for shardID := range NumShards {
+			paths = append(paths, filepath.Join(vb.ShardedWAL.BaseDir,
+				types.GetShardedWALPath(vb.GetVolume(), walNum, shardID)))
+		}
+		return paths
+	}
+	return []string{filepath.Join(vb.WAL.BaseDir,
+		types.GetFilePath(types.FileTypeWALChunk, walNum, vb.GetVolume()))}
+}
+
+// reclaimConsolidatedWALs deletes the local WAL files of every generation
+// consolidated since the last checkpoint. Call only once SaveLiveCheckpointCtx
+// has succeeded: before that the WAL is the only record mapping those blocks.
+//
+// A failed unlink is logged, not returned. RecoverLocalWALs replays a leftover
+// harmlessly on the next open, so it costs space rather than correctness, and
+// failing an otherwise clean drain over it would be the worse trade. The
+// generation does go back on the list, because a transient failure that dropped
+// it would leave those bytes held for the life of the volume, which is the
+// growth this exists to stop.
+// takeConsolidatedWALs removes and returns the generations consolidated so
+// far. Call it before the checkpoint that covers them, so a generation
+// consolidated after that checkpoint was captured cannot join the batch.
+func (vb *VB) takeConsolidatedWALs() []uint64 {
+	vb.pendingWALMu.Lock()
+	defer vb.pendingWALMu.Unlock()
+	taken := vb.consolidatedWALs
+	vb.consolidatedWALs = nil
+	return taken
+}
+
+// returnConsolidatedWALs puts a batch back, ahead of anything consolidated
+// since it was taken: those generations are older.
+func (vb *VB) returnConsolidatedWALs(batch []uint64) {
+	if len(batch) == 0 {
+		return
+	}
+	vb.pendingWALMu.Lock()
+	vb.consolidatedWALs = append(batch, vb.consolidatedWALs...)
+	vb.pendingWALMu.Unlock()
+}
+
+func (vb *VB) reclaimConsolidatedWALs(reclaim []uint64) {
+	var retry []uint64
+	for _, walNum := range reclaim {
+		failed := false
+		for _, path := range vb.walGenerationFiles(walNum) {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				vb.logger().Warn("failed to reclaim consolidated WAL file", "file", path, "error", err)
+				failed = true
+			}
+		}
+		if failed {
+			retry = append(retry, walNum)
+		}
+	}
+	vb.returnConsolidatedWALs(retry)
 }
 
 // WriteWALToChunkCtx is WriteWALToChunk with a caller-supplied context
@@ -3601,6 +3744,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		vb.pendingWALMu.Unlock()
 		return err
 	}
+	vb.markWALConsolidated(currentWALNum)
 
 	return nil
 }
@@ -4170,9 +4314,10 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// of a large volume would revert straight back to one entry per block.
 	flat := make(map[uint64]BlockLookup)
 
-	// Track the highest chunk ObjectID the map references so ObjectNum can be
-	// reconciled to max+1 below, mirroring SeqNum -> maxSeqNum in RecoverLocalWALs.
-	var maxObjectID uint64
+	// Track the highest chunk ObjectID and block SeqNum the map references so
+	// both counters can be reconciled below. The flat decode is one record per
+	// physical block, so block.SeqNum here is that block's own value.
+	var maxObjectID, maxSeqNum uint64
 	haveObject := false
 
 	err := walkBlockCheckpoint(checkpoint, vb.Version, vb.BlockToObjectWAL.WALMagic, func(block BlockLookup) {
@@ -4181,6 +4326,7 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 			maxObjectID = block.ObjectID
 			haveObject = true
 		}
+		maxSeqNum = max(maxSeqNum, block.SeqNum)
 	})
 	if err != nil {
 		vb.logger().Error("Error reading checkpoint", "error", err)
@@ -4220,19 +4366,30 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// load a stale-low ObjectNum. Force it past every referenced chunk ID here so
 	// createChunkFile cannot reuse a live ID and cause a durable AEAD tag failure.
 	if haveObject {
-		next := maxObjectID + 1
-		for {
-			current := vb.ObjectNum.Load()
-			if next <= current {
-				break
-			}
-			if vb.ObjectNum.CompareAndSwap(current, next) {
-				break
-			}
-		}
+		advanceAtomicTo(&vb.ObjectNum, maxObjectID+1)
 	}
 
+	// Reclaiming a consolidated WAL removes the file RecoverLocalWALs used to
+	// raise SeqNum past a stale persisted state, and only encrypted volumes
+	// persist a high-water reservation. Without this, an unencrypted volume
+	// reopened after a crash reuses sequence numbers and classifyRun then
+	// discards the new acknowledged writes as superseded.
+	advanceAtomicTo(&vb.SeqNum, maxSeqNum)
+
 	return nil
+}
+
+// advanceAtomicTo raises n to want, leaving it alone if it is already higher.
+func advanceAtomicTo(n *atomic.Uint64, want uint64) {
+	for {
+		current := n.Load()
+		if want <= current {
+			return
+		}
+		if n.CompareAndSwap(current, want) {
+			return
+		}
+	}
 }
 
 // numberedCheckpointHighWater reads the current WallNum's numbered
@@ -4711,6 +4868,12 @@ func (vb *VB) SaveLiveCheckpoint() error {
 
 // SaveLiveCheckpointCtx is SaveLiveCheckpoint with a caller-supplied context.
 func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
+	// Held across the check, the serialization and the write. Without it two
+	// writers PUT the same key and an older snapshot can land last, leaving
+	// the durable checkpoint behind the map with dirty already cleared.
+	vb.checkpointMu.Lock()
+	defer vb.checkpointMu.Unlock()
+
 	if !vb.BlocksToObject.dirty.Load() {
 		return nil
 	}
@@ -4718,6 +4881,12 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	// Serialize the map under the read lock, then release before doing I/O so
 	// the lock is not held across network writes or retry sleeps.
 	vb.BlocksToObject.mu.RLock()
+	// Cleared here rather than after the write, and inside this critical
+	// section rather than just before the PUT. An install takes this lock for
+	// writing, so it is either before the snapshot and in it, or after the
+	// clear and still marked; clearing any later wipes the flag of a mapping
+	// this checkpoint does not carry, and reclaim then deletes its WAL.
+	vb.BlocksToObject.dirty.Store(false)
 	checkpoint := vb.BlockToObjectWALHeader()
 	stride := vb.blockStride()
 	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
@@ -4728,13 +4897,23 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	})
 	vb.BlocksToObject.mu.RUnlock()
 
+	// Restored on every unsuccessful exit, including a context cancelled in
+	// the backoff below. A statement at the end of the function would miss
+	// that one, and leave an unpersisted map marked clean.
+	saved := false
+	defer func() {
+		if !saved {
+			vb.BlocksToObject.dirty.Store(true)
+		}
+	}()
+
 	headers := []byte{}
 	backoff := vb.checkpointBackoff()
 	var err error
 	for attempt := range 3 {
 		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
 		if err == nil {
-			vb.BlocksToObject.dirty.Store(false)
+			saved = true
 			return nil
 		}
 		if attempt < 2 {
@@ -5460,7 +5639,7 @@ func (vb *VB) EnsureVolumeUUID() error {
 	for hw < vb.SeqNum.Load() {
 		hw += seqNumReservation
 	}
-	persisted, err := vb.persistStateLocal(hw)
+	persisted, _, err := vb.persistStateLocal(hw)
 	if err != nil {
 		return fmt.Errorf("EnsureVolumeUUID: persistStateLocal: %w", err)
 	}
@@ -5477,18 +5656,26 @@ func (vb *VB) EnsureVolumeUUID() error {
 // completion would let those values be re-issued on restart (catastrophic
 // AES-GCM nonce reuse, NIST SP 800-38D §8.3).
 func (vb *VB) saveStateWithHighWater(ctx context.Context, highWater uint64) error {
-	persisted, err := vb.persistStateLocal(highWater)
+	persisted, seqNum, err := vb.persistStateLocal(highWater)
 	if err != nil {
 		return err
 	}
-	return vb.pushStateToBackend(ctx, persisted)
+	if err := vb.pushStateToBackend(ctx, persisted); err != nil {
+		return err
+	}
+	// Advanced only once both copies name this counter. A host attaching the
+	// volume with no local file reads the backend one, so a drain allowed to
+	// skip after a local-only write could unlink the generation it came from.
+	vb.statePersistedSeqNum.Store(seqNum)
+	return nil
 }
 
 // persistStateLocal marshals VBState, seals it for encrypted volumes, and
-// fsyncs the local config.json. Returns the persisted bytes so callers can
-// hand them to pushStateToBackend without re-marshaling. Crash-safety lives
-// in this step: when it returns nil, the new state is durable on local disk.
-func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
+// fsyncs the local config.json. Returns the persisted bytes and the SeqNum
+// they name, so callers can push the same bytes to the backend without
+// re-marshaling and record the counter once that lands. Crash-safety lives in
+// this step: when it returns nil, the new state is durable on local disk.
+func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 	vb.saveStateMu.Lock()
 	defer vb.saveStateMu.Unlock()
 
@@ -5524,7 +5711,7 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
 
 	jsonData, err := json.Marshal(state)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Encrypted volumes append a 16-byte AES-GCM tag binding the JSON bytes to
@@ -5541,10 +5728,10 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
 
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	if err := writeFileAtomic(filename, persisted, 0600); err != nil {
-		return nil, fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
+		return nil, 0, fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
 	}
 
-	return persisted, nil
+	return persisted, state.SeqNum, nil
 }
 
 // pushStateToBackend writes pre-marshaled VBState bytes to the backend (S3
@@ -5775,6 +5962,9 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	vb.BlockSize = state.BlockSize
 	vb.ObjBlockSize = state.ObjBlockSize
 	vb.SeqNum.Store(state.SeqNum)
+	// statePersistedSeqNum is deliberately left at zero. The selected state
+	// may be the local copy with the backend behind it, so the first drain
+	// that can reclaim pays for one state write rather than trusting this one.
 	vb.ObjectNum.Store(state.ObjectNum)
 	vb.WAL.WallNum.Store(state.WALNum)
 	vb.BlockToObjectWAL.WallNum.Store(state.BlockToObjectWALNum)
@@ -5880,7 +6070,7 @@ func (vb *VB) reserveSeqNum(ctx context.Context, n uint64) (start uint64, err er
 	// and block here. Either way, no SeqNum above the durable hw is issued.
 	// If persistStateLocal fails, hw is never published — recovery is just
 	// "retry on next reserve."
-	persisted, err := vb.persistStateLocal(hw)
+	persisted, _, err := vb.persistStateLocal(hw)
 	if err != nil {
 		vb.seqNumHighWaterMu.Unlock()
 		return 0, fmt.Errorf("reserveSeqNum: persistStateLocal: %w", err)
@@ -5907,7 +6097,7 @@ func (vb *VB) reserveSeqNum(ctx context.Context, n uint64) (start uint64, err er
 func (vb *VB) bumpSeqNumHighWater(ctx context.Context) error {
 	vb.seqNumHighWaterMu.Lock()
 	newHW := vb.seqNumHighWater.Load() + seqNumReservation
-	persisted, err := vb.persistStateLocal(newHW)
+	persisted, _, err := vb.persistStateLocal(newHW)
 	if err != nil {
 		vb.seqNumHighWaterMu.Unlock()
 		return err

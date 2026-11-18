@@ -245,6 +245,17 @@ All multi-byte fields are big-endian. Each block record includes a CRC32 checksu
 3. **Sync**: A background goroutine calls `fsync` every 200ms if the dirty flag is set
 4. **Consolidate**: `WriteWALToChunk()` reads the WAL, deduplicates, and packs blocks into chunks
 5. **Rotate**: After consolidation, WALNum increments and a new WAL file is opened
+6. **Reclaim**: Once a checkpoint naming the generation's blocks is durable, and the sequence counter that numbered them is durable, its local file is unlinked
+
+Step 6 waits for the checkpoint rather than following the upload directly.
+Consolidation makes a block's *data* durable as a backend chunk; it does not make the *map* from logical block to chunk durable, and during normal operation the live checkpoint is the only durable copy of that map.
+Between the two the local WAL is the only record of where the block went, so unlinking there leaves the chunk intact on the backend with nothing pointing at it, and the block reads back as never written.
+
+The counter is the second condition because the generation recorded it too.
+`parseBlockCheckpoint` raises `SeqNum` to the highest the checkpoint names, so a current reader needs nothing else, but a reader that takes the counter from `VBState` alone would reissue numbers the reclaimed generation had already used, and `classifyRun` discards a re-numbered write as superseded.
+Unencrypted volumes therefore persist `VBState` before the unlink, skipping it when the counter has not moved since the last state that reached both the local file and the backend.
+A host attaching the volume with no local copy reads the backend one, so a push that failed has to be retried by the next drain rather than skipped.
+Encrypted volumes do not: `LoadState` restarts them at the persisted high-water and `reserveSeqNum` commits each new window durably before publishing it, so their counter already outlives any generation.
 
 ## WAL Recovery
 

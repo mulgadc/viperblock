@@ -89,6 +89,10 @@ func (vb *VB) drainForSnapshot() error {
 		return fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
 	}
 
+	// Taken before the checkpoint for the reason DrainToBackendCtx takes it
+	// there: the batch must hold only generations this checkpoint covers.
+	reclaim := vb.takeConsolidatedWALs()
+
 	// Chunk uploads no longer refresh the live checkpoint per-chunk (that
 	// was a parallel-upload hazard, see createChunkFile). Refresh it once
 	// here so the source volume's live checkpoint reflects the chunks just
@@ -96,7 +100,22 @@ func (vb *VB) drainForSnapshot() error {
 	// Non-fatal: a stale live checkpoint self-heals on the next drain.
 	if err := vb.SaveLiveCheckpoint(); err != nil {
 		vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
+		vb.returnConsolidatedWALs(reclaim)
+		return nil
 	}
+
+	// Same ordering as the drain: the counter has to outlive the files that
+	// recorded it. Non-fatal for the same reason the checkpoint above is.
+	if err := vb.persistCountersBeforeReclaim(context.Background(), reclaim); err != nil {
+		vb.logger().Warn("CreateSnapshot: SaveState before reclaim failed", "err", err)
+		vb.returnConsolidatedWALs(reclaim)
+		return nil
+	}
+
+	// Only on the success path. A failed checkpoint leaves the local WAL as
+	// the sole record mapping these blocks, which is the ordering reclaim
+	// depends on.
+	vb.reclaimConsolidatedWALs(reclaim)
 
 	return nil
 }
