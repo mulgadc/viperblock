@@ -509,16 +509,14 @@ func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T)
 	require.NoError(t, vb.Flush())
 
 	var late []uint64
-	original := afterTakeConsolidatedWALs
-	afterTakeConsolidatedWALs = func() {
-		afterTakeConsolidatedWALs = original
+	vb.afterTakeConsolidatedWALs = func() {
+		vb.afterTakeConsolidatedWALs = nil
 		write(1, 0x22)
 		require.NoError(t, vb.Flush())
 		require.NoError(t, vb.WriteWALToChunk(true))
 		late = vb.takeConsolidatedWALs()
 		vb.returnConsolidatedWALs(late)
 	}
-	t.Cleanup(func() { afterTakeConsolidatedWALs = original })
 
 	require.NoError(t, vb.DrainToBackend())
 

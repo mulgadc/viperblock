@@ -440,6 +440,13 @@ type VB struct {
 	seqNumHighWater   atomic.Uint64
 	seqNumHighWaterMu sync.Mutex
 
+	// afterTakeConsolidatedWALs runs between the drain taking its batch and
+	// writing the checkpoint that covers it. Set only by tests, which have no
+	// other way to consolidate a generation inside that window and prove it is
+	// not reclaimed. Per-VB rather than package-level so one test's hook is
+	// not read by another's chunk uploader.
+	afterTakeConsolidatedWALs func()
+
 	// statePersistedSeqNum is the SeqNum the last durable VBState carried, set
 	// by persistStateLocal. It lets the drain skip its pre-reclaim state write
 	// when the counter has not moved, so an idle drain rotating an empty
@@ -2728,7 +2735,9 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	// checkpoint about to be written covers. One consolidated after this point
 	// stays on the list for the next drain.
 	reclaim := vb.takeConsolidatedWALs()
-	afterTakeConsolidatedWALs()
+	if vb.afterTakeConsolidatedWALs != nil {
+		vb.afterTakeConsolidatedWALs()
+	}
 
 	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
 		vb.returnConsolidatedWALs(reclaim)
@@ -3621,12 +3630,6 @@ func (vb *VB) walGenerationFiles(walNum uint64) []string {
 // generation does go back on the list, because a transient failure that dropped
 // it would leave those bytes held for the life of the volume, which is the
 // growth this exists to stop.
-// afterTakeConsolidatedWALs runs between the drain taking its batch and
-// writing the checkpoint that covers it. A no-op outside tests, which have no
-// other way to consolidate a generation inside that window and prove it is
-// not reclaimed.
-var afterTakeConsolidatedWALs = func() {}
-
 // takeConsolidatedWALs removes and returns the generations consolidated so
 // far. Call it before the checkpoint that covers them, so a generation
 // consolidated after that checkpoint was captured cannot join the batch.
