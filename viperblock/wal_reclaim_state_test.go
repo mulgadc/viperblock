@@ -135,6 +135,8 @@ func TestReclaimPersistsCountersAtLeastTheLiveValues(t *testing.T) {
 	st := persistedState(t, vb)
 	assert.GreaterOrEqual(t, st.SeqNum, vb.SeqNum.Load(),
 		"config.json must name a sequence number the reclaimed generations cannot exceed")
+	assert.GreaterOrEqual(t, st.ObjectNum, vb.ObjectNum.Load(),
+		"the object counter rolls back the same way, and a reused object number overwrites a live chunk")
 }
 
 // TestReclaimHeldWhenTheStateWriteFails gates the ordering. The counter is one

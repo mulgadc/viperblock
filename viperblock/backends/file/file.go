@@ -159,11 +159,15 @@ func (backend *Backend) Init() error {
 	// cache. Write fsyncs the directory it renames an object into, which does
 	// not help if that directory's own entry is lost, so a power cut could
 	// take the whole subtree after reclaim had deleted the local WAL.
-	// The base directory's own entry is in the same position: whoever created
-	// it may not have synced its parent, and losing it takes the chunks and
-	// checkpoints with it.
+	// Provisioning may have created the base directory and some of its
+	// ancestors together without syncing any of them, and an entry lost
+	// anywhere on that chain takes everything below it.
+	if err := syncAncestry(filepath.Dir(backend.config.BaseDir)); err != nil {
+		backend.log.Error("Failed to sync the base directory's ancestry", "dir", backend.config.BaseDir, "error", err)
+		return classifyWriteErr(err)
+	}
+
 	for _, dir := range []string{
-		filepath.Dir(backend.config.BaseDir),
 		backend.config.BaseDir,
 		filepath.Join(backend.config.BaseDir, backend.config.VolumeName),
 		filepath.Join(backend.config.BaseDir, backend.config.VolumeName, "wal"),
@@ -302,6 +306,51 @@ const (
 // neighbours rather than an object.
 func isStagingName(name string) bool {
 	return strings.HasPrefix(name, stagingPrefix) && strings.Contains(name, stagingSuffix)
+}
+
+// syncAncestry fsyncs dir and each ancestor above it, stopping at the
+// filesystem boundary. An fsync cannot make an entry durable in a filesystem
+// it does not reach, so the mount point is where the chain genuinely ends.
+func syncAncestry(dir string) error {
+	for {
+		if err := syncDirectory(dir); err != nil {
+			return err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		same, err := sameFilesystem(dir, parent)
+		if err != nil || !same {
+			return err
+		}
+		dir = parent
+	}
+}
+
+// sameFilesystem reports whether two paths live on one device, which is how a
+// mount point is recognised without parsing the mount table.
+func sameFilesystem(a, b string) (bool, error) {
+	devOf := func(path string) (uint64, error) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return 0, err
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return 0, fmt.Errorf("stat %s: no device number available", path)
+		}
+		return st.Dev, nil
+	}
+	devA, err := devOf(a)
+	if err != nil {
+		return false, err
+	}
+	devB, err := devOf(b)
+	if err != nil {
+		return false, err
+	}
+	return devA == devB, nil
 }
 
 // syncDirectory fsyncs a directory so a rename into it survives a power cut.

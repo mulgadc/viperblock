@@ -477,8 +477,9 @@ func TestInitFailsWhenADirectorySyncFails(t *testing.T) {
 		"the first failure must stop Init rather than continue past it")
 }
 
-// TestInitSyncsTheParentOfEveryDirectoryItCreates names the four directories
-// whose entries hold the rest: the base's own parent, then the base holding
+// TestInitSyncsTheParentOfEveryDirectoryItCreates covers both halves of the
+// chain whose entries hold the rest: the ancestors above the base, which
+// provisioning created and may never have synced, and then the base holding
 // the volume, the volume holding chunks, checkpoints and wal, and wal holding
 // its own two.
 func TestInitSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
@@ -497,7 +498,25 @@ func TestInitSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
 	require.NoError(t, backend.Init())
 
 	vol := filepath.Join(base, "init-sync-all")
-	assert.Equal(t, []string{filepath.Dir(base), base, vol, filepath.Join(vol, "wal")}, synced)
+	require.GreaterOrEqual(t, len(synced), 4)
+	assert.Equal(t, []string{base, vol, filepath.Join(vol, "wal")}, synced[len(synced)-3:],
+		"the three directories Init creates must be synced in parent-first order")
+
+	// The chain above the base is machine-dependent, so assert its shape: it
+	// starts at the base's parent, each step is the parent of the last, and it
+	// stops where the filesystem does.
+	chain := synced[:len(synced)-3]
+	assert.Equal(t, filepath.Dir(base), chain[0])
+	for i := 1; i < len(chain); i++ {
+		assert.Equal(t, filepath.Dir(chain[i-1]), chain[i])
+	}
+	last := chain[len(chain)-1]
+	parent := filepath.Dir(last)
+	if parent != last {
+		same, err := sameFilesystem(last, parent)
+		require.NoError(t, err)
+		assert.False(t, same, "the chain must stop at a mount point or the root, not short of one")
+	}
 }
 
 // TestListObjectsSkipsStagingFiles keeps a write in flight, and one a crash
