@@ -534,3 +534,102 @@ func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T)
 	vb.pendingWALMu.Unlock()
 	assert.Equal(t, late, held, "it must still be waiting for the next checkpoint")
 }
+
+// TestReclaimAndChunkGCCannotLoseABlockTogether composes the two deletes.
+// Chunk GC can delete a chunk the durable live checkpoint still names, since
+// its candidate set comes from the live map. Reclaim takes the local WAL away,
+// so the question is whether the generation that supersedes a swept chunk can
+// be gone at the same time. It cannot: a chunk reaches zero references only
+// because a later write superseded it, that write marks the map dirty under
+// the same lock, and reclaim waits for a checkpoint covering it, which is a
+// checkpoint that no longer names the swept chunk.
+func TestReclaimAndChunkGCCannotLoseABlockTogether(t *testing.T) {
+	root := t.TempDir()
+	const vol = "vol-reclaim-gc"
+	ctx := context.Background()
+
+	backendConfig := file.FileConfig{BaseDir: root, VolumeName: vol}
+	vb, err := New(&VB{
+		VolumeName:      vol,
+		VolumeSize:      64 * 1024 * 1024,
+		BaseDir:         root,
+		WALSyncInterval: -1,
+		GCEnabled:       true,
+		Cache:           Cache{Config: CacheConfig{Size: 0}},
+	}, FileBackend, backendConfig)
+	require.NoError(t, err)
+	require.NoError(t, vb.Backend.Init())
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+	vb.BlockSize = DefaultBlockSize
+	vb.ObjBlockSize = 16 * DefaultBlockSize
+	require.NoError(t, vb.SaveState())
+	require.NoError(t, vb.OpenWAL(&vb.WAL,
+		fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL,
+		fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+
+	const blocks = 8
+	overwrite := func(fill byte) [][]byte {
+		out := make([][]byte, blocks)
+		for i := range blocks {
+			buf := make([]byte, vb.BlockSize)
+			for j := range buf {
+				buf[j] = fill
+			}
+			out[i] = buf
+			require.NoError(t, vb.WriteAt(uint64(i)*uint64(vb.BlockSize), buf))
+		}
+		return out
+	}
+
+	overwrite(0xA1)
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+
+	// The overwrite is consolidated but not checkpointed, so the durable
+	// checkpoint still names the chunk it superseded and that chunk now has
+	// no references in the live map.
+	want := overwrite(0xB2)
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	vb.pendingWALMu.Lock()
+	held := len(vb.consolidatedWALs)
+	vb.pendingWALMu.Unlock()
+	require.Equal(t, 1, held, "the superseding generation must still be held: no checkpoint names it yet")
+
+	before, err := vb.Backend.ListObjectsCtx(ctx, vol+"/chunks/")
+	require.NoError(t, err)
+	vb.sweepChunks(ctx)
+	after, err := vb.Backend.ListObjectsCtx(ctx, vol+"/chunks/")
+	require.NoError(t, err)
+	require.Less(t, len(after), len(before),
+		"the sweep must have deleted the superseded chunk for this test to mean anything")
+
+	// A restarted process: the durable checkpoint names a chunk the sweep
+	// deleted, and the only thing that corrects it is the generation reclaim
+	// has not released.
+	reopened, err := New(&VB{
+		VolumeName:      vol,
+		VolumeSize:      vb.VolumeSize,
+		BaseDir:         root,
+		WALSyncInterval: -1,
+		Cache:           Cache{Config: CacheConfig{Size: 0}},
+	}, FileBackend, backendConfig)
+	require.NoError(t, err)
+	require.NoError(t, reopened.Backend.Init())
+	t.Cleanup(func() { reopened.StopChunkUploader(); reopened.StopWALSyncer() })
+	require.NoError(t, reopened.LoadState())
+	require.NoError(t, reopened.LoadLiveCheckpoint())
+	require.NoError(t, reopened.RecoverLocalWALs())
+	require.NoError(t, reopened.OpenWAL(&reopened.WAL,
+		fmt.Sprintf("%s/%s", reopened.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, reopened.WAL.WallNum.Load(), reopened.GetVolume()))))
+	require.NoError(t, reopened.OpenWAL(&reopened.BlockToObjectWAL,
+		fmt.Sprintf("%s/%s", reopened.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, reopened.BlockToObjectWAL.WallNum.Load(), reopened.GetVolume()))))
+
+	for i := range blocks {
+		got, err := reopened.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+		require.NoError(t, err, "block %d must be readable: the chunk GC swept is superseded, not live", i)
+		assert.Equal(t, want[i], got, "block %d must read as the overwrite, not as the swept chunk the checkpoint names", i)
+	}
+}
