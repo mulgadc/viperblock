@@ -237,7 +237,11 @@ func TestUnlinkBeforeCheckpointLosesAcknowledgedWrites(t *testing.T) {
 		}
 		// Keep the open generation, delete every consolidated one, exactly
 		// what an unlink-on-upload-success implementation would do.
-		if e.Name() == types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()) {
+		// GetFilePath returns a volume-relative path, so compare basenames:
+		// against the whole path this never matched and the open generation
+		// was deleted too, which is not the shortcut being reproduced.
+		open := filepath.Base(types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))
+		if e.Name() == open {
 			continue
 		}
 		require.NoError(t, os.Remove(filepath.Join(walDir, e.Name())))
@@ -479,13 +483,14 @@ func TestRecoveryWithASurvivingWALReadsByteIdentical(t *testing.T) {
 	}
 }
 
-// TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken covers the
-// ordering the batch exists for. The drain takes its batch before writing the
-// checkpoint, so a generation consolidated after that point is not covered by
-// it and must survive, waiting for the next checkpoint instead.
+// TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken drives the
+// real drain and consolidates a second generation inside the window between
+// the drain taking its batch and writing the checkpoint that covers it.
 //
-// Reclaiming it would delete the only record mapping its blocks, which is the
-// same loss as unlinking on upload success.
+// That generation is named by no durable checkpoint, so reclaiming it loses
+// the only record mapping its blocks, which is the same loss as unlinking on
+// upload success. Calling reclaim directly would not gate the drain's
+// ordering: it would stay green with the batch taken after the checkpoint.
 func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T) {
 	dir := t.TempDir()
 	vb := openEncryptedVBInDir(t, dir, "reclaim-batch-boundary", nil)
@@ -502,32 +507,23 @@ func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T)
 
 	write(0, 0x11)
 	require.NoError(t, vb.Flush())
-	require.NoError(t, vb.WriteWALToChunk(true))
 
-	// What a checkpoint written now would cover.
-	batch := vb.takeConsolidatedWALs()
-	require.Len(t, batch, 1, "the first consolidation must be the only member of the batch")
-
-	// Consolidated after the batch was taken, so no checkpoint names it yet.
-	write(1, 0x22)
-	require.NoError(t, vb.Flush())
-	require.NoError(t, vb.WriteWALToChunk(true))
-
-	later := vb.takeConsolidatedWALs()
-	require.Len(t, later, 1, "the second consolidation must be its own generation")
-	require.NotEqual(t, batch[0], later[0])
-	vb.returnConsolidatedWALs(later)
-
-	survivors := vb.walGenerationFiles(later[0])
-	require.NotEmpty(t, survivors)
-
-	vb.reclaimConsolidatedWALs(batch)
-
-	for _, path := range vb.walGenerationFiles(batch[0]) {
-		_, err := os.Stat(path)
-		assert.ErrorIs(t, err, os.ErrNotExist, "the batch the checkpoint covers must be unlinked")
+	var late []uint64
+	original := afterTakeConsolidatedWALs
+	afterTakeConsolidatedWALs = func() {
+		afterTakeConsolidatedWALs = original
+		write(1, 0x22)
+		require.NoError(t, vb.Flush())
+		require.NoError(t, vb.WriteWALToChunk(true))
+		late = vb.takeConsolidatedWALs()
+		vb.returnConsolidatedWALs(late)
 	}
-	for _, path := range survivors {
+	t.Cleanup(func() { afterTakeConsolidatedWALs = original })
+
+	require.NoError(t, vb.DrainToBackend())
+
+	require.Len(t, late, 1, "a generation must have been consolidated inside the window")
+	for _, path := range vb.walGenerationFiles(late[0]) {
 		_, err := os.Stat(path)
 		assert.NoError(t, err,
 			"a generation consolidated after the batch was taken is named by no durable checkpoint, so unlinking it loses the only record of its blocks")
@@ -536,5 +532,5 @@ func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T)
 	vb.pendingWALMu.Lock()
 	held := append([]uint64(nil), vb.consolidatedWALs...)
 	vb.pendingWALMu.Unlock()
-	assert.Equal(t, later, held, "it must still be waiting for the next checkpoint")
+	assert.Equal(t, late, held, "it must still be waiting for the next checkpoint")
 }
