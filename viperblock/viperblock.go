@@ -447,10 +447,10 @@ type VB struct {
 	// not read by another's chunk uploader.
 	afterTakeConsolidatedWALs func()
 
-	// statePersistedSeqNum is the SeqNum the last durable VBState carried, set
-	// by persistStateLocal. It lets the drain skip its pre-reclaim state write
-	// when the counter has not moved, so an idle drain rotating an empty
-	// generation costs nothing.
+	// statePersistedSeqNum is the SeqNum carried by the last VBState that
+	// reached both the local file and the backend. It lets the drain skip its
+	// pre-reclaim state write when the counter has not moved, so an idle drain
+	// rotating an empty generation costs nothing.
 	statePersistedSeqNum atomic.Uint64
 
 	// nextStateSeqNum is the monotonic SaveState generation counter mirrored
@@ -2768,9 +2768,11 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 // high-water outside the lock persistStateLocal takes and could persist a
 // value older than a reservation that landed in between.
 //
-// Skipped when the counter has not moved since the last durable state. A
-// forced drain rotates a generation even with nothing to consolidate, so
-// without that check an idle volume would write config.json on every tick.
+// Skipped when the counter has not moved since the last state that reached
+// both copies. A forced drain rotates a generation even with nothing to
+// consolidate, so without that check an idle volume would write config.json on
+// every tick. A failed backend push leaves the marker behind, so the next
+// drain writes again rather than reclaiming on a local-only copy.
 func (vb *VB) persistCountersBeforeReclaim(ctx context.Context, reclaim []uint64) error {
 	if len(reclaim) == 0 || vb.EncryptionEnabled {
 		return nil
@@ -5637,7 +5639,7 @@ func (vb *VB) EnsureVolumeUUID() error {
 	for hw < vb.SeqNum.Load() {
 		hw += seqNumReservation
 	}
-	persisted, err := vb.persistStateLocal(hw)
+	persisted, _, err := vb.persistStateLocal(hw)
 	if err != nil {
 		return fmt.Errorf("EnsureVolumeUUID: persistStateLocal: %w", err)
 	}
@@ -5654,18 +5656,26 @@ func (vb *VB) EnsureVolumeUUID() error {
 // completion would let those values be re-issued on restart (catastrophic
 // AES-GCM nonce reuse, NIST SP 800-38D §8.3).
 func (vb *VB) saveStateWithHighWater(ctx context.Context, highWater uint64) error {
-	persisted, err := vb.persistStateLocal(highWater)
+	persisted, seqNum, err := vb.persistStateLocal(highWater)
 	if err != nil {
 		return err
 	}
-	return vb.pushStateToBackend(ctx, persisted)
+	if err := vb.pushStateToBackend(ctx, persisted); err != nil {
+		return err
+	}
+	// Advanced only once both copies name this counter. A host attaching the
+	// volume with no local file reads the backend one, so a drain allowed to
+	// skip after a local-only write could unlink the generation it came from.
+	vb.statePersistedSeqNum.Store(seqNum)
+	return nil
 }
 
 // persistStateLocal marshals VBState, seals it for encrypted volumes, and
-// fsyncs the local config.json. Returns the persisted bytes so callers can
-// hand them to pushStateToBackend without re-marshaling. Crash-safety lives
-// in this step: when it returns nil, the new state is durable on local disk.
-func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
+// fsyncs the local config.json. Returns the persisted bytes and the SeqNum
+// they name, so callers can push the same bytes to the backend without
+// re-marshaling and record the counter once that lands. Crash-safety lives in
+// this step: when it returns nil, the new state is durable on local disk.
+func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 	vb.saveStateMu.Lock()
 	defer vb.saveStateMu.Unlock()
 
@@ -5701,7 +5711,7 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
 
 	jsonData, err := json.Marshal(state)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	// Encrypted volumes append a 16-byte AES-GCM tag binding the JSON bytes to
@@ -5718,14 +5728,10 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
 
 	filename := fmt.Sprintf("%s/%s", vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
 	if err := writeFileAtomic(filename, persisted, 0600); err != nil {
-		return nil, fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
+		return nil, 0, fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
 	}
 
-	// Recorded only once the local fsync has landed, since that is the copy a
-	// reopen reads and the only one the drain's skip may rely on.
-	vb.statePersistedSeqNum.Store(state.SeqNum)
-
-	return persisted, nil
+	return persisted, state.SeqNum, nil
 }
 
 // pushStateToBackend writes pre-marshaled VBState bytes to the backend (S3
@@ -5956,9 +5962,9 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	vb.BlockSize = state.BlockSize
 	vb.ObjBlockSize = state.ObjBlockSize
 	vb.SeqNum.Store(state.SeqNum)
-	// This state is the durable one, so a drain has nothing to persist until
-	// the counter moves past it.
-	vb.statePersistedSeqNum.Store(state.SeqNum)
+	// statePersistedSeqNum is deliberately left at zero. The selected state
+	// may be the local copy with the backend behind it, so the first drain
+	// that can reclaim pays for one state write rather than trusting this one.
 	vb.ObjectNum.Store(state.ObjectNum)
 	vb.WAL.WallNum.Store(state.WALNum)
 	vb.BlockToObjectWAL.WallNum.Store(state.BlockToObjectWALNum)
@@ -6064,7 +6070,7 @@ func (vb *VB) reserveSeqNum(ctx context.Context, n uint64) (start uint64, err er
 	// and block here. Either way, no SeqNum above the durable hw is issued.
 	// If persistStateLocal fails, hw is never published — recovery is just
 	// "retry on next reserve."
-	persisted, err := vb.persistStateLocal(hw)
+	persisted, _, err := vb.persistStateLocal(hw)
 	if err != nil {
 		vb.seqNumHighWaterMu.Unlock()
 		return 0, fmt.Errorf("reserveSeqNum: persistStateLocal: %w", err)
@@ -6091,7 +6097,7 @@ func (vb *VB) reserveSeqNum(ctx context.Context, n uint64) (start uint64, err er
 func (vb *VB) bumpSeqNumHighWater(ctx context.Context) error {
 	vb.seqNumHighWaterMu.Lock()
 	newHW := vb.seqNumHighWater.Load() + seqNumReservation
-	persisted, err := vb.persistStateLocal(newHW)
+	persisted, _, err := vb.persistStateLocal(newHW)
 	if err != nil {
 		vb.seqNumHighWaterMu.Unlock()
 		return err

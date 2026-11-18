@@ -253,7 +253,8 @@ Between the two the local WAL is the only record of where the block went, so unl
 
 The counter is the second condition because the generation recorded it too.
 `parseBlockCheckpoint` raises `SeqNum` to the highest the checkpoint names, so a current reader needs nothing else, but a reader that takes the counter from `VBState` alone would reissue numbers the reclaimed generation had already used, and `classifyRun` discards a re-numbered write as superseded.
-Unencrypted volumes therefore persist `VBState` before the unlink, skipping it when the counter has not moved.
+Unencrypted volumes therefore persist `VBState` before the unlink, skipping it when the counter has not moved since the last state that reached both the local file and the backend.
+A host attaching the volume with no local copy reads the backend one, so a push that failed has to be retried by the next drain rather than skipped.
 Encrypted volumes do not: `LoadState` restarts them at the persisted high-water and `reserveSeqNum` commits each new window durably before publishing it, so their counter already outlives any generation.
 
 ## WAL Recovery

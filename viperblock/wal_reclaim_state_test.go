@@ -175,6 +175,44 @@ func TestReclaimHeldWhenTheStateWriteFails(t *testing.T) {
 	assert.Zero(t, remaining, "a durable counter must release every held generation")
 }
 
+// TestReclaimRetriesTheCounterAfterTheBackendPushFails is the hole the skip
+// marker could open. The local copy lands before the backend one, so a marker
+// advanced on the local write alone lets the next drain skip the retry and
+// unlink the generation while a host attaching the volume without that local
+// file still reads a stale counter from the backend.
+func TestReclaimRetriesTheCounterAfterTheBackendPushFails(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "reclaim-state-retry", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	sb := &stateFailBackend{Backend: vb.Backend}
+	vb.Backend = sb
+
+	data := make([]byte, vb.BlockSize)
+	require.NoError(t, vb.WriteAt(0, data))
+
+	sb.fail = true
+	require.Error(t, vb.DrainToBackendCtx(context.Background()))
+
+	held := func() int {
+		vb.pendingWALMu.Lock()
+		defer vb.pendingWALMu.Unlock()
+		return len(vb.consolidatedWALs)
+	}
+	require.Positive(t, held(), "the failed push must hold the generation")
+
+	// No write in between, so the counter has not moved and only the marker
+	// decides whether this drain writes state again.
+	require.Error(t, vb.DrainToBackendCtx(context.Background()),
+		"a drain after a failed push must retry the state write, not skip it")
+	require.Positive(t, held(), "an unpushed counter must not release the generation")
+
+	sb.fail = false
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+	assert.Zero(t, held(), "the retry that reaches the backend must release it")
+}
+
 // TestSnapshotDrainHoldsReclaimWhenTheStateWriteFails is the same ordering on
 // the snapshot path, where both the checkpoint and the state write are
 // non-fatal and the drain returns nil either way.
