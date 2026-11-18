@@ -290,6 +290,11 @@ type VB struct {
 	// createChunkFile's SeqNum guard is a secondary defense, not a substitute.
 	drainMu sync.Mutex
 
+	// checkpointMu serialises SaveLiveCheckpointCtx. Every writer PUTs the
+	// same key, so two of them can land out of order and leave the durable
+	// checkpoint behind the map while the dirty flag says it is current.
+	checkpointMu sync.Mutex
+
 	// flushMu serialises flushWrites. Writes.mu used to do this implicitly by
 	// being held across the whole WAL write, which also blocked every guest
 	// write for its duration; this keeps flushes ordered without that.
@@ -4823,6 +4828,12 @@ func (vb *VB) SaveLiveCheckpoint() error {
 
 // SaveLiveCheckpointCtx is SaveLiveCheckpoint with a caller-supplied context.
 func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
+	// Held across the check, the serialization and the write. Without it two
+	// writers PUT the same key and an older snapshot can land last, leaving
+	// the durable checkpoint behind the map with dirty already cleared.
+	vb.checkpointMu.Lock()
+	defer vb.checkpointMu.Unlock()
+
 	if !vb.BlocksToObject.dirty.Load() {
 		return nil
 	}
@@ -4830,6 +4841,12 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	// Serialize the map under the read lock, then release before doing I/O so
 	// the lock is not held across network writes or retry sleeps.
 	vb.BlocksToObject.mu.RLock()
+	// Cleared here rather than after the write, and inside this critical
+	// section rather than just before the PUT. An install takes this lock for
+	// writing, so it is either before the snapshot and in it, or after the
+	// clear and still marked; clearing any later wipes the flag of a mapping
+	// this checkpoint does not carry, and reclaim then deletes its WAL.
+	vb.BlocksToObject.dirty.Store(false)
 	checkpoint := vb.BlockToObjectWALHeader()
 	stride := vb.blockStride()
 	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
@@ -4840,13 +4857,23 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	})
 	vb.BlocksToObject.mu.RUnlock()
 
+	// Restored on every unsuccessful exit, including a context cancelled in
+	// the backoff below. A statement at the end of the function would miss
+	// that one, and leave an unpersisted map marked clean.
+	saved := false
+	defer func() {
+		if !saved {
+			vb.BlocksToObject.dirty.Store(true)
+		}
+	}()
+
 	headers := []byte{}
 	backoff := vb.checkpointBackoff()
 	var err error
 	for attempt := range 3 {
 		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
 		if err == nil {
-			vb.BlocksToObject.dirty.Store(false)
+			saved = true
 			return nil
 		}
 		if attempt < 2 {
