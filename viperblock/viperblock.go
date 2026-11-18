@@ -440,6 +440,12 @@ type VB struct {
 	seqNumHighWater   atomic.Uint64
 	seqNumHighWaterMu sync.Mutex
 
+	// statePersistedSeqNum is the SeqNum the last durable VBState carried, set
+	// by persistStateLocal. It lets the drain skip its pre-reclaim state write
+	// when the counter has not moved, so an idle drain rotating an empty
+	// generation costs nothing.
+	statePersistedSeqNum atomic.Uint64
+
 	// nextStateSeqNum is the monotonic SaveState generation counter mirrored
 	// from VBState.StateSeqNum. Each SaveState increments it before marshal;
 	// the value is bound into the VBState metadata HMAC and breaks ties when
@@ -2729,12 +2735,41 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
 
+	if err = vb.persistCountersBeforeReclaim(ctx, reclaim); err != nil {
+		vb.returnConsolidatedWALs(reclaim)
+		return fmt.Errorf("drain persist state: %w", err)
+	}
+
 	// The checkpoint naming these generations' blocks is now durable, so their
 	// local WAL files are redundant. A no-op checkpoint (nothing dirty) still
 	// means the persisted one is current, so it releases them too.
 	vb.reclaimConsolidatedWALs(reclaim)
 
 	return nil
+}
+
+// persistCountersBeforeReclaim makes the sequence counter durable before the
+// generations that recorded it are unlinked. A binary that recovers SeqNum
+// only from config.json otherwise reopens with a stale counter and reissues
+// numbers, and classifyRun discards the re-numbered writes as superseded.
+//
+// Encrypted volumes are excluded: LoadState restarts them at the persisted
+// high-water and reserveSeqNum commits each new window durably before it is
+// published, so they already survive this. Writing here would also sample that
+// high-water outside the lock persistStateLocal takes and could persist a
+// value older than a reservation that landed in between.
+//
+// Skipped when the counter has not moved since the last durable state. A
+// forced drain rotates a generation even with nothing to consolidate, so
+// without that check an idle volume would write config.json on every tick.
+func (vb *VB) persistCountersBeforeReclaim(ctx context.Context, reclaim []uint64) error {
+	if len(reclaim) == 0 || vb.EncryptionEnabled {
+		return nil
+	}
+	if vb.SeqNum.Load() <= vb.statePersistedSeqNum.Load() {
+		return nil
+	}
+	return vb.SaveStateCtx(ctx)
 }
 
 // flushSnapshot flushes a snapshot of the hot writes to the WAL. It does not
@@ -5683,6 +5718,10 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, error) {
 		return nil, fmt.Errorf("SaveState: atomic write %s: %w", filename, err)
 	}
 
+	// Recorded only once the local fsync has landed, since that is the copy a
+	// reopen reads and the only one the drain's skip may rely on.
+	vb.statePersistedSeqNum.Store(state.SeqNum)
+
 	return persisted, nil
 }
 
@@ -5914,6 +5953,9 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	vb.BlockSize = state.BlockSize
 	vb.ObjBlockSize = state.ObjBlockSize
 	vb.SeqNum.Store(state.SeqNum)
+	// This state is the durable one, so a drain has nothing to persist until
+	// the counter moves past it.
+	vb.statePersistedSeqNum.Store(state.SeqNum)
 	vb.ObjectNum.Store(state.ObjectNum)
 	vb.WAL.WallNum.Store(state.WALNum)
 	vb.BlockToObjectWAL.WallNum.Store(state.BlockToObjectWALNum)

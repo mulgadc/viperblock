@@ -104,6 +104,14 @@ func (vb *VB) drainForSnapshot() error {
 		return nil
 	}
 
+	// Same ordering as the drain: the counter has to outlive the files that
+	// recorded it. Non-fatal for the same reason the checkpoint above is.
+	if err := vb.persistCountersBeforeReclaim(context.Background(), reclaim); err != nil {
+		vb.logger().Warn("CreateSnapshot: SaveState before reclaim failed", "err", err)
+		vb.returnConsolidatedWALs(reclaim)
+		return nil
+	}
+
 	// Only on the success path. A failed checkpoint leaves the local WAL as
 	// the sole record mapping these blocks, which is the ordering reclaim
 	// depends on.
