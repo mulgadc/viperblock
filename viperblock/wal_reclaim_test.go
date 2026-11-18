@@ -402,7 +402,7 @@ func TestReclaimRetriesAFailedUnlink(t *testing.T) {
 	})
 
 	before, _ := walDirBytes(t, vb)
-	vb.reclaimConsolidatedWALs()
+	vb.reclaimConsolidatedWALs(vb.takeConsolidatedWALs())
 	after, _ := walDirBytes(t, vb)
 	require.Equal(t, before, after, "the unlink must actually have failed for this test to mean anything")
 
@@ -415,7 +415,7 @@ func TestReclaimRetriesAFailedUnlink(t *testing.T) {
 	require.NoError(t, os.Chmod(walDir, info.Mode()))
 	restored = true
 
-	vb.reclaimConsolidatedWALs()
+	vb.reclaimConsolidatedWALs(vb.takeConsolidatedWALs())
 	vb.pendingWALMu.Lock()
 	remaining := len(vb.consolidatedWALs)
 	vb.pendingWALMu.Unlock()
@@ -477,4 +477,64 @@ func TestRecoveryWithASurvivingWALReadsByteIdentical(t *testing.T) {
 		assert.Equal(t, want[i], got,
 			"block %d must read as its latest version: replaying a surviving generation must not reinstate the bytes the checkpoint already superseded", i)
 	}
+}
+
+// TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken covers the
+// ordering the batch exists for. The drain takes its batch before writing the
+// checkpoint, so a generation consolidated after that point is not covered by
+// it and must survive, waiting for the next checkpoint instead.
+//
+// Reclaiming it would delete the only record mapping its blocks, which is the
+// same loss as unlinking on upload success.
+func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "reclaim-batch-boundary", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	write := func(block uint64, fill byte) {
+		buf := make([]byte, vb.BlockSize)
+		for i := range buf {
+			buf[i] = fill
+		}
+		require.NoError(t, vb.WriteAt(block*uint64(vb.BlockSize), buf))
+	}
+
+	write(0, 0x11)
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	// What a checkpoint written now would cover.
+	batch := vb.takeConsolidatedWALs()
+	require.Len(t, batch, 1, "the first consolidation must be the only member of the batch")
+
+	// Consolidated after the batch was taken, so no checkpoint names it yet.
+	write(1, 0x22)
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+
+	later := vb.takeConsolidatedWALs()
+	require.Len(t, later, 1, "the second consolidation must be its own generation")
+	require.NotEqual(t, batch[0], later[0])
+	vb.returnConsolidatedWALs(later)
+
+	survivors := vb.walGenerationFiles(later[0])
+	require.NotEmpty(t, survivors)
+
+	vb.reclaimConsolidatedWALs(batch)
+
+	for _, path := range vb.walGenerationFiles(batch[0]) {
+		_, err := os.Stat(path)
+		assert.ErrorIs(t, err, os.ErrNotExist, "the batch the checkpoint covers must be unlinked")
+	}
+	for _, path := range survivors {
+		_, err := os.Stat(path)
+		assert.NoError(t, err,
+			"a generation consolidated after the batch was taken is named by no durable checkpoint, so unlinking it loses the only record of its blocks")
+	}
+
+	vb.pendingWALMu.Lock()
+	held := append([]uint64(nil), vb.consolidatedWALs...)
+	vb.pendingWALMu.Unlock()
+	assert.Equal(t, later, held, "it must still be waiting for the next checkpoint")
 }

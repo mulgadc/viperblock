@@ -2713,14 +2713,20 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("drain chunk upload: %w", err)
 	}
+	// Taken before the checkpoint so the batch can only hold generations the
+	// checkpoint about to be written covers. One consolidated after this point
+	// stays on the list for the next drain.
+	reclaim := vb.takeConsolidatedWALs()
+
 	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
+		vb.returnConsolidatedWALs(reclaim)
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
 
 	// The checkpoint naming these generations' blocks is now durable, so their
 	// local WAL files are redundant. A no-op checkpoint (nothing dirty) still
 	// means the persisted one is current, so it releases them too.
-	vb.reclaimConsolidatedWALs()
+	vb.reclaimConsolidatedWALs(reclaim)
 
 	return nil
 }
@@ -3574,12 +3580,29 @@ func (vb *VB) walGenerationFiles(walNum uint64) []string {
 // generation does go back on the list, because a transient failure that dropped
 // it would leave those bytes held for the life of the volume, which is the
 // growth this exists to stop.
-func (vb *VB) reclaimConsolidatedWALs() {
+// takeConsolidatedWALs removes and returns the generations consolidated so
+// far. Call it before the checkpoint that covers them, so a generation
+// consolidated after that checkpoint was captured cannot join the batch.
+func (vb *VB) takeConsolidatedWALs() []uint64 {
 	vb.pendingWALMu.Lock()
-	reclaim := vb.consolidatedWALs
+	defer vb.pendingWALMu.Unlock()
+	taken := vb.consolidatedWALs
 	vb.consolidatedWALs = nil
-	vb.pendingWALMu.Unlock()
+	return taken
+}
 
+// returnConsolidatedWALs puts a batch back, ahead of anything consolidated
+// since it was taken: those generations are older.
+func (vb *VB) returnConsolidatedWALs(batch []uint64) {
+	if len(batch) == 0 {
+		return
+	}
+	vb.pendingWALMu.Lock()
+	vb.consolidatedWALs = append(batch, vb.consolidatedWALs...)
+	vb.pendingWALMu.Unlock()
+}
+
+func (vb *VB) reclaimConsolidatedWALs(reclaim []uint64) {
 	var retry []uint64
 	for _, walNum := range reclaim {
 		failed := false
@@ -3593,15 +3616,7 @@ func (vb *VB) reclaimConsolidatedWALs() {
 			retry = append(retry, walNum)
 		}
 	}
-	if len(retry) == 0 {
-		return
-	}
-
-	// Ahead of anything consolidated while the unlinks ran: these generations
-	// are older and are already covered by a durable checkpoint.
-	vb.pendingWALMu.Lock()
-	vb.consolidatedWALs = append(retry, vb.consolidatedWALs...)
-	vb.pendingWALMu.Unlock()
+	vb.returnConsolidatedWALs(retry)
 }
 
 // WriteWALToChunkCtx is WriteWALToChunk with a caller-supplied context

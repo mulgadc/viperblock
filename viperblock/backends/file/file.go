@@ -155,6 +155,21 @@ func (backend *Backend) Init() error {
 		}
 	}
 
+	// MkdirAll leaves each new directory entry only in its parent's page
+	// cache. Write fsyncs the directory it renames an object into, which does
+	// not help if that directory's own entry is lost, so a power cut could
+	// take the whole subtree after reclaim had deleted the local WAL.
+	for _, dir := range []string{
+		backend.config.BaseDir,
+		filepath.Join(backend.config.BaseDir, backend.config.VolumeName),
+		filepath.Join(backend.config.BaseDir, backend.config.VolumeName, "wal"),
+	} {
+		if err := syncDirectory(dir); err != nil {
+			backend.log.Error("Failed to sync directory after create", "dir", dir, "error", err)
+			return classifyWriteErr(err)
+		}
+	}
+
 	return nil
 }
 

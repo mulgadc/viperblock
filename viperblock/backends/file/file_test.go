@@ -446,3 +446,55 @@ func TestWriteFailsWhenTheDirectorySyncFails(t *testing.T) {
 	assert.Equal(t, append(append([]byte{}, headers...), replacement...), got,
 		"the rename itself succeeded, so the new bytes are visible; what failed is the promise that they are on the device")
 }
+
+// TestInitFailsWhenADirectorySyncFails gates the directory entries Init
+// creates being durable before anything writes into them. Write fsyncs the
+// directory it renames an object into, which is no help if that directory's
+// own entry is still only in page cache: a power cut takes the subtree, and
+// the caller has already reclaimed its local WAL on Write's success.
+//
+// The injection is the only way to produce the failure, since a healthy
+// filesystem does not fail fsync on a directory it just created.
+func TestInitFailsWhenADirectorySyncFails(t *testing.T) {
+	base := t.TempDir()
+	injected := errors.New("injected directory sync failure")
+
+	synced := []string{}
+	original := syncDirectory
+	syncDirectory = func(dir string) error {
+		synced = append(synced, dir)
+		return injected
+	}
+	t.Cleanup(func() { syncDirectory = original })
+
+	backend, err := New(FileConfig{BaseDir: base, VolumeName: "init-sync", VolumeSize: 1})
+	require.NoError(t, err)
+
+	err = backend.Init()
+	assert.ErrorIs(t, err, injected,
+		"a directory whose entry is not durable must fail Init rather than let a volume open on it")
+	assert.Equal(t, []string{base}, synced,
+		"the first failure must stop Init rather than continue past it")
+}
+
+// TestInitSyncsTheParentOfEveryDirectoryItCreates names the three directories
+// whose entries hold the rest: the base holds the volume, the volume holds
+// chunks, checkpoints and wal, and wal holds its own two.
+func TestInitSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
+	base := t.TempDir()
+
+	synced := []string{}
+	original := syncDirectory
+	syncDirectory = func(dir string) error {
+		synced = append(synced, dir)
+		return original(dir)
+	}
+	t.Cleanup(func() { syncDirectory = original })
+
+	backend, err := New(FileConfig{BaseDir: base, VolumeName: "init-sync-all", VolumeSize: 1})
+	require.NoError(t, err)
+	require.NoError(t, backend.Init())
+
+	vol := filepath.Join(base, "init-sync-all")
+	assert.Equal(t, []string{base, vol, filepath.Join(vol, "wal")}, synced)
+}
