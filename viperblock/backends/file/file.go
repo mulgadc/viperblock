@@ -159,7 +159,11 @@ func (backend *Backend) Init() error {
 	// cache. Write fsyncs the directory it renames an object into, which does
 	// not help if that directory's own entry is lost, so a power cut could
 	// take the whole subtree after reclaim had deleted the local WAL.
+	// The base directory's own entry is in the same position: whoever created
+	// it may not have synced its parent, and losing it takes the chunks and
+	// checkpoints with it.
 	for _, dir := range []string{
+		filepath.Dir(backend.config.BaseDir),
 		backend.config.BaseDir,
 		filepath.Join(backend.config.BaseDir, backend.config.VolumeName),
 		filepath.Join(backend.config.BaseDir, backend.config.VolumeName, "wal"),
@@ -230,7 +234,7 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	// closing without a sync returned success while the bytes were still only
 	// in page cache, so a caller that reclaims its local WAL on that success
 	// could lose both copies to a power cut.
-	tmp, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(filename), stagingPrefix+filepath.Base(filename)+stagingSuffix)
 	if err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to create chunk file", "error", err)
@@ -284,6 +288,20 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	}
 
 	return nil
+}
+
+// A staging file is named so it is recognisable without knowing the object it
+// is becoming: dot-prefixed to keep it out of a casual listing, and carrying
+// the marker ListObjects filters on.
+const (
+	stagingPrefix = "."
+	stagingSuffix = ".tmp"
+)
+
+// isStagingName reports whether a directory entry is one of Write's in-flight
+// neighbours rather than an object.
+func isStagingName(name string) bool {
+	return strings.HasPrefix(name, stagingPrefix) && strings.Contains(name, stagingSuffix)
 }
 
 // syncDirectory fsyncs a directory so a rename into it survives a power cut.
@@ -443,6 +461,12 @@ func (backend *Backend) ListObjects(prefix string) (keys []string, err error) {
 			return walkErr
 		}
 		if entry.IsDir() {
+			return nil
+		}
+		// A staging file is a write in flight or one a crash abandoned, never
+		// an object. Listing it invites a caller to read a partial write or to
+		// treat it as a WAL generation.
+		if isStagingName(entry.Name()) {
 			return nil
 		}
 		rel, relErr := filepath.Rel(backend.config.BaseDir, path)

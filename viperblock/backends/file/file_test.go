@@ -473,13 +473,14 @@ func TestInitFailsWhenADirectorySyncFails(t *testing.T) {
 	err = backend.Init()
 	assert.ErrorIs(t, err, injected,
 		"a directory whose entry is not durable must fail Init rather than let a volume open on it")
-	assert.Equal(t, []string{base}, synced,
+	assert.Equal(t, []string{filepath.Dir(base)}, synced,
 		"the first failure must stop Init rather than continue past it")
 }
 
-// TestInitSyncsTheParentOfEveryDirectoryItCreates names the three directories
-// whose entries hold the rest: the base holds the volume, the volume holds
-// chunks, checkpoints and wal, and wal holds its own two.
+// TestInitSyncsTheParentOfEveryDirectoryItCreates names the four directories
+// whose entries hold the rest: the base's own parent, then the base holding
+// the volume, the volume holding chunks, checkpoints and wal, and wal holding
+// its own two.
 func TestInitSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
 	base := t.TempDir()
 
@@ -496,5 +497,31 @@ func TestInitSyncsTheParentOfEveryDirectoryItCreates(t *testing.T) {
 	require.NoError(t, backend.Init())
 
 	vol := filepath.Join(base, "init-sync-all")
-	assert.Equal(t, []string{base, vol, filepath.Join(vol, "wal")}, synced)
+	assert.Equal(t, []string{filepath.Dir(base), base, vol, filepath.Join(vol, "wal")}, synced)
+}
+
+// TestListObjectsSkipsStagingFiles keeps a write in flight, and one a crash
+// abandoned, out of the object list. RecoverLocalWALs takes every entry a
+// listing returns with no name filter, so a staging neighbour there is read as
+// a WAL generation and fails integrity on an encrypted volume.
+func TestListObjectsSkipsStagingFiles(t *testing.T) {
+	backend := newTestBackend(t)
+
+	headers := []byte("hdr!")
+	data := []byte("a durable object")
+	require.NoError(t, backend.Write(types.FileTypeChunk, 7, &headers, &data))
+
+	object := filepath.Join(backend.config.BaseDir, types.GetFilePath(types.FileTypeChunk, 7, backend.config.VolumeName))
+	abandoned := filepath.Join(filepath.Dir(object), "."+filepath.Base(object)+".tmp1234")
+	require.NoError(t, os.WriteFile(abandoned, []byte("half a write"), 0600))
+
+	keys, err := backend.ListObjects(backend.config.VolumeName)
+	require.NoError(t, err)
+
+	require.Contains(t, keys, filepath.ToSlash(types.GetFilePath(types.FileTypeChunk, 7, backend.config.VolumeName)),
+		"the renamed object must still be listed")
+	for _, key := range keys {
+		assert.False(t, isStagingName(filepath.Base(key)),
+			"a staging file must not be listed as an object: %s", key)
+	}
 }
