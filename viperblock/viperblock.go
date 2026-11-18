@@ -515,6 +515,17 @@ type VB struct {
 	// this VB instance. Set once, lazily, on the first sweep attempt.
 	gcReconciled atomic.Bool
 
+	// gcCkptMu guards the chunk sets below, maintained only when GCEnabled.
+	// Lock order: BlocksToObject.mu, then gcCkptMu. A sweep never deletes a
+	// chunk the durable or an in-flight live checkpoint names.
+	gcCkptMu       sync.Mutex
+	gcDurableRefs  map[uint64]struct{}
+	gcDurableKnown bool
+	gcInflightRefs map[uint64]struct{}
+	// gcUploading holds chunk IDs minted but not yet installed in the map, so
+	// reconcileChunksOnce cannot mistake an upload in flight for an orphan.
+	gcUploading map[uint64]struct{}
+
 	// gcFloor and gcFloorReady cache the lowest chunk ObjectID chunk GC may
 	// ever consider (see ensureGCFloor): below it, a chunk may still be
 	// referenced by the current numbered checkpoint, read as a fallback if
@@ -3958,6 +3969,10 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// never share a chunk key. The old Load-at-caller/Add-at-end split let two
 	// drains reuse an ID and overwrite a chunk (fatal AEAD mismatch on read).
 	chunkIndex := vb.ObjectNum.Add(1) - 1
+	if vb.GCEnabled {
+		vb.markChunkUploading(chunkIndex)
+		defer vb.clearChunkUploading(chunkIndex)
+	}
 
 	//vb.logger().Info("Creating chunk file", "chunkIndex", chunkIndex, "currentWALNum", currentWALNum)
 
@@ -4702,24 +4717,30 @@ func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 	}
 
 	vb.BlocksToObject.mu.Lock()
+	vb.gcCkptMu.Lock()
 	for _, key := range keys {
 		id, ok := parseChunkObjectID(key)
 		if !ok {
+			continue
+		}
+		// Listed after its upload landed but before its install: not an
+		// orphan. The install tracks it under this same lock.
+		if _, uploading := vb.gcUploading[id]; uploading {
 			continue
 		}
 		if _, tracked := vb.gcRefcount[id]; !tracked {
 			vb.gcRefcount[id] = 0
 		}
 	}
+	vb.gcCkptMu.Unlock()
 	vb.BlocksToObject.mu.Unlock()
 
 	vb.gcReconciled.Store(true)
 }
 
 // sweepChunks deletes superseded chunk objects: below the watermark captured
-// here, at or above the numbered-checkpoint floor, with zero refcount. Call
-// only after a successful SaveLiveCheckpointCtx — a crash between checkpoint
-// save and sweep leaves garbage on disk (safe), never a dangling reference.
+// here, at or above the numbered-checkpoint floor, with zero refcount, and
+// named by neither the durable live checkpoint nor one still being written.
 func (vb *VB) sweepChunks(ctx context.Context) {
 	if !vb.GCEnabled {
 		return
@@ -4742,13 +4763,32 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	watermark := vb.ObjectNum.Load()
 
 	vb.BlocksToObject.mu.Lock()
+	vb.gcCkptMu.Lock()
+	known := vb.gcDurableKnown
 	var candidates []uint64
-	for id, refs := range vb.gcRefcount {
-		if refs == 0 && id >= floor && id < watermark {
+	if known {
+		for id, refs := range vb.gcRefcount {
+			if refs != 0 || id < floor || id >= watermark {
+				continue
+			}
+			// A zero refcount is not enough: the durable checkpoint, or one
+			// being written, may still name the chunk.
+			if _, named := vb.gcDurableRefs[id]; named {
+				continue
+			}
+			if _, named := vb.gcInflightRefs[id]; named {
+				continue
+			}
 			candidates = append(candidates, id)
 		}
 	}
+	vb.gcCkptMu.Unlock()
 	vb.BlocksToObject.mu.Unlock()
+
+	if !known {
+		vb.logger().Info("chunk GC: sweep skipped, no live checkpoint written by this process yet", "volume", vb.VolumeName)
+		return
+	}
 
 	// Last check before anything is deleted, and deliberately here rather than
 	// at the top of the sweep: the caller has already made this sweep's live
@@ -4829,17 +4869,72 @@ feed:
 	return int(sweptCount.Load())
 }
 
-// runGCSweep drains this VB to the backend -- persisting a live checkpoint
-// that already excludes zero-refcount chunks -- and, only if that succeeds,
-// sweeps the chunks it left excluded. Sweeping without a preceding
-// successful drain would risk deleting a chunk an already-durable
-// checkpoint still references; see sweepChunks's doc comment.
+// runGCSweep drains this VB to the backend and, only if that succeeds, sweeps.
+// The first sweep in a process forces the drain to write a live checkpoint,
+// since sweepChunks deletes nothing until it knows which chunks one names.
 func (vb *VB) runGCSweep(ctx context.Context) {
+	vb.gcCkptMu.Lock()
+	known := vb.gcDurableKnown
+	vb.gcCkptMu.Unlock()
+	if !known {
+		// Forces the drain to write a checkpoint, so the sweep learns exactly
+		// which chunks the durable one names.
+		vb.BlocksToObject.dirty.Store(true)
+	}
 	if err := vb.DrainToBackendCtx(ctx); err != nil {
 		vb.logger().Warn("chunk GC: drain before sweep failed, sweep skipped", "err", err)
 		return
 	}
 	vb.sweepChunks(ctx)
+}
+
+// markChunkUploading records a minted chunk ID whose mapping is not installed.
+func (vb *VB) markChunkUploading(id uint64) {
+	vb.gcCkptMu.Lock()
+	if vb.gcUploading == nil {
+		vb.gcUploading = make(map[uint64]struct{})
+	}
+	vb.gcUploading[id] = struct{}{}
+	vb.gcCkptMu.Unlock()
+}
+
+// clearChunkUploading drops id once createChunkFile has installed it or failed.
+func (vb *VB) clearChunkUploading(id uint64) {
+	vb.gcCkptMu.Lock()
+	delete(vb.gcUploading, id)
+	vb.gcCkptMu.Unlock()
+}
+
+// publishInflightCheckpoint records the chunks a serialised live checkpoint
+// names. Called under BlocksToObject.mu, so a sweep sees it before selecting.
+func (vb *VB) publishInflightCheckpoint(refs map[uint64]struct{}) {
+	vb.gcCkptMu.Lock()
+	vb.gcInflightRefs = refs
+	vb.gcCkptMu.Unlock()
+}
+
+// settleInflightCheckpoint retires the in-flight set. A failed write may still
+// have landed with its ack lost, so its chunks stay protected until a later
+// checkpoint succeeds.
+func (vb *VB) settleInflightCheckpoint(saved bool) {
+	vb.gcCkptMu.Lock()
+	defer vb.gcCkptMu.Unlock()
+	inflight := vb.gcInflightRefs
+	vb.gcInflightRefs = nil
+	if saved {
+		vb.gcDurableRefs = inflight
+		vb.gcDurableKnown = true
+		return
+	}
+	if !vb.gcDurableKnown {
+		return
+	}
+	if vb.gcDurableRefs == nil {
+		vb.gcDurableRefs = make(map[uint64]struct{}, len(inflight))
+	}
+	for id := range inflight {
+		vb.gcDurableRefs[id] = struct{}{}
+	}
 }
 
 // LoadBlockState loads the previous blockstate from disk.
@@ -4926,12 +5021,22 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) (err error) {
 	vb.BlocksToObject.dirty.Store(false)
 	checkpoint := vb.BlockToObjectWALHeader()
 	stride := vb.blockStride()
+	var refs map[uint64]struct{}
+	if vb.GCEnabled {
+		refs = make(map[uint64]struct{})
+	}
 	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
+		if refs != nil {
+			refs[block.ObjectID] = struct{}{}
+		}
 		for _, single := range expandBlockLookup(block, stride) {
 			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
 		}
 		return true
 	})
+	if refs != nil {
+		vb.publishInflightCheckpoint(refs)
+	}
 	vb.BlocksToObject.mu.RUnlock()
 
 	// Restored on every unsuccessful exit, including a context cancelled in
@@ -4941,6 +5046,9 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) (err error) {
 	defer func() {
 		if !saved {
 			vb.BlocksToObject.dirty.Store(true)
+		}
+		if refs != nil {
+			vb.settleInflightCheckpoint(saved)
 		}
 	}()
 

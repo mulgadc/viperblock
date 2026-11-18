@@ -534,13 +534,9 @@ func TestReclaimLeavesAGenerationConsolidatedAfterTheBatchWasTaken(t *testing.T)
 }
 
 // TestReclaimAndChunkGCCannotLoseABlockTogether composes the two deletes.
-// Chunk GC can delete a chunk the durable live checkpoint still names, since
-// its candidate set comes from the live map. Reclaim takes the local WAL away,
-// so the question is whether the generation that supersedes a swept chunk can
-// be gone at the same time. It cannot: a chunk reaches zero references only
-// because a later write superseded it, that write marks the map dirty under
-// the same lock, and reclaim waits for a checkpoint covering it, which is a
-// checkpoint that no longer names the swept chunk.
+// Chunk GC keeps a superseded chunk while the durable checkpoint names it,
+// and reclaim keeps the superseding generation until a checkpoint covers it.
+// Once that checkpoint lands both delete, and every block still reads back.
 func TestReclaimAndChunkGCCannotLoseABlockTogether(t *testing.T) {
 	root := t.TempDir()
 	const vol = "vol-reclaim-gc"
@@ -599,14 +595,26 @@ func TestReclaimAndChunkGCCannotLoseABlockTogether(t *testing.T) {
 	before, err := vb.Backend.ListObjectsCtx(ctx, vol+"/chunks/")
 	require.NoError(t, err)
 	vb.sweepChunks(ctx)
+	kept, err := vb.Backend.ListObjectsCtx(ctx, vol+"/chunks/")
+	require.NoError(t, err)
+	require.Equal(t, before, kept,
+		"the durable checkpoint still names the superseded chunk, so the sweep must keep it")
+
+	// The checkpoint naming the overwrite lands, which releases the generation
+	// and lets the sweep delete the superseded chunk.
+	require.NoError(t, vb.DrainToBackendCtx(ctx))
+	vb.pendingWALMu.Lock()
+	held = len(vb.consolidatedWALs)
+	vb.pendingWALMu.Unlock()
+	require.Zero(t, held, "a checkpoint covering the overwrite releases its generation")
+	vb.sweepChunks(ctx)
 	after, err := vb.Backend.ListObjectsCtx(ctx, vol+"/chunks/")
 	require.NoError(t, err)
 	require.Less(t, len(after), len(before),
 		"the sweep must have deleted the superseded chunk for this test to mean anything")
 
-	// A restarted process: the durable checkpoint names a chunk the sweep
-	// deleted, and the only thing that corrects it is the generation reclaim
-	// has not released.
+	// A restarted process sees neither the swept chunk nor the reclaimed
+	// generation, and must read every block from the checkpoint alone.
 	reopened, err := New(&VB{
 		VolumeName:      vol,
 		VolumeSize:      vb.VolumeSize,
@@ -628,6 +636,6 @@ func TestReclaimAndChunkGCCannotLoseABlockTogether(t *testing.T) {
 	for i := range blocks {
 		got, err := reopened.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
 		require.NoError(t, err, "block %d must be readable: the chunk GC swept is superseded, not live", i)
-		assert.Equal(t, want[i], got, "block %d must read as the overwrite, not as the swept chunk the checkpoint names", i)
+		assert.Equal(t, want[i], got, "block %d must read as the overwrite", i)
 	}
 }
