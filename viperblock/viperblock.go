@@ -3968,10 +3968,12 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// Atomically allocate this chunk's ObjectID so concurrent consolidations
 	// never share a chunk key. The old Load-at-caller/Add-at-end split let two
 	// drains reuse an ID and overwrite a chunk (fatal AEAD mismatch on read).
-	chunkIndex := vb.ObjectNum.Add(1) - 1
+	var chunkIndex uint64
 	if vb.GCEnabled {
-		vb.markChunkUploading(chunkIndex)
+		chunkIndex = vb.mintUploadingChunkID()
 		defer vb.clearChunkUploading(chunkIndex)
+	} else {
+		chunkIndex = vb.ObjectNum.Add(1) - 1
 	}
 
 	//vb.logger().Info("Creating chunk file", "chunkIndex", chunkIndex, "currentWALNum", currentWALNum)
@@ -4887,14 +4889,18 @@ func (vb *VB) runGCSweep(ctx context.Context) {
 	vb.sweepChunks(ctx)
 }
 
-// markChunkUploading records a minted chunk ID whose mapping is not installed.
-func (vb *VB) markChunkUploading(id uint64) {
+// mintUploadingChunkID allocates a chunk ID and marks it uploading in one
+// critical section, so reconcile and candidate selection, which hold the same
+// lock, never see the ID allocated but unmarked.
+func (vb *VB) mintUploadingChunkID() uint64 {
 	vb.gcCkptMu.Lock()
+	defer vb.gcCkptMu.Unlock()
+	id := vb.ObjectNum.Add(1) - 1
 	if vb.gcUploading == nil {
 		vb.gcUploading = make(map[uint64]struct{})
 	}
 	vb.gcUploading[id] = struct{}{}
-	vb.gcCkptMu.Unlock()
+	return id
 }
 
 // clearChunkUploading drops id once createChunkFile has installed it or failed.
