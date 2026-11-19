@@ -2198,8 +2198,8 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			pendingAfter := vb.PendingBytes()
 			vb.drainInFlight.Store(false)
 
-			// Guest writes keep arriving during the drain, so this is the net
-			// fall in pendingBytes, the rate the watermark gap is divided by.
+			// This drain's fall in pendingBytes, zero if guest writes outpaced
+			// it. Summed across drains it is not a net rate.
 			var freed int64
 			if pendingAfter < pendingBefore {
 				freed = safecast.Uint64ToInt64(pendingBefore - pendingAfter)
@@ -2250,6 +2250,10 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 // recordBackpressurePhase is a variable so a test can observe the phases of a
 // real wait without installing a global meter provider.
 var recordBackpressurePhase = telemetry.RecordBackpressurePhase
+
+// recordWALOp is a variable so a test can observe which WAL operations a
+// path records and with what outcome.
+var recordWALOp = telemetry.RecordWALOp
 
 // drainStall records how long the backend has been failing to drain and what
 // the last failure was. Volume-scoped, so every writer blocked in
@@ -2634,7 +2638,7 @@ func (vb *VB) Flush() (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	if err = vb.flushWrites(); err != nil {
@@ -3703,7 +3707,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(ctx, "consolidate", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(ctx, "consolidate", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	// Dispatch to sharded implementation when enabled
@@ -4908,7 +4912,7 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(context.Background(), "checkpoint", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(context.Background(), "checkpoint", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	// Serialize the map under the read lock, then release before doing I/O so
@@ -5119,7 +5123,7 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(context.Background(), "replay", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(context.Background(), "replay", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	walDir := filepath.Join(vb.WAL.BaseDir, vb.GetVolume(), "wal", "chunks")

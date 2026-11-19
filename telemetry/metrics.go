@@ -215,11 +215,11 @@ func instruments() {
 			otel.Handle(err)
 		}
 
-		// Splits a wait into driving a drain and polling while another writer
-		// drives one. WAL phase sums cannot: the guest flush path calls the
-		// same Flush(), so those counters mix both callers.
+		// Splits a wait into driving a drain and sleeping between checks. WAL
+		// phase sums cannot: the guest flush path calls the same Flush(), so
+		// those counters mix both callers.
 		backpressurePhaseOps, err = m.Int64Counter("viperblock.write.backpressure.phase.ops",
-			metric.WithDescription("Occurrences of each phase within a backpressure wait: drain (this writer drove one) or poll (it waited on another writer's)."),
+			metric.WithDescription("Occurrences of each phase within a backpressure wait: drain (this writer drove one) or poll (it slept between pending-byte checks, while another writer drained or after its own drain left the volume above the low watermark)."),
 			metric.WithUnit("{operation}"))
 		if err != nil {
 			otel.Handle(err)
@@ -237,7 +237,7 @@ func instruments() {
 			otel.Handle(err)
 		}
 		backpressureDrainedBytes, err = m.Int64Counter("viperblock.write.backpressure.drained_bytes",
-			metric.WithDescription("Bytes pendingBytes fell by during drains driven from the stall path. Divided by the drain phase duration this is the net drain rate under guest load, which is what the watermark gap is divided by."),
+			metric.WithDescription("Sum of the per-drain falls in pendingBytes, over drains driven from the stall path. A drain that left pendingBytes higher adds zero, so this is not a net drain rate."),
 			metric.WithUnit("By"))
 		if err != nil {
 			otel.Handle(err)
@@ -455,8 +455,8 @@ func BackpressureWaiterScope(ctx context.Context, volume string) func() {
 }
 
 // RecordBackpressurePhase records one phase of a backpressure wait: "drain"
-// when this writer drove one, "poll" when it slept on another writer's.
-// drainedBytes is the net fall in pending bytes, meaningful for drain only.
+// when this writer drove one, "poll" for a sleep between pending-byte checks.
+// drainedBytes is that drain's fall in pending bytes, zero if none.
 func RecordBackpressurePhase(ctx context.Context, volume, phase string, elapsed time.Duration, drainedBytes int64) {
 	instruments()
 	attrs := append(volumeAttrs(volume), attribute.String("phase", phase))

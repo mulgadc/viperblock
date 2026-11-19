@@ -67,14 +67,15 @@ func TestRecordWriteBackpressureRecordsLatencyAndTail(t *testing.T) {
 
 	RecordWriteBackpressure(ctx, "vol-1", 50*time.Millisecond)
 	RecordWriteBackpressure(ctx, "vol-1", 1500*time.Millisecond)
+	RecordWriteBackpressure(ctx, "vol-1", 6*time.Second)
 
 	metrics := collect(t, reader)
 	dp := histogramPoint(t, metrics, "viperblock.write.backpressure.latency", map[string]string{"volume.name": "vol-1"})
-	if dp.Count != 2 {
-		t.Errorf("backpressure latency count = %d, want 2", dp.Count)
+	if dp.Count != 3 {
+		t.Errorf("backpressure latency count = %d, want 3", dp.Count)
 	}
-	if !approx(dp.Sum, 1.55) {
-		t.Errorf("backpressure latency sum = %v, want 1.55 seconds", dp.Sum)
+	if !approx(dp.Sum, 7.55) {
+		t.Errorf("backpressure latency sum = %v, want 7.55 seconds", dp.Sum)
 	}
 
 	slow, ok := metrics["viperblock.write.backpressure.slow_waits"].(metricdata.Sum[int64])
@@ -83,18 +84,19 @@ func TestRecordWriteBackpressureRecordsLatencyAndTail(t *testing.T) {
 	}
 	byThreshold := map[string]int64{}
 	for _, p := range slow.DataPoints {
+		wantAttr(t, p.Attributes, "volume.name", "vol-1")
 		v, _ := p.Attributes.Value("threshold")
 		byThreshold[v.AsString()] = p.Value
 	}
-	// The 1.5s wait reaches 100ms and 1s but not 5s; the 50ms wait reaches none.
-	want := map[string]int64{"100ms": 1, "1s": 1}
+	// 50ms reaches no bucket, 1.5s reaches 100ms and 1s, and 6s reaches all three.
+	want := map[string]int64{"100ms": 2, "1s": 2, "5s": 1}
 	for k, v := range want {
 		if byThreshold[k] != v {
 			t.Errorf("slow_waits[%s] = %d, want %d", k, byThreshold[k], v)
 		}
 	}
-	if _, present := byThreshold["5s"]; present {
-		t.Errorf("slow_waits[5s] recorded for waits under 5s: %v", byThreshold)
+	if len(byThreshold) != len(want) {
+		t.Errorf("slow_waits thresholds = %v, want exactly %v", byThreshold, want)
 	}
 }
 
@@ -155,14 +157,17 @@ func TestBackpressureLevelsAndWaiters(t *testing.T) {
 
 	metrics := collect(t, reader)
 	pending := metrics["viperblock.write.backpressure.pending_bytes"].(metricdata.Gauge[int64])
+	wantAttr(t, pending.DataPoints[0].Attributes, "volume.name", "vol-1")
 	if pending.DataPoints[0].Value != 3<<20 {
 		t.Errorf("pending_bytes = %d, want %d", pending.DataPoints[0].Value, 3<<20)
 	}
 	high := metrics["viperblock.write.backpressure.high_watermark_bytes"].(metricdata.Gauge[int64])
+	wantAttr(t, high.DataPoints[0].Attributes, "volume.name", "vol-1")
 	if high.DataPoints[0].Value != 64<<20 {
 		t.Errorf("high_watermark_bytes = %d, want %d", high.DataPoints[0].Value, 64<<20)
 	}
 	waiters := metrics["viperblock.write.backpressure.waiters"].(metricdata.Sum[int64])
+	wantAttr(t, waiters.DataPoints[0].Attributes, "volume.name", "vol-1")
 	if waiters.DataPoints[0].Value != 1 {
 		t.Errorf("waiters = %d, want 1 still blocked", waiters.DataPoints[0].Value)
 	}
