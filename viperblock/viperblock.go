@@ -4731,6 +4731,8 @@ func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 		if _, tracked := vb.gcRefcount[id]; !tracked {
 			vb.gcRefcount[id] = 0
 		}
+		// An orphan above a restored counter must never be minted again.
+		advanceAtomicTo(&vb.ObjectNum, id+1)
 	}
 	vb.gcCkptMu.Unlock()
 	vb.BlocksToObject.mu.Unlock()
@@ -4741,6 +4743,7 @@ func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 // sweepChunks deletes superseded chunk objects: below the watermark captured
 // here, at or above the numbered-checkpoint floor, with zero refcount, and
 // named by neither the durable live checkpoint nor one still being written.
+// Skips until that checkpoint is known: loaded, or written by this process.
 func (vb *VB) sweepChunks(ctx context.Context) {
 	if !vb.GCEnabled {
 		return
@@ -4754,6 +4757,15 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		return
 	}
 
+	vb.gcCkptMu.Lock()
+	known := vb.gcDurableKnown
+	vb.gcCkptMu.Unlock()
+	if !known {
+		// Also keeps reconcile from running before the map is loaded.
+		vb.logger().Info("chunk GC: sweep skipped, durable live checkpoint not yet known", "volume", vb.VolumeName)
+		return
+	}
+
 	vb.reconcileChunksOnce(ctx)
 
 	floor := vb.ensureGCFloor(ctx)
@@ -4764,31 +4776,26 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 
 	vb.BlocksToObject.mu.Lock()
 	vb.gcCkptMu.Lock()
-	known := vb.gcDurableKnown
 	var candidates []uint64
-	if known {
-		for id, refs := range vb.gcRefcount {
-			if refs != 0 || id < floor || id >= watermark {
-				continue
-			}
-			// A zero refcount is not enough: the durable checkpoint, or one
-			// being written, may still name the chunk.
-			if _, named := vb.gcDurableRefs[id]; named {
-				continue
-			}
-			if _, named := vb.gcInflightRefs[id]; named {
-				continue
-			}
-			candidates = append(candidates, id)
+	for id, refs := range vb.gcRefcount {
+		if refs != 0 || id < floor || id >= watermark {
+			continue
 		}
+		// A zero refcount is not enough: the durable checkpoint, or one being
+		// written, may still name the chunk, or its ID may be mid-upload.
+		if _, named := vb.gcDurableRefs[id]; named {
+			continue
+		}
+		if _, named := vb.gcInflightRefs[id]; named {
+			continue
+		}
+		if _, uploading := vb.gcUploading[id]; uploading {
+			continue
+		}
+		candidates = append(candidates, id)
 	}
 	vb.gcCkptMu.Unlock()
 	vb.BlocksToObject.mu.Unlock()
-
-	if !known {
-		vb.logger().Info("chunk GC: sweep skipped, no live checkpoint written by this process yet", "volume", vb.VolumeName)
-		return
-	}
 
 	// Last check before anything is deleted, and deliberately here rather than
 	// at the top of the sweep: the caller has already made this sweep's live
@@ -4870,17 +4877,9 @@ feed:
 }
 
 // runGCSweep drains this VB to the backend and, only if that succeeds, sweeps.
-// The first sweep in a process forces the drain to write a live checkpoint,
-// since sweepChunks deletes nothing until it knows which chunks one names.
+// It never forces a checkpoint: a VB whose map is not loaded yet would
+// overwrite the durable one with an empty map.
 func (vb *VB) runGCSweep(ctx context.Context) {
-	vb.gcCkptMu.Lock()
-	known := vb.gcDurableKnown
-	vb.gcCkptMu.Unlock()
-	if !known {
-		// Forces the drain to write a checkpoint, so the sweep learns exactly
-		// which chunks the durable one names.
-		vb.BlocksToObject.dirty.Store(true)
-	}
 	if err := vb.DrainToBackendCtx(ctx); err != nil {
 		vb.logger().Warn("chunk GC: drain before sweep failed, sweep skipped", "err", err)
 		return
@@ -5085,13 +5084,39 @@ func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
 	checkpoint, err := vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpointLive, 0, 0, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return vb.LoadBlockStateCtx(ctx)
+			if err := vb.LoadBlockStateCtx(ctx); err != nil {
+				return err
+			}
+			// No live checkpoint exists, so none names any chunk.
+			vb.knowDurableCheckpoint(nil)
+			return nil
 		}
 		return fmt.Errorf("read live checkpoint: %w", err)
 	}
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
-	return vb.parseBlockCheckpoint(checkpoint)
+	if err := vb.parseBlockCheckpoint(checkpoint); err != nil {
+		return err
+	}
+	if vb.GCEnabled {
+		refs := make(map[uint64]struct{})
+		if err := walkBlockCheckpoint(checkpoint, vb.Version, vb.BlockToObjectWAL.WALMagic, func(b BlockLookup) {
+			refs[b.ObjectID] = struct{}{}
+		}); err != nil {
+			return err
+		}
+		vb.knowDurableCheckpoint(refs)
+	}
+	return nil
+}
+
+// knowDurableCheckpoint records refs as the chunks the backend's live
+// checkpoint names, as read at load time.
+func (vb *VB) knowDurableCheckpoint(refs map[uint64]struct{}) {
+	vb.gcCkptMu.Lock()
+	vb.gcDurableRefs = refs
+	vb.gcDurableKnown = true
+	vb.gcCkptMu.Unlock()
 }
 
 // readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.

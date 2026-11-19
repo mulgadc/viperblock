@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"path/filepath"
+
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/stretchr/testify/assert"
@@ -254,8 +256,8 @@ func TestS7_ChunkGCReconcileSkipsAChunkStillBeingInstalled(t *testing.T) {
 	assert.Equal(t, data, got)
 }
 
-// A process that has not written a live checkpoint cannot know which chunks
-// the durable one names, so it deletes nothing until runGCSweep writes one.
+// A process that has neither loaded nor written a live checkpoint cannot know
+// which chunks the durable one names, so it deletes nothing until it does.
 func TestChunkGC_SweepWaitsForAKnownDurableCheckpoint(t *testing.T) {
 	vb := newGCTestVB(t, t.TempDir(), "vol-gc-unknown", true)
 	ctx := context.Background()
@@ -272,4 +274,90 @@ func TestChunkGC_SweepWaitsForAKnownDurableCheckpoint(t *testing.T) {
 	vb.runGCSweep(ctx)
 	assertChunkGone(t, vb.Backend, vb.VolumeName, chunkA)
 	assertClosure(t, vb)
+}
+
+// GC starts when the VB is constructed, before the opener loads the map. A
+// sweep in that window must neither delete a chunk nor rewrite the durable
+// checkpoint with the still-empty map.
+// Verifies: ADR-0003:S7.
+func TestS7_ChunkGCLeavesAVolumeWhoseMapIsNotLoaded(t *testing.T) {
+	root := t.TempDir()
+	const vol = "vol-gc-unloaded"
+	ctx := context.Background()
+
+	writer := newGCTestVB(t, root, vol, true)
+	data := randomBlockData(1)
+	writeAndChunk(t, writer, 0, data)
+	chunkA := writer.ObjectNum.Load() - 1
+	require.NoError(t, writer.DrainToBackendCtx(ctx))
+	require.NoError(t, writer.SaveState())
+	durableBefore, named := liveCheckpointChunks(t, writer)
+	require.Contains(t, named, chunkA)
+
+	opener, err := New(&VB{
+		VolumeName:      vol,
+		VolumeSize:      volumeSize,
+		BaseDir:         filepath.Join(root, "viperblock"),
+		WALSyncInterval: -1,
+		GCEnabled:       true,
+		GCInterval:      -1,
+		Cache:           Cache{Config: CacheConfig{Size: 0}},
+	}, FileBackend, file.FileConfig{VolumeName: vol, VolumeSize: volumeSize, BaseDir: root})
+	require.NoError(t, err)
+	require.NoError(t, opener.Backend.Init())
+	t.Cleanup(func() { opener.StopChunkUploader(); opener.StopWALSyncer() })
+
+	opener.runGCSweep(ctx)
+
+	durableAfter, _ := liveCheckpointChunks(t, opener)
+	assert.Equal(t, durableBefore, durableAfter,
+		"ADR-0003:S7 violated: a sweep before the map is loaded rewrote the durable live checkpoint; never force a checkpoint from GC")
+	assertChunkPresent(t, opener.Backend, vol, chunkA)
+}
+
+// After a restart an uploaded-but-never-installed chunk can sit above the
+// restored counter. Reconcile must move the counter past it, and an ID that
+// is mid-upload is never a candidate even if already tracked at zero.
+// Verifies: ADR-0003:S7.
+func TestS7_ChunkGCNeverDeletesAChunkBeingUploaded(t *testing.T) {
+	vb := newGCTestVB(t, t.TempDir(), "vol-gc-reuse", true)
+	gate := newGateBackend(t, vb)
+	ctx := context.Background()
+
+	writeAndChunk(t, vb, 5, randomBlockData(1))
+	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
+
+	orphan := vb.ObjectNum.Load() + 2
+	headers := vb.ChunkHeader()
+	body := randomBlockData(1)
+	require.NoError(t, gate.Backend.WriteCtx(ctx, types.FileTypeChunk, orphan, &headers, &body))
+	vb.sweepChunks(ctx)
+	require.Greater(t, vb.ObjectNum.Load(), orphan, "reconcile must advance the counter past a listed orphan")
+	assertChunkGone(t, vb.Backend, vb.VolumeName, orphan)
+
+	// Stands in for an ID tracked at zero and then minted again.
+	reused := vb.ObjectNum.Load()
+	vb.BlocksToObject.mu.Lock()
+	vb.gcRefcount[reused] = 0
+	vb.BlocksToObject.mu.Unlock()
+
+	data := randomBlockData(1)
+	require.NoError(t, vb.Write(0, data))
+	require.NoError(t, vb.Flush())
+	gate.parkChunk.Store(true)
+	uploadErr := make(chan error, 1)
+	go func() { uploadErr <- vb.WriteWALToChunk(true) }()
+	<-gate.entered
+
+	vb.sweepChunks(ctx)
+	assertChunkPresent(t, vb.Backend, vb.VolumeName, reused)
+
+	close(gate.release)
+	require.NoError(t, <-uploadErr)
+	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
+	vb.sweepChunks(ctx)
+	assertClosure(t, vb)
+	got, err := vb.ReadAt(0, uint64(vb.BlockSize))
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
 }
