@@ -849,7 +849,9 @@ func TestChunkGC_StaleDrainNeverClobbersNewerChunk(t *testing.T) {
 	assert.True(t, staleTracked, "orphaned stale chunk should be tracked for prompt reclaim, not leaked")
 	assert.Zero(t, staleRefs, "orphaned stale chunk must be at refcount 0")
 
-	// A sweep reclaims the stale/orphan chunk and NEVER the live one.
+	// A sweep reclaims the stale/orphan chunk and NEVER the live one. It
+	// needs a durable checkpoint first, so it knows which chunks one names.
+	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
 	vb.sweepChunks(ctx)
 	assertClosure(t, vb)
 	assertChunkPresent(t, vb.Backend, vb.VolumeName, newerChunkID)
