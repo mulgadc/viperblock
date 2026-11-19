@@ -522,6 +522,9 @@ type VB struct {
 	gcDurableRefs  map[uint64]struct{}
 	gcDurableKnown bool
 	gcInflightRefs map[uint64]struct{}
+	// gcUnsettledRefs holds chunks a failed checkpoint write named. That PUT
+	// may still land after a later one, so they stay protected until reload.
+	gcUnsettledRefs map[uint64]struct{}
 	// gcUploading holds chunk IDs minted but not yet installed in the map, so
 	// reconcileChunksOnce cannot mistake an upload in flight for an orphan.
 	gcUploading map[uint64]struct{}
@@ -4742,10 +4745,9 @@ func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 	vb.gcReconciled.Store(true)
 }
 
-// sweepChunks deletes superseded chunk objects: below the watermark captured
-// here, at or above the numbered-checkpoint floor, with zero refcount, and
-// named by neither the durable live checkpoint nor one still being written.
-// Skips until that checkpoint is known: loaded, or written by this process.
+// sweepChunks deletes zero-refcount chunks between the floor and watermark that
+// no durable, in-flight or failed live checkpoint names. Skips until the
+// durable checkpoint is known: loaded, or written by this process.
 func (vb *VB) sweepChunks(ctx context.Context) {
 	if !vb.GCEnabled {
 		return
@@ -4789,6 +4791,9 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 			continue
 		}
 		if _, named := vb.gcInflightRefs[id]; named {
+			continue
+		}
+		if _, named := vb.gcUnsettledRefs[id]; named {
 			continue
 		}
 		if _, uploading := vb.gcUploading[id]; uploading {
@@ -4918,9 +4923,9 @@ func (vb *VB) publishInflightCheckpoint(refs map[uint64]struct{}) {
 	vb.gcCkptMu.Unlock()
 }
 
-// settleInflightCheckpoint retires the in-flight set. A failed write may still
-// have landed with its ack lost, so its chunks stay protected until a later
-// checkpoint succeeds.
+// settleInflightCheckpoint retires the in-flight set. A failed write may land
+// later, even after a newer write succeeds, so its chunks are never released
+// by a later success; only reloading the volume clears them.
 func (vb *VB) settleInflightCheckpoint(saved bool) {
 	vb.gcCkptMu.Lock()
 	defer vb.gcCkptMu.Unlock()
@@ -4931,14 +4936,11 @@ func (vb *VB) settleInflightCheckpoint(saved bool) {
 		vb.gcDurableKnown = true
 		return
 	}
-	if !vb.gcDurableKnown {
-		return
-	}
-	if vb.gcDurableRefs == nil {
-		vb.gcDurableRefs = make(map[uint64]struct{}, len(inflight))
+	if vb.gcUnsettledRefs == nil {
+		vb.gcUnsettledRefs = make(map[uint64]struct{}, len(inflight))
 	}
 	for id := range inflight {
-		vb.gcDurableRefs[id] = struct{}{}
+		vb.gcUnsettledRefs[id] = struct{}{}
 	}
 }
 

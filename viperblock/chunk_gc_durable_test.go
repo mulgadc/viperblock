@@ -23,6 +23,11 @@ type gateBackend struct {
 	parkCheckpoint atomic.Bool
 	parkChunk      atomic.Bool
 	loseAck        atomic.Bool
+	delayWrite     atomic.Bool
+
+	// delayed commits a checkpoint PUT that failed on the client but is
+	// still in flight, so the test can land it after a newer PUT.
+	delayed func() error
 
 	entered chan struct{}
 	release chan struct{}
@@ -47,6 +52,19 @@ func (g *gateBackend) WriteCtx(ctx context.Context, fileType types.FileType, obj
 			// Parked before the write: the durable checkpoint is still the old one.
 			close(g.entered)
 			<-g.release
+		}
+		if g.delayWrite.Load() {
+			if g.delayed == nil {
+				d := append([]byte(nil), (*data)...)
+				var h []byte
+				if headers != nil {
+					h = append([]byte(nil), (*headers)...)
+				}
+				g.delayed = func() error {
+					return g.Backend.WriteCtx(context.Background(), fileType, objectId, &h, &d)
+				}
+			}
+			return errors.New("injected: live checkpoint PUT timed out while still in flight")
 		}
 		if g.loseAck.Load() {
 			if err := g.Backend.WriteCtx(ctx, fileType, objectId, headers, data); err != nil {
@@ -189,8 +207,8 @@ func TestS7_ChunkGCKeepsAChunkAnInFlightCheckpointNames(t *testing.T) {
 	assert.Equal(t, overwrite, got)
 }
 
-// A checkpoint write can land and still report failure. Until a later one
-// succeeds, the chunks it named must be treated as durable.
+// A checkpoint write can land and still report failure. The chunks it named
+// stay protected even after a later write succeeds.
 // Verifies: ADR-0003:S7.
 func TestS7_ChunkGCKeepsAChunkAFailedCheckpointMayHaveWritten(t *testing.T) {
 	vb := newGCTestVB(t, t.TempDir(), "vol-gc-ack-lost", true)
@@ -214,8 +232,41 @@ func TestS7_ChunkGCKeepsAChunkAFailedCheckpointMayHaveWritten(t *testing.T) {
 
 	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
 	vb.sweepChunks(ctx)
-	assertChunkGone(t, vb.Backend, vb.VolumeName, chunkA)
+	assertChunkPresent(t, vb.Backend, vb.VolumeName, chunkA)
 	assertClosure(t, vb)
+}
+
+// A checkpoint PUT that timed out on the client can still land at the store
+// after a newer PUT succeeds, making the older map durable again. No chunk it
+// names may be swept. Verifies: ADR-0003:S7.
+func TestS7_ChunkGCKeepsAChunkALateCheckpointWriteRestores(t *testing.T) {
+	vb := newGCTestVB(t, t.TempDir(), "vol-gc-late-put", true)
+	gate := newGateBackend(t, vb)
+	ctx := context.Background()
+
+	writeAndChunk(t, vb, 5, randomBlockData(1))
+	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
+
+	dataA := randomBlockData(1)
+	writeAndChunk(t, vb, 0, dataA)
+	chunkA := vb.ObjectNum.Load() - 1
+	gate.delayWrite.Store(true)
+	require.Error(t, vb.SaveLiveCheckpointCtx(ctx))
+	gate.delayWrite.Store(false)
+	require.NotNil(t, gate.delayed)
+
+	writeAndChunk(t, vb, 0, randomBlockData(1))
+	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
+	_, named := liveCheckpointChunks(t, vb)
+	require.NotContains(t, named, chunkA, "the newer checkpoint must have superseded chunk A")
+	vb.sweepChunks(ctx)
+
+	require.NoError(t, gate.delayed(), "the timed-out PUT lands last")
+	_, named = liveCheckpointChunks(t, vb)
+	require.Contains(t, named, chunkA)
+	for id := range named {
+		readChunk(t, vb, id)
+	}
 }
 
 // The first sweep lists the chunk prefix to find orphans. A chunk uploaded but
