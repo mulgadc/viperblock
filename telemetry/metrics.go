@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -28,6 +29,7 @@ var (
 
 	walOpCount       metric.Int64Counter
 	walOpDurationSum metric.Float64Counter
+	walOpLatency     metric.Float64Histogram
 
 	guestIOOps         metric.Int64Counter
 	guestIOBytes       metric.Int64Counter
@@ -38,6 +40,16 @@ var (
 
 	backpressureWaits       metric.Int64Counter
 	backpressureDurationSum metric.Float64Counter
+	backpressureLatency     metric.Float64Histogram
+	backpressurePending     metric.Int64Gauge
+	backpressureHigh        metric.Int64Gauge
+	backpressureWaiters     metric.Int64UpDownCounter
+	backpressureSlowWaits   metric.Int64Counter
+
+	backpressurePhaseOps         metric.Int64Counter
+	backpressurePhaseDurationSum metric.Float64Counter
+	backpressurePhaseLatency     metric.Float64Histogram
+	backpressureDrainedBytes     metric.Int64Counter
 
 	rmwConflicts  metric.Int64Counter
 	volumeOpens   metric.Int64Counter
@@ -84,13 +96,21 @@ func instruments() {
 		}
 
 		walOpCount, err = m.Int64Counter("viperblock.wal.operations",
-			metric.WithDescription("Count of WAL flush/replay/consolidate operations."),
+			metric.WithDescription("Count of WAL flush/replay/consolidate/checkpoint operations."),
 			metric.WithUnit("{operation}"))
 		if err != nil {
 			otel.Handle(err)
 		}
 		walOpDurationSum, err = m.Float64Counter("viperblock.wal.operation.duration.sum",
-			metric.WithDescription("Cumulative seconds spent in WAL flush/replay/consolidate operations."),
+			metric.WithDescription("Cumulative seconds spent in WAL flush/replay/consolidate/checkpoint operations."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		// ".latency", not ".duration": duration is already an object in
+		// Elasticsearch, so a same-named histogram would be dropped at ingest.
+		walOpLatency, err = m.Float64Histogram("viperblock.wal.operation.latency",
+			metric.WithDescription("Distribution of WAL flush/replay/consolidate/checkpoint operation time, by phase."),
 			metric.WithUnit("s"))
 		if err != nil {
 			otel.Handle(err)
@@ -155,6 +175,70 @@ func instruments() {
 		backpressureDurationSum, err = m.Float64Counter("viperblock.write.backpressure.duration.sum",
 			metric.WithDescription("Cumulative seconds guest writes spent blocked on backpressure, waiting for the backend to drain."),
 			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureLatency, err = m.Float64Histogram("viperblock.write.backpressure.latency",
+			metric.WithDescription("Distribution of how long each blocked guest write waited on backpressure. The tail, not the mean, is what costs a datastore its leader."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// The two levels the gate compares. Both were previously inferable only
+		// from a wait count, which is how a wrong watermark went unnoticed.
+		backpressurePending, err = m.Int64Gauge("viperblock.write.backpressure.pending_bytes",
+			metric.WithDescription("Buffered bytes not yet durable in a backend chunk, as the backpressure gate sees them. Approaching the high-watermark means the background uploader is not keeping up with the guest."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureHigh, err = m.Int64Gauge("viperblock.write.backpressure.high_watermark_bytes",
+			metric.WithDescription("Runtime high-watermark the gate blocks at, after the WAL-device free-space clamp. Not the 256MB default unless the device has room, so it must be read rather than assumed."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// duration.sum records a stall once per writer that sat through it,
+		// so N writers blocked on one event read as N events without this.
+		backpressureWaiters, err = m.Int64UpDownCounter("viperblock.write.backpressure.waiters",
+			metric.WithDescription("Guest writes currently blocked on backpressure for this volume. A value above 1 means duration.sum is counting one stall several times over."),
+			metric.WithUnit("{writer}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureSlowWaits, err = m.Int64Counter("viperblock.write.backpressure.slow_waits",
+			metric.WithDescription("Guest writes that blocked for at least the bucket's threshold. The 1s bucket is the one that costs a datastore its leader."),
+			metric.WithUnit("{wait}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		// Splits a wait into driving a drain and sleeping between checks. WAL
+		// phase sums cannot: the guest flush path calls the same Flush(), so
+		// those counters mix both callers.
+		backpressurePhaseOps, err = m.Int64Counter("viperblock.write.backpressure.phase.ops",
+			metric.WithDescription("Occurrences of each phase within a backpressure wait: drain (this writer drove one) or poll (it slept between pending-byte checks, while another writer drained or after its own drain left the volume above the low watermark)."),
+			metric.WithUnit("{operation}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressurePhaseDurationSum, err = m.Float64Counter("viperblock.write.backpressure.phase.duration.sum",
+			metric.WithDescription("Cumulative seconds spent in each phase within a backpressure wait. Against duration.sum this is where a stall actually goes."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressurePhaseLatency, err = m.Float64Histogram("viperblock.write.backpressure.phase.latency",
+			metric.WithDescription("Distribution of each phase within a backpressure wait, drain or poll."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		backpressureDrainedBytes, err = m.Int64Counter("viperblock.write.backpressure.drained_bytes",
+			metric.WithDescription("Sum of the per-drain falls in pendingBytes, over drains driven from the stall path. A drain that left pendingBytes higher adds zero, so this is not a net drain rate."),
+			metric.WithUnit("By"))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -283,9 +367,9 @@ func RecordBackendIO(ctx context.Context, op, backendType, volume, outcome strin
 	}
 }
 
-// RecordWALOp records one WAL lifecycle operation: op count and cumulative
-// duration (as duration.sum, added to on every call). phase is
-// "flush"/"replay"/"consolidate", outcome is "success"/"error".
+// RecordWALOp records one WAL lifecycle operation: op count, cumulative
+// duration (as duration.sum) and its latency distribution. phase is
+// "flush"/"replay"/"consolidate"/"checkpoint", outcome is "success"/"error".
 func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed time.Duration) {
 	instruments()
 	attrs := []attribute.KeyValue{
@@ -302,6 +386,9 @@ func RecordWALOp(ctx context.Context, phase, volume, outcome string, elapsed tim
 	}
 	if walOpDurationSum != nil {
 		walOpDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+	if walOpLatency != nil {
+		walOpLatency.Record(ctx, elapsed.Seconds(), opt)
 	}
 }
 
@@ -323,6 +410,92 @@ func RecordWriteBackpressure(ctx context.Context, volume string, elapsed time.Du
 	if backpressureDurationSum != nil {
 		backpressureDurationSum.Add(ctx, elapsed.Seconds(), opt)
 	}
+	if backpressureLatency != nil {
+		backpressureLatency.Record(ctx, elapsed.Seconds(), opt)
+	}
+	recordBackpressureTail(ctx, volume, elapsed)
+}
+
+// backpressureSlowThresholds are the tail buckets a wait is counted into. A
+// wait past several is counted in each, so a bucket reads "at least this long".
+var backpressureSlowThresholds = []struct {
+	label string
+	limit time.Duration
+}{
+	{"100ms", 100 * time.Millisecond},
+	{"1s", time.Second},
+	{"5s", 5 * time.Second},
+}
+
+// recordBackpressureTail counts one completed wait into every tail bucket it
+// reaches, so the tail is readable from counters alone.
+func recordBackpressureTail(ctx context.Context, volume string, elapsed time.Duration) {
+	if backpressureSlowWaits == nil {
+		return
+	}
+	for _, t := range backpressureSlowThresholds {
+		if elapsed < t.limit {
+			continue
+		}
+		attrs := append(volumeAttrs(volume), attribute.String("threshold", t.label))
+		backpressureSlowWaits.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(attrs...)))
+	}
+}
+
+// BackpressureWaiterScope counts a writer as blocked until the returned
+// function is called. Call it exactly once, on the way out of the wait.
+func BackpressureWaiterScope(ctx context.Context, volume string) func() {
+	instruments()
+	if backpressureWaiters == nil {
+		return func() {}
+	}
+	opt := metric.WithAttributeSet(attribute.NewSet(volumeAttrs(volume)...))
+	backpressureWaiters.Add(ctx, 1, opt)
+	return func() { backpressureWaiters.Add(ctx, -1, opt) }
+}
+
+// RecordBackpressurePhase records one phase of a backpressure wait: "drain"
+// when this writer drove one, "poll" for a sleep between pending-byte checks.
+// drainedBytes is that drain's fall in pending bytes, zero if none.
+func RecordBackpressurePhase(ctx context.Context, volume, phase string, elapsed time.Duration, drainedBytes int64) {
+	instruments()
+	attrs := append(volumeAttrs(volume), attribute.String("phase", phase))
+	opt := metric.WithAttributeSet(attribute.NewSet(attrs...))
+
+	if backpressurePhaseOps != nil {
+		backpressurePhaseOps.Add(ctx, 1, opt)
+	}
+	if backpressurePhaseDurationSum != nil {
+		backpressurePhaseDurationSum.Add(ctx, elapsed.Seconds(), opt)
+	}
+	if backpressurePhaseLatency != nil {
+		backpressurePhaseLatency.Record(ctx, elapsed.Seconds(), opt)
+	}
+	if backpressureDrainedBytes != nil && drainedBytes > 0 {
+		backpressureDrainedBytes.Add(ctx, drainedBytes, opt)
+	}
+}
+
+// RecordBackpressureLevels samples the two levels the gate compares: buffered
+// bytes and the runtime high-watermark. Sampled whether or not the write
+// blocks, so a volume tracking just under its watermark shows before it stalls.
+func RecordBackpressureLevels(ctx context.Context, volume string, pending, high uint64) {
+	instruments()
+	opt := metric.WithAttributeSet(attribute.NewSet(volumeAttrs(volume)...))
+	if backpressurePending != nil {
+		backpressurePending.Record(ctx, safecast.Uint64ToInt64(pending), opt)
+	}
+	if backpressureHigh != nil {
+		backpressureHigh.Record(ctx, safecast.Uint64ToInt64(high), opt)
+	}
+}
+
+// volumeAttrs is the per-volume attribute slice, empty for an unnamed volume.
+func volumeAttrs(volume string) []attribute.KeyValue {
+	if volume == "" {
+		return nil
+	}
+	return []attribute.KeyValue{attribute.String("volume.name", volume)}
 }
 
 // RecordGuestIO records one NBD request served to the guest: op count, bytes

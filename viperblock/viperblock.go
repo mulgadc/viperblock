@@ -2152,7 +2152,9 @@ func (vb *VB) signalSizeTrigger() {
 // triggered this wait.
 func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	high := vb.maxPendingBytes()
-	if vb.PendingBytes() <= high {
+	pending := vb.PendingBytes()
+	telemetry.RecordBackpressureLevels(ctx, vb.VolumeName, pending, high)
+	if pending <= high {
 		return nil
 	}
 
@@ -2160,7 +2162,9 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 	// than function entry: recording the unblocked case would leave a mean
 	// dominated by zeros and hide the stall it exists to show.
 	stalledSince := time.Now()
+	releaseWaiter := telemetry.BackpressureWaiterScope(ctx, vb.VolumeName)
 	defer func() {
+		releaseWaiter()
 		telemetry.RecordWriteBackpressure(context.Background(), vb.VolumeName, time.Since(stalledSince))
 	}()
 
@@ -2187,9 +2191,20 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			if stalled, _ := vb.drainStall.elapsed(); stalled > budget {
 				drainCtx, cancel = context.WithTimeout(ctx, vb.recoveryProbeTimeout())
 			}
+			drainStarted := time.Now()
+			pendingBefore := vb.PendingBytes()
 			err := vb.DrainToBackendCtx(drainCtx)
 			cancel()
+			pendingAfter := vb.PendingBytes()
 			vb.drainInFlight.Store(false)
+
+			// This drain's fall in pendingBytes, zero if guest writes outpaced
+			// it. Summed across drains it is not a net rate.
+			var freed int64
+			if pendingAfter < pendingBefore {
+				freed = safecast.Uint64ToInt64(pendingBefore - pendingAfter)
+			}
+			recordBackpressurePhase(ctx, vb.VolumeName, "drain", time.Since(drainStarted), freed)
 			if err != nil {
 				if errors.Is(err, ErrNoSpace) {
 					return err
@@ -2216,11 +2231,14 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 			return stalledDrainErr(stalled, lastErr)
 		}
 
+		pollStarted := time.Now()
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
+			recordBackpressurePhase(ctx, vb.VolumeName, "poll", time.Since(pollStarted), 0)
 			return ctx.Err()
 		}
+		recordBackpressurePhase(ctx, vb.VolumeName, "poll", time.Since(pollStarted), 0)
 		if backoff < maxBackoff {
 			backoff *= 2
 		}
@@ -2228,6 +2246,14 @@ func (vb *VB) awaitBackpressure(ctx context.Context) error {
 
 	return nil
 }
+
+// recordBackpressurePhase is a variable so a test can observe the phases of a
+// real wait without installing a global meter provider.
+var recordBackpressurePhase = telemetry.RecordBackpressurePhase
+
+// recordWALOp is a variable so a test can observe which WAL operations a
+// path records and with what outcome.
+var recordWALOp = telemetry.RecordWALOp
 
 // drainStall records how long the backend has been failing to drain and what
 // the last failure was. Volume-scoped, so every writer blocked in
@@ -2612,7 +2638,7 @@ func (vb *VB) Flush() (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(context.Background(), "flush", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	if err = vb.flushWrites(); err != nil {
@@ -3681,7 +3707,7 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(ctx, "consolidate", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(ctx, "consolidate", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	// Dispatch to sharded implementation when enabled
@@ -4867,7 +4893,7 @@ func (vb *VB) SaveLiveCheckpoint() error {
 }
 
 // SaveLiveCheckpointCtx is SaveLiveCheckpoint with a caller-supplied context.
-func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
+func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) (err error) {
 	// Held across the check, the serialization and the write. Without it two
 	// writers PUT the same key and an older snapshot can land last, leaving
 	// the durable checkpoint behind the map with dirty already cleared.
@@ -4877,6 +4903,17 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 	if !vb.BlocksToObject.dirty.Load() {
 		return nil
 	}
+
+	// Timed after the dirty check, so a no-op checkpoint is not counted and
+	// the third phase of a drain is visible next to flush and consolidate.
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		recordWALOp(context.Background(), "checkpoint", vb.VolumeName, outcome, time.Since(start))
+	}()
 
 	// Serialize the map under the read lock, then release before doing I/O so
 	// the lock is not held across network writes or retry sleeps.
@@ -4909,7 +4946,6 @@ func (vb *VB) SaveLiveCheckpointCtx(ctx context.Context) error {
 
 	headers := []byte{}
 	backoff := vb.checkpointBackoff()
-	var err error
 	for attempt := range 3 {
 		err = vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &headers, &checkpoint)
 		if err == nil {
@@ -5087,7 +5123,7 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordWALOp(context.Background(), "replay", vb.VolumeName, outcome, time.Since(start))
+		recordWALOp(context.Background(), "replay", vb.VolumeName, outcome, time.Since(start))
 	}()
 
 	walDir := filepath.Join(vb.WAL.BaseDir, vb.GetVolume(), "wal", "chunks")
