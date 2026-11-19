@@ -1319,7 +1319,7 @@ func TestChunkGC_SweepsUnderSustainedSlowDrains(t *testing.T) {
 		WALSyncInterval:     -1,
 		ChunkUploadInterval: -1,
 		GCEnabled:           true,
-		GCInterval:          30 * time.Millisecond,
+		GCInterval:          -1,
 		Logger:              slog.New(slog.NewTextHandler(safeBuf, &slog.HandlerOptions{Level: slog.LevelInfo})),
 		Cache:               Cache{Config: CacheConfig{Size: 0}},
 	}
@@ -1363,6 +1363,7 @@ func TestChunkGC_SweepsUnderSustainedSlowDrains(t *testing.T) {
 	// Start the uploader and the (now independent) GC sweeper.
 	vb.ChunkUploadInterval = 20 * time.Millisecond
 	vb.StartChunkUploader()
+	vb.GCInterval = 30 * time.Millisecond
 	vb.StartChunkGC()
 
 	// Teardown runs LIFO: stop the writer, then the goroutines, then remove files.
