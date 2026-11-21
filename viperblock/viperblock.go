@@ -306,6 +306,9 @@ type VB struct {
 	LeaseEpoch uint64
 	// MapDeleteDeferral overrides DefaultMapDeleteDeferral; tests shorten it.
 	MapDeleteDeferral time.Duration
+	// ResumeEpoch lets an open continue a head this process wrote under the
+	// same epoch on an earlier connection, instead of refusing it.
+	ResumeEpoch bool
 	mapClock          func() time.Time
 	mapChain          mapChainState
 
@@ -1412,6 +1415,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		GCEnabled:           config.GCEnabled,
 		LeaseEpoch:          config.LeaseEpoch,
 		MapDeleteDeferral:   config.MapDeleteDeferral,
+		ResumeEpoch:         config.ResumeEpoch,
 		GCInterval:          config.GCInterval,
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: walBaseDir, WALMagic: walMagic},
@@ -6718,8 +6722,11 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 		firstErr = mapErr
 	}
 
-	// Upload the state to the backend
-	if err := vb.SaveStateCtx(ctx); err != nil {
+	// A format-2 volume whose map commit failed writes no VBState: for a new
+	// volume its presence would report a creation whose map is not durable.
+	if vb.IsMapDelta() && mapErr != nil {
+		vb.logger().Error("Close: map commit failed, VBState not saved", "err", mapErr)
+	} else if err := vb.SaveStateCtx(ctx); err != nil {
 		vb.logger().Error("Could not save state", "err", err)
 		if firstErr == nil {
 			firstErr = err

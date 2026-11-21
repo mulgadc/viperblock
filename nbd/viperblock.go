@@ -3,6 +3,7 @@ package main
 import (
 	"C"
 	"strconv"
+	"sync/atomic"
 	"unsafe"
 
 	"libguestfs.org/nbdkit"
@@ -109,6 +110,10 @@ var use_shardwal bool = false
 
 // lease_epoch orders this launch's map heads above every earlier launch's.
 var lease_epoch uint64
+
+// mapClaimed records that this process has claimed its epoch, so a later
+// connection resumes the heads it wrote instead of refusing them.
+var mapClaimed atomic.Bool
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -348,8 +353,9 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role:       "nbdkit",
-		LeaseEpoch: lease_epoch,
+		Role:        "nbdkit",
+		LeaseEpoch:  lease_epoch,
+		ResumeEpoch: mapClaimed.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -414,19 +420,23 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	// recovery/drains would reuse a live chunk ID and overwrite it, leaving a
 	// durable AEAD tag failure. LoadLiveCheckpoint falls back to the numbered
 	// checkpoint when no live one exists yet (brand-new volume).
-	err = vb.LoadLiveCheckpoint()
+	// One deadline covers the load and the claim, so a format-2 volume's first
+	// head under this launch's epoch lands within it, or the open fails.
+	claimCtx, cancelClaim := context.WithTimeout(context.Background(), mapClaimTimeout)
+	err = vb.LoadLiveCheckpointCtx(claimCtx)
 
 	if err != nil {
+		cancelClaim()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
 	}
 
-	// A format-2 volume's first head under this launch's epoch is durable
-	// before recovery or any guest IO, or the open fails.
-	claimCtx, cancelClaim := context.WithTimeout(context.Background(), mapClaimTimeout)
 	err = vb.ClaimMapCtx(claimCtx)
 	cancelClaim()
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
+	}
+	if vb.IsMapDelta() {
+		mapClaimed.Store(true)
 	}
 
 	err = vb.RecoverLocalWALs()

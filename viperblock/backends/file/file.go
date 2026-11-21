@@ -143,6 +143,7 @@ func (backend *Backend) Init() error {
 		"wal",
 		"wal/chunks",
 		"wal/blocks",
+		"map",
 	}
 
 	for _, dir := range dirs {

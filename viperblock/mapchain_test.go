@@ -136,7 +136,7 @@ func openWALs(t testing.TB, vb *VB) {
 func (mv *mapVolume) create(t testing.TB, epoch uint64) (*VB, *mapFaultBackend) {
 	t.Helper()
 	vb, fb := mv.engine(t, epoch)
-	require.NoError(t, vb.InitMapDeltaCtx(context.Background()))
+	require.NoError(t, vb.InitMapDeltaCtx(context.Background(), true))
 	require.NoError(t, vb.SaveState())
 	openWALs(t, vb)
 	return vb, fb
@@ -621,4 +621,102 @@ func TestMapDelta_EmptyCommitNeedsNoEpochAndAChangeDoes(t *testing.T) {
 	require.NoError(t, reader.DrainToBackendCtx(context.Background()), "an idle drain on a reader succeeds")
 	require.NoError(t, reader.Write(1, randomBlockData(1)))
 	require.ErrorIs(t, reader.DrainToBackendCtx(context.Background()), ErrMapNoLeaseEpoch)
+}
+
+// The same nbdkit process reconnecting resumes the heads it wrote under its
+// own epoch; any other launch with that epoch is still refused.
+func TestMapDelta_SameProcessReconnectResumesItsEpoch(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.create(t, 5)
+	writeDrain(t, vb, 0, randomBlockData(1))
+	vb.Detach()
+
+	first, _, err := mv.open(t, 6)
+	require.NoError(t, err)
+	a := randomBlockData(1)
+	writeDrain(t, first, 1, a)
+	require.NoError(t, first.CloseCtx(context.Background()))
+
+	refused, _ := mv.engine(t, 6)
+	require.NoError(t, refused.LoadState())
+	require.ErrorIs(t, refused.LoadLiveCheckpoint(), ErrMapEpochNotNewer, "another launch may never reuse an epoch")
+
+	again, _ := mv.engine(t, 6)
+	again.ResumeEpoch = true
+	require.NoError(t, again.LoadState())
+	require.NoError(t, again.LoadLiveCheckpoint())
+	require.NoError(t, again.ClaimMapCtx(context.Background()))
+	require.NoError(t, again.RecoverLocalWALs())
+	openWALs(t, again)
+	b := randomBlockData(1)
+	writeDrain(t, again, 2, b)
+	require.NoError(t, again.CloseCtx(context.Background()))
+
+	next, _, err := mv.open(t, 7)
+	require.NoError(t, err)
+	assert.Equal(t, append(slices.Clone(a), b...), readBlocks(t, next, 1, 2))
+}
+
+// A seeded create publishes no head until the seed's map is a durable base,
+// and a failed commit leaves no VBState to report the volume created.
+func TestMapDelta_SeededCreatePublishesOnlyTheCompleteMap(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("commit-fails=%t", fail), func(t *testing.T) {
+			mv := newMapVolume(t, volumeSize, nil)
+			vb, fb := mv.engine(t, 5)
+			require.NoError(t, vb.InitMapDeltaCtx(context.Background(), false))
+			openWALs(t, vb)
+			seed := randomBlockData(4)
+			require.NoError(t, vb.Write(0, seed))
+			assert.Empty(t, mv.mapKeys(t, mapHeadPrefix), "no head before the seed is durable")
+			fb.failHead.Store(fail)
+			err := vb.CloseCtx(context.Background())
+			state := filepath.Join(mv.root, types.GetFilePath(types.FileTypeConfig, 0, mv.name))
+			if fail {
+				require.Error(t, err)
+				assert.Empty(t, mv.mapKeys(t, mapHeadPrefix))
+				_, serr := os.Stat(state)
+				assert.True(t, os.IsNotExist(serr), "no VBState after a failed seed commit")
+				return
+			}
+			require.NoError(t, err)
+			_, serr := os.Stat(state)
+			require.NoError(t, serr)
+			re, _, oerr := mv.open(t, 6)
+			require.NoError(t, oerr)
+			assert.Equal(t, seed, readBlocks(t, re, 0, 4))
+			re.checkpointMu.Lock()
+			assert.Empty(t, re.mapChain.head.Deltas, "the seed is the base")
+			re.checkpointMu.Unlock()
+		})
+	}
+}
+
+func TestMapDelta_ClaimAfterItsDeadlineWritesNothing(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.create(t, 5)
+	writeDrain(t, vb, 0, randomBlockData(1))
+	vb.Detach()
+	before := mv.mapKeys(t, mapHeadPrefix)
+
+	re, _ := mv.engine(t, 6)
+	require.NoError(t, re.LoadState())
+	require.NoError(t, re.LoadLiveCheckpoint())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.Error(t, re.ClaimMapCtx(ctx))
+	assert.Equal(t, before, mv.mapKeys(t, mapHeadPrefix))
+}
+
+func TestMapDelta_ClaimMovesChunkIDsPastAStaleWriter(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	old, _ := mv.create(t, 5)
+	writeDrain(t, old, 0, randomBlockData(1))
+	staleNext := old.ObjectNum.Load()
+
+	re, _ := mv.engine(t, 6)
+	require.NoError(t, re.LoadState())
+	require.NoError(t, re.LoadLiveCheckpoint())
+	require.NoError(t, re.ClaimMapCtx(context.Background()))
+	assert.GreaterOrEqual(t, re.ObjectNum.Load(), staleNext+mapClaimObjectGap)
 }

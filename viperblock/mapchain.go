@@ -47,6 +47,11 @@ const (
 	mapBaseMaxAge          = time.Hour
 
 	mapCommitAttempts = 3
+
+	// mapClaimObjectGap is how far a claim moves the chunk counter past the
+	// loaded map, so a stale writer's in-flight chunk uploads cannot land on
+	// an id the new holder allocates.
+	mapClaimObjectGap = 1 << 20
 )
 
 var (
@@ -448,9 +453,11 @@ func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
 }
 
 // InitMapDeltaCtx makes a new volume format 2 under its creation epoch: the
-// fence stub at both v1 keys, an empty base, and the first head, each durable
-// before the next. The caller writes VBState afterwards.
-func (vb *VB) InitMapDeltaCtx(ctx context.Context) error {
+// fence stub at both v1 keys, then the base and first head, each durable
+// before the next. With publish false, as for a seeded volume, no head is
+// written yet: the first commit writes the seeded map as the base, so no
+// head ever names an incomplete creation. The caller writes VBState last.
+func (vb *VB) InitMapDeltaCtx(ctx context.Context, publish bool) error {
 	if vb.LeaseEpoch == 0 {
 		return ErrMapNoLeaseEpoch
 	}
@@ -465,6 +472,13 @@ func (vb *VB) InitMapDeltaCtx(ctx context.Context) error {
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
 	vb.setMapDelta()
+	if !publish {
+		vb.BlocksToObject.mu.Lock()
+		vb.BlocksToObject.replaced = true
+		vb.BlocksToObject.mu.Unlock()
+		vb.mapChain.claimed = true
+		return nil
+	}
 	vb.BlocksToObject.mu.RLock()
 	runs := vb.mapRunsLocked()
 	vb.BlocksToObject.mu.RUnlock()
@@ -554,8 +568,25 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 		}
 		newest[1]++
 	}
-	if vb.LeaseEpoch != 0 && newest[0] >= vb.LeaseEpoch {
+	resume := vb.ResumeEpoch && vb.LeaseEpoch != 0 && newest[0] == vb.LeaseEpoch
+	if vb.LeaseEpoch != 0 && newest[0] >= vb.LeaseEpoch && !resume {
 		return fmt.Errorf("%w: newest %d, launch %d", ErrMapEpochNotNewer, newest[0], vb.LeaseEpoch)
+	}
+	var resumeObjN uint64
+	if resume {
+		// This process wrote that head on an earlier connection: continue its
+		// numbering rather than claim again.
+		keys, lerr := vb.Backend.ListObjectsCtx(ctx, vb.VolumeName+"/map/")
+		if lerr != nil {
+			return fmt.Errorf("map: list own objects: %w", lerr)
+		}
+		for _, k := range keys {
+			for _, prefix := range []string{mapDeltaPrefix, mapBasePrefix} {
+				if e, id, ok := parseMapObjectKey(k, prefix); ok && e == vb.LeaseEpoch {
+					resumeObjN = max(resumeObjN, id+1)
+				}
+			}
+		}
 	}
 
 	headData, err := vb.Backend.ReadKeyCtx(ctx, mapObjectKey(mapHeadPrefix, newest[0], newest[1]))
@@ -617,6 +648,11 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	vb.mapChain.deltaBytes = deltaBytes
 	vb.mapChain.lastBase = vb.mapNow()
 	vb.mapChain.pending = nil
+	if resume {
+		vb.mapChain.headN = newest[1] + 1
+		vb.mapChain.objN = resumeObjN
+		vb.mapChain.claimed = true
+	}
 	return nil
 }
 
@@ -673,6 +709,12 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	if vb.mapChain.claimed {
 		return nil
 	}
+	// The caller's deadline runs from before the load, so a slow load cannot
+	// leave the claim landing after an older writer's deletes come due.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("map: claim deadline passed: %w", err)
+	}
+	advanceAtomicTo(&vb.ObjectNum, vb.ObjectNum.Load()+mapClaimObjectGap)
 	if err := vb.putMapHead(ctx, vb.mapChain.head); err != nil {
 		return fmt.Errorf("map: claim head: %w", err)
 	}
@@ -832,7 +874,8 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.replaced = false
 	vb.BlocksToObject.mu.Unlock()
-	vb.scheduleMapPruneLocked(ctx, next, prev)
+	lastHead := vb.mapChain.headN - 1
+	go vb.scheduleMapPrune(context.WithoutCancel(ctx), next, prev, lastHead)
 	return nil
 }
 
@@ -892,13 +935,17 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 		vb.mapChain.deltaBytes += uint64(d.Size)
 	}
 	vb.mapChain.lastBase = vb.mapNow()
-	vb.scheduleMapPruneLocked(ctx, next, prev)
+	lastHead := vb.mapChain.headN - 1
+	vb.checkpointMu.Unlock()
+	vb.scheduleMapPrune(ctx, next, prev, lastHead)
+	vb.checkpointMu.Lock()
 }
 
-// scheduleMapPruneLocked queues for deferred deletion every map object that
+// scheduleMapPrune queues for deferred deletion every map object that
 // neither the newest head nor the one before it names: one generation back
-// stays readable. Caller holds checkpointMu.
-func (vb *VB) scheduleMapPruneLocked(ctx context.Context, newest, prev mapHead) {
+// stays readable. The listing runs without checkpointMu, so commits are not
+// held behind it; lastHead is the newest head's number when it was taken.
+func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, lastHead uint64) {
 	keep := map[string]bool{}
 	for _, h := range []mapHead{newest, prev} {
 		keep[h.Base.key(mapBasePrefix)] = true
@@ -911,8 +958,8 @@ func (vb *VB) scheduleMapPruneLocked(ctx context.Context, newest, prev mapHead) 
 		vb.logger().Warn("map: prune listing failed, will retry at the next base", "volume", vb.VolumeName, "err", err)
 		return
 	}
-	lastHead := vb.mapChain.headN - 1
 	eligible := vb.mapNow().Add(vb.mapDeleteDeferral())
+	var queue []deferredMapDelete
 	for _, full := range keys {
 		rel := strings.TrimPrefix(full, vb.VolumeName+"/")
 		if keep[rel] {
@@ -927,8 +974,11 @@ func (vb *VB) scheduleMapPruneLocked(ctx context.Context, newest, prev mapHead) 
 		} else if e, _, ok := parseMapObjectKey(rel, mapBasePrefix); ok && e > vb.LeaseEpoch {
 			continue
 		}
-		vb.mapChain.deletes = append(vb.mapChain.deletes, deferredMapDelete{key: rel, eligibleAt: eligible})
+		queue = append(queue, deferredMapDelete{key: rel, eligibleAt: eligible})
 	}
+	vb.checkpointMu.Lock()
+	vb.mapChain.deletes = append(vb.mapChain.deletes, queue...)
+	vb.checkpointMu.Unlock()
 }
 
 // higherEpochHeadExists reports whether a later launch has committed. A
