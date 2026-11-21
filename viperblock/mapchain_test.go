@@ -788,8 +788,9 @@ func TestMapDelta_PruneNeverDeletesADeltaCommittedDuringItsListing(t *testing.T)
 	assert.Equal(t, during, readBlocks(t, re, 7, 1))
 }
 
-// Close waits for a background base, so no head is written after it returns.
-func TestMapDelta_CloseWaitsForABaseInFlight(t *testing.T) {
+// Close stops a background base rather than wait it out, and the base it
+// stopped publishes no head, so no head is written after Close returns.
+func TestMapDelta_CloseStopsABaseInFlight(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
 	vb, fb := mv.create(t, 5)
 	var finished atomic.Bool
@@ -804,8 +805,15 @@ func TestMapDelta_CloseWaitsForABaseInFlight(t *testing.T) {
 	release := func() { once.Do(func() { close(gate) }) }
 	t.Cleanup(release)
 	vb.mapChain.beforeWait = release
+	headsBefore := len(mv.mapKeys(t, mapHeadPrefix))
 	require.NoError(t, vb.CloseCtx(context.Background()))
-	assert.True(t, finished.Load(), "the base finished before Close returned")
+	assert.True(t, finished.Load(), "the base pass ended before Close returned")
+	assert.Equal(t, headsBefore, len(mv.mapKeys(t, mapHeadPrefix)), "a stopped base publishes no head")
+	re, _, err := mv.open(t, 6)
+	require.NoError(t, err)
+	re.checkpointMu.Lock()
+	assert.NotEmpty(t, re.mapChain.head.Deltas, "the deltas the unpublished base covered are still named")
+	re.checkpointMu.Unlock()
 }
 
 // waitDeletesIdle waits for a delete pass still running to finish, then

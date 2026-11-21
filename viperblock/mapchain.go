@@ -371,6 +371,11 @@ type mapChainState struct {
 	// so Close and Detach can wait for every head this engine will write.
 	bg      sync.WaitGroup
 	closing atomic.Bool
+	// bgCancel cancels the context background passes run under, so stopping
+	// them waits for a write to abort, not for a whole base to finish.
+	bgMu     sync.Mutex
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 
 	// baseBusy is set while a background base is written.
 	baseBusy atomic.Bool
@@ -859,8 +864,9 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 	vb.mapChain.head = next
 	vb.mapChain.deltaBytes += uint64(ref.Size)
 	if snap != nil && !vb.mapChain.closing.Load() && vb.mapChain.baseBusy.CompareAndSwap(false, true) {
+		bgCtx := vb.mapBackgroundCtx()
 		vb.mapChain.bg.Go(func() {
-			vb.writeMapBase(context.WithoutCancel(ctx), snap, ref)
+			vb.writeMapBase(bgCtx, snap, ref)
 		})
 	}
 	vb.maybeProcessMapDeletes()
@@ -896,8 +902,9 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 	vb.BlocksToObject.mu.Unlock()
 	bound := vb.mapPruneBoundLocked()
 	if !vb.mapChain.closing.Load() {
+		bgCtx := vb.mapBackgroundCtx()
 		vb.mapChain.bg.Go(func() {
-			vb.scheduleMapPrune(context.WithoutCancel(ctx), next, prev, bound)
+			vb.scheduleMapPrune(bgCtx, next, prev, bound)
 		})
 	}
 	return nil
@@ -917,10 +924,26 @@ func (vb *VB) mapPruneBoundLocked() mapPruneBound {
 // so no head is written after the caller returns.
 func (vb *VB) stopMapBackground() {
 	vb.mapChain.closing.Store(true)
+	vb.mapChain.bgMu.Lock()
+	if vb.mapChain.bgCancel != nil {
+		vb.mapChain.bgCancel()
+	}
+	vb.mapChain.bgMu.Unlock()
 	if vb.mapChain.beforeWait != nil {
 		vb.mapChain.beforeWait()
 	}
 	vb.mapChain.bg.Wait()
+}
+
+// mapBackgroundCtx is the context every background pass runs under, which
+// stopMapBackground cancels.
+func (vb *VB) mapBackgroundCtx() context.Context {
+	vb.mapChain.bgMu.Lock()
+	defer vb.mapChain.bgMu.Unlock()
+	if vb.mapChain.bgCtx == nil {
+		vb.mapChain.bgCtx, vb.mapChain.bgCancel = context.WithCancel(context.Background())
+	}
+	return vb.mapChain.bgCtx
 }
 
 // writeMapBase writes the whole map as delta covered commits it, then
@@ -959,7 +982,8 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
-	if vb.mapChain.fenced.Load() {
+	// A stopped engine publishes nothing more; the written base is an orphan.
+	if vb.mapChain.fenced.Load() || vb.mapChain.closing.Load() || ctx.Err() != nil {
 		return
 	}
 	idx := slices.Index(vb.mapChain.head.Deltas, covered)
@@ -1067,6 +1091,7 @@ func (vb *VB) maybeProcessMapDeletes() {
 		return
 	}
 	vb.mapChain.deletes = rest
+	bgCtx := vb.mapBackgroundCtx()
 	vb.mapChain.bg.Go(func() {
 		defer func() {
 			vb.mapChain.deleteBusy.Store(false)
@@ -1074,7 +1099,7 @@ func (vb *VB) maybeProcessMapDeletes() {
 				vb.mapChain.afterDeletes()
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(bgCtx, 5*time.Minute)
 		defer cancel()
 		vb.deleteMapKeys(ctx, due)
 	})
