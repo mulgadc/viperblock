@@ -245,7 +245,7 @@ All multi-byte fields are big-endian. Each block record includes a CRC32 checksu
 3. **Sync**: A background goroutine calls `fsync` every 200ms if the dirty flag is set
 4. **Consolidate**: `WriteWALToChunk()` reads the WAL, deduplicates, and packs blocks into chunks
 5. **Rotate**: After consolidation, WALNum increments and a new WAL file is opened
-6. **Reclaim**: Once a checkpoint naming the generation's blocks is durable, and the sequence counter that numbered them is durable, its local file is unlinked
+6. **Reclaim**: Once a durable map naming the generation's blocks exists, and the sequence counter that numbered them is durable, its local file is unlinked. For a format-1 volume that map is the live checkpoint; for a format-2 volume it is the newest committed head, its base and the deltas it names (see "Format 2: heads, deltas and bases" below)
 
 Step 6 waits for the checkpoint rather than following the upload directly.
 Consolidation makes a block's *data* durable as a backend chunk; it does not make the *map* from logical block to chunk durable, and during normal operation the live checkpoint is the only durable copy of that map.
@@ -265,6 +265,8 @@ On startup, `RecoverLocalWALs()` scans for unconsolidated WAL files:
 2. Replay valid block records into the block store
 3. Rebuild the in-memory state from recovered blocks
 4. Resume normal operation with consolidated state
+
+A format-2 volume commits the replay as a delta and head, and removes the replayed files only once that commit is durable; a failed commit fails the open and keeps them.
 
 ---
 
@@ -349,7 +351,7 @@ A chunk holds many blocks (`ObjBlockSize`, multi-MB) behind one `BlockLookup` en
 
 **Reference tracking.** `VB` maintains `gcRefcount map[uint64]uint64`, one entry per chunk `ObjectID` currently named by at least one `BlockLookup`, counting how many block entries name it. `createChunkFile` increments the new chunk's count and decrements the superseded chunk's count for every block it repoints; a count reaching zero marks the chunk swept-candidate (the entry is left in the map at zero rather than deleted, so a sweep can find it). `parseBlockCheckpoint` rebuilds this table from scratch on every checkpoint load, so it is always derivable from the current live map and needs no separate persistence. Only maintained when `GCEnabled` is true.
 
-**Sweep timing.** Deleting a chunk is only safe once the durable checkpoint that stops referencing it has landed — otherwise a crash regresses recovery to an older checkpoint that still points at a now-deleted chunk. The sweep therefore only ever runs immediately after a successful `SaveLiveCheckpointCtx` (as the last step of `DrainToBackendCtx`), never from `createChunkFile` (which runs under the parallel chunk-upload pool and cannot see a checkpoint-durable, coalesced view of the map — the same reason per-chunk live-checkpoint writes were removed from that path). It runs from the existing chunk-uploader goroutine on its own `GCInterval` ticker (default 5 minutes, decoupled from the 30-second `ChunkUploadInterval`; `<= 0` disables the periodic sweep), plus once more on `Close`.
+**Sweep timing.** (A format-2 volume adds the deferral and the higher-epoch check described under "Format 2: heads, deltas and bases".) Deleting a chunk is only safe once the durable checkpoint that stops referencing it has landed — otherwise a crash regresses recovery to an older checkpoint that still points at a now-deleted chunk. The sweep therefore only ever runs immediately after a successful `SaveLiveCheckpointCtx` (as the last step of `DrainToBackendCtx`), never from `createChunkFile` (which runs under the parallel chunk-upload pool and cannot see a checkpoint-durable, coalesced view of the map — the same reason per-chunk live-checkpoint writes were removed from that path). It runs from the existing chunk-uploader goroutine on its own `GCInterval` ticker (default 5 minutes, decoupled from the 30-second `ChunkUploadInterval`; `<= 0` disables the periodic sweep), plus once more on `Close`.
 
 **Watermark clamp.** A sweep captures `watermark := vb.ObjectNum.Load()` once, at mark time, and only considers `ObjectID < watermark`. A chunk minted after that point is structurally excluded, without needing a mutex between writers and the sweep: unreferenced-is-terminal means a chunk that was live at mark time is still correctly excluded (nonzero refcount) at sweep time, and a chunk minted after mark time fails the watermark check outright.
 
@@ -397,6 +399,24 @@ BlockLookup{
 ```
 
 A single extent entry replaces 10 individual block entries, reducing memory usage and improving lookup efficiency.
+
+## Format 2: heads, deltas and bases
+
+A volume whose `VBState` records `MapFormat: 2`, or whose `checkpoints/blocks.live.bin` holds the fence stub, persists its map as a chain rather than one checkpoint object:
+
+| Object | Written | Holds |
+| --- | --- | --- |
+| `map/delta.<epoch>.<id>` | Every drain that installed a run | Only the runs that drain installed, in install order |
+| `map/base.<epoch>.<id>` | In the background, once the deltas above the last base reach its size (at least 256 KiB), 512 deltas accumulate, or an hour passes with any delta | The whole map, from a copy-on-write snapshot taken in the same critical section as the delta it covers |
+| `map/head.<epoch>.<n>` | After each delta or base, as the commit point; never overwritten | The base and the exact deltas above it, each with its size and CRC32C |
+
+Runs are varint-encoded against the previous record, and every block keeps its own sequence number. Each object carries its kind, volume name, epoch and id under one CRC32C.
+
+- **Epochs.** `epoch` is the launch's lease epoch, passed to nbdkit as `lease_epoch`. An open fails if the newest head's epoch is not below its own, and it commits `head.<epoch>.0` over the loaded map before recovery or guest IO.
+- **Commit.** A failed or ambiguous delta or head write commits nothing; the batch merges into the next commit under new names.
+- **Open.** The newest head by `(epoch, n)` is found by listing `map/` and then probing forward with single-key reads. A missing or corrupt object fails the open; an older head is never used instead. An open also fails if either v1 key no longer holds the stub.
+- **Deletes.** Pruning after a base keeps one generation back. A dropped map object, or a chunk GC finds at zero references, is deleted no sooner than `2 × volumeLeaseTTL` (90 s) later, and only after a listing finds no head of a higher epoch. A writer that finds one deletes nothing, fences itself and fails further writes.
+- **v1 keys.** Both `blocks.live.bin` and the numbered checkpoint at the volume's `BlockToObjectWALNum` hold a stub with magic `VBMF`, which every v1 parser rejects. Format 2 never writes either key again and never writes a local numbered checkpoint.
 
 ## Block-to-Object WAL
 
@@ -616,6 +636,7 @@ The plugin implements the full nbdkit interface:
 | `base_dir` | Local storage directory |
 | `cache_size` | LRU cache size (percentage of system memory) |
 | `shardwal` | Enable sharded WAL (`true`/`false`) |
+| `lease_epoch` | This launch's lease epoch; orders a format-2 volume's map heads above every earlier launch's |
 | `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `false`) |
 
 ---
