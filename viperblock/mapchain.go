@@ -371,11 +371,10 @@ type mapChainState struct {
 	// so Close and Detach can wait for every head this engine will write.
 	bg      sync.WaitGroup
 	closing atomic.Bool
-	// bgCancel cancels the context background passes run under, so stopping
-	// them waits for a write to abort, not for a whole base to finish.
-	bgMu     sync.Mutex
-	bgCtx    context.Context
-	bgCancel context.CancelFunc
+	// bgStop, closed by stopMapBackground, cancels every background pass, so
+	// stopping them waits for a write to abort, not for a base to finish.
+	bgMu   sync.Mutex
+	bgStop chan struct{}
 
 	// baseBusy is set while a background base is written.
 	baseBusy atomic.Bool
@@ -864,8 +863,9 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 	vb.mapChain.head = next
 	vb.mapChain.deltaBytes += uint64(ref.Size)
 	if snap != nil && !vb.mapChain.closing.Load() && vb.mapChain.baseBusy.CompareAndSwap(false, true) {
-		bgCtx := vb.mapBackgroundCtx()
 		vb.mapChain.bg.Go(func() {
+			bgCtx, cancel := vb.mapBackgroundCtx()
+			defer cancel()
 			vb.writeMapBase(bgCtx, snap, ref)
 		})
 	}
@@ -902,8 +902,9 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 	vb.BlocksToObject.mu.Unlock()
 	bound := vb.mapPruneBoundLocked()
 	if !vb.mapChain.closing.Load() {
-		bgCtx := vb.mapBackgroundCtx()
 		vb.mapChain.bg.Go(func() {
+			bgCtx, cancel := vb.mapBackgroundCtx()
+			defer cancel()
 			vb.scheduleMapPrune(bgCtx, next, prev, bound)
 		})
 	}
@@ -925,8 +926,13 @@ func (vb *VB) mapPruneBoundLocked() mapPruneBound {
 func (vb *VB) stopMapBackground() {
 	vb.mapChain.closing.Store(true)
 	vb.mapChain.bgMu.Lock()
-	if vb.mapChain.bgCancel != nil {
-		vb.mapChain.bgCancel()
+	if vb.mapChain.bgStop == nil {
+		vb.mapChain.bgStop = make(chan struct{})
+	}
+	select {
+	case <-vb.mapChain.bgStop:
+	default:
+		close(vb.mapChain.bgStop)
 	}
 	vb.mapChain.bgMu.Unlock()
 	if vb.mapChain.beforeWait != nil {
@@ -935,16 +941,24 @@ func (vb *VB) stopMapBackground() {
 	vb.mapChain.bg.Wait()
 }
 
-// mapBackgroundCtx is the context every background pass runs under, which
-// stopMapBackground cancels. newVB creates it; a VB assembled without newVB
-// gets an uncancellable one.
-func (vb *VB) mapBackgroundCtx() context.Context {
+// mapBackgroundCtx returns a context for one background pass that
+// stopMapBackground cancels. The caller cancels it when the pass ends.
+func (vb *VB) mapBackgroundCtx() (context.Context, context.CancelFunc) {
 	vb.mapChain.bgMu.Lock()
-	defer vb.mapChain.bgMu.Unlock()
-	if vb.mapChain.bgCtx == nil {
-		return context.Background()
+	if vb.mapChain.bgStop == nil {
+		vb.mapChain.bgStop = make(chan struct{})
 	}
-	return vb.mapChain.bgCtx
+	stop := vb.mapChain.bgStop
+	vb.mapChain.bgMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // writeMapBase writes the whole map as delta covered commits it, then
@@ -1092,8 +1106,9 @@ func (vb *VB) maybeProcessMapDeletes() {
 		return
 	}
 	vb.mapChain.deletes = rest
-	bgCtx := vb.mapBackgroundCtx()
 	vb.mapChain.bg.Go(func() {
+		bgCtx, cancelBg := vb.mapBackgroundCtx()
+		defer cancelBg()
 		defer func() {
 			vb.mapChain.deleteBusy.Store(false)
 			if vb.mapChain.afterDeletes != nil {
