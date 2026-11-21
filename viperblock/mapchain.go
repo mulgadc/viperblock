@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -366,6 +367,11 @@ type mapChainState struct {
 	deltaBytes uint64
 	lastBase   time.Time
 
+	// bg tracks background base and delete passes; closing stops new ones,
+	// so Close and Detach can wait for every head this engine will write.
+	bg      sync.WaitGroup
+	closing atomic.Bool
+
 	// baseBusy is set while a background base is written.
 	baseBusy atomic.Bool
 	// deleteBusy is set while deferred deletes are processed.
@@ -378,6 +384,8 @@ type mapChainState struct {
 	// base or delete pass finishes.
 	afterBase    func()
 	afterDeletes func()
+	// beforeWait, when set by a test, runs as Close begins waiting.
+	beforeWait func()
 
 	// chunkSeen records when chunk GC first found each zero-reference chunk.
 	// Guarded by BlocksToObject.mu.
@@ -504,6 +512,16 @@ func (vb *VB) mapRunsLocked() []BlockLookup {
 		return true
 	})
 	return runs
+}
+
+// MapCommittedCtx reports whether a format-2 volume has any committed head.
+// A volume whose VBState exists without one is an incomplete creation.
+func (vb *VB) MapCommittedCtx(ctx context.Context) (bool, error) {
+	heads, err := vb.listMapHeads(ctx)
+	if err != nil {
+		return false, err
+	}
+	return len(heads) > 0, nil
 }
 
 // listMapHeads returns every committed head's (epoch, n), unordered.
@@ -840,8 +858,12 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 	committed = true
 	vb.mapChain.head = next
 	vb.mapChain.deltaBytes += uint64(ref.Size)
-	if snap != nil && vb.mapChain.baseBusy.CompareAndSwap(false, true) {
-		go vb.writeMapBase(context.WithoutCancel(ctx), snap, ref)
+	if snap != nil && !vb.mapChain.closing.Load() && vb.mapChain.baseBusy.CompareAndSwap(false, true) {
+		vb.mapChain.bg.Add(1)
+		go func() {
+			defer vb.mapChain.bg.Done()
+			vb.writeMapBase(context.WithoutCancel(ctx), snap, ref)
+		}()
 	}
 	vb.maybeProcessMapDeletes()
 	return nil
@@ -874,9 +896,35 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.replaced = false
 	vb.BlocksToObject.mu.Unlock()
-	lastHead := vb.mapChain.headN - 1
-	go vb.scheduleMapPrune(context.WithoutCancel(ctx), next, prev, lastHead)
+	bound := vb.mapPruneBoundLocked()
+	if !vb.mapChain.closing.Load() {
+		vb.mapChain.bg.Add(1)
+		go func() {
+			defer vb.mapChain.bg.Done()
+			vb.scheduleMapPrune(context.WithoutCancel(ctx), next, prev, bound)
+		}()
+	}
 	return nil
+}
+
+// mapPruneBound is what a prune pass may not touch: this epoch's objects and
+// heads allocated at or after it, which a commit since may already name.
+type mapPruneBound struct {
+	objN, headN uint64
+}
+
+func (vb *VB) mapPruneBoundLocked() mapPruneBound {
+	return mapPruneBound{objN: vb.mapChain.objN, headN: vb.mapChain.headN}
+}
+
+// stopMapBackground stops new background passes and waits for running ones,
+// so no head is written after the caller returns.
+func (vb *VB) stopMapBackground() {
+	vb.mapChain.closing.Store(true)
+	if vb.mapChain.beforeWait != nil {
+		vb.mapChain.beforeWait()
+	}
+	vb.mapChain.bg.Wait()
 }
 
 // writeMapBase writes the whole map as delta covered commits it, then
@@ -935,9 +983,9 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 		vb.mapChain.deltaBytes += uint64(d.Size)
 	}
 	vb.mapChain.lastBase = vb.mapNow()
-	lastHead := vb.mapChain.headN - 1
+	bound := vb.mapPruneBoundLocked()
 	vb.checkpointMu.Unlock()
-	vb.scheduleMapPrune(ctx, next, prev, lastHead)
+	vb.scheduleMapPrune(ctx, next, prev, bound)
 	vb.checkpointMu.Lock()
 }
 
@@ -945,7 +993,7 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 // neither the newest head nor the one before it names: one generation back
 // stays readable. The listing runs without checkpointMu, so commits are not
 // held behind it; lastHead is the newest head's number when it was taken.
-func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, lastHead uint64) {
+func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, bound mapPruneBound) {
 	keep := map[string]bool{}
 	for _, h := range []mapHead{newest, prev} {
 		keep[h.Base.key(mapBasePrefix)] = true
@@ -965,13 +1013,15 @@ func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, lastHe
 		if keep[rel] {
 			continue
 		}
+		// The newest two heads stay, and anything this epoch allocated at or
+		// after the bound may be named by a commit made since it was taken.
 		if e, n, ok := parseMapObjectKey(rel, mapHeadPrefix); ok {
-			if e > vb.LeaseEpoch || (e == vb.LeaseEpoch && n+1 >= lastHead) {
+			if e > vb.LeaseEpoch || (e == vb.LeaseEpoch && n+2 >= bound.headN) {
 				continue
 			}
-		} else if e, _, ok := parseMapObjectKey(rel, mapDeltaPrefix); ok && e > vb.LeaseEpoch {
+		} else if e, id, ok := parseMapObjectKey(rel, mapDeltaPrefix); ok && (e > vb.LeaseEpoch || (e == vb.LeaseEpoch && id >= bound.objN)) {
 			continue
-		} else if e, _, ok := parseMapObjectKey(rel, mapBasePrefix); ok && e > vb.LeaseEpoch {
+		} else if e, id, ok := parseMapObjectKey(rel, mapBasePrefix); ok && (e > vb.LeaseEpoch || (e == vb.LeaseEpoch && id >= bound.objN)) {
 			continue
 		}
 		queue = append(queue, deferredMapDelete{key: rel, eligibleAt: eligible})
@@ -1017,11 +1067,13 @@ func (vb *VB) maybeProcessMapDeletes() {
 		vb.mapChain.deletes = rest
 		return
 	}
-	if !vb.mapChain.deleteBusy.CompareAndSwap(false, true) {
+	if vb.mapChain.closing.Load() || !vb.mapChain.deleteBusy.CompareAndSwap(false, true) {
 		return
 	}
 	vb.mapChain.deletes = rest
+	vb.mapChain.bg.Add(1)
 	go func() {
+		defer vb.mapChain.bg.Done()
 		defer func() {
 			vb.mapChain.deleteBusy.Store(false)
 			if vb.mapChain.afterDeletes != nil {

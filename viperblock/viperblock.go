@@ -1565,6 +1565,7 @@ func (vb *VB) Detach() {
 	vb.StopChunkGC()
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
+	vb.stopMapBackground()
 	vb.releaseEngine()
 }
 
@@ -6673,6 +6674,9 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 	vb.StopChunkGC()
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
+	// No background base or delete outlives Close, and none starts after it,
+	// so a reconnect never shares a head number with this engine.
+	vb.stopMapBackground()
 
 	flushErr := vb.Flush()
 	if flushErr != nil {
@@ -6725,8 +6729,8 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 
 	// A format-2 volume whose map commit failed writes no VBState: for a new
 	// volume its presence would report a creation whose map is not durable.
-	if vb.IsMapDelta() && mapErr != nil {
-		vb.logger().Error("Close: map commit failed, VBState not saved", "err", mapErr)
+	if vb.IsMapDelta() && firstErr != nil {
+		vb.logger().Error("Close: writes not durable, VBState not saved", "err", firstErr)
 	} else if err := vb.SaveStateCtx(ctx); err != nil {
 		vb.logger().Error("Could not save state", "err", err)
 		if firstErr == nil {

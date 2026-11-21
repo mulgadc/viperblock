@@ -29,8 +29,21 @@ type mapFaultBackend struct {
 	failHead       atomic.Bool
 	failDelta      atomic.Bool
 	hideNewestHead atomic.Bool
+	failChunks     atomic.Bool
 	keyWrites      atomic.Int64
 	keyBytes       atomic.Int64
+
+	// onMapList, when set, runs once inside the next listing of map/.
+	onMapList atomic.Pointer[func()]
+	// baseGate, when set, holds every base write until it is closed.
+	baseGate atomic.Pointer[chan struct{}]
+}
+
+func (b *mapFaultBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
+	if b.failChunks.Load() && fileType == types.FileTypeChunk {
+		return errInjected
+	}
+	return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
 }
 
 var _ types.Backend = (*mapFaultBackend)(nil)
@@ -42,12 +55,20 @@ func (b *mapFaultBackend) WriteKeyCtx(ctx context.Context, key string, data []by
 	if b.failDelta.Load() && strings.HasPrefix(key, mapDeltaPrefix) {
 		return errInjected
 	}
+	if g := b.baseGate.Load(); g != nil && strings.HasPrefix(key, mapBasePrefix) {
+		<-*g
+	}
 	b.keyWrites.Add(1)
 	b.keyBytes.Add(int64(len(data)))
 	return b.Backend.WriteKeyCtx(ctx, key, data)
 }
 
 func (b *mapFaultBackend) ListObjectsCtx(ctx context.Context, prefix string) ([]string, error) {
+	if strings.HasSuffix(prefix, "/map/") {
+		if fn := b.onMapList.Swap(nil); fn != nil {
+			(*fn)()
+		}
+	}
 	keys, err := b.Backend.ListObjectsCtx(ctx, prefix)
 	if err != nil || !b.hideNewestHead.Load() {
 		return keys, err
@@ -719,4 +740,70 @@ func TestMapDelta_ClaimMovesChunkIDsPastAStaleWriter(t *testing.T) {
 	require.NoError(t, re.LoadLiveCheckpoint())
 	require.NoError(t, re.ClaimMapCtx(context.Background()))
 	assert.GreaterOrEqual(t, re.ObjectNum.Load(), staleNext+mapClaimObjectGap)
+}
+
+// A failed chunk upload at Close, like a failed commit, leaves no VBState to
+// report a seeded creation complete.
+func TestMapDelta_SeededCreateFailedChunkUploadWritesNoState(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, fb := mv.engine(t, 5)
+	require.NoError(t, vb.InitMapDeltaCtx(context.Background(), false))
+	openWALs(t, vb)
+	require.NoError(t, vb.Write(0, randomBlockData(2)))
+	fb.failChunks.Store(true)
+	require.Error(t, vb.CloseCtx(context.Background()))
+	_, err := os.Stat(filepath.Join(mv.root, types.GetFilePath(types.FileTypeConfig, 0, mv.name)))
+	assert.True(t, os.IsNotExist(err))
+	assert.Empty(t, mv.mapKeys(t, mapHeadPrefix))
+}
+
+// A delta committed while a prune pass lists map/ is outside the pass's
+// bound, so it survives the deferred delete and the next open reads it.
+func TestMapDelta_PruneNeverDeletesADeltaCommittedDuringItsListing(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, fb := mv.create(t, 5)
+	bases := make(chan struct{}, 4)
+	deletes := make(chan struct{}, 8)
+	vb.mapChain.afterBase = func() { bases <- struct{}{} }
+	vb.mapChain.afterDeletes = func() { deletes <- struct{}{} }
+
+	writeDrain(t, vb, 0, randomBlockData(1))
+	mv.clock.advance(mapBaseMaxAge)
+	during := randomBlockData(1)
+	hook := func() { writeDrain(t, vb, 7, during) }
+	fb.onMapList.Store(&hook)
+	writeDrain(t, vb, 1, randomBlockData(1))
+	<-bases
+
+	mv.clock.advance(DefaultMapDeleteDeferral)
+	untilTrue(t, deletes, func() bool {
+		vb.checkpointMu.Lock()
+		defer vb.checkpointMu.Unlock()
+		return len(vb.mapChain.deletes) == 0
+	}, func() { writeDrain(t, vb, 2, randomBlockData(1)) })
+	vb.Detach()
+
+	re, _, err := mv.open(t, 6)
+	require.NoError(t, err, "every delta the newest head names still exists")
+	assert.Equal(t, during, readBlocks(t, re, 7, 1))
+}
+
+// Close waits for a background base, so no head is written after it returns.
+func TestMapDelta_CloseWaitsForABaseInFlight(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, fb := mv.create(t, 5)
+	var finished atomic.Bool
+	vb.mapChain.afterBase = func() { finished.Store(true) }
+	gate := make(chan struct{})
+	fb.baseGate.Store(&gate)
+
+	writeDrain(t, vb, 0, randomBlockData(1))
+	mv.clock.advance(mapBaseMaxAge)
+	writeDrain(t, vb, 1, randomBlockData(1))
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+	vb.mapChain.beforeWait = release
+	require.NoError(t, vb.CloseCtx(context.Background()))
+	assert.True(t, finished.Load(), "the base finished before Close returned")
 }
