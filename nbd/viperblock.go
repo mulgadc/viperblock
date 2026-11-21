@@ -45,6 +45,10 @@ const shutdownDrainTimeout = 20 * time.Second
 // own bound is shutdownDrainTimeout.
 const openLockWait = shutdownDrainTimeout
 
+// mapClaimTimeout bounds the first head's write at open to the volume lease
+// TTL, so a launch that cannot commit it never serves IO.
+const mapClaimTimeout = 45 * time.Second
+
 // otelShutdown flushes the OTLP exporters on Unload, if otelsetup.Init
 // configured real ones. nil (a no-op) when OTLP export is not configured.
 var otelShutdown func(context.Context) error
@@ -102,6 +106,9 @@ var cache_size int = viperblock.DefaultCacheBlocks
 var max_pending_bytes uint64 = 0
 var upload_workers int = 16
 var use_shardwal bool = false
+
+// lease_epoch orders this launch's map heads above every earlier launch's.
+var lease_epoch uint64
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -202,6 +209,13 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "shardwal" {
 		use_shardwal = value == "true" || value == "1"
+		return nil
+	} else if key == "lease_epoch" {
+		var err error
+		lease_epoch, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return err
+		}
 		return nil
 	} else if key == "gc_enabled" {
 		gc_enabled = value == "true" || value == "1"
@@ -334,7 +348,8 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role: "nbdkit",
+		Role:       "nbdkit",
+		LeaseEpoch: lease_epoch,
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -403,6 +418,15 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
+	}
+
+	// A format-2 volume's first head under this launch's epoch is durable
+	// before recovery or any guest IO, or the open fails.
+	claimCtx, cancelClaim := context.WithTimeout(context.Background(), mapClaimTimeout)
+	err = vb.ClaimMapCtx(claimCtx)
+	cancelClaim()
+	if err != nil {
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
 	}
 
 	err = vb.RecoverLocalWALs()
