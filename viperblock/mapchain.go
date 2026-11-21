@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/safecast"
 	"github.com/mulgadc/viperblock/types"
 )
 
@@ -88,11 +89,10 @@ func mapObjectKey(prefix string, epoch, id uint64) string {
 // parseMapObjectKey extracts (epoch, id) from a key ending in prefix+E.N,
 // whether or not the volume name precedes it.
 func parseMapObjectKey(key, prefix string) (epoch, id uint64, ok bool) {
-	i := strings.LastIndex(key, prefix)
-	if i < 0 {
+	_, rest, found := strings.Cut(key, prefix)
+	if !found {
 		return 0, 0, false
 	}
-	rest := key[i+len(prefix):]
 	dot := strings.IndexByte(rest, '.')
 	if dot <= 0 {
 		return 0, 0, false
@@ -130,11 +130,11 @@ func frameMapObject(kind byte, volume string, epoch, id uint64, body []byte) []b
 	out := make([]byte, 0, 32+len(volume)+len(body))
 	out = append(out, mapObjectMagic[:]...)
 	out = append(out, kind, mapObjectVersion)
-	out = binary.AppendUvarint(out, uint64(len(volume)))
+	out = binary.AppendUvarint(out, safecast.IntToUint64(len(volume)))
 	out = append(out, volume...)
 	out = binary.BigEndian.AppendUint64(out, epoch)
 	out = binary.BigEndian.AppendUint64(out, id)
-	out = binary.AppendUvarint(out, uint64(len(body)))
+	out = binary.AppendUvarint(out, safecast.IntToUint64(len(body)))
 	out = append(out, body...)
 	return binary.BigEndian.AppendUint32(out, crc32.Checksum(out, crc32cTable))
 }
@@ -152,44 +152,58 @@ func unframeMapObject(data []byte, kind byte, volume string, epoch, id uint64) (
 	}
 	p := payload[6:]
 	vlen, n := binary.Uvarint(p)
-	if n <= 0 || uint64(len(p)-n) < vlen {
+	if n <= 0 || safecast.IntToUint64(len(p)-n) < vlen {
 		return nil, fmt.Errorf("%w: volume name", ErrMapObjectCorrupt)
 	}
-	if string(p[n:n+int(vlen)]) != volume {
-		return nil, fmt.Errorf("%w: object belongs to volume %q", ErrMapObjectCorrupt, p[n:n+int(vlen)])
+	end := n + safecast.Uint64ToInt(vlen)
+	if string(p[n:end]) != volume {
+		return nil, fmt.Errorf("%w: object belongs to volume %q", ErrMapObjectCorrupt, p[n:end])
 	}
-	p = p[n+int(vlen):]
+	p = p[end:]
 	if len(p) < 16 || binary.BigEndian.Uint64(p) != epoch || binary.BigEndian.Uint64(p[8:]) != id {
 		return nil, fmt.Errorf("%w: epoch or id", ErrMapObjectCorrupt)
 	}
 	p = p[16:]
 	blen, n := binary.Uvarint(p)
-	if n <= 0 || uint64(len(p)-n) != blen {
+	if n <= 0 || safecast.IntToUint64(len(p)-n) != blen {
 		return nil, fmt.Errorf("%w: body length", ErrMapObjectCorrupt)
 	}
 	return p[n:], nil
 }
 
-func zigzag(v int64) uint64   { return uint64((v << 1) ^ (v >> 63)) }
-func unzigzag(u uint64) int64 { return int64(u>>1) ^ -int64(u&1) }
+// deltaEnc codes cur against prev as a magnitude with the sign in the low
+// bit, so small moves either way stay small varints.
+func deltaEnc(cur, prev uint64) uint64 {
+	if cur >= prev {
+		return (cur - prev) << 1
+	}
+	return (prev-cur)<<1 - 1
+}
+
+func deltaDec(prev, v uint64) uint64 {
+	if v&1 == 0 {
+		return prev + v>>1
+	}
+	return prev - (v+1)>>1
+}
 
 // encodeMapRuns encodes runs in the order given, each field a varint delta
 // against the previous record. Every block keeps its own sequence number:
 // a run of consecutive seqs stores its first and a flag, any other run one
 // zigzag delta per further block.
 func encodeMapRuns(runs []BlockLookup) []byte {
-	out := binary.AppendUvarint(nil, uint64(len(runs)))
+	out := binary.AppendUvarint(nil, safecast.IntToUint64(len(runs)))
 	var prevEnd, prevObj, prevSeq uint64
 	for _, r := range runs {
-		out = binary.AppendUvarint(out, zigzag(int64(r.StartBlock-prevEnd)))
-		out = binary.AppendUvarint(out, uint64(r.NumBlocks))
-		out = binary.AppendUvarint(out, zigzag(int64(r.ObjectID-prevObj)))
+		out = binary.AppendUvarint(out, deltaEnc(r.StartBlock, prevEnd))
+		out = binary.AppendUvarint(out, safecast.IntToUint64(int(r.NumBlocks)))
+		out = binary.AppendUvarint(out, deltaEnc(r.ObjectID, prevObj))
 		out = binary.AppendUvarint(out, uint64(r.ObjectOffset))
 		first := r.seqNumAt(0)
-		out = binary.AppendUvarint(out, zigzag(int64(first-prevSeq)))
+		out = binary.AppendUvarint(out, deltaEnc(first, prevSeq))
 		consecutive := true
 		for i := 1; i < int(r.NumBlocks); i++ {
-			if r.seqNumAt(i) != first+uint64(i) {
+			if r.seqNumAt(i) != first+safecast.IntToUint64(i) {
 				consecutive = false
 				break
 			}
@@ -201,7 +215,7 @@ func encodeMapRuns(runs []BlockLookup) []byte {
 			prev := first
 			for i := 1; i < int(r.NumBlocks); i++ {
 				s := r.seqNumAt(i)
-				out = binary.AppendUvarint(out, zigzag(int64(s-prev)))
+				out = binary.AppendUvarint(out, deltaEnc(s, prev))
 				prev = s
 			}
 		}
@@ -224,7 +238,7 @@ func decodeMapRuns(body []byte) ([]BlockLookup, error) {
 	if err != nil {
 		return nil, err
 	}
-	if count > uint64(len(body)) {
+	if count > safecast.IntToUint64(len(body)) {
 		return nil, fmt.Errorf("%w: run count %d", ErrMapObjectCorrupt, count)
 	}
 	runs := make([]BlockLookup, 0, count)
@@ -240,12 +254,12 @@ func decodeMapRuns(body []byte) ([]BlockLookup, error) {
 			return nil, fmt.Errorf("%w: run fields", ErrMapObjectCorrupt)
 		}
 		r := BlockLookup{
-			StartBlock:   prevEnd + uint64(unzigzag(f[0])),
-			NumBlocks:    uint16(f[1]),
-			ObjectID:     prevObj + uint64(unzigzag(f[2])),
-			ObjectOffset: uint32(f[3]),
+			StartBlock:   deltaDec(prevEnd, f[0]),
+			NumBlocks:    safecast.IntToUint16(safecast.Uint64ToInt(f[1])),
+			ObjectID:     deltaDec(prevObj, f[2]),
+			ObjectOffset: safecast.Uint64ToUint32(f[3]),
 		}
-		first := prevSeq + uint64(unzigzag(f[4]))
+		first := deltaDec(prevSeq, f[4])
 		flag := p[0]
 		p = p[1:]
 		seqs := make([]uint64, r.NumBlocks)
@@ -253,7 +267,7 @@ func decodeMapRuns(body []byte) ([]BlockLookup, error) {
 		switch flag {
 		case 0:
 			for i := 1; i < len(seqs); i++ {
-				seqs[i] = first + uint64(i)
+				seqs[i] = first + safecast.IntToUint64(i)
 			}
 		case 1:
 			for i := 1; i < len(seqs); i++ {
@@ -261,7 +275,7 @@ func decodeMapRuns(body []byte) ([]BlockLookup, error) {
 				if derr != nil {
 					return nil, derr
 				}
-				seqs[i] = seqs[i-1] + uint64(unzigzag(d))
+				seqs[i] = deltaDec(seqs[i-1], d)
 			}
 		default:
 			return nil, fmt.Errorf("%w: seq flag %d", ErrMapObjectCorrupt, flag)
@@ -285,7 +299,7 @@ func appendRef(out []byte, r mapObjRef) []byte {
 
 func encodeMapHead(h mapHead) []byte {
 	out := appendRef(nil, h.Base)
-	out = binary.AppendUvarint(out, uint64(len(h.Deltas)))
+	out = binary.AppendUvarint(out, safecast.IntToUint64(len(h.Deltas)))
 	for _, d := range h.Deltas {
 		out = appendRef(out, d)
 	}
@@ -307,7 +321,7 @@ func decodeMapHead(body []byte) (mapHead, error) {
 		if len(p) < 4 || vals[2] > 0xFFFFFFFF {
 			return r, fmt.Errorf("%w: truncated head", ErrMapObjectCorrupt)
 		}
-		r = mapObjRef{Epoch: vals[0], ID: vals[1], Size: uint32(vals[2]), CRC: binary.BigEndian.Uint32(p)}
+		r = mapObjRef{Epoch: vals[0], ID: vals[1], Size: safecast.Uint64ToUint32(vals[2]), CRC: binary.BigEndian.Uint32(p)}
 		p = p[4:]
 		return r, nil
 	}
@@ -317,7 +331,7 @@ func decodeMapHead(body []byte) (mapHead, error) {
 		return h, err
 	}
 	count, n := binary.Uvarint(p)
-	if n <= 0 || count > uint64(len(p)) {
+	if n <= 0 || count > safecast.IntToUint64(len(p)) {
 		return h, fmt.Errorf("%w: delta count", ErrMapObjectCorrupt)
 	}
 	p = p[n:]
@@ -419,7 +433,7 @@ func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body [
 	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
 	vb.mapChain.objN++
 	data := frameMapObject(kind, vb.VolumeName, ref.Epoch, ref.ID, body)
-	ref.Size = uint32(len(data))
+	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
 	return ref, vb.writeMapKey(ctx, ref.key(prefix), data)
 }
@@ -505,7 +519,7 @@ func (vb *VB) readMapObject(ctx context.Context, prefix string, kind byte, ref m
 		}
 		return nil, err
 	}
-	if uint32(len(data)) != ref.Size || crc32.Checksum(data, crc32cTable) != ref.CRC {
+	if safecast.IntToUint32(len(data)) != ref.Size || crc32.Checksum(data, crc32cTable) != ref.CRC {
 		return nil, fmt.Errorf("%w: %s digest", ErrMapObjectCorrupt, ref.key(prefix))
 	}
 	return unframeMapObject(data, kind, vb.VolumeName, ref.Epoch, ref.ID)
@@ -777,7 +791,7 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 	vb.mapChain.head = next
 	vb.mapChain.deltaBytes += uint64(ref.Size)
 	if snap != nil && vb.mapChain.baseBusy.CompareAndSwap(false, true) {
-		go vb.writeMapBase(snap, ref)
+		go vb.writeMapBase(context.WithoutCancel(ctx), snap, ref)
 	}
 	vb.maybeProcessMapDeletes()
 	return nil
@@ -816,14 +830,14 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 
 // writeMapBase writes the whole map as delta covered commits it, then
 // publishes a head naming that base and every delta committed above it.
-func (vb *VB) writeMapBase(snap *extentIndex[BlockLookup], covered mapObjRef) {
+func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup], covered mapObjRef) {
 	defer func() {
 		vb.mapChain.baseBusy.Store(false)
 		if vb.mapChain.afterBase != nil {
 			vb.mapChain.afterBase()
 		}
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
 	defer cancel()
 
 	runs := make([]BlockLookup, 0, snap.len())
@@ -840,7 +854,7 @@ func (vb *VB) writeMapBase(snap *extentIndex[BlockLookup], covered mapObjRef) {
 	vb.mapChain.objN++
 	vb.checkpointMu.Unlock()
 	data := frameMapObject(mapKindBase, vb.VolumeName, ref.Epoch, ref.ID, body)
-	ref.Size = uint32(len(data))
+	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
 	if err := vb.writeMapKey(ctx, ref.key(mapBasePrefix), data); err != nil {
 		vb.logger().Warn("map: base write failed, will retry at the next trigger", "volume", vb.VolumeName, "err", err)
