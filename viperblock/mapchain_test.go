@@ -31,11 +31,12 @@ type mapFaultBackend struct {
 	hideNewestHead atomic.Bool
 	failChunks     atomic.Bool
 	failConfig     atomic.Bool
+	keyWrites      atomic.Int64
+	keyBytes       atomic.Int64
+
 	// landConfig writes a config PUT, then reports it failed: a committed
 	// write whose response was lost.
 	landConfig atomic.Bool
-	keyWrites      atomic.Int64
-	keyBytes       atomic.Int64
 
 	// onMapList, when set, runs once inside the next listing of map/.
 	onMapList atomic.Pointer[func()]
