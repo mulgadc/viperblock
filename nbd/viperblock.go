@@ -3,6 +3,7 @@ package main
 import (
 	"C"
 	"strconv"
+	"sync/atomic"
 	"unsafe"
 
 	"libguestfs.org/nbdkit"
@@ -44,6 +45,10 @@ const shutdownDrainTimeout = 20 * time.Second
 // lock. It covers a handover behind the previous connection's drain, whose
 // own bound is shutdownDrainTimeout.
 const openLockWait = shutdownDrainTimeout
+
+// mapClaimTimeout bounds the first head's write at open to the volume lease
+// TTL, so a launch that cannot commit it never serves IO.
+const mapClaimTimeout = 45 * time.Second
 
 // otelShutdown flushes the OTLP exporters on Unload, if otelsetup.Init
 // configured real ones. nil (a no-op) when OTLP export is not configured.
@@ -102,6 +107,17 @@ var cache_size int = viperblock.DefaultCacheBlocks
 var max_pending_bytes uint64 = 0
 var upload_workers int = 16
 var use_shardwal bool = false
+
+// lease_epoch orders this launch's map heads above every earlier launch's.
+var lease_epoch uint64
+
+// mapClaimed records that this process has claimed its epoch, so a later
+// connection resumes the heads it wrote instead of refusing them.
+var mapClaimed atomic.Bool
+
+// mapHeadN and mapObjN carry a closed connection's map counters to the next
+// connection, ambiguous writes included, so no head number is reused.
+var mapHeadN, mapObjN atomic.Uint64
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -202,6 +218,13 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		return nil
 	} else if key == "shardwal" {
 		use_shardwal = value == "true" || value == "1"
+		return nil
+	} else if key == "lease_epoch" {
+		var err error
+		lease_epoch, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return err
+		}
 		return nil
 	} else if key == "gc_enabled" {
 		gc_enabled = value == "true" || value == "1"
@@ -334,7 +357,11 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role: "nbdkit",
+		Role:        "nbdkit",
+		LeaseEpoch:  lease_epoch,
+		ResumeEpoch: mapClaimed.Load(),
+		ResumeHeadN: mapHeadN.Load(),
+		ResumeObjN:  mapObjN.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -399,10 +426,23 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	// recovery/drains would reuse a live chunk ID and overwrite it, leaving a
 	// durable AEAD tag failure. LoadLiveCheckpoint falls back to the numbered
 	// checkpoint when no live one exists yet (brand-new volume).
-	err = vb.LoadLiveCheckpoint()
+	// One deadline covers the load and the claim, so a format-2 volume's first
+	// head under this launch's epoch lands within it, or the open fails.
+	claimCtx, cancelClaim := context.WithTimeout(context.Background(), mapClaimTimeout)
+	err = vb.LoadLiveCheckpointCtx(claimCtx)
 
 	if err != nil {
+		cancelClaim()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
+	}
+
+	err = vb.ClaimMapCtx(claimCtx)
+	cancelClaim()
+	if err != nil {
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
+	}
+	if vb.IsMapDelta() {
+		mapClaimed.Store(true)
 	}
 
 	err = vb.RecoverLocalWALs()
@@ -652,6 +692,11 @@ func (c *ViperBlockConnection) Close() {
 		slog.Error("Close: DrainToBackend failed", "err", err)
 	}
 
+	defer func() {
+		h, o := c.vb.MapCounters()
+		mapHeadN.Store(max(mapHeadN.Load(), h))
+		mapObjN.Store(max(mapObjN.Load(), o))
+	}()
 	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
 	} else if err := viperblock.WriteSealReceipt(base_dir, volume); err != nil {

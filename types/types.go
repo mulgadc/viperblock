@@ -62,6 +62,12 @@ type Backend interface {
 	// its in-memory state.
 	ListObjects(prefix string) (keys []string, err error)
 	ListObjectsCtx(ctx context.Context, prefix string) (keys []string, err error)
+	// ReadKeyCtx, WriteKeyCtx and DeleteKeyCtx address an object of this
+	// backend's own volume by a key relative to it, for objects whose names
+	// carry more than one number. A missing object reads as os.ErrNotExist.
+	ReadKeyCtx(ctx context.Context, key string) (data []byte, err error)
+	WriteKeyCtx(ctx context.Context, key string, data []byte) (err error)
+	DeleteKeyCtx(ctx context.Context, key string) (err error)
 	Sync()
 	GetBackendType() string
 	GetHost() string

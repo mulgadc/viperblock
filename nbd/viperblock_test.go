@@ -29,6 +29,7 @@ func resetPluginConfigState() {
 	wal_base_dir = ""
 	encryption_key_file = ""
 	loadedMasterKey = nil
+	lease_epoch = 0
 }
 
 // TestConfig_WalBaseDirRoundTrips pins that the "wal_base_dir" nbdkit param
@@ -221,4 +222,15 @@ func TestConfigComplete_StartsNoBackgroundWorkBeforeAfterFork(t *testing.T) {
 	assert.NoError(t, p.AfterFork())
 	assert.NotNil(t, otelShutdown, "AfterFork must start OTLP export when an endpoint is configured")
 	assert.Greater(t, runtime.NumGoroutine(), before, "OTLP exporters run in background goroutines")
+}
+
+func TestConfig_LeaseEpochParsesAndRejectsGarbage(t *testing.T) {
+	resetPluginConfigState()
+	defer resetPluginConfigState()
+
+	p := &ViperBlockPlugin{}
+	assert.NoError(t, p.Config("lease_epoch", "18446744073709551615"))
+	assert.Equal(t, uint64(18446744073709551615), lease_epoch)
+	assert.Error(t, p.Config("lease_epoch", "-1"))
+	assert.Error(t, p.Config("lease_epoch", "seven"))
 }
