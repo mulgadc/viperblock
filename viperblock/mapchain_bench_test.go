@@ -129,3 +129,34 @@ func BenchmarkMapOpenFromBaseAndDeltas(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMapDrainDuringBase times drains while background bases run: every
+// 64 drains the base falls due by age and is written concurrently, with the
+// timer running, from the copy-on-write snapshot the drain takes.
+func BenchmarkMapDrainDuringBase(b *testing.B) {
+	for _, shape := range mapBenchShapes[1:] {
+		b.Run(shape.name, func(b *testing.B) {
+			mv := newMapVolume(b, 1<<50, nil)
+			vb, _ := mv.create(b, 5)
+			fillBenchMap(vb, shape.runs, shape.runBlock)
+			ctx := context.Background()
+			benchChange(vb, 0)
+			if err := vb.persistMapCtx(ctx); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if i%64 == 0 {
+					mv.clock.advance(mapBaseMaxAge)
+				}
+				benchChange(vb, i+1)
+				if err := vb.persistMapCtx(ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			vb.waitMapBackground()
+		})
+	}
+}
