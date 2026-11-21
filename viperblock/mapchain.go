@@ -941,7 +941,8 @@ func (vb *VB) mapBackgroundCtx() context.Context {
 	vb.mapChain.bgMu.Lock()
 	defer vb.mapChain.bgMu.Unlock()
 	if vb.mapChain.bgCtx == nil {
-		vb.mapChain.bgCtx, vb.mapChain.bgCancel = context.WithCancel(context.Background())
+		bgCtx, cancel := context.WithCancel(context.Background())
+		vb.mapChain.bgCtx, vb.mapChain.bgCancel = bgCtx, cancel
 	}
 	return vb.mapChain.bgCtx
 }

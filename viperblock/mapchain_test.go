@@ -808,7 +808,7 @@ func TestMapDelta_CloseStopsABaseInFlight(t *testing.T) {
 	headsBefore := len(mv.mapKeys(t, mapHeadPrefix))
 	require.NoError(t, vb.CloseCtx(context.Background()))
 	assert.True(t, finished.Load(), "the base pass ended before Close returned")
-	assert.Equal(t, headsBefore, len(mv.mapKeys(t, mapHeadPrefix)), "a stopped base publishes no head")
+	assert.Len(t, mv.mapKeys(t, mapHeadPrefix), headsBefore, "a stopped base publishes no head")
 	re, _, err := mv.open(t, 6)
 	require.NoError(t, err)
 	re.checkpointMu.Lock()
