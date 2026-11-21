@@ -143,7 +143,7 @@ func TestMapConvert_OpenRunsAndReopensEveryShape(t *testing.T) {
 }
 
 func TestMapConvert_AFailureBeforeVBStateLeavesFormatOne(t *testing.T) {
-	for _, step := range []string{"delta", "head", "state"} {
+	for _, step := range []string{"delta", "head", "stub"} {
 		t.Run(step, func(t *testing.T) {
 			mv := newMapVolume(t, 64<<20, nil)
 			v1 := mv.createV1(t)
@@ -222,11 +222,52 @@ func TestMapConvert_UnacknowledgedVBStateKeepsWALUntilItLands(t *testing.T) {
 	require.NoError(t, vb.Write(7, more))
 	require.Error(t, vb.DrainToBackendCtx(context.Background()))
 
-	// A crash now: the next opener reads format 1 and recovers the WAL.
+	// A crash now. The backend's VBState still says format 1, but the
+	// stubs landed: the opener completes the flip and recovers the WAL.
 	vb.Detach()
+	require.NotEqual(t, MapFormatDelta, persistedFormat(t, mv))
+	require.True(t, liveIsStub(t, mv))
 	re, _, err := mv.open(t, 8)
 	require.NoError(t, err)
+	assert.True(t, re.IsMapDelta())
 	assertBlockMap(t, re, map[uint64][]byte{0: first, 6: late, 7: more})
+	assert.Equal(t, MapFormatDelta, persistedFormat(t, mv))
+}
+
+func TestMapConvert_AmbiguousVBStateWriteThatLandedIsRetried(t *testing.T) {
+	mv := newMapVolume(t, 64<<20, testKey(t, 12))
+	v1 := mv.createV1(t)
+	require.NoError(t, v1.CloseCtx(context.Background()))
+
+	vb, fb := mv.convertReady(t, 7)
+	fb.landConfig.Store(true)
+	d := randomBlockData(1)
+	require.NoError(t, vb.Write(4, d))
+	require.Error(t, vb.DrainToBackendCtx(context.Background()), "a lost response is not an acknowledgement")
+	assert.Equal(t, MapFormatDelta, persistedFormat(t, mv), "the write itself landed")
+	fb.landConfig.Store(false)
+	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+	require.NoError(t, vb.CloseCtx(context.Background()))
+
+	re, _, err := mv.open(t, 8)
+	require.NoError(t, err)
+	assert.True(t, re.IsMapDelta())
+	assertBlockMap(t, re, map[uint64][]byte{4: d})
+}
+
+func TestMapConvert_StateSaveNeverLowersTheHighWater(t *testing.T) {
+	mv := newMapVolume(t, 64<<20, testKey(t, 13))
+	vb := mv.createV1(t)
+	vb.seqNumHighWater.Store(5000)
+	_, _, err := vb.persistStateLocal(100)
+	require.NoError(t, err)
+	vb.seqNumHighWater.Store(200)
+	_, _, err = vb.persistStateLocal(150)
+	require.NoError(t, err)
+
+	re, _ := mv.engine(t, 0)
+	require.NoError(t, re.LoadState())
+	assert.GreaterOrEqual(t, re.seqNumHighWater.Load(), uint64(5000))
 }
 
 func TestMapConvert_StateRetriedUntilAcknowledged(t *testing.T) {

@@ -754,6 +754,8 @@ func (p *ViperBlockPlugin) Unload() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
+	// No conversion flips on this closing drain either.
+	activeVB.StopMapBackground()
 	if err := activeVB.DrainToBackendCtx(ctx); err != nil {
 		slog.Error("Unload: DrainToBackend failed", "err", err)
 	}

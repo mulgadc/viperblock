@@ -31,6 +31,9 @@ type mapFaultBackend struct {
 	hideNewestHead atomic.Bool
 	failChunks     atomic.Bool
 	failConfig     atomic.Bool
+	// landConfig writes a config PUT, then reports it failed: a committed
+	// write whose response was lost.
+	landConfig atomic.Bool
 	keyWrites      atomic.Int64
 	keyBytes       atomic.Int64
 
@@ -45,6 +48,12 @@ func (b *mapFaultBackend) WriteCtx(ctx context.Context, fileType types.FileType,
 		return errInjected
 	}
 	if b.failConfig.Load() && fileType == types.FileTypeConfig {
+		return errInjected
+	}
+	if b.landConfig.Load() && fileType == types.FileTypeConfig {
+		if err := b.Backend.WriteCtx(ctx, fileType, objectId, headers, data); err != nil {
+			return err
+		}
 		return errInjected
 	}
 	return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data)

@@ -496,6 +496,10 @@ type VB struct {
 	// shared with the read-path mutex so LookupBlockToObject and friends
 	// stay uncontended.
 	saveStateMu sync.Mutex
+	// savedHighWater is the highest SeqNumHighWater any state save has
+	// written, so a save that sampled an older one never lowers it.
+	// Guarded by saveStateMu.
+	savedHighWater uint64
 
 	// checkpointRetryBackoff is the first inter-attempt sleep in
 	// SaveLiveCheckpointCtx (0 uses DefaultCheckpointRetryBackoff). Only tests
@@ -5828,6 +5832,11 @@ func (vb *VB) saveStateWithHighWater(ctx context.Context, highWater uint64) erro
 func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 	vb.saveStateMu.Lock()
 	defer vb.saveStateMu.Unlock()
+	// A caller samples its high-water before taking the lock; a reservation
+	// may have saved a higher one since, and a later generation must not
+	// record a lower one.
+	highWater = max(highWater, vb.seqNumHighWater.Load(), vb.savedHighWater)
+	vb.savedHighWater = highWater
 
 	walNum := vb.WAL.WallNum.Load()
 	if vb.UseShardedWAL && vb.ShardedWAL != nil {

@@ -13,8 +13,8 @@ import (
 
 // A format-1 volume converts to format 2 while it runs, by its own writer:
 // a background base from a copy-on-write snapshot, then a flip at a later
-// ordinary drain. VBState is the authority for the format; the stubs follow
-// it only to fence builds that do not read format 2.
+// ordinary drain. VBState is the authority for the format; a stub at the
+// live key under a format-1 VBState is a flip the loader completes.
 
 type mapConvPhase uint8
 
@@ -31,16 +31,18 @@ const (
 // ordinary drain starts it again.
 const mapConvRetry = time.Minute
 
+// mapConvMaxFlipRuns bounds what a flip encodes inside a drain: a batch that
+// outgrew it while the base was written restarts the conversion instead.
+const mapConvMaxFlipRuns = 1 << 16
+
 type mapConversion struct {
 	phase   mapConvPhase
 	started time.Time
 	retryAt time.Time
-	// statePending is set from the flip until VBState naming format 2 is
-	// acknowledged. Until then every commit retries it and fails, so no
-	// WAL is reclaimed while the authority may still say format 1.
-	statePending bool
-	// stubsPending is set until both fence stubs are written after VBState.
-	stubsPending bool
+	// pending is set from the flip's first stub write until both stubs and
+	// VBState naming format 2 are acknowledged. Until then every commit
+	// retries them and fails, so no WAL is reclaimed meanwhile.
+	pending bool
 	// repair is set when the v1 loader found the stub under a VBState that
 	// says format 1, so the claim rewrites VBState.
 	repair bool
@@ -206,6 +208,13 @@ func (vb *VB) flipMapLocked(ctx context.Context) error {
 		vb.abandonConversionLocked()
 		return errConvAbandoned
 	}
+	if len(vb.BlocksToObject.changes) > mapConvMaxFlipRuns {
+		vb.BlocksToObject.mu.Unlock()
+		vb.logger().Info("map: conversion batch outgrew the flip bound; restarting it", "volume", vb.VolumeName, "step", "flip")
+		vb.abandonConversionLocked()
+		c.retryAt = time.Time{}
+		return errConvAbandoned
+	}
 	batch := vb.BlocksToObject.changes
 	vb.BlocksToObject.changes = nil
 	vb.BlocksToObject.dirty.Store(false)
@@ -239,37 +248,54 @@ func (vb *VB) flipMapLocked(ctx context.Context) error {
 		}
 		vb.mapChain.deltaBytes += uint64(ref.Size)
 	}
-	if err := step("state"); err != nil {
+	if err := step("stub"); err != nil {
 		return undo(err)
 	}
 
-	// The VBState write is the flip. From here the engine is format 2
-	// whatever the write's outcome, because an unacknowledged write may
-	// still land: it never writes a v1 checkpoint again.
+	// From the first stub write the engine is format 2 whatever the outcome,
+	// because an unacknowledged write may still land: it never writes a v1
+	// checkpoint again. The stubs precede VBState, so a crash between them
+	// leaves a stub under a format-1 VBState, which the loader completes.
 	vb.mapChain.head = next
 	vb.mapChain.claimed = true
 	vb.MapCreationEpoch = vb.LeaseEpoch
 	vb.BlockToObjectWAL.WallNum.Add(1)
 	vb.setMapDelta()
 	c.phase = convIdle
-	c.statePending = true
-	c.stubsPending = true
+	c.pending = true
 	err := vb.finishConversionLocked(ctx)
 	vb.logger().Info("map converted to format 2", "volume", vb.VolumeName, "epoch", vb.LeaseEpoch,
 		"runs", len(batch), "base_bytes", vb.mapChain.baseBytes, "duration", vb.mapNow().Sub(c.started),
-		"state_written", !c.statePending)
+		"committed", !c.pending)
 	return err
 }
 
-// finishConversionLocked writes what a flip still owes: VBState, retried
-// while unacknowledged and failing the commit until it is, then the stubs.
-// Caller holds checkpointMu.
+// finishConversionLocked writes what a flip still owes, each retried and
+// failing the commit until acknowledged: the numbered stub, the live stub,
+// then VBState naming format 2. Caller holds checkpointMu.
 func (vb *VB) finishConversionLocked(ctx context.Context) error {
 	c := &vb.mapChain.conv
-	if c.statePending {
+	if !c.pending {
+		return nil
+	}
+	stub := MapFenceStub()
+	empty := []byte{}
+	writes := []struct {
+		step  string
+		write func() error
+	}{
+		{"numbered stub", func() error {
+			return vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), &empty, &stub)
+		}},
+		{"live stub", func() error {
+			return vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &empty, &stub)
+		}},
+		{"state", func() error { return vb.SaveStateCtx(ctx) }},
+	}
+	for _, w := range writes {
 		var err error
 		for attempt := range mapCommitAttempts {
-			if err = vb.SaveStateCtx(ctx); err == nil {
+			if err = w.write(); err == nil {
 				break
 			}
 			if attempt < mapCommitAttempts-1 {
@@ -281,24 +307,11 @@ func (vb *VB) finishConversionLocked(ctx context.Context) error {
 			}
 		}
 		if err != nil {
-			vb.logger().Error("map: converted VBState not acknowledged; keeping WAL and retrying", "volume", vb.VolumeName, "step", "state", "err", err)
-			return fmt.Errorf("map: write converted VBState: %w", err)
+			vb.logger().Error("map: conversion not yet committed; keeping WAL and retrying", "volume", vb.VolumeName, "step", w.step, "err", err)
+			return fmt.Errorf("map: conversion %s: %w", w.step, err)
 		}
-		c.statePending = false
 	}
-	if c.stubsPending {
-		stub := MapFenceStub()
-		empty := []byte{}
-		if err := vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load(), &empty, &stub); err != nil {
-			vb.logger().Warn("map: numbered fence stub not written; retrying at the next commit", "volume", vb.VolumeName, "step", "stub", "err", err)
-			return nil
-		}
-		if err := vb.Backend.WriteCtx(ctx, types.FileTypeBlockCheckpointLive, 0, &empty, &stub); err != nil {
-			vb.logger().Warn("map: live fence stub not written; retrying at the next commit", "volume", vb.VolumeName, "step", "stub", "err", err)
-			return nil
-		}
-		c.stubsPending = false
-	}
+	c.pending = false
 	return nil
 }
 
@@ -312,7 +325,6 @@ func (vb *VB) repairConvertedStateLocked(ctx context.Context) error {
 	c.repair = false
 	vb.logger().Warn("map: VBState said format 1 over a converted map; rewriting it", "volume", vb.VolumeName, "step", "resume")
 	vb.BlockToObjectWAL.WallNum.Add(1)
-	c.statePending = true
-	c.stubsPending = true
+	c.pending = true
 	return vb.finishConversionLocked(ctx)
 }
