@@ -754,3 +754,71 @@ func (backend *Backend) SetConfig(config any) error {
 func (backend *Backend) GetHost() string {
 	return backend.config.Host
 }
+
+// ReadKeyCtx reads the whole object at key, relative to this backend's volume.
+func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte, err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	}()
+	if backend.config.s3Client == nil {
+		return nil, fmt.Errorf("S3 client not initialized")
+	}
+	out, err := backend.config.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(backend.config.VolumeName + "/" + key),
+	})
+	if err != nil {
+		return nil, classifyReadErr(err)
+	}
+	defer out.Body.Close()
+	return io.ReadAll(out.Body)
+}
+
+// WriteKeyCtx writes data at key, relative to this backend's volume.
+func (backend *Backend) WriteKeyCtx(ctx context.Context, key string, data []byte) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "write", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	}()
+	if backend.config.s3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+	_, err = backend.config.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(backend.config.VolumeName + "/" + key),
+		Body:   bytes.NewReader(data),
+	})
+	if err != nil {
+		return classifyWriteErr(err)
+	}
+	return nil
+}
+
+// DeleteKeyCtx removes the object at key, relative to this backend's volume.
+func (backend *Backend) DeleteKeyCtx(ctx context.Context, key string) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "delete", "s3", backend.config.VolumeName, outcome, 0, time.Since(start))
+	}()
+	if backend.config.s3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+	_, err = backend.config.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(backend.config.VolumeName + "/" + key),
+	})
+	return wrapNotFound(err)
+}

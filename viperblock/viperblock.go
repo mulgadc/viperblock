@@ -158,6 +158,16 @@ type VBState struct {
 	SeqNumHighWater   uint64  `json:"SeqNumHighWater,omitempty"`
 	StateSeqNum       uint64  `json:"StateSeqNum,omitempty"`
 	KeyFingerprint    string  `json:"KeyFingerprint,omitempty"`
+
+	// MapFormat is 2 for a volume whose map is a chain of heads, deltas and
+	// bases; absent or 1 for the single checkpoint object.
+	MapFormat uint8 `json:"MapFormat,omitempty"`
+	// MapCommitted is set once a format-2 volume has a durable head. Without
+	// it, a format-2 VBState is an incomplete creation.
+	MapCommitted bool `json:"MapCommitted,omitempty"`
+	// MapCreationEpoch is the epoch the volume was created under. Every head
+	// carries it, and an open whose newest head carries another fails.
+	MapCreationEpoch uint64 `json:"MapCreationEpoch,omitempty"`
 }
 
 // snapshotAncestor carries one level of the flattened read chain for a COW clone.
@@ -294,6 +304,25 @@ type VB struct {
 	// same key, so two of them can land out of order and leave the durable
 	// checkpoint behind the map while the dirty flag says it is current.
 	checkpointMu sync.Mutex
+
+	// MapFormat is the volume's persisted map format, MapFormatDelta or not.
+	MapFormat uint8
+	// LeaseEpoch orders this launch's map heads above every earlier
+	// launch's. A format-2 volume can be read without one, never committed.
+	LeaseEpoch uint64
+	// MapDeleteDeferral overrides DefaultMapDeleteDeferral; tests shorten it.
+	MapDeleteDeferral time.Duration
+	// ResumeEpoch lets an open continue a head this process wrote under the
+	// same epoch on an earlier connection, instead of refusing it, starting
+	// its counters no lower than ResumeHeadN and ResumeObjN.
+	ResumeEpoch bool
+	ResumeHeadN uint64
+	ResumeObjN  uint64
+	// MapCreationEpoch is the creation epoch VBState records.
+	MapCreationEpoch uint64
+
+	mapClock func() time.Time
+	mapChain mapChainState
 
 	// flushMu serialises flushWrites. Writes.mu used to do this implicitly by
 	// being held across the whole WAL write, which also blocked every guest
@@ -671,6 +700,13 @@ type BlocksToObject struct {
 	// fractureScratch is reused across insertCoalescedLocked calls to hold the
 	// overlapping entries, which must be collected before the index is mutated.
 	fractureScratch []BlockLookup
+
+	// trackChanges records each run createChunkFile installs into changes,
+	// for a format-2 volume's next delta. replaced marks a wholesale
+	// replacement of the map, which the next commit writes as a base.
+	trackChanges bool
+	changes      []BlockLookup
+	replaced     bool
 }
 
 type BlockLookup struct {
@@ -1389,6 +1425,11 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		WALSyncInterval:     config.WALSyncInterval,
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		GCEnabled:           config.GCEnabled,
+		LeaseEpoch:          config.LeaseEpoch,
+		MapDeleteDeferral:   config.MapDeleteDeferral,
+		ResumeEpoch:         config.ResumeEpoch,
+		ResumeHeadN:         config.ResumeHeadN,
+		ResumeObjN:          config.ResumeObjN,
 		GCInterval:          config.GCInterval,
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: walBaseDir, WALMagic: walMagic},
@@ -1537,6 +1578,7 @@ func (vb *VB) Detach() {
 	vb.StopChunkGC()
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
+	vb.stopMapBackground()
 	vb.releaseEngine()
 }
 
@@ -2371,6 +2413,9 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	// Only backendFull qualifies, which is latched from a drain the backend
 	// actually rejected. Nearfull pressure rides on a SUCCESSFUL response and
 	// means "slow down", so it throttles via maxPendingBytes instead.
+	if vb.mapChain.fenced.Load() {
+		return ErrMapFenced
+	}
 	if vb.backendFull.Load() {
 		// Probe for recovery instead of failing outright: this is exactly the
 		// moment a guest retries after an operator frees space and resumes.
@@ -2559,6 +2604,9 @@ func (vb *VB) writeOneBlockLocked(ctx context.Context, b, blockSize uint64, part
 }
 
 func (vb *VB) Write(block uint64, data []byte) (err error) {
+	if vb.mapChain.fenced.Load() {
+		return ErrMapFenced
+	}
 	blockLen := uint64(len(data))
 
 	// First check the block exists in our volume size
@@ -2765,7 +2813,7 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		vb.afterTakeConsolidatedWALs()
 	}
 
-	if err = vb.SaveLiveCheckpointCtx(ctx); err != nil {
+	if err = vb.persistMapCtx(ctx); err != nil {
 		vb.returnConsolidatedWALs(reclaim)
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
@@ -4032,6 +4080,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	stride := int(strideU32)
 
 	vb.BlocksToObject.mu.Lock()
+	installed := false
 	// installSegment maps [segStart, segEnd) of matchedBlocks -- which the
 	// caller guarantees is one consecutive, superseding run -- onto this chunk.
 	installSegment := func(segStart, segEnd int) {
@@ -4062,6 +4111,10 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			gcRefcount = vb.gcRefcount
 		}
 		vb.BlocksToObject.insertCoalescedLocked(newBlock, strideU32, gcRefcount)
+		installed = true
+		if vb.BlocksToObject.trackChanges {
+			vb.BlocksToObject.changes = append(vb.BlocksToObject.changes, newBlock)
+		}
 
 		// Transition from Pending to Persisted, one range op per run. Per-block
 		// SeqNums keep the location/seqNum binding atomic per block; a stale
@@ -4152,7 +4205,11 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 
 		runStart = runEnd
 	}
-	vb.BlocksToObject.dirty.Store(true)
+	// Only a run actually installed changes the map. Marking it dirty for a
+	// chunk whose blocks were all superseded re-persists an unchanged map.
+	if installed {
+		vb.BlocksToObject.dirty.Store(true)
+	}
 	vb.BlocksToObject.mu.Unlock()
 
 	// Do NOT checkpoint per chunk here. createChunkFile runs under the parallel
@@ -4735,7 +4792,12 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 
 	vb.reconcileChunksOnce(ctx)
 
-	floor := vb.ensureGCFloor(ctx)
+	// A format-2 volume has no numbered checkpoint to fall back to, so no
+	// floor; its deletes wait out the deferral instead, below.
+	var floor uint64
+	if !vb.IsMapDelta() {
+		floor = vb.ensureGCFloor(ctx)
+	}
 	// Captured once: any chunk minted after this point is excluded by the
 	// "id < watermark" check below, so BlocksToObject.mu need not be held
 	// across the delete calls that follow.
@@ -4748,7 +4810,17 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 			candidates = append(candidates, id)
 		}
 	}
+	if vb.IsMapDelta() {
+		candidates = vb.mapChunkCandidatesLocked(candidates)
+	}
 	vb.BlocksToObject.mu.Unlock()
+
+	if vb.IsMapDelta() && len(candidates) > 0 {
+		if newer, err := vb.higherEpochHeadExists(ctx); err != nil || newer {
+			vb.logger().Warn("chunk GC: sweep skipped, could not confirm no newer lease holder", "volume", vb.VolumeName, "newer", newer, "err", err)
+			return
+		}
+	}
 
 	// Last check before anything is deleted, and deliberately here rather than
 	// at the top of the sweep: the caller has already made this sweep's live
@@ -4850,6 +4922,9 @@ func (vb *VB) LoadBlockState() (err error) {
 // LoadBlockStateCtx is LoadBlockState with a caller-supplied context threaded
 // through the checkpoint fetch.
 func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
+	if vb.IsMapDelta() {
+		return vb.loadMapChainCtx(ctx)
+	}
 	var checkpoint []byte
 
 	// Step 1. Validate the local persistent disk contains the state
@@ -4877,6 +4952,10 @@ func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
+	}
+
+	if IsMapFenceStub(checkpoint) {
+		return vb.loadMapChainCtx(ctx)
 	}
 
 	vb.BlocksToObject.mu.Lock()
@@ -4974,12 +5053,19 @@ func (vb *VB) LoadLiveCheckpoint() error {
 
 // LoadLiveCheckpointCtx is LoadLiveCheckpoint with a caller-supplied context.
 func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
+	if vb.IsMapDelta() {
+		return vb.loadMapChainCtx(ctx)
+	}
 	checkpoint, err := vb.Backend.ReadCtx(ctx, types.FileTypeBlockCheckpointLive, 0, 0, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return vb.LoadBlockStateCtx(ctx)
 		}
 		return fmt.Errorf("read live checkpoint: %w", err)
+	}
+	// The stub is the authority for format 2, whatever VBState says.
+	if IsMapFenceStub(checkpoint) {
+		return vb.loadMapChainCtx(ctx)
 	}
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
@@ -5311,6 +5397,20 @@ func (vb *VB) RecoverLocalWALs() (err error) {
 	// Persist recovered state
 	if err := vb.SaveState(); err != nil {
 		return fmt.Errorf("WAL recovery: failed to save state: %w", err)
+	}
+	// A format-2 volume's commit is its only map, so its failure keeps the
+	// replayed WAL: nothing else names these blocks.
+	if vb.IsMapDelta() {
+		if err := vb.persistMapCtx(context.Background()); err != nil {
+			return fmt.Errorf("WAL recovery: failed to commit map: %w", err)
+		}
+		for _, fname := range successFiles {
+			if err := os.Remove(filepath.Join(walDir, fname)); err != nil {
+				vb.logger().Warn("WAL recovery: failed to remove WAL file", "file", fname, "error", err)
+			}
+		}
+		vb.logger().Info("WAL recovery: complete", "recovered_blocks", len(sortedBlocks))
+		return nil
 	}
 	if err := vb.SaveBlockState(); err != nil {
 		return fmt.Errorf("WAL recovery: failed to save block state: %w", err)
@@ -5737,6 +5837,9 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 		EncryptionEnabled:   vb.EncryptionEnabled,
 		VolumeUUID:          vb.VolumeUUID,
 		SeqNumHighWater:     highWater,
+		MapFormat:           vb.MapFormat,
+		MapCommitted:        vb.mapChain.committed.Load(),
+		MapCreationEpoch:    vb.MapCreationEpoch,
 	}
 
 	if vb.EncryptionEnabled {
@@ -6016,6 +6119,13 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 
 	vb.Version = state.Version
 	vb.VolumeConfig = state.VolumeConfig
+	if state.MapFormat == MapFormatDelta {
+		vb.setMapDelta()
+		vb.MapCreationEpoch = state.MapCreationEpoch
+		if state.MapCommitted {
+			vb.mapChain.committed.Store(true)
+		}
+	}
 
 	vb.nextStateSeqNum.Store(state.StateSeqNum)
 
@@ -6583,13 +6693,16 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 	vb.StopChunkGC()
 	vb.StopChunkUploader()
 	vb.StopWALSyncer()
+	// No background base or delete outlives Close, and none starts after it,
+	// so a reconnect never shares a head number with this engine.
+	vb.stopMapBackground()
 
 	flushErr := vb.Flush()
 	if flushErr != nil {
 		vb.logger().Error("failed to flush during Close", "error", flushErr)
 	}
 
-	var walErr error
+	var walErr, mapErr error
 	if vb.UseShardedWAL {
 		walErr = vb.WriteShardedWALToChunkCtx(ctx, true)
 	} else {
@@ -6604,8 +6717,11 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 		// preferred over the numbered checkpoint saved below) reflects the
 		// chunks just uploaded during this Close. Non-fatal: SaveBlockState
 		// below still persists the same map to the numbered checkpoint.
-		if cpErr := vb.SaveLiveCheckpointCtx(ctx); cpErr != nil {
+		if cpErr := vb.persistMapCtx(ctx); cpErr != nil {
 			vb.logger().Warn("Close: SaveLiveCheckpoint failed", "err", cpErr)
+			if vb.IsMapDelta() {
+				mapErr = cpErr
+			}
 		} else {
 			// One last sweep, now that the live checkpoint durably excludes
 			// every zero-refcount chunk. Run before SaveBlockState so
@@ -6626,9 +6742,15 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 	if firstErr == nil {
 		firstErr = walErr
 	}
+	if firstErr == nil {
+		firstErr = mapErr
+	}
 
-	// Upload the state to the backend
-	if err := vb.SaveStateCtx(ctx); err != nil {
+	// A format-2 volume whose map commit failed writes no VBState: for a new
+	// volume its presence would report a creation whose map is not durable.
+	if vb.IsMapDelta() && firstErr != nil {
+		vb.logger().Error("Close: writes not durable, VBState not saved", "err", firstErr)
+	} else if err := vb.SaveStateCtx(ctx); err != nil {
 		vb.logger().Error("Could not save state", "err", err)
 		if firstErr == nil {
 			firstErr = err
@@ -6638,10 +6760,14 @@ func (vb *VB) CloseCtx(ctx context.Context) error {
 	// Always attempt to save the block checkpoint even if SaveState or WAL
 	// flush failed — in-memory BlockLookup may reflect successfully flushed
 	// writes from earlier Flush calls and must not be lost.
-	if err := vb.SaveBlockStateCtx(ctx); err != nil {
-		vb.logger().Error("Could not save block state", "err", err)
-		if firstErr == nil {
-			firstErr = err
+	// A format-2 volume never writes the numbered checkpoint: its key holds
+	// the fence stub, and its map is the committed chain.
+	if !vb.IsMapDelta() {
+		if err := vb.SaveBlockStateCtx(ctx); err != nil {
+			vb.logger().Error("Could not save block state", "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
@@ -6721,6 +6847,9 @@ func (vb *VB) Reset() error {
 
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.lookup.clear()
+	vb.BlocksToObject.changes = nil
+	vb.BlocksToObject.replaced = true
+	vb.BlocksToObject.dirty.Store(true)
 	vb.BlocksToObject.mu.Unlock()
 
 	vb.Writes.mu.Lock()
