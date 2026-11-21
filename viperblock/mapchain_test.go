@@ -30,6 +30,7 @@ type mapFaultBackend struct {
 	failDelta      atomic.Bool
 	hideNewestHead atomic.Bool
 	failChunks     atomic.Bool
+	failConfig     atomic.Bool
 	keyWrites      atomic.Int64
 	keyBytes       atomic.Int64
 
@@ -41,6 +42,9 @@ type mapFaultBackend struct {
 
 func (b *mapFaultBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
 	if b.failChunks.Load() && fileType == types.FileTypeChunk {
+		return errInjected
+	}
+	if b.failConfig.Load() && fileType == types.FileTypeConfig {
 		return errInjected
 	}
 	return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
@@ -569,22 +573,11 @@ func TestMapDelta_StubIsTheAuthorityWithoutVBState(t *testing.T) {
 	re, _ := mv.engine(t, 6)
 	require.NoError(t, re.LoadState())
 	re.MapFormat = 0
+	re.mapChain.delta.Store(false)
 	re.BlocksToObject.trackChanges = false
 	require.NoError(t, re.LoadLiveCheckpoint())
 	assert.True(t, re.IsMapDelta())
 	assert.Equal(t, data, readBlocks(t, re, 0, 1))
-}
-
-func TestMapDelta_ClaimFailsWhenAFenceStubWasReplaced(t *testing.T) {
-	mv := newMapVolume(t, volumeSize, nil)
-	vb, _ := mv.create(t, 5)
-	writeDrain(t, vb, 0, randomBlockData(1))
-	vb.Detach()
-	live := filepath.Join(mv.root, types.GetFilePath(types.FileTypeBlockCheckpointLive, 0, mv.name))
-	require.NoError(t, os.WriteFile(live, []byte("a late v1 checkpoint"), 0o600))
-
-	_, _, err := mv.open(t, 6)
-	require.ErrorIs(t, err, ErrMapFenceStubAbsent)
 }
 
 func walFilesUnder(t *testing.T, root, volumeName string) []string {

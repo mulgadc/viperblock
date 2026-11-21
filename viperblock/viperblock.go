@@ -2813,7 +2813,7 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		vb.afterTakeConsolidatedWALs()
 	}
 
-	if err = vb.persistMapCtx(ctx); err != nil {
+	if err = vb.persistMapForCtx(ctx, true); err != nil {
 		vb.returnConsolidatedWALs(reclaim)
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
@@ -4955,7 +4955,13 @@ func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 	}
 
 	if IsMapFenceStub(checkpoint) {
-		return vb.loadMapChainCtx(ctx)
+		if err := vb.loadMapChainCtx(ctx); err != nil {
+			return err
+		}
+		vb.checkpointMu.Lock()
+		vb.mapChain.conv.repair = true
+		vb.checkpointMu.Unlock()
+		return nil
 	}
 
 	vb.BlocksToObject.mu.Lock()
@@ -5063,9 +5069,17 @@ func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
 		}
 		return fmt.Errorf("read live checkpoint: %w", err)
 	}
-	// The stub is the authority for format 2, whatever VBState says.
+	// VBState decides the format. A stub here under a VBState that says
+	// format 1 is a conversion whose VBState write was lost or overwritten:
+	// load format 2, and the claim rewrites VBState.
 	if IsMapFenceStub(checkpoint) {
-		return vb.loadMapChainCtx(ctx)
+		if err := vb.loadMapChainCtx(ctx); err != nil {
+			return err
+		}
+		vb.checkpointMu.Lock()
+		vb.mapChain.conv.repair = true
+		vb.checkpointMu.Unlock()
+		return nil
 	}
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
@@ -5837,7 +5851,7 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 		EncryptionEnabled:   vb.EncryptionEnabled,
 		VolumeUUID:          vb.VolumeUUID,
 		SeqNumHighWater:     highWater,
-		MapFormat:           vb.MapFormat,
+		MapFormat:           vb.persistedMapFormat(),
 		MapCommitted:        vb.mapChain.committed.Load(),
 		MapCreationEpoch:    vb.MapCreationEpoch,
 	}
