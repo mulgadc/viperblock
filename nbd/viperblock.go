@@ -114,6 +114,10 @@ var lease_epoch uint64
 // mapClaimed records that this process has claimed its epoch, so a later
 // connection resumes the heads it wrote instead of refusing them.
 var mapClaimed atomic.Bool
+
+// mapHeadN and mapObjN carry a closed connection's map counters to the next
+// connection, ambiguous writes included, so no head number is reused.
+var mapHeadN, mapObjN atomic.Uint64
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -356,6 +360,8 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		Role:        "nbdkit",
 		LeaseEpoch:  lease_epoch,
 		ResumeEpoch: mapClaimed.Load(),
+		ResumeHeadN: mapHeadN.Load(),
+		ResumeObjN:  mapObjN.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -686,6 +692,11 @@ func (c *ViperBlockConnection) Close() {
 		slog.Error("Close: DrainToBackend failed", "err", err)
 	}
 
+	defer func() {
+		h, o := c.vb.MapCounters()
+		mapHeadN.Store(max(mapHeadN.Load(), h))
+		mapObjN.Store(max(mapObjN.Load(), o))
+	}()
 	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
 	} else if err := viperblock.WriteSealReceipt(base_dir, volume); err != nil {

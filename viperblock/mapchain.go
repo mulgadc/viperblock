@@ -71,6 +71,7 @@ var (
 	ErrMapNotClaimed      = errors.New("map: this launch has not committed its first head")
 	ErrMapFenced          = errors.New("map: a newer lease holder has committed; this writer is fenced")
 	ErrMapFenceStubAbsent = errors.New("map: a format-2 volume is missing its v1 fence stub")
+	ErrMapLineage         = errors.New("map: the newest head belongs to a different creation than VBState")
 )
 
 // MapFenceStub is what a format-2 volume holds at both v1 checkpoint keys.
@@ -122,12 +123,15 @@ func (r mapObjRef) key(prefix string) string { return mapObjectKey(prefix, r.Epo
 
 // mapHead is the commit point: the base and the exact deltas above it.
 type mapHead struct {
-	Base   mapObjRef
-	Deltas []mapObjRef
+	// Creation is the creation epoch every head of this volume carries, so a
+	// head from one creation attempt never pairs with another's VBState.
+	Creation uint64
+	Base     mapObjRef
+	Deltas   []mapObjRef
 }
 
 func (h mapHead) clone() mapHead {
-	return mapHead{Base: h.Base, Deltas: slices.Clone(h.Deltas)}
+	return mapHead{Creation: h.Creation, Base: h.Base, Deltas: slices.Clone(h.Deltas)}
 }
 
 // frameMapObject wraps body with the header binding it to its kind, volume,
@@ -304,7 +308,8 @@ func appendRef(out []byte, r mapObjRef) []byte {
 }
 
 func encodeMapHead(h mapHead) []byte {
-	out := appendRef(nil, h.Base)
+	out := binary.AppendUvarint(nil, h.Creation)
+	out = appendRef(out, h.Base)
 	out = binary.AppendUvarint(out, safecast.IntToUint64(len(h.Deltas)))
 	for _, d := range h.Deltas {
 		out = appendRef(out, d)
@@ -333,6 +338,11 @@ func decodeMapHead(body []byte) (mapHead, error) {
 	}
 	var h mapHead
 	var err error
+	creation, n := binary.Uvarint(p)
+	if n <= 0 {
+		return h, fmt.Errorf("%w: creation epoch", ErrMapObjectCorrupt)
+	}
+	h.Creation, p = creation, p[n:]
 	if h.Base, err = ref(); err != nil {
 		return h, err
 	}
@@ -381,6 +391,9 @@ type mapChainState struct {
 	// deleteBusy is set while deferred deletes are processed.
 	deleteBusy atomic.Bool
 	fenced     atomic.Bool
+	// committed is set once any head of this volume is durable, and is
+	// persisted in VBState as the creation-complete signal.
+	committed atomic.Bool
 
 	deletes []deferredMapDelete
 
@@ -461,7 +474,19 @@ func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
 	n := vb.mapChain.headN
 	vb.mapChain.headN++
 	data := frameMapObject(mapKindHead, vb.VolumeName, vb.LeaseEpoch, n, encodeMapHead(h))
-	return vb.writeMapKey(ctx, mapObjectKey(mapHeadPrefix, vb.LeaseEpoch, n), data)
+	if err := vb.writeMapKey(ctx, mapObjectKey(mapHeadPrefix, vb.LeaseEpoch, n), data); err != nil {
+		return err
+	}
+	vb.mapChain.committed.Store(true)
+	return nil
+}
+
+// MapCounters reports the next head number and object id this engine would
+// use, ambiguous writes included, for a later engine of the same process.
+func (vb *VB) MapCounters() (headN, objN uint64) {
+	vb.checkpointMu.Lock()
+	defer vb.checkpointMu.Unlock()
+	return vb.mapChain.headN, vb.mapChain.objN
 }
 
 // InitMapDeltaCtx makes a new volume format 2 under its creation epoch: the
@@ -484,6 +509,8 @@ func (vb *VB) InitMapDeltaCtx(ctx context.Context, publish bool) error {
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
 	vb.setMapDelta()
+	vb.MapCreationEpoch = vb.LeaseEpoch
+	vb.mapChain.head.Creation = vb.LeaseEpoch
 	if !publish {
 		vb.BlocksToObject.mu.Lock()
 		vb.BlocksToObject.replaced = true
@@ -498,7 +525,7 @@ func (vb *VB) InitMapDeltaCtx(ctx context.Context, publish bool) error {
 	if err != nil {
 		return fmt.Errorf("map: write first base: %w", err)
 	}
-	h := mapHead{Base: base}
+	h := mapHead{Creation: vb.LeaseEpoch, Base: base}
 	if err := vb.putMapHead(ctx, h); err != nil {
 		return fmt.Errorf("map: write first head: %w", err)
 	}
@@ -516,16 +543,6 @@ func (vb *VB) mapRunsLocked() []BlockLookup {
 		return true
 	})
 	return runs
-}
-
-// MapCommittedCtx reports whether a format-2 volume has any committed head.
-// A volume whose VBState exists without one is an incomplete creation.
-func (vb *VB) MapCommittedCtx(ctx context.Context) (bool, error) {
-	heads, err := vb.listMapHeads(ctx)
-	if err != nil {
-		return false, err
-	}
-	return len(heads) > 0, nil
 }
 
 // listMapHeads returns every committed head's (epoch, n), unordered.
@@ -623,6 +640,9 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if vb.MapCreationEpoch != 0 && h.Creation != vb.MapCreationEpoch {
+		return fmt.Errorf("%w: head creation %d, VBState creation %d", ErrMapLineage, h.Creation, vb.MapCreationEpoch)
+	}
 	baseBody, err := vb.readMapObject(ctx, mapBasePrefix, mapKindBase, h.Base)
 	if err != nil {
 		return err
@@ -670,9 +690,12 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	vb.mapChain.deltaBytes = deltaBytes
 	vb.mapChain.lastBase = vb.mapNow()
 	vb.mapChain.pending = nil
+	vb.mapChain.committed.Store(true)
 	if resume {
-		vb.mapChain.headN = newest[1] + 1
-		vb.mapChain.objN = resumeObjN
+		// The earlier engine's counters cover writes it sent but cannot know
+		// landed, so they win over what the listing shows.
+		vb.mapChain.headN = max(newest[1]+1, vb.ResumeHeadN)
+		vb.mapChain.objN = max(resumeObjN, vb.ResumeObjN)
 		vb.mapChain.claimed = true
 	}
 	return nil
@@ -886,7 +909,7 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 	if err != nil {
 		return fmt.Errorf("map: write base: %w", err)
 	}
-	next := mapHead{Base: base}
+	next := mapHead{Creation: vb.mapChain.head.Creation, Base: base}
 	if err := vb.putMapHead(ctx, next); err != nil {
 		return fmt.Errorf("map: write head: %w", err)
 	}
@@ -924,6 +947,8 @@ func (vb *VB) mapPruneBoundLocked() mapPruneBound {
 // stopMapBackground stops new background passes and waits for running ones,
 // so no head is written after the caller returns.
 func (vb *VB) stopMapBackground() {
+	// Publication checks closing under checkpointMu, so nothing publishes
+	// after this returns; a pass still unwinding writes only orphans.
 	vb.mapChain.closing.Store(true)
 	vb.mapChain.bgMu.Lock()
 	if vb.mapChain.bgStop == nil {
@@ -938,6 +963,11 @@ func (vb *VB) stopMapBackground() {
 	if vb.mapChain.beforeWait != nil {
 		vb.mapChain.beforeWait()
 	}
+}
+
+// waitMapBackground waits for every background pass to return. Only tests
+// call it; stopping never waits.
+func (vb *VB) waitMapBackground() {
 	vb.mapChain.bg.Wait()
 }
 
@@ -1006,7 +1036,7 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 		return
 	}
 	prev := vb.mapChain.head
-	next := mapHead{Base: base, Deltas: slices.Clone(prev.Deltas[idx+1:])}
+	next := mapHead{Creation: prev.Creation, Base: base, Deltas: slices.Clone(prev.Deltas[idx+1:])}
 	if err := vb.putMapHead(ctx, next); err != nil {
 		vb.logger().Warn("map: base head write failed", "volume", vb.VolumeName, "err", err)
 		return
@@ -1133,6 +1163,9 @@ func (vb *VB) deleteMapKeys(ctx context.Context, keys []string) {
 	}
 	var failed []string
 	for _, k := range keys {
+		if vb.mapChain.closing.Load() {
+			return
+		}
 		if derr := vb.Backend.DeleteKeyCtx(ctx, k); derr != nil && !errors.Is(derr, os.ErrNotExist) {
 			failed = append(failed, k)
 		}

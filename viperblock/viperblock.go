@@ -162,6 +162,12 @@ type VBState struct {
 	// MapFormat is 2 for a volume whose map is a chain of heads, deltas and
 	// bases; absent or 1 for the single checkpoint object.
 	MapFormat uint8 `json:"MapFormat,omitempty"`
+	// MapCommitted is set once a format-2 volume has a durable head. Without
+	// it, a format-2 VBState is an incomplete creation.
+	MapCommitted bool `json:"MapCommitted,omitempty"`
+	// MapCreationEpoch is the epoch the volume was created under. Every head
+	// carries it, and an open whose newest head carries another fails.
+	MapCreationEpoch uint64 `json:"MapCreationEpoch,omitempty"`
 }
 
 // snapshotAncestor carries one level of the flattened read chain for a COW clone.
@@ -307,8 +313,13 @@ type VB struct {
 	// MapDeleteDeferral overrides DefaultMapDeleteDeferral; tests shorten it.
 	MapDeleteDeferral time.Duration
 	// ResumeEpoch lets an open continue a head this process wrote under the
-	// same epoch on an earlier connection, instead of refusing it.
+	// same epoch on an earlier connection, instead of refusing it, starting
+	// its counters no lower than ResumeHeadN and ResumeObjN.
 	ResumeEpoch bool
+	ResumeHeadN uint64
+	ResumeObjN  uint64
+	// MapCreationEpoch is the creation epoch VBState records.
+	MapCreationEpoch uint64
 
 	mapClock func() time.Time
 	mapChain mapChainState
@@ -1417,6 +1428,8 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		LeaseEpoch:          config.LeaseEpoch,
 		MapDeleteDeferral:   config.MapDeleteDeferral,
 		ResumeEpoch:         config.ResumeEpoch,
+		ResumeHeadN:         config.ResumeHeadN,
+		ResumeObjN:          config.ResumeObjN,
 		GCInterval:          config.GCInterval,
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: walBaseDir, WALMagic: walMagic},
@@ -5825,6 +5838,8 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 		VolumeUUID:          vb.VolumeUUID,
 		SeqNumHighWater:     highWater,
 		MapFormat:           vb.MapFormat,
+		MapCommitted:        vb.mapChain.committed.Load(),
+		MapCreationEpoch:    vb.MapCreationEpoch,
 	}
 
 	if vb.EncryptionEnabled {
@@ -6106,6 +6121,10 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 	vb.VolumeConfig = state.VolumeConfig
 	if state.MapFormat == MapFormatDelta {
 		vb.setMapDelta()
+		vb.MapCreationEpoch = state.MapCreationEpoch
+		if state.MapCommitted {
+			vb.mapChain.committed.Store(true)
+		}
 	}
 
 	vb.nextStateSeqNum.Store(state.StateSeqNum)

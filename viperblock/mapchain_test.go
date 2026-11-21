@@ -807,8 +807,9 @@ func TestMapDelta_CloseStopsABaseInFlight(t *testing.T) {
 	vb.mapChain.beforeWait = release
 	headsBefore := len(mv.mapKeys(t, mapHeadPrefix))
 	require.NoError(t, vb.CloseCtx(context.Background()))
-	assert.True(t, finished.Load(), "the base pass ended before Close returned")
-	assert.Len(t, mv.mapKeys(t, mapHeadPrefix), headsBefore, "a stopped base publishes no head")
+	vb.waitMapBackground()
+	assert.True(t, finished.Load())
+	assert.Len(t, mv.mapKeys(t, mapHeadPrefix), headsBefore, "a base stopped by Close publishes no head, even after Close returns")
 	re, _, err := mv.open(t, 6)
 	require.NoError(t, err)
 	re.checkpointMu.Lock()
@@ -823,4 +824,69 @@ func waitDeletesIdle(vb *VB, ch chan struct{}) {
 		<-ch
 	}
 	drainSignals(ch)
+}
+
+// A head from one creation attempt never pairs with another attempt's VBState.
+func TestMapDelta_HeadFromAnotherCreationFailsTheOpen(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	first, _ := mv.create(t, 5)
+	writeDrain(t, first, 0, randomBlockData(1))
+	first.Detach()
+
+	// A retry under creation epoch 6 wrote its VBState, then crashed before
+	// publishing its first head.
+	retry, _ := mv.engine(t, 6)
+	require.NoError(t, retry.InitMapDeltaCtx(context.Background(), false))
+	require.NoError(t, retry.SaveState())
+	retry.Detach()
+
+	re, _ := mv.engine(t, 7)
+	require.NoError(t, re.LoadState())
+	require.ErrorIs(t, re.LoadLiveCheckpoint(), ErrMapLineage)
+}
+
+// VBState records MapCommitted only once a head is durable, so it, not a
+// listing, tells an incomplete creation from a volume.
+func TestMapDelta_VBStateRecordsCommitOnlyAfterAHead(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.engine(t, 5)
+	require.NoError(t, vb.InitMapDeltaCtx(context.Background(), false))
+	require.NoError(t, vb.SaveState())
+	state, err := vb.ReadState()
+	require.NoError(t, err)
+	assert.False(t, state.MapCommitted, "VBState written before the seed commits")
+	assert.Equal(t, uint64(5), state.MapCreationEpoch)
+
+	openWALs(t, vb)
+	require.NoError(t, vb.Write(0, randomBlockData(1)))
+	require.NoError(t, vb.CloseCtx(context.Background()))
+	re, _ := mv.engine(t, 6)
+	state, err = re.ReadState()
+	require.NoError(t, err)
+	assert.True(t, state.MapCommitted)
+}
+
+// A resumed connection takes its counters from the engine before it, which
+// covers writes that engine sent and the listing does not show.
+func TestMapDelta_ResumeStartsAtTheEarlierEnginesCounters(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.create(t, 5)
+	writeDrain(t, vb, 0, randomBlockData(1))
+	vb.Detach()
+	first, _, err := mv.open(t, 6)
+	require.NoError(t, err)
+	writeDrain(t, first, 1, randomBlockData(1))
+	require.NoError(t, first.CloseCtx(context.Background()))
+	headN, objN := first.MapCounters()
+
+	again, _ := mv.engine(t, 6)
+	again.ResumeEpoch = true
+	again.ResumeHeadN, again.ResumeObjN = headN+7, objN+7
+	require.NoError(t, again.LoadState())
+	require.NoError(t, again.LoadLiveCheckpoint())
+	require.NoError(t, again.RecoverLocalWALs())
+	openWALs(t, again)
+	writeDrain(t, again, 2, randomBlockData(1))
+	assert.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN+7),
+		"a number the earlier engine may have sent is never reused")
 }
