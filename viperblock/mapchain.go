@@ -859,11 +859,9 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 	vb.mapChain.head = next
 	vb.mapChain.deltaBytes += uint64(ref.Size)
 	if snap != nil && !vb.mapChain.closing.Load() && vb.mapChain.baseBusy.CompareAndSwap(false, true) {
-		vb.mapChain.bg.Add(1)
-		go func() {
-			defer vb.mapChain.bg.Done()
+		vb.mapChain.bg.Go(func() {
 			vb.writeMapBase(context.WithoutCancel(ctx), snap, ref)
-		}()
+		})
 	}
 	vb.maybeProcessMapDeletes()
 	return nil
@@ -898,11 +896,9 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 	vb.BlocksToObject.mu.Unlock()
 	bound := vb.mapPruneBoundLocked()
 	if !vb.mapChain.closing.Load() {
-		vb.mapChain.bg.Add(1)
-		go func() {
-			defer vb.mapChain.bg.Done()
+		vb.mapChain.bg.Go(func() {
 			vb.scheduleMapPrune(context.WithoutCancel(ctx), next, prev, bound)
-		}()
+		})
 	}
 	return nil
 }
@@ -1071,15 +1067,13 @@ func (vb *VB) maybeProcessMapDeletes() {
 		return
 	}
 	vb.mapChain.deletes = rest
-	vb.mapChain.bg.Add(1)
-	go func() {
-		defer vb.mapChain.bg.Done()
+	vb.mapChain.bg.Go(func() {
 		defer func() {
 			vb.mapChain.deleteBusy.Store(false)
 			if vb.mapChain.afterDeletes != nil {
 				vb.mapChain.afterDeletes()
 			}
-		}()
+		})
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		vb.deleteMapKeys(ctx, due)
