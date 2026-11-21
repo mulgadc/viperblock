@@ -1465,6 +1465,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		vb.aead = config.MasterKey.AEAD
 		vb.volumeNameHash = computeVolumeNameHash(config.VolumeName)
 	}
+	vb.mapChain.bgCtx, vb.mapChain.bgCancel = context.WithCancel(context.Background())
 
 	vb.BlocksToObject.lookup.clear()
 	if vb.GCEnabled {

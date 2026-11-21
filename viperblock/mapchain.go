@@ -936,13 +936,13 @@ func (vb *VB) stopMapBackground() {
 }
 
 // mapBackgroundCtx is the context every background pass runs under, which
-// stopMapBackground cancels.
+// stopMapBackground cancels. newVB creates it; a VB assembled without newVB
+// gets an uncancellable one.
 func (vb *VB) mapBackgroundCtx() context.Context {
 	vb.mapChain.bgMu.Lock()
 	defer vb.mapChain.bgMu.Unlock()
 	if vb.mapChain.bgCtx == nil {
-		bgCtx, cancel := context.WithCancel(context.Background())
-		vb.mapChain.bgCtx, vb.mapChain.bgCancel = bgCtx, cancel
+		return context.Background()
 	}
 	return vb.mapChain.bgCtx
 }
