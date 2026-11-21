@@ -417,6 +417,9 @@ Runs are varint-encoded against the previous record, and every block keeps its o
 - **Open.** The newest head by `(epoch, n)` is found by listing `map/` and then probing forward with single-key reads. A missing or corrupt object fails the open; an older head is never used instead. An open also fails if either v1 key no longer holds the stub.
 - **Deletes.** Pruning after a base keeps one generation back. A dropped map object, or a chunk GC finds at zero references, is deleted no sooner than `2 × volumeLeaseTTL` (90 s) later, and only after a listing finds no head of a higher epoch. A writer that finds one deletes nothing, fences itself and fails further writes.
 - **v1 keys.** Both `blocks.live.bin` and the numbered checkpoint at the volume's `BlockToObjectWALNum` hold a stub with magic `VBMF`, which every v1 parser rejects. Format 2 never writes either key again and never writes a local numbered checkpoint.
+- **Creation.** A volume is created once `VBState` records `MapCommitted`, which is set only after a head is durable; an encrypted volume writes `VBState` earlier, when it reserves sequence numbers, so `VBState` alone does not mean created. A seeded create publishes no head until its seed commits as the base. Every head carries the creation epoch `VBState` records as `MapCreationEpoch`, and an open whose newest head carries another fails closed.
+- **Reconnect.** A later connection to the same nbdkit process resumes its epoch's heads, starting its counters at the previous connection's, so a write that connection sent is never renumbered.
+- **Stopping.** Close and Detach cancel background bases, prunes and deletes without waiting; publication and deletes check for it under the commit lock, so nothing is published after they return.
 
 ## Block-to-Object WAL
 
