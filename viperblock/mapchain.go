@@ -727,15 +727,23 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 	if vb.mapChain.fenced.Load() {
 		return ErrMapFenced
 	}
-	if vb.LeaseEpoch == 0 {
-		return ErrMapNoLeaseEpoch
-	}
-	if !vb.mapChain.claimed {
-		return ErrMapNotClaimed
-	}
 
 	var snap *extentIndex[BlockLookup]
 	vb.BlocksToObject.mu.Lock()
+	// Nothing to commit succeeds whatever the epoch, so an engine that only
+	// reads, and drains an empty WAL, never fails a drain.
+	if !vb.BlocksToObject.replaced && len(vb.BlocksToObject.changes) == 0 && len(vb.mapChain.pending) == 0 {
+		vb.BlocksToObject.dirty.Store(false)
+		vb.BlocksToObject.mu.Unlock()
+		return nil
+	}
+	if vb.LeaseEpoch == 0 || !vb.mapChain.claimed {
+		vb.BlocksToObject.mu.Unlock()
+		if vb.LeaseEpoch == 0 {
+			return ErrMapNoLeaseEpoch
+		}
+		return ErrMapNotClaimed
+	}
 	if vb.BlocksToObject.replaced {
 		runs := vb.mapRunsLocked()
 		vb.BlocksToObject.changes = nil

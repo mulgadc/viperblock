@@ -606,3 +606,19 @@ func untilTrue(t *testing.T, signals chan struct{}, cond func() bool, trigger fu
 		}
 	}
 }
+
+func TestMapDelta_EmptyCommitNeedsNoEpochAndAChangeDoes(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.create(t, 5)
+	writeDrain(t, vb, 0, randomBlockData(1))
+	vb.Detach()
+
+	reader, _ := mv.engine(t, 0)
+	require.NoError(t, reader.LoadState())
+	require.NoError(t, reader.LoadLiveCheckpoint())
+	require.NoError(t, reader.RecoverLocalWALs(), "recovery with nothing to replay commits nothing")
+	openWALs(t, reader)
+	require.NoError(t, reader.DrainToBackendCtx(context.Background()), "an idle drain on a reader succeeds")
+	require.NoError(t, reader.Write(1, randomBlockData(1)))
+	require.ErrorIs(t, reader.DrainToBackendCtx(context.Background()), ErrMapNoLeaseEpoch)
+}
