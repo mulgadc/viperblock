@@ -309,8 +309,9 @@ type VB struct {
 	// ResumeEpoch lets an open continue a head this process wrote under the
 	// same epoch on an earlier connection, instead of refusing it.
 	ResumeEpoch bool
-	mapClock          func() time.Time
-	mapChain          mapChainState
+
+	mapClock func() time.Time
+	mapChain mapChainState
 
 	// flushMu serialises flushWrites. Writes.mu used to do this implicitly by
 	// being held across the whole WAL write, which also blocked every guest
