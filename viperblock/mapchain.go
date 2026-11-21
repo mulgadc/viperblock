@@ -1073,11 +1073,11 @@ func (vb *VB) maybeProcessMapDeletes() {
 			if vb.mapChain.afterDeletes != nil {
 				vb.mapChain.afterDeletes()
 			}
-		})
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		vb.deleteMapKeys(ctx, due)
-	}()
+	})
 }
 
 // deleteMapKeys deletes keys after checking that no later launch has

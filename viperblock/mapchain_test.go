@@ -482,7 +482,7 @@ func TestMapDelta_StaleWriterFencesItselfBeforeDeleting(t *testing.T) {
 		writeDrain(t, old, 1, randomBlockData(1))
 		<-bases
 	}
-	drainSignals(deletes)
+	waitDeletesIdle(old, deletes)
 	before := mv.mapKeys(t, "map/")
 
 	// A newer launch takes over while the old writer is still running.
@@ -806,4 +806,13 @@ func TestMapDelta_CloseWaitsForABaseInFlight(t *testing.T) {
 	vb.mapChain.beforeWait = release
 	require.NoError(t, vb.CloseCtx(context.Background()))
 	assert.True(t, finished.Load(), "the base finished before Close returned")
+}
+
+// waitDeletesIdle waits for a delete pass still running to finish, then
+// discards its signal. A pass clears its busy flag before signalling.
+func waitDeletesIdle(vb *VB, ch chan struct{}) {
+	for vb.mapChain.deleteBusy.Load() {
+		<-ch
+	}
+	drainSignals(ch)
 }
