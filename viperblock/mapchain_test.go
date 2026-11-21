@@ -90,7 +90,7 @@ type mapVolume struct {
 	clock      *mapTestClock
 }
 
-func newMapVolume(t *testing.T, size uint64, key *masterkey.Key) *mapVolume {
+func newMapVolume(t testing.TB, size uint64, key *masterkey.Key) *mapVolume {
 	t.Helper()
 	return &mapVolume{
 		root: t.TempDir(), name: "vol-map", size: size, key: key,
@@ -99,7 +99,7 @@ func newMapVolume(t *testing.T, size uint64, key *masterkey.Key) *mapVolume {
 }
 
 // engine constructs a VB for the volume under epoch, without loading it.
-func (mv *mapVolume) engine(t *testing.T, epoch uint64) (*VB, *mapFaultBackend) {
+func (mv *mapVolume) engine(t testing.TB, epoch uint64) (*VB, *mapFaultBackend) {
 	t.Helper()
 	vb, err := New(&VB{
 		VolumeName:          mv.name,
@@ -126,14 +126,14 @@ func (mv *mapVolume) engine(t *testing.T, epoch uint64) (*VB, *mapFaultBackend) 
 	return vb, wrapped
 }
 
-func openWALs(t *testing.T, vb *VB) {
+func openWALs(t testing.TB, vb *VB) {
 	t.Helper()
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 }
 
 // create makes the volume format 2 under a creation epoch, VBState last.
-func (mv *mapVolume) create(t *testing.T, epoch uint64) (*VB, *mapFaultBackend) {
+func (mv *mapVolume) create(t testing.TB, epoch uint64) (*VB, *mapFaultBackend) {
 	t.Helper()
 	vb, fb := mv.engine(t, epoch)
 	require.NoError(t, vb.InitMapDeltaCtx(context.Background()))
