@@ -98,7 +98,7 @@ func (vb *VB) drainForSnapshot() error {
 	// here so the source volume's live checkpoint reflects the chunks just
 	// uploaded, same as DrainToBackendCtx does after its own drain.
 	// Non-fatal: a stale live checkpoint self-heals on the next drain.
-	if err := vb.SaveLiveCheckpoint(); err != nil {
+	if err := vb.persistMapCtx(context.Background()); err != nil {
 		vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
 		vb.returnConsolidatedWALs(reclaim)
 		return nil

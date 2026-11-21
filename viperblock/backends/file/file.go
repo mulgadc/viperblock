@@ -246,7 +246,19 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+	var h, d []byte
+	if headers != nil {
+		h = *headers
+	}
+	if data != nil {
+		d = *data
+	}
+	return backend.writeFileDurable(filename, h, d)
+}
 
+// writeFileDurable writes headers then data to filename and makes the result
+// durable before returning.
+func (backend *Backend) writeFileDurable(filename string, headers, data []byte) (err error) {
 	// Write to a temporary neighbour, fsync it, then rename into place and
 	// fsync the directory. Truncating the destination with os.Create and
 	// closing without a sync returned success while the bytes were still only
@@ -268,13 +280,13 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 		}
 	}()
 
-	if _, err = tmp.Write(*headers); err != nil {
+	if _, err = tmp.Write(headers); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write headers", "error", err)
 		return err
 	}
 
-	if _, err = tmp.Write(*data); err != nil {
+	if _, err = tmp.Write(data); err != nil {
 		err = classifyWriteErr(err)
 		backend.log.Error("Failed to write data", "error", err)
 		return err
@@ -552,4 +564,50 @@ func (backend *Backend) ListObjectsCtx(_ context.Context, prefix string) (keys [
 
 func (backend *Backend) GetHost() string {
 	return ""
+}
+
+// ReadKeyCtx reads the whole object at key, relative to this backend's volume.
+func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte, err error) {
+	start := time.Now()
+	data, err = os.ReadFile(backend.keyPath(key))
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "read", "file", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	return data, err
+}
+
+// WriteKeyCtx writes data at key durably, with the same staging, fsync and
+// rename as Write, creating the key's directory if needed.
+func (backend *Backend) WriteKeyCtx(ctx context.Context, key string, data []byte) (err error) {
+	start := time.Now()
+	defer func() {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "write", "file", backend.config.VolumeName, outcome, len(data), time.Since(start))
+	}()
+	filename := backend.keyPath(key)
+	if err = os.MkdirAll(filepath.Dir(filename), 0o750); err != nil {
+		return classifyWriteErr(err)
+	}
+	return backend.writeFileDurable(filename, nil, data)
+}
+
+// DeleteKeyCtx removes the object at key.
+func (backend *Backend) DeleteKeyCtx(ctx context.Context, key string) (err error) {
+	start := time.Now()
+	err = os.Remove(backend.keyPath(key))
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "delete", "file", backend.config.VolumeName, outcome, 0, time.Since(start))
+	return err
+}
+
+func (backend *Backend) keyPath(key string) string {
+	return filepath.Join(backend.config.BaseDir, backend.config.VolumeName, filepath.FromSlash(key))
 }

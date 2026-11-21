@@ -104,6 +104,12 @@ func (ix *extentIndex[V]) scan(fn func(V) bool) {
 	ix.t.Scan(func(_ uint64, v V) bool { return fn(v) })
 }
 
+// copy returns an isolated copy-on-write snapshot. Mutates the index's
+// isolation id, so the caller holds the lock for writing.
+func (ix *extentIndex[V]) copy() *extentIndex[V] {
+	return &extentIndex[V]{t: *ix.t.Copy()}
+}
+
 // clear drops every extent.
 func (ix *extentIndex[V]) clear() {
 	ix.t.Clear()
