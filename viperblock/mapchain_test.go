@@ -30,8 +30,13 @@ type mapFaultBackend struct {
 	failDelta      atomic.Bool
 	hideNewestHead atomic.Bool
 	failChunks     atomic.Bool
+	failConfig     atomic.Bool
 	keyWrites      atomic.Int64
 	keyBytes       atomic.Int64
+
+	// landConfig writes a config PUT, then reports it failed: a committed
+	// write whose response was lost.
+	landConfig atomic.Bool
 
 	// onMapList, when set, runs once inside the next listing of map/.
 	onMapList atomic.Pointer[func()]
@@ -41,6 +46,15 @@ type mapFaultBackend struct {
 
 func (b *mapFaultBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) error {
 	if b.failChunks.Load() && fileType == types.FileTypeChunk {
+		return errInjected
+	}
+	if b.failConfig.Load() && fileType == types.FileTypeConfig {
+		return errInjected
+	}
+	if b.landConfig.Load() && fileType == types.FileTypeConfig {
+		if err := b.Backend.WriteCtx(ctx, fileType, objectId, headers, data); err != nil {
+			return err
+		}
 		return errInjected
 	}
 	return b.Backend.WriteCtx(ctx, fileType, objectId, headers, data)
@@ -147,7 +161,7 @@ func (mv *mapVolume) engine(t testing.TB, epoch uint64) (*VB, *mapFaultBackend) 
 	return vb, wrapped
 }
 
-func openWALs(t testing.TB, vb *VB) {
+func openMapWALs(t testing.TB, vb *VB) {
 	t.Helper()
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
@@ -159,7 +173,7 @@ func (mv *mapVolume) create(t testing.TB, epoch uint64) (*VB, *mapFaultBackend) 
 	vb, fb := mv.engine(t, epoch)
 	require.NoError(t, vb.InitMapDeltaCtx(context.Background(), true))
 	require.NoError(t, vb.SaveState())
-	openWALs(t, vb)
+	openMapWALs(t, vb)
 	return vb, fb
 }
 
@@ -177,7 +191,7 @@ func (mv *mapVolume) open(t *testing.T, epoch uint64) (*VB, *mapFaultBackend, er
 	if err := vb.RecoverLocalWALs(); err != nil {
 		return vb, fb, err
 	}
-	openWALs(t, vb)
+	openMapWALs(t, vb)
 	return vb, fb, nil
 }
 
@@ -569,22 +583,11 @@ func TestMapDelta_StubIsTheAuthorityWithoutVBState(t *testing.T) {
 	re, _ := mv.engine(t, 6)
 	require.NoError(t, re.LoadState())
 	re.MapFormat = 0
+	re.mapChain.delta.Store(false)
 	re.BlocksToObject.trackChanges = false
 	require.NoError(t, re.LoadLiveCheckpoint())
 	assert.True(t, re.IsMapDelta())
 	assert.Equal(t, data, readBlocks(t, re, 0, 1))
-}
-
-func TestMapDelta_ClaimFailsWhenAFenceStubWasReplaced(t *testing.T) {
-	mv := newMapVolume(t, volumeSize, nil)
-	vb, _ := mv.create(t, 5)
-	writeDrain(t, vb, 0, randomBlockData(1))
-	vb.Detach()
-	live := filepath.Join(mv.root, types.GetFilePath(types.FileTypeBlockCheckpointLive, 0, mv.name))
-	require.NoError(t, os.WriteFile(live, []byte("a late v1 checkpoint"), 0o600))
-
-	_, _, err := mv.open(t, 6)
-	require.ErrorIs(t, err, ErrMapFenceStubAbsent)
 }
 
 func walFilesUnder(t *testing.T, root, volumeName string) []string {
@@ -638,7 +641,7 @@ func TestMapDelta_EmptyCommitNeedsNoEpochAndAChangeDoes(t *testing.T) {
 	require.NoError(t, reader.LoadState())
 	require.NoError(t, reader.LoadLiveCheckpoint())
 	require.NoError(t, reader.RecoverLocalWALs(), "recovery with nothing to replay commits nothing")
-	openWALs(t, reader)
+	openMapWALs(t, reader)
 	require.NoError(t, reader.DrainToBackendCtx(context.Background()), "an idle drain on a reader succeeds")
 	require.NoError(t, reader.Write(1, randomBlockData(1)))
 	require.ErrorIs(t, reader.DrainToBackendCtx(context.Background()), ErrMapNoLeaseEpoch)
@@ -668,7 +671,7 @@ func TestMapDelta_SameProcessReconnectResumesItsEpoch(t *testing.T) {
 	require.NoError(t, again.LoadLiveCheckpoint())
 	require.NoError(t, again.ClaimMapCtx(context.Background()))
 	require.NoError(t, again.RecoverLocalWALs())
-	openWALs(t, again)
+	openMapWALs(t, again)
 	b := randomBlockData(1)
 	writeDrain(t, again, 2, b)
 	require.NoError(t, again.CloseCtx(context.Background()))
@@ -686,7 +689,7 @@ func TestMapDelta_SeededCreatePublishesOnlyTheCompleteMap(t *testing.T) {
 			mv := newMapVolume(t, volumeSize, nil)
 			vb, fb := mv.engine(t, 5)
 			require.NoError(t, vb.InitMapDeltaCtx(context.Background(), false))
-			openWALs(t, vb)
+			openMapWALs(t, vb)
 			seed := randomBlockData(4)
 			require.NoError(t, vb.Write(0, seed))
 			assert.Empty(t, mv.mapKeys(t, mapHeadPrefix), "no head before the seed is durable")
@@ -748,7 +751,7 @@ func TestMapDelta_SeededCreateFailedChunkUploadWritesNoState(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
 	vb, fb := mv.engine(t, 5)
 	require.NoError(t, vb.InitMapDeltaCtx(context.Background(), false))
-	openWALs(t, vb)
+	openMapWALs(t, vb)
 	require.NoError(t, vb.Write(0, randomBlockData(2)))
 	fb.failChunks.Store(true)
 	require.Error(t, vb.CloseCtx(context.Background()))
@@ -857,7 +860,7 @@ func TestMapDelta_VBStateRecordsCommitOnlyAfterAHead(t *testing.T) {
 	assert.False(t, state.MapCommitted, "VBState written before the seed commits")
 	assert.Equal(t, uint64(5), state.MapCreationEpoch)
 
-	openWALs(t, vb)
+	openMapWALs(t, vb)
 	require.NoError(t, vb.Write(0, randomBlockData(1)))
 	require.NoError(t, vb.CloseCtx(context.Background()))
 	re, _ := mv.engine(t, 6)
@@ -885,7 +888,7 @@ func TestMapDelta_ResumeStartsAtTheEarlierEnginesCounters(t *testing.T) {
 	require.NoError(t, again.LoadState())
 	require.NoError(t, again.LoadLiveCheckpoint())
 	require.NoError(t, again.RecoverLocalWALs())
-	openWALs(t, again)
+	openMapWALs(t, again)
 	writeDrain(t, again, 2, randomBlockData(1))
 	assert.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN+7),
 		"a number the earlier engine may have sent is never reused")

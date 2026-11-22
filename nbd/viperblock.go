@@ -686,6 +686,8 @@ func (c *ViperBlockConnection) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
+	// No conversion flips on a closing drain, and none starts.
+	c.vb.StopMapBackground()
 	// DrainToBackend before Close so the live checkpoint is current. Close
 	// will also flush WAL chunks, but does not save the live checkpoint.
 	if err := c.vb.DrainToBackendCtx(ctx); err != nil {
@@ -696,6 +698,10 @@ func (c *ViperBlockConnection) Close() {
 		h, o := c.vb.MapCounters()
 		mapHeadN.Store(max(mapHeadN.Load(), h))
 		mapObjN.Store(max(mapObjN.Load(), o))
+		// A volume this connection converted has heads under this epoch.
+		if c.vb.IsMapDelta() {
+			mapClaimed.Store(true)
+		}
 	}()
 	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
@@ -748,6 +754,8 @@ func (p *ViperBlockPlugin) Unload() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
+	// No conversion flips on this closing drain either.
+	activeVB.StopMapBackground()
 	if err := activeVB.DrainToBackendCtx(ctx); err != nil {
 		slog.Error("Unload: DrainToBackend failed", "err", err)
 	}

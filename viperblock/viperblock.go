@@ -496,6 +496,10 @@ type VB struct {
 	// shared with the read-path mutex so LookupBlockToObject and friends
 	// stay uncontended.
 	saveStateMu sync.Mutex
+	// savedHighWater is the highest SeqNumHighWater any state save has
+	// written, so a save that sampled an older one never lowers it.
+	// Guarded by saveStateMu.
+	savedHighWater uint64
 
 	// checkpointRetryBackoff is the first inter-attempt sleep in
 	// SaveLiveCheckpointCtx (0 uses DefaultCheckpointRetryBackoff). Only tests
@@ -2813,7 +2817,7 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		vb.afterTakeConsolidatedWALs()
 	}
 
-	if err = vb.persistMapCtx(ctx); err != nil {
+	if err = vb.persistMapForCtx(ctx, true); err != nil {
 		vb.returnConsolidatedWALs(reclaim)
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
@@ -4955,7 +4959,13 @@ func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 	}
 
 	if IsMapFenceStub(checkpoint) {
-		return vb.loadMapChainCtx(ctx)
+		if err := vb.loadMapChainCtx(ctx); err != nil {
+			return err
+		}
+		vb.checkpointMu.Lock()
+		vb.mapChain.conv.repair = true
+		vb.checkpointMu.Unlock()
+		return nil
 	}
 
 	vb.BlocksToObject.mu.Lock()
@@ -5063,9 +5073,17 @@ func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
 		}
 		return fmt.Errorf("read live checkpoint: %w", err)
 	}
-	// The stub is the authority for format 2, whatever VBState says.
+	// VBState decides the format. A stub here under a VBState that says
+	// format 1 is a conversion whose VBState write was lost or overwritten:
+	// load format 2, and the claim rewrites VBState.
 	if IsMapFenceStub(checkpoint) {
-		return vb.loadMapChainCtx(ctx)
+		if err := vb.loadMapChainCtx(ctx); err != nil {
+			return err
+		}
+		vb.checkpointMu.Lock()
+		vb.mapChain.conv.repair = true
+		vb.checkpointMu.Unlock()
+		return nil
 	}
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
@@ -5814,6 +5832,11 @@ func (vb *VB) saveStateWithHighWater(ctx context.Context, highWater uint64) erro
 func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 	vb.saveStateMu.Lock()
 	defer vb.saveStateMu.Unlock()
+	// A caller samples its high-water before taking the lock; a reservation
+	// may have saved a higher one since, and a later generation must not
+	// record a lower one.
+	highWater = max(highWater, vb.seqNumHighWater.Load(), vb.savedHighWater)
+	vb.savedHighWater = highWater
 
 	walNum := vb.WAL.WallNum.Load()
 	if vb.UseShardedWAL && vb.ShardedWAL != nil {
@@ -5837,7 +5860,7 @@ func (vb *VB) persistStateLocal(highWater uint64) ([]byte, uint64, error) {
 		EncryptionEnabled:   vb.EncryptionEnabled,
 		VolumeUUID:          vb.VolumeUUID,
 		SeqNumHighWater:     highWater,
-		MapFormat:           vb.MapFormat,
+		MapFormat:           vb.persistedMapFormat(),
 		MapCommitted:        vb.mapChain.committed.Load(),
 		MapCreationEpoch:    vb.MapCreationEpoch,
 	}

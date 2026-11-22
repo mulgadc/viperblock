@@ -223,7 +223,7 @@ The WAL provides crash durability for writes that have left the in-memory buffer
 │                        WAL Header (18 bytes)                   │
 ├───────────┬───────────┬────────────┬──────────────────────────┤
 │ Magic (4) │ Version(2)│ BlockSize(4)│ Timestamp (8)           │
-│  "VBWL"   │ uint16 BE │ uint32 BE  │ uint64 BE (UnixNano)    │
+│  "VBWL"   │ uint16 BE │ uint32 BE  │ uint64 BE (Unix seconds)│
 └───────────┴───────────┴────────────┴──────────────────────────┘
 ┌───────────────────────────────────────────────────────────────┐
 │                   Block Record (28 bytes + data)               │
@@ -402,7 +402,7 @@ A single extent entry replaces 10 individual block entries, reducing memory usag
 
 ## Format 2: heads, deltas and bases
 
-A volume whose `VBState` records `MapFormat: 2`, or whose `checkpoints/blocks.live.bin` holds the fence stub, persists its map as a chain rather than one checkpoint object:
+A volume whose `VBState` records `MapFormat: 2` persists its map as a chain rather than one checkpoint object. Every volume this build creates is format 2; a format-1 volume converts while it runs ("Conversion" below). `VBState` decides the format, so an open reads nothing extra to choose a loader:
 
 | Object | Written | Holds |
 | --- | --- | --- |
@@ -414,33 +414,34 @@ Runs are varint-encoded against the previous record, and every block keeps its o
 
 - **Epochs.** `epoch` is the launch's lease epoch, passed to nbdkit as `lease_epoch`. An open fails if the newest head's epoch is not below its own, and it commits `head.<epoch>.0` over the loaded map before recovery or guest IO.
 - **Commit.** A failed or ambiguous delta or head write commits nothing; the batch merges into the next commit under new names.
-- **Open.** The newest head by `(epoch, n)` is found by listing `map/` and then probing forward with single-key reads. A missing or corrupt object fails the open; an older head is never used instead. An open also fails if either v1 key no longer holds the stub.
+- **Open.** The newest head by `(epoch, n)` is found by listing `map/` and then probing forward with single-key reads. A missing or corrupt object fails the open; an older head is never used instead.
 - **Deletes.** Pruning after a base keeps one generation back. A dropped map object, or a chunk GC finds at zero references, is deleted no sooner than `2 × volumeLeaseTTL` (90 s) later, and only after a listing finds no head of a higher epoch. A writer that finds one deletes nothing, fences itself and fails further writes.
-- **v1 keys.** Both `blocks.live.bin` and the numbered checkpoint at the volume's `BlockToObjectWALNum` hold a stub with magic `VBMF`, which every v1 parser rejects. Format 2 never writes either key again and never writes a local numbered checkpoint.
+- **v1 keys.** Both `blocks.live.bin` and the numbered checkpoint at the volume's `BlockToObjectWALNum` hold a stub with magic `VBMF`, which every v1 parser rejects, so a build that does not read format 2 fails closed. Format 2 never writes either key again, never writes a local numbered checkpoint, and does not read them on open.
+- **Conversion.** A format-1 volume opened with a lease epoch converts by its own writer. An ordinary drain snapshots the map copy-on-write and writes it in the background as a base and `head.<epoch>.0`, while v1 drains continue. The next ordinary drain after that is durable, never a close's final drain, flips: it writes the installs since the snapshot as a delta and head instead of a v1 checkpoint, then `VBState` with `MapFormat: 2`, which is the flip. That write is retried while unacknowledged, and until it lands every commit fails and keeps its WAL; the engine never writes a v1 checkpoint again. The stubs follow. A failure before the `VBState` write leaves the volume format 1. A v1 loader that finds the stub at `blocks.live.bin` under a `VBState` saying format 1 loads format 2 and the claim rewrites `VBState`. Every open logs its map format; the flip logs `map converted to format 2`.
 - **Creation.** A volume is created once `VBState` records `MapCommitted`, which is set only after a head is durable; an encrypted volume writes `VBState` earlier, when it reserves sequence numbers, so `VBState` alone does not mean created. A seeded create publishes no head until its seed commits as the base. Every head carries the creation epoch `VBState` records as `MapCreationEpoch`, and an open whose newest head carries another fails closed.
 - **Reconnect.** A later connection to the same nbdkit process resumes its epoch's heads, starting its counters at the previous connection's, so a write that connection sent is never renumbered.
 - **Stopping.** Close and Detach cancel background bases, prunes and deletes without waiting; publication and deletes check for it under the commit lock, so nothing is published after they return.
 
-## Block-to-Object WAL
+## Format 1: the block checkpoint
 
-The block mapping is itself persisted via a dedicated WAL to survive restarts:
+A format-1 volume persists the whole map as one checkpoint object, `checkpoints/blocks.live.bin` after every drain and `checkpoints/blocks.{n:08d}.bin` at Close:
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│              Block-to-Object WAL Header (6 bytes)              │
-├───────────┬───────────────────────────────────────────────────┤
-│ Magic (4) │ Version (2)                                        │
-│  "VBWB"   │ uint16 BE                                          │
-└───────────┴───────────────────────────────────────────────────┘
+│              Checkpoint Header (14 bytes)                      │
+├───────────┬────────────┬──────────────────────────────────────┤
+│ Magic (4) │ Version (2)│ Timestamp (8)                         │
+│  "VBWB"   │ uint16 BE  │ uint64 BE, Unix seconds               │
+└───────────┴────────────┴──────────────────────────────────────┘
 ┌───────────────────────────────────────────────────────────────┐
-│              Entry (26 bytes each)                              │
-├──────────────┬────────────┬──────────┬─────────────┬──────────┤
-│ StartBlock(8)│NumBlocks(2)│ObjectID(8)│ObjOffset(4)│Padding(4)│
-│ uint64 BE    │ uint16 BE  │uint64 BE │ uint32 BE   │          │
-└──────────────┴────────────┴──────────┴─────────────┴──────────┘
+│              Record (34 bytes, one per mapped block)           │
+├────────────┬────────────┬───────────┬───────────┬──────────┬──┤
+│StartBlock 8│NumBlocks 2 │ObjectID 8 │ObjOffset 4│ SeqNum 8 │CRC32 4│
+│ uint64 BE  │ always 1   │ uint64 BE │ uint32 BE │uint64 BE │IEEE│
+└────────────┴────────────┴───────────┴───────────┴──────────┴──┘
 ```
 
-On startup, `LoadBlockState()` replays this WAL to rebuild the `BlocksToObject` index.
+Runs are expanded on write, so the checkpoint is 34 bytes per mapped block whatever was written. On open, `LoadLiveCheckpoint()` parses it to rebuild the `BlocksToObject` index, falling back to the numbered checkpoint when no live one exists.
 
 ---
 

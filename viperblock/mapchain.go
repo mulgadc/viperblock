@@ -64,14 +64,13 @@ var (
 // Errors a format-2 volume's map can fail with. Each fails the open or the
 // commit rather than serve or persist a map that may be stale.
 var (
-	ErrMapHeadMissing     = errors.New("map: no committed head")
-	ErrMapObjectCorrupt   = errors.New("map: object missing or fails its digest")
-	ErrMapEpochNotNewer   = errors.New("map: newest head's epoch is not below this launch's")
-	ErrMapNoLeaseEpoch    = errors.New("map: a format-2 commit needs a lease epoch")
-	ErrMapNotClaimed      = errors.New("map: this launch has not committed its first head")
-	ErrMapFenced          = errors.New("map: a newer lease holder has committed; this writer is fenced")
-	ErrMapFenceStubAbsent = errors.New("map: a format-2 volume is missing its v1 fence stub")
-	ErrMapLineage         = errors.New("map: the newest head belongs to a different creation than VBState")
+	ErrMapHeadMissing   = errors.New("map: no committed head")
+	ErrMapObjectCorrupt = errors.New("map: object missing or fails its digest")
+	ErrMapEpochNotNewer = errors.New("map: newest head's epoch is not below this launch's")
+	ErrMapNoLeaseEpoch  = errors.New("map: a format-2 commit needs a lease epoch")
+	ErrMapNotClaimed    = errors.New("map: this launch has not committed its first head")
+	ErrMapFenced        = errors.New("map: a newer lease holder has committed; this writer is fenced")
+	ErrMapLineage       = errors.New("map: the newest head belongs to a different creation than VBState")
 )
 
 // MapFenceStub is what a format-2 volume holds at both v1 checkpoint keys.
@@ -391,6 +390,9 @@ type mapChainState struct {
 	// deleteBusy is set while deferred deletes are processed.
 	deleteBusy atomic.Bool
 	fenced     atomic.Bool
+	// delta mirrors MapFormat == MapFormatDelta for readers outside
+	// checkpointMu, since a conversion flips the format while drains run.
+	delta atomic.Bool
 	// committed is set once any head of this volume is durable, and is
 	// persisted in VBState as the creation-complete signal.
 	committed atomic.Bool
@@ -407,6 +409,10 @@ type mapChainState struct {
 	// chunkSeen records when chunk GC first found each zero-reference chunk.
 	// Guarded by BlocksToObject.mu.
 	chunkSeen map[uint64]time.Time
+
+	// conv is a format-1 volume's conversion to format 2. Guarded by
+	// checkpointMu.
+	conv mapConversion
 }
 
 type deferredMapDelete struct {
@@ -429,12 +435,13 @@ func (vb *VB) mapDeleteDeferral() time.Duration {
 }
 
 // IsMapDelta reports whether this volume persists its map as format 2.
-func (vb *VB) IsMapDelta() bool { return vb.MapFormat == MapFormatDelta }
+func (vb *VB) IsMapDelta() bool { return vb.mapChain.delta.Load() }
 
 // setMapDelta switches the in-memory volume to format 2, so installs record
 // their runs for the next delta.
 func (vb *VB) setMapDelta() {
 	vb.MapFormat = MapFormatDelta
+	vb.mapChain.delta.Store(true)
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.trackChanges = true
 	vb.BlocksToObject.mu.Unlock()
@@ -681,7 +688,11 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 		}
 	}
 	vb.finishMapLoadLocked()
+	if vb.MapCreationEpoch == 0 {
+		vb.MapCreationEpoch = h.Creation
+	}
 	vb.MapFormat = MapFormatDelta
+	vb.mapChain.delta.Store(true)
 	vb.BlocksToObject.trackChanges = true
 	vb.BlocksToObject.changes = nil
 	vb.BlocksToObject.dirty.Store(false)
@@ -740,19 +751,17 @@ func (vb *VB) finishMapLoadLocked() {
 // ClaimMapCtx commits this launch's first head over the loaded map, before
 // any guest IO, so it supersedes every head an older writer can still issue.
 func (vb *VB) ClaimMapCtx(ctx context.Context) error {
+	vb.logger().Info("map format", "volume", vb.VolumeName, "format", max(vb.MapFormat, MapFormatLegacy), "epoch", vb.LeaseEpoch)
 	if !vb.IsMapDelta() {
 		return nil
 	}
 	if vb.LeaseEpoch == 0 {
 		return ErrMapNoLeaseEpoch
 	}
-	if err := vb.verifyMapFenceStubs(ctx); err != nil {
-		return err
-	}
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
 	if vb.mapChain.claimed {
-		return nil
+		return vb.repairConvertedStateLocked(ctx)
 	}
 	// The caller's deadline runs from before the load, so a slow load cannot
 	// leave the claim landing after an older writer's deletes come due.
@@ -764,35 +773,25 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 		return fmt.Errorf("map: claim head: %w", err)
 	}
 	vb.mapChain.claimed = true
-	return nil
+	return vb.repairConvertedStateLocked(ctx)
 }
 
-// verifyMapFenceStubs fails the open if either v1 key no longer holds the
-// stub: a late v1 write has replaced it, and an older build could read it.
-func (vb *VB) verifyMapFenceStubs(ctx context.Context) error {
-	for _, k := range []struct {
-		ft types.FileType
-		id uint64
-	}{{types.FileTypeBlockCheckpointLive, 0}, {types.FileTypeBlockCheckpoint, vb.BlockToObjectWAL.WallNum.Load()}} {
-		data, err := vb.Backend.ReadCtx(ctx, k.ft, k.id, 0, 0)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("map: read fence stub: %w", err)
-		}
-		if err != nil || !IsMapFenceStub(data) {
-			return fmt.Errorf("%w: %s", ErrMapFenceStubAbsent, types.GetFilePath(k.ft, k.id, vb.VolumeName))
-		}
-	}
-	return nil
-}
-
-// persistMapCtx makes the in-memory map durable in the volume's format.
+// persistMapCtx makes the in-memory map durable in the volume's format. It
+// never converts a format-1 volume: only an ordinary drain does that.
 func (vb *VB) persistMapCtx(ctx context.Context) error {
+	return vb.persistMapForCtx(ctx, false)
+}
+
+func (vb *VB) persistMapForCtx(ctx context.Context, drain bool) error {
 	if !vb.IsMapDelta() {
-		return vb.SaveLiveCheckpointCtx(ctx)
+		return vb.persistFormatOneCtx(ctx, drain)
 	}
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
-	return vb.commitMapDeltaLocked(ctx)
+	if err := vb.commitMapDeltaLocked(ctx); err != nil {
+		return err
+	}
+	return vb.finishConversionLocked(ctx)
 }
 
 func (vb *VB) mapBaseDueLocked() bool {
@@ -964,6 +963,10 @@ func (vb *VB) stopMapBackground() {
 		vb.mapChain.beforeWait()
 	}
 }
+
+// StopMapBackground stops background map work and any conversion before a
+// close's final drain, so that drain never flips a format-1 volume.
+func (vb *VB) StopMapBackground() { vb.stopMapBackground() }
 
 // waitMapBackground waits for every background pass to return. Only tests
 // call it; stopping never waits.
