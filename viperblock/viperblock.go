@@ -475,6 +475,7 @@ type VB struct {
 	// not reclaimed. Per-VB rather than package-level so one test's hook is
 	// not read by another's chunk uploader.
 	afterTakeConsolidatedWALs func()
+	beforeChunkMap            func()
 
 	// statePersistedSeqNum is the SeqNum carried by the last VBState that
 	// reached both the local file and the backend. It lets the drain skip its
@@ -1014,6 +1015,10 @@ type WAL struct {
 	// must wait for it rather than read the cleared dirty flag and conclude
 	// its own record is already durable.
 	syncMu sync.Mutex
+
+	rollbackErr  error // guarded by mu
+	appendFile   func(*os.File, []byte) (int, error)
+	truncateFile func(*os.File, int64) error
 
 	mu sync.RWMutex
 }
@@ -1860,33 +1865,24 @@ func (vb *VB) syncWALIfDirty() {
 // Note: Only the last file in vb.WAL.DB is the active WAL being written to.
 // Previous files are closed after WriteWALToChunk processes them.
 func (vb *VB) syncWAL() error {
-	// Held across the check and the fsync. Without it a caller that appended
-	// before this fsync began would see the cleared flag mid-flight and report
-	// its write durable while the only fsync covering it was still running.
-	vb.WAL.syncMu.Lock()
-	defer vb.WAL.syncMu.Unlock()
+	wal := &vb.WAL
+	wal.syncMu.Lock()
+	defer wal.syncMu.Unlock()
 
-	if !vb.WAL.dirty.Load() {
+	wal.mu.RLock()
+	defer wal.mu.RUnlock()
+	if wal.rollbackErr != nil {
+		return wal.rollbackErr
+	}
+	if !wal.dirty.Load() {
 		return nil
 	}
 
-	// Cleared before the fsync so a write arriving during it re-marks the WAL
-	// and the next caller syncs again rather than trusting this one.
-	vb.WAL.dirty.Store(false)
-
-	vb.WAL.mu.RLock()
-	defer vb.WAL.mu.RUnlock()
-
-	// Only sync the current active WAL (last in slice)
-	// Previous WAL files are already closed after chunking
-	if len(vb.WAL.DB) > 0 {
-		activeWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
-		if activeWAL != nil {
-			if err := activeWAL.Sync(); err != nil {
-				// Re-mark as dirty so the next tick retries
-				vb.WAL.dirty.Store(true)
-				return fmt.Errorf("WAL sync: %w", err)
-			}
+	wal.dirty.Store(false)
+	if len(wal.DB) > 0 && wal.DB[len(wal.DB)-1] != nil {
+		if err := wal.DB[len(wal.DB)-1].Sync(); err != nil {
+			wal.dirty.Store(true)
+			return fmt.Errorf("WAL sync: %w", err)
 		}
 	}
 	return nil
@@ -1958,61 +1954,51 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 }
 
 // openWALLocked creates and opens a new WAL file. Caller must hold wal.mu.
-func (vb *VB) openWALLocked(wal *WAL, filename string) (err error) {
-	// Create the directory if it doesn't exist
+func (vb *VB) openWALLocked(wal *WAL, filename string) error {
 	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
-		return fmt.Errorf("failed to create WAL directory: %w", err)
+		return fmt.Errorf("create WAL directory: %w", err)
 	}
-
-	// Create the file if it doesn't exist, make sure writes and committed immediately
-	// Removed syscall.O_SYNC, TODO implement buffer, sync every 250ms / 1MB data
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
-	if err != nil {
-		return fmt.Errorf("failed to open WAL file: %w", err)
-	}
-
-	// Chunk WAL: a non-empty file at a freshly rotated walNum means another
-	// writer already header-stamped it; refuse instead of corrupting it.
-	// BlockToObjectWAL never rotates, so a prior header there is expected.
-	if wal.WALMagic == vb.WAL.WALMagic {
-		info, statErr := file.Stat()
-		if statErr != nil {
-			_ = file.Close()
-			return fmt.Errorf("failed to stat WAL file: %w", statErr)
-		}
-		if info.Size() > 0 {
-			_ = file.Close()
-			return fmt.Errorf("%w: %s has %d existing bytes", ErrWALAlreadyOpen, filename, info.Size())
-		}
-	}
-
-	// Append the WAL header, format
-	// Check our type
-	var headers []byte
-
-	switch wal.WALMagic {
-	case vb.WAL.WALMagic:
-		// Write the WAL header
-		headers = vb.WALHeader()
-	case vb.BlockToObjectWAL.WALMagic:
-		// Write the BlockToObjectWAL header
-		headers = vb.BlockToObjectWALHeader()
+	chunk := wal.WALMagic == vb.WAL.WALMagic
+	flags := os.O_CREATE | os.O_APPEND | os.O_RDWR
+	var header []byte
+	switch {
+	case chunk:
+		flags |= os.O_EXCL
+		header = vb.WALHeader()
+	case wal.WALMagic == vb.BlockToObjectWAL.WALMagic:
+		header = vb.BlockToObjectWALHeader()
 	default:
-		return fmt.Errorf("invalid WAL magic")
+		return errors.New("invalid WAL magic")
 	}
 
-	_, err = file.Write(headers)
-
+	file, err := os.OpenFile(filename, flags, 0600)
 	if err != nil {
-		return err
+		if chunk && errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w: %s", ErrWALAlreadyOpen, filename)
+		}
+		return fmt.Errorf("open WAL file: %w", err)
 	}
-
-	// Append the latest "hot" WAL file to the DB
+	n, err := wal.write(file, header)
+	if err != nil || n != len(header) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		err = errors.Join(err, file.Close())
+		if chunk {
+			// Only remove a file this attempt created exclusively.
+			err = errors.Join(err, os.Remove(filename))
+		}
+		return fmt.Errorf("write WAL header: %w", err)
+	}
 	wal.DB = append(wal.DB, file)
+	return nil
+}
 
-	vb.logger().Debug("OpenWAL complete, new WAL", "file", *file)
-
-	return err
+func (wal *WAL) write(file *os.File, data []byte) (int, error) {
+	if wal.appendFile != nil {
+		return wal.appendFile(file, data)
+	}
+	return file.Write(data)
 }
 
 // NewShardedWAL creates a ShardedWAL with initialized (but unopened) shards.
@@ -2738,23 +2724,19 @@ func (vb *VB) retireFlushed(flushBlocks []Block, flushed map[uint64]uint64) {
 		return
 	}
 
-	vb.Writes.mu.Lock()
-	remaining := make([]Block, 0, len(vb.Writes.Blocks))
-	for _, b := range vb.Writes.Blocks {
-		if seq, ok := flushed[b.Block]; !ok || b.SeqNum > seq {
-			remaining = append(remaining, b)
-		}
-	}
-	vb.Writes.Blocks = remaining
-	vb.Writes.mu.Unlock()
-
 	vb.PendingBackendWrites.mu.Lock()
-	for _, b := range flushBlocks {
-		if _, ok := flushed[b.Block]; ok {
-			vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, b)
-		}
-	}
+	vb.PendingBackendWrites.Blocks = append(vb.PendingBackendWrites.Blocks, flushBlocks...)
 	vb.PendingBackendWrites.mu.Unlock()
+
+	vb.Writes.mu.Lock()
+	vb.Writes.Blocks = slices.DeleteFunc(vb.Writes.Blocks, func(b Block) bool {
+		seq, ok := flushed[b.Block]
+		return ok && b.SeqNum <= seq
+	})
+	if len(vb.Writes.Blocks) == 0 && cap(vb.Writes.Blocks) > 1024 {
+		vb.Writes.Blocks = nil
+	}
+	vb.Writes.mu.Unlock()
 }
 
 // DrainToBackend flushes all in-memory writes to the WAL, uploads accumulated
@@ -2864,36 +2846,41 @@ func (vb *VB) persistCountersBeforeReclaim(ctx context.Context, reclaim []uint64
 // flushSnapshot flushes a snapshot of the hot writes to the WAL. It does not
 // hold Writes.mu; the caller serialises flushes via flushMu.
 func (vb *VB) flushSnapshot(flushBlocks []Block) error {
-	// flushed maps block number -> latest SeqNum that landed in the WAL,
-	// used to filter vb.Writes.Blocks and feed PendingBackendWrites. It
-	// dedupes by block number, so its cardinality CANNOT be used to detect
-	// partial flushes: when a hot block is rewritten N times in a window,
-	// N successful WriteWAL calls collapse into one map entry. successCount
-	// tracks records persisted, which is what "partial flush" actually means.
-	flushed := make(map[uint64]uint64)
+	flushed := make(map[uint64]uint64, len(flushBlocks))
 	successCount := 0
-
-	for _, block := range flushBlocks {
-		if err := vb.WriteWAL(block); err != nil {
-			vb.logger().Error("ERROR FLUSHING:", "block", block.Block, "error", err)
+	var scratch []byte
+	var appendErr error
+	for successCount < len(flushBlocks) {
+		end, encodedBytes := vb.walBatchLimit(flushBlocks, successCount)
+		batch := flushBlocks[successCount:end]
+		if len(batch) == 1 {
+			appendErr = vb.WriteWAL(batch[0])
+		} else {
+			if cap(scratch) < encodedBytes {
+				scratch = make([]byte, 0, encodedBytes)
+			}
+			scratch = scratch[:0]
+			for _, block := range batch {
+				scratch = vb.appendWALRecord(scratch, block)
+			}
+			appendErr = vb.writeEncodedWAL(scratch)
+		}
+		if appendErr != nil {
 			break
 		}
-
-		successCount++
-		flushed[block.Block] = block.SeqNum
-
-		// Mark block as Pending in BlockStore (Hot -> Pending transition).
-		// Keyed on SeqNum: without Writes.mu held, the block may have been
-		// rewritten since the snapshot, and that newer data is not in the WAL.
-		if vb.UseBlockStore && vb.BlockStore != nil {
-			vb.BlockStore.MarkPending(block.Block, block.SeqNum)
+		for _, block := range batch {
+			flushed[block.Block] = max(flushed[block.Block], block.SeqNum)
+			if vb.UseBlockStore && vb.BlockStore != nil {
+				vb.BlockStore.MarkPending(block.Block, block.SeqNum)
+			}
 		}
+		successCount = end
 	}
 
-	vb.retireFlushed(flushBlocks, flushed)
+	vb.retireFlushed(flushBlocks[:successCount], flushed)
 
-	if successCount < len(flushBlocks) {
-		return fmt.Errorf("partial flush: %d of %d records flushed", successCount, len(flushBlocks))
+	if appendErr != nil {
+		return fmt.Errorf("partial flush: %d of %d records flushed: %w", successCount, len(flushBlocks), appendErr)
 	}
 
 	return nil
@@ -2903,6 +2890,10 @@ func (vb *VB) flushSnapshot(flushBlocks []Block) error {
 // in parallel, one goroutine per shard. It does not hold Writes.mu; the caller
 // serialises flushes via flushMu.
 func (vb *VB) flushSnapshotSharded(flushBlocks []Block) error {
+	return vb.flushShards(flushBlocks, vb.WriteShardedWAL)
+}
+
+func (vb *VB) flushShards(flushBlocks []Block, appendBlock func(Block) error) error {
 	// Group blocks by shard
 	var shardGroups [NumShards][]Block
 	for _, block := range flushBlocks {
@@ -2930,7 +2921,7 @@ func (vb *VB) flushSnapshotSharded(flushBlocks []Block) error {
 			flushed := make(map[uint64]uint64)
 			successCount := 0
 			for _, block := range shardGroups[shardID] {
-				if err := vb.WriteShardedWAL(block); err != nil {
+				if err := appendBlock(block); err != nil {
 					vb.logger().Error("ERROR FLUSHING SHARD:", "shard", shardID, "block", block.Block, "error", err)
 					results[shardID].err = err
 					results[shardID].flushed = flushed
@@ -2938,7 +2929,7 @@ func (vb *VB) flushSnapshotSharded(flushBlocks []Block) error {
 					return
 				}
 				successCount++
-				flushed[block.Block] = block.SeqNum
+				flushed[block.Block] = max(flushed[block.Block], block.SeqNum)
 
 				if vb.UseBlockStore && vb.BlockStore != nil {
 					vb.BlockStore.MarkPending(block.Block, block.SeqNum)
@@ -2955,19 +2946,19 @@ func (vb *VB) flushSnapshotSharded(flushBlocks []Block) error {
 	// flushLocked. totalSuccess sums records persisted per shard.
 	allFlushed := make(map[uint64]uint64)
 	var firstErr error
-	totalSuccess := 0
+	completed := make([]Block, 0, len(flushBlocks))
 	for i := range NumShards {
 		maps.Copy(allFlushed, results[i].flushed)
-		totalSuccess += results[i].successCount
+		completed = append(completed, shardGroups[i][:results[i].successCount]...)
 		if results[i].err != nil && firstErr == nil {
 			firstErr = results[i].err
 		}
 	}
 
-	vb.retireFlushed(flushBlocks, allFlushed)
+	vb.retireFlushed(completed, allFlushed)
 
 	if firstErr != nil {
-		return fmt.Errorf("partial sharded flush: %d of %d records flushed: %w", totalSuccess, len(flushBlocks), firstErr)
+		return fmt.Errorf("partial sharded flush: %d of %d records flushed: %w", len(completed), len(flushBlocks), firstErr)
 	}
 
 	return nil
@@ -2994,73 +2985,102 @@ func (vb *VB) Flush2() (err error) {
 	return nil
 }
 
-func (vb *VB) WriteWAL(block Block) (err error) {
-	var record []byte
+func (vb *VB) WriteWAL(block Block) error {
+	return vb.writeEncodedWAL(vb.appendWALRecord(nil, block))
+}
+
+const walBatchBytes = 256 << 10
+
+func (vb *VB) walBatchLimit(blocks []Block, start int) (end, size int) {
+	headerAndTag := 28
+	if vb.EncryptionEnabled {
+		headerAndTag = 24 + 16
+	}
+	for end = start; end < len(blocks); end++ {
+		next := size + headerAndTag + len(blocks[end].Data)
+		if end > start && next > walBatchBytes {
+			break
+		}
+		size = next
+	}
+	return end, size
+}
+
+func (vb *VB) appendWALRecord(dst []byte, block Block) []byte {
+	headerSize, tagSize := 28, 0
+	if vb.EncryptionEnabled {
+		headerSize, tagSize = 24, 16
+	}
+	start := len(dst)
+	end := start + headerSize + len(block.Data) + tagSize
+	if cap(dst) < end {
+		grown := make([]byte, start, max(end, 2*cap(dst)))
+		copy(grown, dst)
+		dst = grown
+	}
+	dst = dst[:start+headerSize]
+	header := dst[start:]
+	binary.BigEndian.PutUint64(header[0:8], block.SeqNum)
+	binary.BigEndian.PutUint64(header[8:16], block.Block)
+	binary.BigEndian.PutUint64(header[16:24], block.Len)
 
 	if vb.EncryptionEnabled {
-		// Encrypted layout (magic VBWE), per-record:
-		//   [SeqNum(8) | BlockNum(8) | BlockLen(8) | ciphertext(BlockLen) | tag(16)]
-		// CRC32 is dropped — the 16-byte GCM tag subsumes it (NIST SP 800-38D
-		// §5: AEAD provides confidentiality and integrity in one primitive).
-		// Nonce: (SeqNum, VolumeUUID, DomainWAL). AAD: (volumeNameHash,
-		// BlockNum, SeqNum). Bound together they defeat cross-volume swap,
-		// in-place rollback, and positional shuffle on WAL replay.
-		const headerLen = 24
-		record = make([]byte, headerLen, headerLen+len(block.Data)+16)
-		binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
-		binary.BigEndian.PutUint64(record[8:16], block.Block)
-		binary.BigEndian.PutUint64(record[16:24], block.Len)
 		nonce := makeNonce(block.SeqNum, vb.VolumeUUID, DomainWAL)
 		var aad [AADLen]byte
 		initAAD(&aad, vb.volumeNameHash)
 		updateAAD(&aad, block.Block, block.SeqNum)
-		record = vb.aead.Seal(record, nonce[:], block.Data, aad[:])
+		return vb.aead.Seal(dst, nonce[:], block.Data, aad[:])
+	}
+
+	checksum := crc32.ChecksumIEEE(header[:24])
+	checksum = crc32.Update(checksum, crc32.IEEETable, block.Data)
+	binary.BigEndian.PutUint32(header[24:28], checksum)
+	return append(dst, block.Data...)
+}
+
+func (vb *VB) writeEncodedWAL(record []byte) error {
+	wal := &vb.WAL
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+	if wal.rollbackErr != nil {
+		return wal.rollbackErr
+	}
+	if len(wal.DB) == 0 {
+		return errors.New("no active WAL")
+	}
+
+	current := wal.DB[len(wal.DB)-1]
+	// Stat supplies the rollback boundary for both solo and batched appends.
+	before, err := current.Stat()
+	if err != nil {
+		return fmt.Errorf("stat active WAL: %w", err)
+	}
+	n, err := wal.write(current, record)
+	if n > 0 {
+		wal.dirty.Store(true)
+	}
+	if err == nil && n == len(record) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	if n == 0 {
+		return fmt.Errorf("append WAL: %w", err)
+	}
+
+	offset := before.Size()
+	var truncErr error
+	if wal.truncateFile != nil {
+		truncErr = wal.truncateFile(current, offset)
 	} else {
-		// Legacy layout (magic VBWL), per-record:
-		//   [SeqNum(8) | BlockNum(8) | BlockLen(8) | CRC32(4) | data(BlockLen)]
-		recordSize := 28 + len(block.Data)
-		record = make([]byte, recordSize)
-		binary.BigEndian.PutUint64(record[0:8], block.SeqNum)
-		binary.BigEndian.PutUint64(record[8:16], block.Block)
-		binary.BigEndian.PutUint64(record[16:24], block.Len)
-		checksum := crc32.ChecksumIEEE(record[0:24])
-		checksum = crc32.Update(checksum, crc32.IEEETable, block.Data)
-		binary.BigEndian.PutUint32(record[24:28], checksum)
-		copy(record[28:], block.Data)
+		truncErr = current.Truncate(offset)
 	}
-
-	vb.WAL.mu.Lock()
-	currentWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
-	// O_APPEND makes the file offset unreliable; Stat is the source of truth
-	// for the on-disk boundary we may need to roll back to.
-	preStat, statErr := currentWAL.Stat()
-	if statErr != nil {
-		vb.WAL.mu.Unlock()
-		return fmt.Errorf("error obtaining WAL size before write: %w", statErr)
+	if truncErr != nil {
+		wal.rollbackErr = fmt.Errorf("WAL rollback to %d failed after append of %d/%d bytes: %w", offset, n, len(record), errors.Join(err, truncErr))
+		return wal.rollbackErr
 	}
-	preSize := preStat.Size()
-	n, err := currentWAL.Write(record)
-	vb.WAL.dirty.Store(true)
-
-	if err != nil || n != len(record) {
-		// Torn write: roll back to the last record boundary so future appends
-		// and replay stay aligned with the record framing.
-		truncErr := currentWAL.Truncate(preSize)
-		vb.WAL.mu.Unlock()
-
-		if truncErr != nil {
-			return fmt.Errorf("incomplete WAL write (wrote %d of %d bytes) and truncate to %d failed: %w", n, len(record), preSize, truncErr)
-		}
-		if err != nil {
-			vb.logger().Error("WAL write failed, truncated to last boundary", "n", n, "expected", len(record), "preSize", preSize, "error", err)
-			return fmt.Errorf("WAL write failed (truncated to %d): %w", preSize, err)
-		}
-		vb.logger().Error("WAL incomplete write, truncated to last boundary", "n", n, "expected", len(record), "preSize", preSize)
-		return fmt.Errorf("incomplete write to WAL: wrote %d of %d bytes (truncated to %d)", n, len(record), preSize)
-	}
-
-	vb.WAL.mu.Unlock()
-	return nil
+	return fmt.Errorf("WAL write failed (truncated to %d) after append of %d/%d bytes: %w", offset, n, len(record), err)
 }
 
 // WriteShardedWAL writes a block to the appropriate shard based on block number.
@@ -3774,45 +3794,8 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 		return err
 	}
 
-	// First, lock, and close the current WAL file
-	vb.WAL.mu.Lock()
-	if len(vb.WAL.DB) == 0 {
-		vb.WAL.mu.Unlock()
-		return nil
-	}
-	currentWALNum := vb.WAL.WallNum.Load()
-	pendingWAL := vb.WAL.DB[len(vb.WAL.DB)-1]
-
-	// Check if we should write the chunk based on size
-	if !force {
-		fstat, err := pendingWAL.Stat()
-		if err != nil {
-			vb.WAL.mu.Unlock()
-			return fmt.Errorf("could not validate WAL size: %w", err)
-		}
-		if fstat.Size() < int64(vb.ObjBlockSize) {
-			vb.WAL.mu.Unlock()
-			vb.logger().InfoContext(ctx, "WAL is less than 4MB, skipping chunk write")
-			return nil
-		}
-	}
-
-	// Sync and close the pending WAL under the lock so no concurrent
-	// WriteWAL() can write after sync but before close.
-	if err := pendingWAL.Sync(); err != nil {
-		vb.WAL.mu.Unlock()
-		return fmt.Errorf("failed to sync WAL before chunking: %w", err)
-	}
-	if err := pendingWAL.Close(); err != nil {
-		vb.logger().Warn("failed to close pending WAL", "error", err)
-	}
-
-	// Open the next WAL file while still holding the lock so there is no
-	// window where syncWALIfDirty or WriteWAL can see a closed DB entry.
-	nextWalNum := vb.WAL.WallNum.Add(1)
-	err = vb.openWALLocked(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, nextWalNum, vb.GetVolume())))
-	vb.WAL.mu.Unlock()
-	if err != nil {
+	currentWALNum, rotated, err := vb.rotateChunkWAL(force)
+	if err != nil || !rotated {
 		return err
 	}
 
@@ -3825,6 +3808,47 @@ func (vb *VB) WriteWALToChunkCtx(ctx context.Context, force bool) (err error) {
 	vb.markWALConsolidated(currentWALNum)
 
 	return nil
+}
+
+// rotateChunkWAL waits for the append-to-pending handoff before sealing.
+func (vb *VB) rotateChunkWAL(force bool) (uint64, bool, error) {
+	vb.flushMu.Lock()
+	defer vb.flushMu.Unlock()
+	wal := &vb.WAL
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	if wal.rollbackErr != nil {
+		return 0, false, wal.rollbackErr
+	}
+	if len(wal.DB) == 0 {
+		return 0, false, nil
+	}
+	current := wal.DB[len(wal.DB)-1]
+	if !force {
+		info, err := current.Stat()
+		if err != nil {
+			return 0, false, fmt.Errorf("validate WAL size: %w", err)
+		}
+		if info.Size() < int64(vb.ObjBlockSize) {
+			return 0, false, nil
+		}
+	}
+	if err := current.Sync(); err != nil {
+		return 0, false, fmt.Errorf("sync WAL before chunking: %w", err)
+	}
+
+	currentNum := wal.WallNum.Load()
+	next := currentNum + 1
+	path := filepath.Join(wal.BaseDir, types.GetFilePath(types.FileTypeWALChunk, next, vb.GetVolume()))
+	if err := vb.openWALLocked(wal, path); err != nil {
+		return 0, false, err
+	}
+	wal.WallNum.Store(next)
+	if err := current.Close(); err != nil {
+		vb.logger().Warn("failed to close pending WAL", "error", err)
+	}
+	return currentNum, true, nil
 }
 
 // consolidateWALGeneration reads, dedupes, and uploads WAL generation walNum's
@@ -4044,45 +4068,14 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		return err
 	}
 
-	// After upload completion, remove from PendingBackendWrites
-	// Build a hash map of matched block numbers for O(1) lookup instead of O(n²)
-	matchedBlockMap := make(map[uint64]struct{}, len(*matchedBlocks))
-	for _, mb := range *matchedBlocks {
-		matchedBlockMap[mb.Block] = struct{}{}
-	}
-
-	vb.PendingBackendWrites.mu.Lock()
-
-	// Filter pending writes in-place using the hash map for O(n) complexity
-	// We iterate through the slice once, keeping non-matched blocks at the front
-	n := 0
-	var freedBytes int64
-	for _, block := range vb.PendingBackendWrites.Blocks {
-		if _, matched := matchedBlockMap[block.Block]; !matched {
-			// Block not in matched set, keep it in pending writes
-			vb.PendingBackendWrites.Blocks[n] = block
-			n++
-		} else {
-			// Block was successfully written to backend, update cache
-			vb.Cache.put(block.Block, block.SeqNum, block.Data)
-			freedBytes += int64(len(block.Data))
-		}
-	}
-	// Truncate the slice to remove processed blocks
-	vb.PendingBackendWrites.Blocks = vb.PendingBackendWrites.Blocks[:n]
-
-	vb.PendingBackendWrites.mu.Unlock()
-
-	// This chunk's bytes have left both Writes.Blocks (filtered out at flush
-	// time) and PendingBackendWrites.Blocks (just above) — release them from
-	// the backpressure counter WriteAtCtx's awaitBackpressure gate watches.
-	vb.pendingBytes.Add(-freedBytes)
-
 	headerLen := len(headers)
 
 	strideU32 := vb.blockStride()
 	stride := int(strideU32)
 
+	if vb.beforeChunkMap != nil {
+		vb.beforeChunkMap()
+	}
 	vb.BlocksToObject.mu.Lock()
 	installed := false
 	// installSegment maps [segStart, segEnd) of matchedBlocks -- which the
@@ -4215,6 +4208,30 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		vb.BlocksToObject.dirty.Store(true)
 	}
 	vb.BlocksToObject.mu.Unlock()
+
+	// A generation upload can finish after newer writes reached the next WAL.
+	uploaded := make(map[uint64]uint64, len(*matchedBlocks))
+	for _, mb := range *matchedBlocks {
+		uploaded[mb.Block] = max(uploaded[mb.Block], mb.SeqNum)
+	}
+
+	vb.PendingBackendWrites.mu.Lock()
+	var freedBytes int64
+	vb.PendingBackendWrites.Blocks = slices.DeleteFunc(vb.PendingBackendWrites.Blocks, func(block Block) bool {
+		seq, ok := uploaded[block.Block]
+		if !ok || block.SeqNum > seq {
+			return false
+		}
+		vb.Cache.put(block.Block, block.SeqNum, block.Data)
+		freedBytes += int64(len(block.Data))
+		return true
+	})
+	vb.PendingBackendWrites.mu.Unlock()
+
+	// This chunk's bytes have left both Writes.Blocks (filtered out at flush
+	// time) and PendingBackendWrites.Blocks (just above) — release them from
+	// the backpressure counter WriteAtCtx's awaitBackpressure gate watches.
+	vb.pendingBytes.Add(-freedBytes)
 
 	// Do NOT checkpoint per chunk here. createChunkFile runs under the parallel
 	// upload pool, so concurrent per-chunk SaveLiveCheckpointCtx calls can PUT
