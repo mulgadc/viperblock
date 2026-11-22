@@ -204,7 +204,8 @@ func TestWALCodecExactBytes(t *testing.T) {
 }
 
 func TestFailedSuccessorHeaderCanBeRetried(t *testing.T) {
-	vb, _ := newEnospcTestVB(t)
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, backend := mv.create(t, 5)
 	initial := vb.WAL.WallNum.Load()
 	active := vb.WAL.DB[len(vb.WAL.DB)-1].Name()
 	next := filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, initial+1, vb.GetVolume()))
@@ -227,11 +228,28 @@ func TestFailedSuccessorHeaderCanBeRetried(t *testing.T) {
 	vb.WAL.appendFile = nil
 	require.NoError(t, vb.WriteWALToChunk(true))
 	require.FileExists(t, active, "upload alone cannot reclaim the WAL")
+	backend.failHead.Store(true)
+	require.Error(t, vb.DrainToBackend())
+	require.FileExists(t, active, "a failed head publication cannot reclaim the WAL")
+	backend.failHead.Store(false)
 	require.NoError(t, vb.DrainToBackend())
 	require.NoFileExists(t, active)
-	got, err := vb.ReadAt(0, uint64(vb.BlockSize))
+	vb.Detach()
+	reopened, _, err := mv.open(t, 6)
 	require.NoError(t, err)
-	require.Equal(t, data, got)
+	require.Equal(t, data, readBlocks(t, reopened, 0, 1))
+}
+
+func TestInitialOpenAcceptsEmptyWAL(t *testing.T) {
+	vb, _ := newEnospcTestVB(t)
+	path := filepath.Join(t.TempDir(), "wal")
+	require.NoError(t, os.WriteFile(path, nil, 0600))
+	wal := &WAL{WALMagic: vb.WAL.WALMagic}
+	require.NoError(t, vb.OpenWAL(wal, path))
+	t.Cleanup(func() { _ = wal.DB[0].Close() })
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, int64(vb.WALHeaderSize()), info.Size())
 }
 
 func TestBarrierWaitingForSyncObservesRollbackFailure(t *testing.T) {

@@ -1950,11 +1950,11 @@ func (vb *VB) OpenWAL(wal *WAL, filename string) (err error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	return vb.openWALLocked(wal, filename)
+	return vb.openWALLocked(wal, filename, false)
 }
 
 // openWALLocked creates and opens a new WAL file. Caller must hold wal.mu.
-func (vb *VB) openWALLocked(wal *WAL, filename string) error {
+func (vb *VB) openWALLocked(wal *WAL, filename string, exclusive bool) error {
 	if err := os.MkdirAll(filepath.Dir(filename), 0750); err != nil {
 		return fmt.Errorf("create WAL directory: %w", err)
 	}
@@ -1963,7 +1963,9 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) error {
 	var header []byte
 	switch {
 	case chunk:
-		flags |= os.O_EXCL
+		if exclusive {
+			flags |= os.O_EXCL
+		}
 		header = vb.WALHeader()
 	case wal.WALMagic == vb.BlockToObjectWAL.WALMagic:
 		header = vb.BlockToObjectWALHeader()
@@ -1978,13 +1980,24 @@ func (vb *VB) openWALLocked(wal *WAL, filename string) error {
 		}
 		return fmt.Errorf("open WAL file: %w", err)
 	}
+	if chunk && !exclusive {
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return fmt.Errorf("stat initial WAL file: %w", err)
+		}
+		if info.Size() > 0 {
+			_ = file.Close()
+			return fmt.Errorf("%w: %s", ErrWALAlreadyOpen, filename)
+		}
+	}
 	n, err := wal.write(file, header)
 	if err != nil || n != len(header) {
 		if err == nil {
 			err = io.ErrShortWrite
 		}
 		err = errors.Join(err, file.Close())
-		if chunk {
+		if exclusive {
 			// Only remove a file this attempt created exclusively.
 			err = errors.Join(err, os.Remove(filename))
 		}
@@ -3841,7 +3854,7 @@ func (vb *VB) rotateChunkWAL(force bool) (uint64, bool, error) {
 	currentNum := wal.WallNum.Load()
 	next := currentNum + 1
 	path := filepath.Join(wal.BaseDir, types.GetFilePath(types.FileTypeWALChunk, next, vb.GetVolume()))
-	if err := vb.openWALLocked(wal, path); err != nil {
+	if err := vb.openWALLocked(wal, path, true); err != nil {
 		return 0, false, err
 	}
 	wal.WallNum.Store(next)
