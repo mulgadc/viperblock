@@ -17,7 +17,7 @@ func (mv *mapVolume) createV1(t *testing.T) *VB {
 	t.Helper()
 	vb, _ := mv.engine(t, 0)
 	require.NoError(t, vb.SaveState())
-	openWALs(t, vb)
+	openMapWALs(t, vb)
 	return vb
 }
 
