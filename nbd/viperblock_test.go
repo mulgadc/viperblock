@@ -465,7 +465,8 @@ func TestPReadDestinationContentsAndOwnership(t *testing.T) {
 	copy(want[512:], patch)
 	copy(want[bs+512:], patch)
 	check(mapped)
-
+	_, err := reopened.ReadAt(3*bs+1, 0)
+	require.ErrorIs(t, err, viperblock.ErrZeroBlock)
 }
 
 type callbackReadFault struct {
@@ -635,10 +636,16 @@ func TestPReadDestinationPreservesReadAheadQueueAccounting(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first read never entered the backend")
 	}
-	secondErr := conn.PRead(second, bs, 0)
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- conn.PRead(second, bs, 0) }()
+	select {
+	case err := <-secondResult:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second read did not complete while the first was held")
+	}
 	release()
 	require.NoError(t, <-firstResult)
-	require.NoError(t, secondErr)
 	require.Equal(t, image[:bs], first)
 	require.Equal(t, image[bs:2*bs], second)
 	require.EqualValues(t, 2*bs, probe.bodyBytes.Load())

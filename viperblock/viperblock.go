@@ -6705,10 +6705,6 @@ func (vb *VB) readAtCtx(ctx context.Context, offset, length uint64, dst []byte) 
 	if length > size-offset {
 		return nil, ErrRequestOutOfRange
 	}
-	if length == 0 {
-		return dst, nil
-	}
-
 	blockSize := uint64(vb.BlockSize)
 	firstBlock := offset / blockSize
 	innerOffset := offset % blockSize
@@ -6717,7 +6713,7 @@ func (vb *VB) readAtCtx(ctx context.Context, offset, length uint64, dst []byte) 
 
 	var fullData []byte
 	var err error
-	direct := dst != nil && vb.UseBlockStore && innerOffset == 0 && length%blockSize == 0
+	direct := length > 0 && dst != nil && vb.UseBlockStore && innerOffset == 0 && length%blockSize == 0
 	vb.readsInFlight.Add(1)
 	if direct {
 		fullData, err = vb.readBlockStore(ctx, firstBlock, length, dst)
