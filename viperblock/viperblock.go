@@ -614,6 +614,15 @@ type CacheConfig struct {
 type cachedBlock struct {
 	seqNum uint64
 	data   []byte
+	origin *inheritedCacheOrigin
+}
+
+type inheritedCacheOrigin struct {
+	volume   string
+	uuid     [4]byte
+	nameHash [32]byte
+	objectID uint64
+	offset   uint32
 }
 
 // Cache is a bounded plaintext block cache sitting beside the authoritative
@@ -628,11 +637,18 @@ type Cache struct {
 // get returns the cached plaintext for a block only if it was cached under the
 // sequence number the caller resolved, so a superseded copy is never served.
 func (c *Cache) get(block, seqNum uint64) ([]byte, bool) {
+	return c.getFrom(block, seqNum, nil)
+}
+
+func (c *Cache) getFrom(block, seqNum uint64, origin *inheritedCacheOrigin) ([]byte, bool) {
 	if c.Config.Size == 0 {
 		return nil, false
 	}
 	cb, ok := c.lru.Get(block)
-	if !ok || cb.seqNum != seqNum {
+	if !ok || cb.seqNum != seqNum || (cb.origin == nil) != (origin == nil) {
+		return nil, false
+	}
+	if origin != nil && *cb.origin != *origin {
 		return nil, false
 	}
 	return cb.data, true
@@ -664,10 +680,14 @@ func (vb *VB) cacheFetched(data []byte, runs ...ConsecutiveBlocks) {
 // put stores a copy of data. The caller's buffer is cloned because it is
 // usually a window into a larger read buffer that it will keep writing to.
 func (c *Cache) put(block, seqNum uint64, data []byte) {
+	c.putFrom(block, seqNum, data, nil)
+}
+
+func (c *Cache) putFrom(block, seqNum uint64, data []byte, origin *inheritedCacheOrigin) {
 	if c.Config.Size == 0 {
 		return
 	}
-	c.lru.Add(block, cachedBlock{seqNum: seqNum, data: bytes.Clone(data)})
+	c.lru.Add(block, cachedBlock{seqNum: seqNum, data: bytes.Clone(data), origin: origin})
 }
 
 type ObjectMap struct {
@@ -6544,7 +6564,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			if vb.BaseBlockMap != nil {
 				baseObjectID, baseObjectOffset, baseSeqNum, baseErr := vb.LookupBaseBlockToObject(currentBlock)
 				if baseErr == nil {
-					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
+					block := ConsecutiveBlock{
 						BlockPosition: i,
 						StartBlock:    currentBlock,
 						NumBlocks:     1,
@@ -6553,7 +6573,11 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 						ObjectID:      baseObjectID,
 						ObjectOffset:  baseObjectOffset,
 						SeqNum:        baseSeqNum,
-					})
+					}
+					if blockRequests == 1 && vb.Cache.Config.Size != 0 {
+						return vb.readInheritedBlock(ctx, vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, block, data)
+					}
+					baseConsecutiveBlocks = append(baseConsecutiveBlocks, block)
 					continue
 				}
 			}
@@ -6564,7 +6588,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 				lookup, pos, ok := vb.ancestors[ai].blocks.resolveBlockLookup(currentBlock)
 				vb.ancestors[ai].blocks.mu.RUnlock()
 				if ok {
-					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
+					block := ConsecutiveBlock{
 						BlockPosition: i,
 						StartBlock:    currentBlock,
 						NumBlocks:     1,
@@ -6573,7 +6597,12 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 						ObjectID:      lookup.ObjectID,
 						ObjectOffset:  lookup.offsetAt(pos, vb.blockStride()),
 						SeqNum:        lookup.seqNumAt(pos),
-					})
+					}
+					if blockRequests == 1 && vb.Cache.Config.Size != 0 {
+						ancestor := vb.ancestors[ai]
+						return vb.readInheritedBlock(ctx, ancestor.sourceVolumeName, ancestor.sourceVolumeUUID, ancestor.sourceVolumeNameHash, block, data)
+					}
+					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], block)
 					ancFound = true
 					break
 				}
@@ -6687,8 +6716,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		}
 	}
 
-	vb.cacheFetched(data, consecutiveBlocks, baseConsecutiveBlocks)
-	vb.cacheFetched(data, ancestorConsBlocks...)
+	vb.cacheFetched(data, consecutiveBlocks)
 
 	return data, zeroBlockErr
 }
@@ -7150,7 +7178,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 			if vb.BaseBlockMap != nil {
 				objectID, objectOffset, baseSeqNum, baseErr := vb.LookupBaseBlockToObject(currentBlock)
 				if baseErr == nil {
-					baseConsecutiveBlocks = append(baseConsecutiveBlocks, ConsecutiveBlock{
+					block := ConsecutiveBlock{
 						BlockPosition: i,
 						StartBlock:    currentBlock,
 						NumBlocks:     1,
@@ -7159,7 +7187,11 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 						ObjectID:      objectID,
 						ObjectOffset:  objectOffset,
 						SeqNum:        baseSeqNum,
-					})
+					}
+					if blockRequests == 1 && vb.Cache.Config.Size != 0 {
+						return vb.readInheritedBlock(ctx, vb.SourceVolumeName, vb.SourceVolumeUUID, vb.sourceVolumeNameHash, block, data)
+					}
+					baseConsecutiveBlocks = append(baseConsecutiveBlocks, block)
 					continue
 				}
 			}
@@ -7174,7 +7206,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 			for ai := range vb.ancestors {
 				lookup, pos, ok := vb.ancestors[ai].blocks.resolveBlockLookup(currentBlock)
 				if ok {
-					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], ConsecutiveBlock{
+					block := ConsecutiveBlock{
 						BlockPosition: i,
 						StartBlock:    currentBlock,
 						NumBlocks:     1,
@@ -7183,7 +7215,15 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 						ObjectID:      lookup.ObjectID,
 						ObjectOffset:  lookup.offsetAt(pos, vb.blockStride()),
 						SeqNum:        lookup.seqNumAt(pos),
-					})
+					}
+					if blockRequests == 1 && vb.Cache.Config.Size != 0 {
+						for ai := range vb.ancestors {
+							vb.ancestors[ai].blocks.mu.RUnlock()
+						}
+						ancestor := vb.ancestors[ai]
+						return vb.readInheritedBlock(ctx, ancestor.sourceVolumeName, ancestor.sourceVolumeUUID, ancestor.sourceVolumeNameHash, block, data)
+					}
+					ancestorConsBlocks[ai] = append(ancestorConsBlocks[ai], block)
 					ancFound = true
 					break
 				}
@@ -7237,8 +7277,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 		}
 	}
 
-	vb.cacheFetched(data, consecutiveBlocks, baseConsecutiveBlocks)
-	vb.cacheFetched(data, ancestorConsBlocks...)
+	vb.cacheFetched(data, consecutiveBlocks)
 
 	return data, zeroBlockErr
 }
@@ -7306,6 +7345,25 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 	}
 
 	return nil
+}
+
+// readInheritedBlock serves a single resolved source block without fragmenting larger reads.
+func (vb *VB) readInheritedBlock(ctx context.Context, volume string, uuid [4]byte, nameHash [32]byte, block ConsecutiveBlock, dst []byte) ([]byte, error) {
+	vb.planReadAhead(block.StartBlock, 1, nil)
+	origin := inheritedCacheOrigin{
+		volume: volume, uuid: uuid, nameHash: nameHash,
+		objectID: block.ObjectID, offset: block.ObjectOffset,
+	}
+	if data, ok := vb.Cache.getFrom(block.StartBlock, block.SeqNum, &origin); ok {
+		copy(dst, data)
+		return dst, nil
+	}
+	if err := vb.fetchBaseBlocksFromBackend(ctx, volume, uuid, nameHash, ConsecutiveBlocks{block}, dst); err != nil {
+		return nil, err
+	}
+	storedOrigin := origin
+	vb.Cache.putFrom(block.StartBlock, block.SeqNum, dst, &storedOrigin)
+	return dst, nil
 }
 
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
