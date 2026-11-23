@@ -2,13 +2,16 @@ package viperblock
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
 	"github.com/stretchr/testify/require"
 )
@@ -39,6 +42,18 @@ func detachConsolidationVolume(vb *VB) {
 	}
 }
 
+type scanChunkWrites struct {
+	types.Backend
+	count atomic.Int64
+}
+
+func (w *scanChunkWrites) WriteCtx(ctx context.Context, typ types.FileType, id uint64, headers, data *[]byte) error {
+	if typ == types.FileTypeChunk {
+		w.count.Add(1)
+	}
+	return w.Backend.WriteCtx(ctx, typ, id, headers, data)
+}
+
 func TestDrainRefusesIncompleteWALRecord(t *testing.T) {
 	for _, encrypted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
@@ -48,6 +63,8 @@ func TestDrainRefusesIncompleteWALRecord(t *testing.T) {
 			}
 			vb := newConsolidationVolume(t, t.TempDir(), key)
 			t.Cleanup(func() { detachConsolidationVolume(vb) })
+			writes := &scanChunkWrites{Backend: vb.Backend}
+			vb.Backend = writes
 			blockSize := int(vb.BlockSize)
 			data := bytes.Repeat([]byte{0x72}, 2*blockSize)
 			// A missing zero byte would pass the cleartext CRC if padded.
@@ -61,6 +78,7 @@ func TestDrainRefusesIncompleteWALRecord(t *testing.T) {
 
 			require.ErrorIs(t, vb.DrainToBackend(), io.ErrUnexpectedEOF)
 			require.FileExists(t, wal.Name())
+			require.Zero(t, writes.count.Load(), "the malformed generation must not upload chunks")
 			_, _, _, err = vb.LookupBlockToObject(0)
 			require.ErrorIs(t, err, ErrZeroBlock)
 
@@ -79,6 +97,7 @@ func TestDrainRefusesIncompleteWALRecord(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, laterRecords, 1)
 			require.Equal(t, later, laterRecords[0].Data)
+			require.Zero(t, writes.count.Load(), "the retry must not upload either generation")
 		})
 	}
 }
@@ -130,6 +149,8 @@ func TestDrainRefusesWALCorruptionPastReadBuffer(t *testing.T) {
 			}
 			vb := newConsolidationVolume(t, t.TempDir(), key)
 			t.Cleanup(func() { detachConsolidationVolume(vb) })
+			writes := &scanChunkWrites{Backend: vb.Backend}
+			vb.Backend = writes
 			require.NoError(t, vb.WriteAt(0, bytes.Repeat([]byte{0xb9}, 256<<10)))
 			require.NoError(t, vb.Flush())
 			wal := vb.WAL.DB[len(vb.WAL.DB)-1]
@@ -153,6 +174,7 @@ func TestDrainRefusesWALCorruptionPastReadBuffer(t *testing.T) {
 				require.ErrorContains(t, err, "checksum mismatch")
 			}
 			require.FileExists(t, wal.Name())
+			require.Zero(t, writes.count.Load(), "the malformed generation must not upload chunks")
 			_, _, _, err = vb.LookupBlockToObject(0)
 			require.ErrorIs(t, err, ErrZeroBlock)
 		})
@@ -162,8 +184,11 @@ func TestDrainRefusesWALCorruptionPastReadBuffer(t *testing.T) {
 func TestDrainRefusesShortWALHeader(t *testing.T) {
 	vb := newConsolidationVolume(t, t.TempDir(), nil)
 	t.Cleanup(func() { detachConsolidationVolume(vb) })
+	writes := &scanChunkWrites{Backend: vb.Backend}
+	vb.Backend = writes
 	wal := vb.WAL.DB[len(vb.WAL.DB)-1]
 	require.NoError(t, wal.Truncate(int64(vb.WALHeaderSize())-1))
 	require.ErrorIs(t, vb.DrainToBackend(), io.ErrUnexpectedEOF)
 	require.FileExists(t, wal.Name())
+	require.Zero(t, writes.count.Load())
 }
