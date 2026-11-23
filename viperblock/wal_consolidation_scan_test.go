@@ -109,3 +109,47 @@ func BenchmarkConsolidationScan(b *testing.B) {
 		}
 	}
 }
+
+func TestDrainRefusesWALCorruptionPastReadBuffer(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			var key *masterkey.Key
+			if encrypted {
+				key = testKey(t, 0x63)
+			}
+			vb := newConsolidationVolume(t, t.TempDir(), key)
+			t.Cleanup(func() { detachConsolidationVolume(vb) })
+			require.NoError(t, vb.WriteAt(0, bytes.Repeat([]byte{0xb9}, 256<<10)))
+			require.NoError(t, vb.Flush())
+			wal := vb.WAL.DB[len(vb.WAL.DB)-1]
+			info, err := wal.Stat()
+			require.NoError(t, err)
+			require.Greater(t, info.Size(), int64(256<<10))
+			var old [1]byte
+			_, err = wal.ReadAt(old[:], info.Size()-1)
+			require.NoError(t, err)
+			old[0] ^= 0x80
+			_, err = wal.WriteAt(old[:], info.Size()-1)
+			require.NoError(t, err)
+
+			err = vb.DrainToBackend()
+			if encrypted {
+				require.ErrorIs(t, err, ErrIntegrity)
+			} else {
+				require.ErrorContains(t, err, "checksum mismatch")
+			}
+			require.FileExists(t, wal.Name())
+			_, _, _, err = vb.LookupBlockToObject(0)
+			require.ErrorIs(t, err, ErrZeroBlock)
+		})
+	}
+}
+
+func TestDrainRefusesShortWALHeader(t *testing.T) {
+	vb := newConsolidationVolume(t, t.TempDir(), nil)
+	t.Cleanup(func() { detachConsolidationVolume(vb) })
+	wal := vb.WAL.DB[len(vb.WAL.DB)-1]
+	require.NoError(t, wal.Truncate(int64(vb.WALHeaderSize())-1))
+	require.ErrorIs(t, vb.DrainToBackend(), io.ErrUnexpectedEOF)
+	require.FileExists(t, wal.Name())
+}
