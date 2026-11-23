@@ -6452,7 +6452,7 @@ func (vb *VB) loadStateAttemptCtx(ctx context.Context, filename string) (state V
 func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []byte, err error) {
 	// Use optimized BlockStore path if enabled
 	if vb.UseBlockStore {
-		return vb.readBlockStore(ctx, block, blockLen)
+		return vb.readBlockStore(ctx, block, blockLen, nil)
 	}
 
 	// Check blockLen a multiple of a blocksize
@@ -6686,41 +6686,57 @@ func (vb *VB) ReadAt(offset uint64, length uint64) ([]byte, error) {
 // ReadAtCtx is ReadAt with a caller-supplied context that flows through
 // backend chunk fetches for trace propagation.
 func (vb *VB) ReadAtCtx(ctx context.Context, offset uint64, length uint64) ([]byte, error) {
-	// First check the block exists in our volume size
-	if offset > vb.GetVolumeSize() {
+	return vb.readAtCtx(ctx, offset, length, nil)
+}
+
+// ReadAtInto fills dst synchronously and retains no reference to it.
+// ErrZeroBlock accompanies valid data with zero-filled holes. Discard dst
+// on any other error.
+func (vb *VB) ReadAtInto(offset uint64, dst []byte) error {
+	_, err := vb.readAtCtx(context.Background(), offset, uint64(len(dst)), dst)
+	return err
+}
+
+func (vb *VB) readAtCtx(ctx context.Context, offset, length uint64, dst []byte) ([]byte, error) {
+	size := vb.GetVolumeSize()
+	if offset > size {
 		return nil, ErrRequestTooLarge
 	}
-
-	if offset+length > vb.GetVolumeSize() {
+	if length > size-offset {
 		return nil, ErrRequestOutOfRange
+	}
+	if length == 0 {
+		return dst, nil
 	}
 
 	blockSize := uint64(vb.BlockSize)
-
-	// Calculate first and last block numbers
 	firstBlock := offset / blockSize
+	innerOffset := offset % blockSize
 	lastBlock := (offset + length - 1) / blockSize
 	blockCount := lastBlock - firstBlock + 1
 
-	// Read entire range of needed blocks
+	var fullData []byte
+	var err error
+	direct := dst != nil && vb.UseBlockStore && innerOffset == 0 && length%blockSize == 0
 	vb.readsInFlight.Add(1)
-	fullData, err := vb.read(ctx, firstBlock, blockCount*blockSize)
+	if direct {
+		fullData, err = vb.readBlockStore(ctx, firstBlock, length, dst)
+	} else {
+		fullData, err = vb.read(ctx, firstBlock, blockCount*blockSize)
+	}
 	vb.readsInFlight.Add(-1)
 
 	if err != nil && !errors.Is(err, ErrZeroBlock) {
 		return nil, err
 	}
-
-	// Compute offset within the first block
-	innerOffset := offset % blockSize
-
-	// read() always returns a full-length buffer when err is nil or ErrZeroBlock
-	// (it only returns nil data alongside a genuine error), so this guard is
-	// belt-and-suspenders — it encodes that invariant rather than dereferencing blind.
 	if fullData == nil {
 		return nil, err
 	}
-	return fullData[innerOffset : innerOffset+length], err
+	data := fullData[innerOffset : innerOffset+length]
+	if dst != nil && !direct {
+		copy(dst, data)
+	}
+	return data, err
 }
 
 // Close runs CloseCtx with a background context, so every non-shutdown
@@ -7038,14 +7054,17 @@ func (vb *VB) DisableBlockStore() {
 
 // readBlockStore is the optimized read path using UnifiedBlockStore
 // Provides O(1) lookups instead of O(n) map rebuilding per read.
-func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64) (data []byte, err error) {
+func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64, data []byte) (_ []byte, err error) {
 	// Check blockLen is a multiple of blocksize
 	if blockLen%uint64(vb.BlockSize) != 0 {
 		return nil, ErrRequestBlockSize
 	}
 
 	var zeroBlockErr error
-	data = make([]byte, blockLen)
+	provided := data != nil
+	if !provided {
+		data = make([]byte, blockLen)
+	}
 	blockRequests := blockLen / uint64(vb.BlockSize)
 
 	stream := &streamRequest{block: block, blockRequests: blockRequests}
@@ -7158,6 +7177,9 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64)
 			// ReadEntryRun's unresolved blocks correspond to "no own-volume,
 			// base-map, or ancestor data for this block".
 			zeroBlockErr = ErrZeroBlock
+			if provided {
+				clear(data[start:end])
+			}
 		}
 	}
 
