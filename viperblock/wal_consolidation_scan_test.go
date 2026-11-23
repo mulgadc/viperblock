@@ -83,10 +83,9 @@ func TestDrainRefusesIncompleteWALRecord(t *testing.T) {
 			_, _, _, err = vb.LookupBlockToObject(0)
 			require.ErrorIs(t, err, ErrZeroBlock)
 
-			replayed, _, err := vb.readWALFileForRecovery(wal.Name())
-			require.NoError(t, err)
-			require.Len(t, replayed, 1)
-			require.Equal(t, data[:blockSize], replayed[0].Data)
+			_, _, err = vb.readWALFileForRecovery(wal.Name())
+			require.ErrorIs(t, err, ErrIntegrity)
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 
 			later := bytes.Repeat([]byte{0xd3}, blockSize)
 			require.NoError(t, vb.WriteAt(2*uint64(blockSize), later))
