@@ -2,6 +2,7 @@ package viperblock
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -96,4 +98,57 @@ func TestIOProfileServe(t *testing.T) {
 	defer done()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "endpoint"), []byte(fmt.Sprint(listener.Addr())), 0600))
 	<-ctx.Done()
+}
+
+// TestIOProfileBarrierPhases keeps the engine and socket timing samples separate.
+func TestIOProfileBarrierPhases(t *testing.T) {
+	root := os.Getenv("VB_IO_PROFILE_WAL")
+	if root == "" {
+		t.Skip("requires scratch WAL on the measured filesystem")
+	}
+	const name, size = "io-profile-barrier", 128 << 20
+	vb, err := New(&VB{
+		VolumeName: name, VolumeSize: size, BaseDir: root,
+		LeaseEpoch: 1, MasterKey: testKey(t, 0x26), EncryptionEnabled: true,
+		WALSyncInterval: -1, ChunkUploadInterval: -1,
+	}, "s3", s3.S3Config{
+		VolumeName: name, VolumeSize: size, Region: "ap-southeast-2",
+		Bucket: sharedBucket, AccessKey: AccessKey, SecretKey: SecretKey,
+		Host: "https://" + sharedServerHost, HTTPClient: testHTTPClient,
+	})
+	require.NoError(t, err)
+	t.Cleanup(vb.Detach)
+	require.NoError(t, vb.Backend.Init())
+	require.NoError(t, vb.InitMapDeltaCtx(t.Context(), true))
+	require.NoError(t, vb.SaveState())
+	openMapWALs(t, vb)
+
+	original := recordWALOp
+	t.Cleanup(func() { recordWALOp = original })
+	var lock sync.Mutex
+	recordWALOp = func(ctx context.Context, phase, volume, outcome string, elapsed time.Duration) {
+		original(ctx, phase, volume, outcome, elapsed)
+		if volume == name {
+			lock.Lock()
+			t.Logf("profile-wal %s %s %d", phase, outcome, elapsed.Nanoseconds())
+			lock.Unlock()
+		}
+	}
+	data := bytes.Repeat([]byte{0x5b}, 4096)
+	for batch := range 6 {
+		for block := range 16 {
+			offset := uint64((batch*16 + block) * len(data))
+			require.NoError(t, vb.WriteAt(offset, data))
+			start := time.Now()
+			require.NoError(t, vb.flushWrites())
+			t.Logf("profile-wal append success %d", time.Since(start).Nanoseconds())
+			start = time.Now()
+			require.NoError(t, vb.syncWAL())
+			t.Logf("profile-wal sync success %d", time.Since(start).Nanoseconds())
+		}
+		start := time.Now()
+		require.NoError(t, vb.DrainToBackend())
+		t.Logf("profile-wal full-drain success %d", time.Since(start).Nanoseconds())
+	}
+	require.NoError(t, vb.Close())
 }
