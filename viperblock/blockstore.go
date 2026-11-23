@@ -52,6 +52,7 @@ type BlockEntry struct {
 
 type indexEntry struct {
 	BlockEntry
+
 	sharedWithWAL bool
 }
 
