@@ -6698,38 +6698,45 @@ func (vb *VB) ReadAtInto(offset uint64, dst []byte) error {
 }
 
 func (vb *VB) readAtCtx(ctx context.Context, offset, length uint64, dst []byte) ([]byte, error) {
-	size := vb.GetVolumeSize()
-	if offset > size {
+	// First check the block exists in our volume size
+	if offset > vb.GetVolumeSize() {
 		return nil, ErrRequestTooLarge
 	}
-	if length > size-offset {
+
+	if length > vb.GetVolumeSize()-offset {
 		return nil, ErrRequestOutOfRange
 	}
+
 	blockSize := uint64(vb.BlockSize)
+
+	// Calculate first and last block numbers
 	firstBlock := offset / blockSize
-	innerOffset := offset % blockSize
 	lastBlock := (offset + length - 1) / blockSize
 	blockCount := lastBlock - firstBlock + 1
 
-	var fullData []byte
-	var err error
-	direct := length > 0 && dst != nil && vb.UseBlockStore && innerOffset == 0 && length%blockSize == 0
+	// Read entire range of needed blocks
 	vb.readsInFlight.Add(1)
-	if direct {
-		fullData, err = vb.readBlockStore(ctx, firstBlock, length, dst)
-	} else {
-		fullData, err = vb.read(ctx, firstBlock, blockCount*blockSize)
+	defer vb.readsInFlight.Add(-1)
+	if dst != nil && vb.UseBlockStore && length > 0 && offset%blockSize == 0 && length%blockSize == 0 {
+		return vb.readBlockStore(ctx, firstBlock, length, dst)
 	}
-	vb.readsInFlight.Add(-1)
+	fullData, err := vb.read(ctx, firstBlock, blockCount*blockSize)
 
 	if err != nil && !errors.Is(err, ErrZeroBlock) {
 		return nil, err
 	}
+
+	// Compute offset within the first block
+	innerOffset := offset % blockSize
+
+	// read() always returns a full-length buffer when err is nil or ErrZeroBlock
+	// (it only returns nil data alongside a genuine error), so this guard is
+	// belt-and-suspenders — it encodes that invariant rather than dereferencing blind.
 	if fullData == nil {
 		return nil, err
 	}
 	data := fullData[innerOffset : innerOffset+length]
-	if dst != nil && !direct {
+	if dst != nil {
 		copy(dst, data)
 	}
 	return data, err
