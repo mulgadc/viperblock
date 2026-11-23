@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -420,6 +422,257 @@ func BenchmarkPWrite(b *testing.B) {
 				}
 				offset += size
 			}
+		})
+	}
+}
+
+func TestPReadDestinationContentsAndOwnership(t *testing.T) {
+	const bs = 4096
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	defer detachWriteBufferVolume(vb)
+	openWriteBufferWAL(t, vb)
+	hot := &ViperBlockConnection{vb: vb}
+	want := make([]byte, 3*bs)
+	copy(want, bytes.Repeat([]byte{0xb6}, bs))
+	copy(want[2*bs:], bytes.Repeat([]byte{0x3e}, bs))
+	require.NoError(t, vb.WriteAt(0, want[:bs]))
+	require.NoError(t, vb.WriteAt(2*bs, want[2*bs:]))
+
+	check := func(conn *ViperBlockConnection) {
+		t.Helper()
+		for _, r := range []struct{ offset, length int }{{0, len(want)}, {bs, bs}, {bs - 512, bs}, {2 * bs, bs}} {
+			dst := bytes.Repeat([]byte{0xf9}, r.length)
+			require.NoError(t, conn.PRead(dst, uint64(r.offset), 0))
+			require.Equal(t, want[r.offset:r.offset+r.length], dst)
+			clear(dst)
+		}
+	}
+	check(hot)
+	require.NoError(t, vb.DrainToBackend())
+	detachWriteBufferVolume(vb)
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	require.NoError(t, reopened.SetCacheSize(32, 0))
+	mapped := &ViperBlockConnection{vb: reopened}
+	check(mapped)
+	check(mapped)
+	require.Error(t, mapped.PRead(make([]byte, bs), reopened.GetVolumeSize()-512, 0))
+	require.Error(t, mapped.PRead(make([]byte, bs), reopened.GetVolumeSize()+1, 0))
+	patch := bytes.Repeat([]byte{0x7e}, 512)
+	require.NoError(t, mapped.PWrite(patch, 512, 0))
+	require.NoError(t, mapped.PWrite(patch, bs+512, 0))
+	copy(want[512:], patch)
+	copy(want[bs+512:], patch)
+	check(mapped)
+	_, err := reopened.ReadAt(3*bs+1, 0)
+	require.ErrorIs(t, err, viperblock.ErrZeroBlock)
+}
+
+type callbackReadFault struct {
+	types.Backend
+	corruptTag bool
+}
+
+func (f callbackReadFault) ReadCtx(ctx context.Context, typ types.FileType, id uint64, off, n uint32) ([]byte, error) {
+	got, err := f.Backend.ReadCtx(ctx, typ, id, off, n)
+	if err != nil || typ != types.FileTypeChunk || off == 0 || len(got) < 2 {
+		return got, err
+	}
+	if f.corruptTag {
+		got[len(got)-1] ^= 0x80
+		return got, nil
+	}
+	return got[:len(got)-1], nil
+}
+
+func TestPReadRejectsFaultyMappedData(t *testing.T) {
+	for _, mode := range []string{"short", "bad-tag"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			var key *masterkey.Key
+			if mode == "bad-tag" {
+				var err error
+				key, err = masterkey.New(bytes.Repeat([]byte{0x26}, masterkey.MasterKeySize))
+				require.NoError(t, err)
+			}
+			vb := newWriteBufferVolume(t, root, 1, key)
+			defer detachWriteBufferVolume(vb)
+			openWriteBufferWAL(t, vb)
+			require.NoError(t, vb.WriteAt(0, bytes.Repeat([]byte{0xac}, 4096)))
+			require.NoError(t, vb.DrainToBackend())
+			detachWriteBufferVolume(vb)
+
+			reopened := reopenWriteBufferVolume(t, root, key)
+			reopened.Backend = callbackReadFault{Backend: reopened.Backend, corruptTag: mode == "bad-tag"}
+			conn := &ViperBlockConnection{vb: reopened}
+			err := conn.PRead(make([]byte, 4096), 0, 0)
+			if mode == "bad-tag" {
+				require.ErrorContains(t, err, "integrity")
+			} else {
+				require.ErrorContains(t, err, "short")
+			}
+		})
+	}
+}
+
+func TestPReadDestinationWithConcurrentOverwrite(t *testing.T) {
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	defer detachWriteBufferVolume(vb)
+	openWriteBufferWAL(t, vb)
+	conn := &ViperBlockConnection{vb: vb}
+	a := bytes.Repeat([]byte{0x24}, 4096)
+	b := bytes.Repeat([]byte{0xa5}, 4096)
+	require.NoError(t, conn.PWrite(a, 0, 0))
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Go(func() {
+		<-start
+		for range 128 {
+			for _, src := range [][]byte{b, a} {
+				if err := conn.PWrite(src, 0, 0); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}
+	})
+	group.Go(func() {
+		<-start
+		dst := make([]byte, 4096)
+		for range 128 {
+			if err := conn.PRead(dst, 0, 0); err != nil {
+				t.Error(err)
+				return
+			}
+			if !bytes.Equal(dst, a) && !bytes.Equal(dst, b) {
+				t.Error("read returned neither full block")
+				return
+			}
+			clear(dst)
+		}
+	})
+	close(start)
+	group.Wait()
+}
+
+func TestPReadDestinationCoversCloneAndHoles(t *testing.T) {
+	const bs = 4096
+	root := t.TempDir()
+	source := newWriteBufferVolume(t, root, 1, nil)
+	defer detachWriteBufferVolume(source)
+	openWriteBufferWAL(t, source)
+	inherited := bytes.Repeat([]byte{0x97}, bs)
+	own := bytes.Repeat([]byte{0x64}, bs)
+	require.NoError(t, source.WriteAt(0, inherited))
+	_, err := source.CreateSnapshot("read-destination-snapshot")
+	require.NoError(t, err)
+
+	clone, err := viperblock.New(&viperblock.VB{
+		VolumeName: "read-destination-clone", VolumeSize: 128 << 20,
+		BaseDir: filepath.Join(root, "local"), LeaseEpoch: 1,
+		WALSyncInterval: -1, ChunkUploadInterval: -1,
+	}, "file", file.FileConfig{VolumeName: "read-destination-clone", VolumeSize: 128 << 20, BaseDir: filepath.Join(root, "backend")})
+	require.NoError(t, err)
+	defer detachWriteBufferVolume(clone)
+	require.NoError(t, clone.Backend.Init())
+	require.NoError(t, clone.OpenFromSnapshot("read-destination-snapshot"))
+	require.NoError(t, clone.WriteAt(2*bs, own))
+	dst := bytes.Repeat([]byte{0x2c}, 3*bs)
+	conn := &ViperBlockConnection{vb: clone}
+	require.NoError(t, conn.PRead(dst, 0, 0))
+	want := make([]byte, 3*bs)
+	copy(want, inherited)
+	copy(want[2*bs:], own)
+	require.Equal(t, want, dst)
+}
+
+type callbackReadQueueProbe struct {
+	types.Backend
+	firstOffset      uint32
+	entered, release chan struct{}
+	bodyBytes        atomic.Uint64
+}
+
+func (p *callbackReadQueueProbe) ReadCtx(ctx context.Context, typ types.FileType, id uint64, off, n uint32) ([]byte, error) {
+	if typ == types.FileTypeChunk {
+		if off == p.firstOffset {
+			close(p.entered)
+			<-p.release
+		}
+		p.bodyBytes.Add(uint64(n))
+	}
+	return p.Backend.ReadCtx(ctx, typ, id, off, n)
+}
+
+func TestPReadDestinationPreservesReadAheadQueueAccounting(t *testing.T) {
+	const bs = 4096
+	root := t.TempDir()
+	writer := newWriteBufferVolume(t, root, 1, nil)
+	defer detachWriteBufferVolume(writer)
+	openWriteBufferWAL(t, writer)
+	image := bytes.Repeat([]byte{0x13}, 16*bs)
+	copy(image[bs:2*bs], bytes.Repeat([]byte{0x83}, bs))
+	require.NoError(t, writer.WriteAt(0, image))
+	require.NoError(t, writer.DrainToBackend())
+	_, offset, _, err := writer.LookupBlockToObject(0)
+	require.NoError(t, err)
+	detachWriteBufferVolume(writer)
+
+	vb := reopenWriteBufferVolume(t, root, nil)
+	require.NoError(t, vb.SetCacheSize(16, 0))
+	probe := &callbackReadQueueProbe{Backend: vb.Backend, firstOffset: offset,
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	vb.Backend = probe
+	release := sync.OnceFunc(func() { close(probe.release) })
+	defer release()
+	conn := &ViperBlockConnection{vb: vb}
+	firstResult := make(chan error, 1)
+	first, second := make([]byte, bs), make([]byte, bs)
+	go func() { firstResult <- conn.PRead(first, 0, 0) }()
+	select {
+	case <-probe.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first read never entered the backend")
+	}
+	secondResult := make(chan error, 1)
+	go func() { secondResult <- conn.PRead(second, bs, 0) }()
+	select {
+	case err := <-secondResult:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second read did not complete while the first was held")
+	}
+	release()
+	require.NoError(t, <-firstResult)
+	require.Equal(t, image[:bs], first)
+	require.Equal(t, image[bs:2*bs], second)
+	require.EqualValues(t, 2*bs, probe.bodyBytes.Load())
+}
+
+func BenchmarkPRead(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	for _, size := range []int{4 << 10, 1 << 20, 64 << 20} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			vb := newWriteBufferVolume(b, b.TempDir(), 1, nil)
+			b.Cleanup(func() { detachWriteBufferVolume(vb) })
+			openWriteBufferWAL(b, vb)
+			conn := &ViperBlockConnection{vb: vb}
+			seed := bytes.Repeat([]byte{0x56}, size)
+			require.NoError(b, vb.WriteAt(0, seed))
+			dst := make([]byte, size)
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				if err := conn.PRead(dst, 0, 0); err != nil {
+					b.Fatal(err)
+				}
+			}
+			require.Equal(b, seed, dst)
 		})
 	}
 }
