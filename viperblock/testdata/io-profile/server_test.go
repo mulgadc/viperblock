@@ -71,13 +71,12 @@ func TestIOProfileServe(t *testing.T) {
 	proxy.Transport = testHTTPClient.Transport
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
-	enabledPath := filepath.Join(root, "record-ranges")
+	record := os.Getenv("VB_IO_PROFILE_RECORD") == "1"
 	server := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rangeHeader := r.Header.Get("Range")
-			_, enabled := os.Stat(enabledPath)
-			if r.Method != http.MethodGet || rangeHeader == "" || enabled != nil {
+			if !record || r.Method != http.MethodGet || rangeHeader == "" {
 				proxy.ServeHTTP(w, r)
 				return
 			}

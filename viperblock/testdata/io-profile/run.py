@@ -3,6 +3,7 @@ import argparse
 import ctypes as c
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import statistics
@@ -76,10 +77,22 @@ def percentile(samples, value):
     return sorted(samples)[int((len(samples)-1)*value)] / 1000
 
 
-def bench(lib, handle, image, count):
+def drain(path):
+    start = time.monotonic_ns()
+    with socket.socket(socket.AF_UNIX) as change:
+        change.settimeout(10)
+        change.connect(str(path))
+        with change.makefile("rb") as response:
+            if response.readline() != b"OK\n":
+                raise RuntimeError("forced drain failed")
+    return (time.monotonic_ns() - start)/1000
+
+
+def bench(lib, handle, image, count, executor=None, snapshot_path=None):
     buf = c.create_string_buffer(4096)
     written = c.create_string_buffer(bytes([0x77])*4096, 4096)
     stats = {"read": [], "write": [], "flush": []}
+    drain_result = None
     for i in range(count):
         offset = (i % 16) * 4096
         start = time.monotonic_ns()
@@ -90,13 +103,18 @@ def bench(lib, handle, image, count):
                 start = time.monotonic_ns()
                 success(lib, lib.nbd_flush(handle, 0))
                 stats["flush"].append(time.monotonic_ns()-start)
+            if i == 200 and executor is not None:
+                drain_result = executor.submit(drain, snapshot_path)
         else:
             success(lib, lib.nbd_pread(handle, buf, 4096, offset, 0))
             stats["read"].append(time.monotonic_ns()-start)
             if buf.raw != image[offset:offset+4096]:
                 raise RuntimeError(f"incorrect bytes at {offset}")
-    return {f"{op}_{kind}_us": val for op, rows in stats.items() for kind, val in
-            (("p50", statistics.median(rows)/1000), ("p99", percentile(rows, 0.99)))}
+    summary = {f"{op}_{kind}_us": val for op, rows in stats.items() for kind, val in
+               (("p50", statistics.median(rows)/1000), ("p99", percentile(rows, 0.99)))}
+    if drain_result is not None:
+        summary["drain_us"] = drain_result.result()
+    return summary
 
 
 def main():
@@ -108,9 +126,7 @@ def main():
     lib = nbd_library()
     with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp, tempfile.TemporaryDirectory(dir=args.wal_root) as waltmp:
         root = Path(tmp)
-        env.update(VB_IO_PROFILE_ROOT=tmp, TMPDIR=tmp)
-        if args.record:
-            (root / "record-ranges").touch()
+        env.update(VB_IO_PROFILE_ROOT=tmp, TMPDIR=tmp, VB_IO_PROFILE_RECORD="1" if args.record else "0")
 
         with (args.out / "predastore.log").open("w") as log:
             server = subprocess.Popen([str(args.server_test.resolve()), "-test.run", "^TestIOProfileServe$",
@@ -155,6 +171,10 @@ def main():
                 bench(lib, handle, image, 100)
                 rows = [bench(lib, handle, image, 600) for _ in range(args.samples)]
                 (args.out / "mixed.json").write_text(json.dumps(rows, indent=2))
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    snapshot_path = Path(waltmp) / "io-profile-clone/snapshot.sock"
+                    rows = [bench(lib, handle, image, 600, executor, snapshot_path) for _ in range(args.samples)]
+                (args.out / "active-drain.json").write_text(json.dumps(rows, indent=2))
                 return
 
             handle = connect(lib, sock)
@@ -167,11 +187,7 @@ def main():
             if args.mode != "fua":
                 success(lib, lib.nbd_flush(handle, 0))
             if args.mode == "reclaim":
-                with socket.socket(socket.AF_UNIX) as change:
-                    change.settimeout(10)
-                    change.connect(str(Path(waltmp) / "io-profile-clone/snapshot.sock"))
-                    if change.makefile("rb").readline() != b"OK\n":
-                        raise RuntimeError("forced drain failed")
+                drain(Path(waltmp) / "io-profile-clone/snapshot.sock")
             else:
                 generations = [path for path in Path(waltmp).rglob("wal.*.bin") if path.stat().st_size > 4096]
                 if not generations:
