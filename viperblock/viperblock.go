@@ -3879,7 +3879,7 @@ func (vb *VB) consolidateWALGeneration(ctx context.Context, walNum uint64) error
 
 	// Read and validate WAL header (magic, version, timestamp)
 	headers := make([]byte, vb.WALHeaderSize())
-	if _, err := pendingWAL2.Read(headers); err != nil {
+	if _, err := io.ReadFull(pendingWAL2, headers); err != nil {
 		return fmt.Errorf("error reading WAL headers: %w", err)
 	}
 
@@ -3943,7 +3943,7 @@ func (vb *VB) consolidateWALGeneration(ctx context.Context, walNum uint64) error
 	} else {
 		for {
 			data := make([]byte, 28+vb.BlockSize)
-			_, err := pendingWAL2.Read(data)
+			_, err := io.ReadFull(pendingWAL2, data)
 			if err != nil {
 				if err == io.EOF {
 					break
