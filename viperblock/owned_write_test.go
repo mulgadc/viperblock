@@ -3,6 +3,7 @@ package viperblock
 import (
 	"bytes"
 	"context"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -39,22 +40,51 @@ func TestOwnedWriteReplaysDespitePublicBufferMutation(t *testing.T) {
 	pending := store.GetPendingBlocks()
 	require.Len(t, pending, 1)
 	clear(pending[0].Data)
+	dst := make([]byte, blockSize)
+	require.NoError(t, vb.ReadAtInto(0, dst))
+	require.Equal(t, expected, dst)
+
 	change := bytes.Repeat([]byte{0xa5}, 512)
+	require.NoError(t, vb.WriteAt(512, change))
+	copy(expected[512:], change)
+	require.NoError(t, vb.ReadAtInto(0, dst))
+	require.Equal(t, expected, dst)
 	require.NoError(t, vb.WriteAt(uint64(blockSize)+512, change))
 	require.NoError(t, vb.Flush())
 	second := make([]byte, blockSize)
 	copy(second[512:], change)
 	expected = append(expected, second...)
 
-	protected := walFilesUnder(t, volume.root, volume.name)
+	protected := make(map[string]int64)
+	for _, path := range walFilesUnder(t, volume.root, volume.name) {
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		if info.Size() > int64(vb.WALHeaderSize()) {
+			protected[path] = info.Size()
+		}
+	}
+	require.NotEmpty(t, protected)
 	backend.failHead.Store(true)
 	require.Error(t, vb.DrainToBackendCtx(context.Background()))
-	require.Subset(t, walFilesUnder(t, volume.root, volume.name), protected)
+	for path, size := range protected {
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		require.Equal(t, size, info.Size())
+	}
 	vb.Detach()
 
 	healthy, _, err := volume.open(t, 2)
 	require.NoError(t, err)
 	require.Equal(t, expected, readBlocks(t, healthy, 0, 2))
+	for path := range protected {
+		info, err := os.Stat(path)
+		if err == nil {
+			// Reopen may create an empty generation at the same name.
+			require.LessOrEqual(t, info.Size(), int64(vb.WALHeaderSize()))
+		} else {
+			require.ErrorIs(t, err, os.ErrNotExist)
+		}
+	}
 	healthy.Detach()
 
 	fresh, _ := volume.engine(t, 3)

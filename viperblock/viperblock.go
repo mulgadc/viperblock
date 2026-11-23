@@ -7126,7 +7126,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 	// fresh-location) pair. See ReadEntryRun's doc comment.
 	entries := make([]BlockEntry, blockRequests)
 	resolved := make([]bool, blockRequests)
-	vb.BlockStore.readEntryRun(block, blockRequests, entries, resolved)
+	vb.BlockStore.readEntryRun(block, blockRequests, entries, resolved, true)
 
 	// Ancestor layers are probed under one lock each rather than one lock per
 	// block per ancestor, which on a 1 MiB read with two ancestors was 512

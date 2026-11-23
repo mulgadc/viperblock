@@ -43,15 +43,19 @@ func (s BlockState) String() string {
 
 // BlockEntry represents a single block's metadata and data in the unified store.
 type BlockEntry struct {
-	Data          []byte     // Block data for Hot/Pending/Cached states
-	SeqNum        uint64     // Sequence number for ordering writes
-	ObjectID      uint64     // Object ID for Persisted state (which chunk file)
-	ObjectOffset  uint32     // Offset within the chunk file for Persisted state
-	State         BlockState // Current state of the block
+	Data         []byte     // Block data for Hot/Pending/Cached states
+	SeqNum       uint64     // Sequence number for ordering writes
+	ObjectID     uint64     // Object ID for Persisted state (which chunk file)
+	ObjectOffset uint32     // Offset within the chunk file for Persisted state
+	State        BlockState // Current state of the block
+}
+
+type indexEntry struct {
+	BlockEntry
 	sharedWithWAL bool
 }
 
-func (entry BlockEntry) dataForCaller() []byte {
+func (entry indexEntry) dataForCaller() []byte {
 	if entry.sharedWithWAL {
 		return bytes.Clone(entry.Data)
 	}
@@ -61,7 +65,7 @@ func (entry BlockEntry) dataForCaller() []byte {
 // IndexShard is a single shard of the block index with its own lock.
 type IndexShard struct {
 	mu      sync.RWMutex
-	entries map[uint64]*BlockEntry
+	entries map[uint64]*indexEntry
 }
 
 const (
@@ -164,7 +168,7 @@ func NewUnifiedBlockStore(blockSize uint32) *UnifiedBlockStore {
 	// Initialize all shards
 	for i := range NumShards {
 		ubs.shards[i] = &IndexShard{
-			entries: make(map[uint64]*BlockEntry),
+			entries: make(map[uint64]*indexEntry),
 		}
 	}
 
@@ -260,7 +264,7 @@ func (ubs *UnifiedBlockStore) ReadBlock(blockNum uint64) (*BlockEntry, bool) {
 	// (ObjectID, ObjectOffset, SeqNum) as a unit to rebuild the chunk nonce,
 	// and a concurrent MarkPersisted mutating the live entry would otherwise
 	// hand back a torn triple (old location, new seqNum) that fails AEAD.
-	var snapshot BlockEntry
+	var snapshot indexEntry
 	if exists {
 		snapshot = *entry
 	}
@@ -268,7 +272,7 @@ func (ubs *UnifiedBlockStore) ReadBlock(blockNum uint64) (*BlockEntry, bool) {
 	ubs.stats.Reads.Add(1)
 	if exists {
 		snapshot.Data = snapshot.dataForCaller()
-		return &snapshot, true
+		return &snapshot.BlockEntry, true
 	}
 
 	// Not in the sharded index -- it may have been coalesced into the
@@ -286,7 +290,7 @@ func (ubs *UnifiedBlockStore) ReadSingle(blockNum uint64) ([]byte, BlockState, e
 	shard := ubs.getShard(blockNum)
 	shard.mu.RLock()
 	entry, exists := shard.entries[blockNum]
-	var snapshot BlockEntry
+	var snapshot indexEntry
 	if exists {
 		snapshot = *entry
 	}
@@ -342,7 +346,7 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 	shard := ubs.getShard(blockNum)
 	shard.mu.RLock()
 	entry, exists := shard.entries[blockNum]
-	var snapshot BlockEntry
+	var snapshot indexEntry
 	if exists {
 		snapshot = *entry
 	}
@@ -358,7 +362,7 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 			return pe, true
 		}
 		ubs.stats.CacheMiss.Add(1)
-		return snapshot, false
+		return snapshot.BlockEntry, false
 	}
 
 	switch snapshot.State {
@@ -374,7 +378,7 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 		ubs.stats.CacheMiss.Add(1)
 	}
 	snapshot.Data = snapshot.dataForCaller()
-	return snapshot, true
+	return snapshot.BlockEntry, true
 }
 
 // ReadEntryRun resolves the count blocks starting at startBlock into out,
@@ -390,16 +394,11 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 // writer, so each of those acquisitions was a chance to stall behind a chunk
 // upload. This takes it once.
 func (ubs *UnifiedBlockStore) ReadEntryRun(startBlock, count uint64, out []BlockEntry, found []bool) {
-	ubs.readEntryRun(startBlock, count, out, found)
-	for i := range count {
-		if found[i] {
-			out[i].Data = out[i].dataForCaller()
-		}
-	}
+	ubs.readEntryRun(startBlock, count, out, found, false)
 }
 
-// readEntryRun borrows shared data for the engine's synchronous copy.
-func (ubs *UnifiedBlockStore) readEntryRun(startBlock, count uint64, out []BlockEntry, found []bool) {
+// readEntryRun may borrow shared data for the engine's synchronous copy.
+func (ubs *UnifiedBlockStore) readEntryRun(startBlock, count uint64, out []BlockEntry, found []bool, borrow bool) {
 	if count == 0 {
 		return
 	}
@@ -413,7 +412,10 @@ func (ubs *UnifiedBlockStore) readEntryRun(startBlock, count uint64, out []Block
 		shard.mu.RLock()
 		entry, exists := shard.entries[blockNum]
 		if exists {
-			out[i] = *entry
+			out[i] = entry.BlockEntry
+			if !borrow {
+				out[i].Data = entry.dataForCaller()
+			}
 		}
 		shard.mu.RUnlock()
 
@@ -485,7 +487,7 @@ func (ubs *UnifiedBlockStore) Write(blockNum uint64, data []byte) uint64 {
 	shard.mu.Lock()
 	entry, exists := shard.entries[blockNum]
 	if !exists {
-		entry = &BlockEntry{}
+		entry = &indexEntry{}
 		shard.entries[blockNum] = entry
 	}
 
@@ -520,7 +522,7 @@ func (ubs *UnifiedBlockStore) writeWithSeqNum(blockNum uint64, data []byte, seqN
 	shard.mu.Lock()
 	entry, exists := shard.entries[blockNum]
 	if !exists {
-		entry = &BlockEntry{}
+		entry = &indexEntry{}
 		shard.entries[blockNum] = entry
 	}
 
@@ -687,7 +689,7 @@ func (ubs *UnifiedBlockStore) SetPersisted(blockNum, objectID uint64, offset uin
 
 	entry, exists := shard.entries[blockNum]
 	if !exists {
-		entry = &BlockEntry{}
+		entry = &indexEntry{}
 		shard.entries[blockNum] = entry
 	}
 
@@ -808,7 +810,7 @@ func (ubs *UnifiedBlockStore) GetPersistedInfo(blockNum uint64) (objectID uint64
 	shard := ubs.getShard(blockNum)
 	shard.mu.RLock()
 	entry, exists := shard.entries[blockNum]
-	var snapshot BlockEntry
+	var snapshot indexEntry
 	if exists {
 		snapshot = *entry
 	}
@@ -888,7 +890,7 @@ func (ubs *UnifiedBlockStore) Clear() {
 	for i := range NumShards {
 		shard := ubs.shards[i]
 		shard.mu.Lock()
-		shard.entries = make(map[uint64]*BlockEntry)
+		shard.entries = make(map[uint64]*indexEntry)
 		shard.mu.Unlock()
 	}
 
