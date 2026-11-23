@@ -13,6 +13,7 @@ import (
 
 type inheritedReadCounter struct {
 	types.Backend
+
 	payloadReads int
 	truncateRead int
 }
