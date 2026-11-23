@@ -593,18 +593,14 @@ func (c *ViperBlockConnection) PWrite(buf []byte, offset uint64,
 	flags uint32) (err error) {
 	defer c.recordGuest("write", len(buf), time.Now(), &err)
 
-	//slog.Info("PWRITE:", "len", len(buf), "offset", offset)
-
 	if c.readonly {
 		err = nbdkit.PluginError{Errmsg: "write to a read-only export", Errno: syscall.EROFS}
 		return err
 	}
 
-	data := make([]byte, len(buf))
-
-	copy(data, buf)
-
-	if writeErr := c.vb.WriteAt(offset, data); writeErr != nil {
+	// WriteAt copies the borrowed nbdkit buffer into engine-owned blocks
+	// synchronously without mutating or retaining the input.
+	if writeErr := c.vb.WriteAt(offset, buf); writeErr != nil {
 		err = backendErrToPluginError("Could not write data", writeErr)
 		return err
 	}
