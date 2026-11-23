@@ -44,6 +44,7 @@ func detachConsolidationVolume(vb *VB) {
 
 type scanChunkWrites struct {
 	types.Backend
+
 	count atomic.Int64
 }
 
