@@ -1,0 +1,64 @@
+package viperblock
+
+import (
+	"bytes"
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestOwnedWriteReplaysDespitePublicBufferMutation(t *testing.T) {
+	volume := newMapVolume(t, 128<<20, testKey(t, 0x31))
+	vb, backend := volume.create(t, 1)
+	blockSize := int(vb.BlockSize)
+	expected := bytes.Repeat([]byte{0x61}, blockSize)
+	src := bytes.Clone(expected)
+	require.NoError(t, vb.WriteAt(0, src))
+	clear(src)
+
+	store := vb.BlockStore
+	snapshot, found := store.ReadBlock(0)
+	require.True(t, found)
+	clear(snapshot.Data)
+	single, _, err := store.ReadSingle(0)
+	require.NoError(t, err)
+	clear(single)
+	entry, found := store.ReadEntry(0)
+	require.True(t, found)
+	clear(entry.Data)
+	runs, foundRun := make([]BlockEntry, 1), make([]bool, 1)
+	store.ReadEntryRun(0, 1, runs, foundRun)
+	require.True(t, foundRun[0])
+	clear(runs[0].Data)
+	hot := store.GetHotBlocks()
+	require.Len(t, hot, 1)
+	clear(hot[0].Data)
+
+	require.NoError(t, vb.Flush())
+	pending := store.GetPendingBlocks()
+	require.Len(t, pending, 1)
+	clear(pending[0].Data)
+	change := bytes.Repeat([]byte{0xa5}, 512)
+	require.NoError(t, vb.WriteAt(uint64(blockSize)+512, change))
+	require.NoError(t, vb.Flush())
+	second := make([]byte, blockSize)
+	copy(second[512:], change)
+	expected = append(expected, second...)
+
+	protected := walFilesUnder(t, volume.root, volume.name)
+	backend.failHead.Store(true)
+	require.Error(t, vb.DrainToBackendCtx(context.Background()))
+	require.Subset(t, walFilesUnder(t, volume.root, volume.name), protected)
+	vb.Detach()
+
+	healthy, _, err := volume.open(t, 2)
+	require.NoError(t, err)
+	require.Equal(t, expected, readBlocks(t, healthy, 0, 2))
+	healthy.Detach()
+
+	fresh, _ := volume.engine(t, 3)
+	require.NoError(t, fresh.LoadState())
+	require.NoError(t, fresh.LoadLiveCheckpoint())
+	require.Equal(t, expected, readBlocks(t, fresh, 0, 2))
+}

@@ -1,6 +1,7 @@
 package viperblock
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -42,11 +43,19 @@ func (s BlockState) String() string {
 
 // BlockEntry represents a single block's metadata and data in the unified store.
 type BlockEntry struct {
-	Data         []byte     // Block data for Hot/Pending/Cached states
-	SeqNum       uint64     // Sequence number for ordering writes
-	ObjectID     uint64     // Object ID for Persisted state (which chunk file)
-	ObjectOffset uint32     // Offset within the chunk file for Persisted state
-	State        BlockState // Current state of the block
+	Data          []byte     // Block data for Hot/Pending/Cached states
+	SeqNum        uint64     // Sequence number for ordering writes
+	ObjectID      uint64     // Object ID for Persisted state (which chunk file)
+	ObjectOffset  uint32     // Offset within the chunk file for Persisted state
+	State         BlockState // Current state of the block
+	sharedWithWAL bool
+}
+
+func (entry BlockEntry) dataForCaller() []byte {
+	if entry.sharedWithWAL {
+		return bytes.Clone(entry.Data)
+	}
+	return entry.Data
 }
 
 // IndexShard is a single shard of the block index with its own lock.
@@ -258,6 +267,7 @@ func (ubs *UnifiedBlockStore) ReadBlock(blockNum uint64) (*BlockEntry, bool) {
 	shard.mu.RUnlock()
 	ubs.stats.Reads.Add(1)
 	if exists {
+		snapshot.Data = snapshot.dataForCaller()
 		return &snapshot, true
 	}
 
@@ -299,13 +309,13 @@ func (ubs *UnifiedBlockStore) ReadSingle(blockNum uint64) ([]byte, BlockState, e
 	switch snapshot.State {
 	case BlockStateHot:
 		ubs.stats.HotReads.Add(1)
-		return snapshot.Data, snapshot.State, nil
+		return snapshot.dataForCaller(), snapshot.State, nil
 	case BlockStatePending:
 		ubs.stats.PendReads.Add(1)
-		return snapshot.Data, snapshot.State, nil
+		return snapshot.dataForCaller(), snapshot.State, nil
 	case BlockStateCached:
 		ubs.stats.CacheHits.Add(1)
-		return snapshot.Data, snapshot.State, nil
+		return snapshot.dataForCaller(), snapshot.State, nil
 	case BlockStatePersisted:
 		ubs.stats.BackendReads.Add(1)
 		return nil, BlockStatePersisted, nil // Caller fetches from backend
@@ -363,6 +373,7 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 	default:
 		ubs.stats.CacheMiss.Add(1)
 	}
+	snapshot.Data = snapshot.dataForCaller()
 	return snapshot, true
 }
 
@@ -379,6 +390,16 @@ func (ubs *UnifiedBlockStore) ReadEntry(blockNum uint64) (BlockEntry, bool) {
 // writer, so each of those acquisitions was a chance to stall behind a chunk
 // upload. This takes it once.
 func (ubs *UnifiedBlockStore) ReadEntryRun(startBlock, count uint64, out []BlockEntry, found []bool) {
+	ubs.readEntryRun(startBlock, count, out, found)
+	for i := range count {
+		if found[i] {
+			out[i].Data = out[i].dataForCaller()
+		}
+	}
+}
+
+// readEntryRun borrows shared data for the engine's synchronous copy.
+func (ubs *UnifiedBlockStore) readEntryRun(startBlock, count uint64, out []BlockEntry, found []bool) {
 	if count == 0 {
 		return
 	}
@@ -473,6 +494,7 @@ func (ubs *UnifiedBlockStore) Write(blockNum uint64, data []byte) uint64 {
 		entry.SeqNum = seqNum
 		entry.State = BlockStateHot
 		entry.Data = dataCopy
+		entry.sharedWithWAL = false
 		// Clear persisted info since we have new data
 		entry.ObjectID = 0
 		entry.ObjectOffset = 0
@@ -486,11 +508,14 @@ func (ubs *UnifiedBlockStore) Write(blockNum uint64, data []byte) uint64 {
 // WriteWithSeqNum stores a block with a specific sequence number
 // Used for WAL replay and state recovery.
 func (ubs *UnifiedBlockStore) WriteWithSeqNum(blockNum uint64, data []byte, seqNum uint64) {
-	shard := ubs.getShard(blockNum)
+	copied := make([]byte, len(data))
+	copy(copied, data)
+	ubs.writeWithSeqNum(blockNum, copied, seqNum, false)
+}
 
-	// Make copy of data
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
+// writeWithSeqNum takes immutable data. A shared payload also backs a WAL record.
+func (ubs *UnifiedBlockStore) writeWithSeqNum(blockNum uint64, data []byte, seqNum uint64, sharedWithWAL bool) {
+	shard := ubs.getShard(blockNum)
 
 	shard.mu.Lock()
 	entry, exists := shard.entries[blockNum]
@@ -503,7 +528,8 @@ func (ubs *UnifiedBlockStore) WriteWithSeqNum(blockNum uint64, data []byte, seqN
 	if seqNum > entry.SeqNum {
 		entry.SeqNum = seqNum
 		entry.State = BlockStateHot
-		entry.Data = dataCopy
+		entry.Data = data
+		entry.sharedWithWAL = sharedWithWAL
 		entry.ObjectID = 0
 		entry.ObjectOffset = 0
 	}
@@ -558,6 +584,7 @@ func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset ui
 		entry.ObjectOffset = offset
 		entry.SeqNum = seqNum
 		entry.Data = nil // Release memory - data is now on backend
+		entry.sharedWithWAL = false
 		return true
 	}
 	return false
@@ -671,6 +698,7 @@ func (ubs *UnifiedBlockStore) SetPersisted(blockNum, objectID uint64, offset uin
 		entry.ObjectID = objectID
 		entry.ObjectOffset = offset
 		entry.Data = nil
+		entry.sharedWithWAL = false
 	}
 }
 
@@ -742,7 +770,7 @@ func (ubs *UnifiedBlockStore) GetHotBlocks() []Block {
 					SeqNum: entry.SeqNum,
 					Block:  blockNum,
 					Len:    uint64(len(entry.Data)),
-					Data:   entry.Data,
+					Data:   entry.dataForCaller(),
 				})
 			}
 		}
@@ -765,7 +793,7 @@ func (ubs *UnifiedBlockStore) GetPendingBlocks() []Block {
 					SeqNum: entry.SeqNum,
 					Block:  blockNum,
 					Len:    uint64(len(entry.Data)),
-					Data:   entry.Data,
+					Data:   entry.dataForCaller(),
 				})
 			}
 		}
