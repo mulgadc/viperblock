@@ -262,6 +262,7 @@ func checkPWriteBufferReuse(t *testing.T, key *masterkey.Key) {
 	t.Helper()
 	root := t.TempDir()
 	vb := newWriteBufferVolume(t, root, 1, key)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
 	openWriteBufferWAL(t, vb)
 	conn := &ViperBlockConnection{vb: vb}
 
@@ -292,19 +293,56 @@ func checkPWriteBufferReuse(t *testing.T, key *masterkey.Key) {
 	require.Equal(t, want, got)
 	require.NoError(t, conn.Flush(0))
 	// Detach without draining so the next engine must use the local WAL.
-	vb.Detach()
-	require.NoError(t, vb.WAL.DB[0].Close())
+	detachWriteBufferVolume(vb)
+	vb = nil
 
-	reopened := newWriteBufferVolume(t, root, 2, key)
-	require.NoError(t, reopened.LoadState())
-	require.NoError(t, reopened.LoadLiveCheckpoint())
-	require.NoError(t, reopened.ClaimMapCtx(t.Context()))
+	reopened := reopenWriteBufferVolume(t, root, key)
 	_, _, _, err = reopened.LookupBlockToObject(0)
 	require.ErrorIs(t, err, viperblock.ErrZeroBlock, "the checkpoint must not contain the new blocks")
 	require.NoError(t, reopened.RecoverLocalWALs())
 	got, err = reopened.ReadAt(0, uint64(len(want)))
 	require.NoError(t, err)
 	require.Equal(t, want, got)
+}
+
+// TestPWriteDoesNotRetainRequestBufferOnError forces the second block's
+// read-modify-write to fail after the first full block has been buffered.
+func TestPWriteDoesNotRetainRequestBufferOnError(t *testing.T) {
+	const blockSize = 4096
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(1)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	conn := &ViperBlockConnection{vb: reopened}
+	input := bytes.Repeat([]byte{0x64}, blockSize+512)
+	want := bytes.Clone(input)
+	err = conn.PWrite(input, 0, 0)
+	require.ErrorContains(t, err, "failed to read block 1 for RMW")
+	require.Equal(t, want, input)
+	clear(input)
+	got, err := reopened.ReadAt(0, blockSize)
+	require.NoError(t, err)
+	require.Equal(t, want[:blockSize], got)
+}
+
+func reopenWriteBufferVolume(t *testing.T, root string, key *masterkey.Key) *viperblock.VB {
+	t.Helper()
+	vb := newWriteBufferVolume(t, root, 2, key)
+	t.Cleanup(vb.Detach)
+	require.NoError(t, vb.LoadState())
+	require.NoError(t, vb.LoadLiveCheckpoint())
+	require.NoError(t, vb.ClaimMapCtx(t.Context()))
+	return vb
 }
 
 func newWriteBufferVolume(t testing.TB, root string, epoch uint64, key *masterkey.Key) *viperblock.VB {
@@ -321,8 +359,10 @@ func newWriteBufferVolume(t testing.TB, root string, epoch uint64, key *masterke
 		VolumeName: config.VolumeName, VolumeSize: config.VolumeSize, BaseDir: backendDir,
 	})
 	require.NoError(t, err)
-	t.Cleanup(vb.Detach)
-	require.NoError(t, vb.Backend.Init())
+	if err := vb.Backend.Init(); err != nil {
+		vb.Detach()
+		t.Fatal(err)
+	}
 	return vb
 }
 
@@ -332,11 +372,16 @@ func openWriteBufferWAL(t testing.TB, vb *viperblock.VB) {
 	require.NoError(t, vb.SaveState())
 	walPath := filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Add(1), vb.GetVolume()))
 	require.NoError(t, vb.OpenWAL(&vb.WAL, walPath))
-	t.Cleanup(func() {
-		for _, wal := range vb.WAL.DB {
-			_ = wal.Close()
-		}
-	})
+}
+
+func detachWriteBufferVolume(vb *viperblock.VB) {
+	if vb == nil {
+		return
+	}
+	vb.Detach()
+	for _, wal := range vb.WAL.DB {
+		_ = wal.Close()
+	}
 }
 
 func BenchmarkPWrite(b *testing.B) {
@@ -346,11 +391,16 @@ func BenchmarkPWrite(b *testing.B) {
 
 	for _, size := range []int{4 << 10, 1 << 20} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {
-			vb := newWriteBufferVolume(b, b.TempDir(), 1, nil)
-			openWriteBufferWAL(b, vb)
-			conn := &ViperBlockConnection{vb: vb}
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newWriteBufferVolume(b, root, 1, nil)
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
 			buf := bytes.Repeat([]byte{0x56}, size)
-			// Keep the dirty set bounded for long runs.
+			// Keep both the dirty set and temporary disk use bounded.
 			const window = 16 << 20
 			offset := 0
 			b.SetBytes(int64(size))
@@ -358,7 +408,10 @@ func BenchmarkPWrite(b *testing.B) {
 			for b.Loop() {
 				if offset == window {
 					b.StopTimer()
-					require.NoError(b, vb.DrainToBackend())
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					conn.vb = newVolume()
 					offset = 0
 					b.StartTimer()
 				}
