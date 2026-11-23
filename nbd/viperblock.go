@@ -573,13 +573,12 @@ func (c *ViperBlockConnection) PRead(buf []byte, offset uint64, flags uint32) (e
 	defer c.recordGuest("read", len(buf), time.Now(), &err)
 
 	slog.Debug("PREAD:", "offset", offset, "len", len(buf))
-	data, readErr := c.vb.ReadAt(offset, uint64(len(buf)))
+	readErr := c.vb.ReadAtInto(offset, buf)
 	if readErr != nil && readErr != viperblock.ErrZeroBlock {
 		err = nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not read data: %v", readErr)}
 		return err
 	}
 
-	copy(buf, data)
 	return nil
 }
 
