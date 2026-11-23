@@ -22,6 +22,7 @@ def arguments():
     parser.add_argument("--mode", choices=["bench", "flush", "fua", "reclaim"], default="bench")
     parser.add_argument("--samples", type=int, default=6)
     parser.add_argument("--record", action="store_true")
+    parser.add_argument("--crash-plugin", type=Path)
     parser.add_argument("--wal-root", default="/dev/shm")
     return parser.parse_args()
 
@@ -85,7 +86,7 @@ def drain(path):
         with change.makefile("rb") as response:
             if response.readline() != b"OK\n":
                 raise RuntimeError("forced drain failed")
-    return (time.monotonic_ns() - start)/1000
+    return start, time.monotonic_ns()
 
 
 def bench(lib, handle, image, count, executor=None, snapshot_path=None):
@@ -98,28 +99,40 @@ def bench(lib, handle, image, count, executor=None, snapshot_path=None):
         start = time.monotonic_ns()
         if i % 10 == 0:
             success(lib, lib.nbd_pwrite(handle, written, 4096, (16 << 20)+offset, 0))
-            stats["write"].append(time.monotonic_ns()-start)
+            stats["write"].append((start, time.monotonic_ns()))
             if i % 50 == 0:
                 start = time.monotonic_ns()
                 success(lib, lib.nbd_flush(handle, 0))
-                stats["flush"].append(time.monotonic_ns()-start)
+                stats["flush"].append((start, time.monotonic_ns()))
             if i == 200 and executor is not None:
                 drain_result = executor.submit(drain, snapshot_path)
         else:
             success(lib, lib.nbd_pread(handle, buf, 4096, offset, 0))
-            stats["read"].append(time.monotonic_ns()-start)
+            stats["read"].append((start, time.monotonic_ns()))
             if buf.raw != image[offset:offset+4096]:
                 raise RuntimeError(f"incorrect bytes at {offset}")
-    summary = {f"{op}_{kind}_us": val for op, rows in stats.items() for kind, val in
-               (("p50", statistics.median(rows)/1000), ("p99", percentile(rows, 0.99)))}
+    summary = {}
+    for op, events in stats.items():
+        durations = [end-start for start, end in events]
+        summary[f"{op}_p50_us"] = statistics.median(durations)/1000
+        summary[f"{op}_p99_us"] = percentile(durations, 0.99)
     if drain_result is not None:
-        summary["drain_us"] = drain_result.result()
+        drain_start, drain_end = drain_result.result()
+        summary["drain_us"] = (drain_end-drain_start)/1000
+        for op, events in stats.items():
+            overlap = [end-start for start, end in events if start < drain_end and end > drain_start]
+            summary[f"{op}_overlap_count"] = len(overlap)
+            if overlap:
+                summary[f"{op}_overlap_p50_us"] = statistics.median(overlap)/1000
     return summary
 
 
 def main():
     args = arguments()
     args.out.mkdir(parents=True, exist_ok=True)
+    if args.mode != "bench" and args.crash_plugin is None:
+        raise ValueError("recovery cases require the plugin built with background I/O disabled (--crash-plugin)")
+    serving_plugin = args.plugin if args.mode == "bench" else args.crash_plugin
     env = dict(os.environ, AWS_ACCESS_KEY_ID="localfixture", AWS_SECRET_ACCESS_KEY="localfixturesecret",
                VB_ACCESS_KEY="localfixture", VB_SECRET_KEY="localfixturesecret",
                SSL_CERT_FILE=str((args.source / "config/server.pem").resolve()), GOMAXPROCS="4")
@@ -144,7 +157,7 @@ def main():
             def start_export(epoch, cache, wal=waltmp):
                 sock.unlink(missing_ok=True)
                 with (args.out / f"nbdkit-{epoch}.log").open("w") as trace:
-                    process = subprocess.Popen([args.nbdkit, "-f", "-U", str(sock), str(args.plugin.resolve()),
+                    process = subprocess.Popen([args.nbdkit, "-f", "-U", str(sock), str(serving_plugin.resolve()),
                                                 "size=134217728", "volume=io-profile-clone", "bucket=predastore",
                                                 "region=ap-southeast-2", f"host=https://{endpoint}", f"base_dir={wal}",
                                                 f"lease_epoch={epoch}", f"cache_size={cache}",
@@ -168,6 +181,27 @@ def main():
                 nbd = start_export(3, 128)
                 wait_ready(sock, nbd)
                 handle = connect(lib, sock)
+                if args.record:
+                    ranges = args.out / "predastore.log"
+
+                    def count_payloads():
+                        return sum("profile-start " in line and "/io-profile-source/chunks/" in line
+                                   and not line.endswith(" bytes=0-3") for line in ranges.read_text().splitlines())
+
+                    buf = c.create_string_buffer(4096)
+                    before = count_payloads()
+                    success(lib, lib.nbd_pread(handle, buf, 4096, 0, 0))
+                    cold_count = count_payloads() - before
+                    if cold_count != 1 or buf.raw != image[:4096]:
+                        raise RuntimeError("expected one source fetch for the first inherited read")
+                    before = count_payloads()
+                    for _ in range(8):
+                        success(lib, lib.nbd_pread(handle, buf, 4096, 0, 0))
+                        if buf.raw != image[:4096]:
+                            raise RuntimeError("incorrect repeated inherited bytes")
+                    after = count_payloads()
+                    (args.out / "warm-source-counts.json").write_text(json.dumps({"cold": cold_count,
+                                                                                   "warm_8": after-before}))
                 bench(lib, handle, image, 100)
                 rows = [bench(lib, handle, image, 600) for _ in range(args.samples)]
                 (args.out / "mixed.json").write_text(json.dumps(rows, indent=2))

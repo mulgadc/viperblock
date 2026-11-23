@@ -81,6 +81,7 @@ func TestIOProfileServe(t *testing.T) {
 				return
 			}
 			start := time.Now()
+			log.Printf("profile-start %s %s", r.URL.Path, rangeHeader)
 			proxy.ServeHTTP(w, r)
 			log.Printf("profile-range %s %s %d", r.URL.Path, rangeHeader, time.Since(start).Nanoseconds())
 		}),
