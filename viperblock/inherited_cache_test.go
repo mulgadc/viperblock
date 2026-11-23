@@ -3,6 +3,7 @@ package viperblock
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
@@ -41,8 +42,9 @@ func createInheritedCacheFixture(t testing.TB) (parent, child *VB, original []by
 	original = bytes.Repeat([]byte{0x5a}, int(parent.BlockSize))
 	require.NoError(t, parent.WriteAt(0, original))
 	require.NoError(t, parent.WriteAt(uint64(parent.BlockSize), original))
-	require.NoError(t, parent.DrainToBackend())
 	require.NoError(t, parent.WriteAt(2*uint64(parent.BlockSize), original))
+	require.NoError(t, parent.DrainToBackend())
+	require.NoError(t, parent.WriteAt(3*uint64(parent.BlockSize), original))
 	_, err = parent.CreateSnapshot("snap-cache-source")
 	require.NoError(t, err)
 	volume.name = "vol-cache-child"
@@ -122,14 +124,47 @@ func TestInheritedMixedFailureLeavesCacheEmpty(t *testing.T) {
 	require.NoError(t, child.SetCacheSize(8, 0))
 	backend := &inheritedReadCounter{Backend: child.Backend, truncateRead: 2}
 	child.Backend = backend
-	dst := make([]byte, 3*len(original))
+	dst := make([]byte, 4*len(original))
 	require.ErrorContains(t, child.ReadAtInto(0, dst), "short read")
 	require.Equal(t, 2, backend.payloadReads)
 	require.Zero(t, child.Cache.lru.Len())
 }
 
+func TestInheritedAncestorCacheAndDisabled(t *testing.T) {
+	_, child, original := createInheritedCacheFixture(t)
+	require.NoError(t, child.WriteAt(4*uint64(child.BlockSize), original))
+	_, err := child.CreateSnapshot("snap-cache-intermediate")
+	require.NoError(t, err)
+	volume := newMapVolume(t, child.VolumeSize, child.MasterKey)
+	volume.root = filepath.Dir(child.BaseDir)
+	volume.name = "vol-cache-grandchild"
+	grandchild, _ := volume.create(t, 1)
+	require.NoError(t, grandchild.OpenFromSnapshot("snap-cache-intermediate"))
+	require.NotEmpty(t, grandchild.ancestors)
+	backend := &inheritedReadCounter{Backend: grandchild.Backend}
+	grandchild.Backend = backend
+	dst := make([]byte, len(original))
+
+	for _, useBlockStore := range []bool{true, false} {
+		grandchild.UseBlockStore = useBlockStore
+		for _, cacheSize := range []int{0, 8} {
+			require.NoError(t, grandchild.SetCacheSize(cacheSize, 0))
+			backend.payloadReads = 0
+			for range 2 {
+				require.NoError(t, grandchild.ReadAtInto(0, dst))
+				require.Equal(t, original, dst)
+			}
+			if cacheSize == 0 {
+				require.Equal(t, 2, backend.payloadReads)
+			} else {
+				require.Equal(t, 1, backend.payloadReads)
+			}
+		}
+	}
+}
+
 func BenchmarkSnapshotPlaintextRead(b *testing.B) {
-	for _, name := range []string{"inherited-warm", "inherited-disabled", "own-warm", "inherited-partly-warm-8KiB"} {
+	for _, name := range []string{"inherited-warm", "inherited-disabled", "own-warm", "inherited-partly-warm-12KiB"} {
 		b.Run(name, func(b *testing.B) {
 			parent, child, original := createInheritedCacheFixture(b)
 			volume := child
@@ -144,17 +179,27 @@ func BenchmarkSnapshotPlaintextRead(b *testing.B) {
 			dst := make([]byte, len(original))
 			require.NoError(b, volume.ReadAtInto(0, dst))
 			backend.payloadReads = 0
-			if name == "inherited-partly-warm-8KiB" {
-				dst = make([]byte, 2*len(original))
+			if name == "inherited-partly-warm-12KiB" {
+				dst = make([]byte, 3*len(original))
 			}
 			b.SetBytes(int64(len(dst)))
 			b.ReportAllocs()
 			for b.Loop() {
+				if name == "inherited-partly-warm-12KiB" {
+					b.StopTimer()
+					volume.Cache.purge()
+					require.NoError(b, volume.ReadAtInto(uint64(len(original)), dst[:len(original)]))
+					backend.payloadReads--
+					b.StartTimer()
+				}
 				if err := volume.ReadAtInto(0, dst); err != nil {
 					b.Fatal(err)
 				}
 			}
 			b.ReportMetric(float64(backend.payloadReads)/float64(b.N), "source-payload/op")
+			if name == "inherited-partly-warm-12KiB" {
+				require.Equal(b, b.N, backend.payloadReads)
+			}
 			require.Equal(b, bytes.Repeat(original, len(dst)/len(original)), dst)
 		})
 	}
