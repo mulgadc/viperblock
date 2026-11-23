@@ -129,8 +129,11 @@ func TestDrainRefusesWALCorruptionPastReadBuffer(t *testing.T) {
 			_, err = wal.ReadAt(old[:], info.Size()-1)
 			require.NoError(t, err)
 			old[0] ^= 0x80
-			_, err = wal.WriteAt(old[:], info.Size()-1)
+			edit, err := os.OpenFile(wal.Name(), os.O_WRONLY, 0)
 			require.NoError(t, err)
+			_, err = edit.WriteAt(old[:], info.Size()-1)
+			require.NoError(t, err)
+			require.NoError(t, edit.Close())
 
 			err = vb.DrainToBackend()
 			if encrypted {
