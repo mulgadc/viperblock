@@ -68,6 +68,17 @@ func TestDrainRefusesIncompleteWALRecord(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, replayed, 1)
 			require.Equal(t, data[:blockSize], replayed[0].Data)
+
+			later := bytes.Repeat([]byte{0xd3}, blockSize)
+			require.NoError(t, vb.WriteAt(2*uint64(blockSize), later))
+			active := vb.WAL.DB[len(vb.WAL.DB)-1]
+			require.ErrorIs(t, vb.DrainToBackend(), io.ErrUnexpectedEOF)
+			require.FileExists(t, wal.Name())
+			require.FileExists(t, active.Name())
+			laterRecords, _, err := vb.readWALFileForRecovery(active.Name())
+			require.NoError(t, err)
+			require.Len(t, laterRecords, 1)
+			require.Equal(t, later, laterRecords[0].Data)
 		})
 	}
 }
