@@ -11,6 +11,7 @@ lib.nbd_create.restype = c.c_void_p
 lib.nbd_connect_unix.argtypes = [c.c_void_p, c.c_char_p]
 lib.nbd_pread.argtypes = [c.c_void_p, c.c_void_p, c.c_size_t, c.c_uint64, c.c_uint32]
 lib.nbd_get_errno.restype = c.c_int
+lib.nbd_get_error.restype = c.c_char_p
 lib.nbd_close.argtypes = [c.c_void_p]
 mode = sys.argv[2]
 expected_rc = -1 if mode == "error" else 0
@@ -27,8 +28,11 @@ def private_kib(pid):
 with tempfile.TemporaryDirectory(dir="/dev/shm") as temp:
     sock = Path(temp) / "nbd.sock"
     env = dict(os.environ, GOMAXPROCS="4")
-    with subprocess.Popen([os.getenv("NBDKIT", "/usr/bin/nbdkit"), "-f", "-t", "4", "-U", str(sock), sys.argv[1]],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env) as server:
+    args = [os.getenv("NBDKIT", "/usr/bin/nbdkit"), "-f", "-t", "4", "-U", str(sock), sys.argv[1]]
+    if mode == "debug":
+        args.insert(1, "-v")
+    transcript = os.getenv("SHIM_VERBOSE_TRANSCRIPT", os.devnull)
+    with open(transcript, "wb") as log, subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=log, env=env) as server:
         try:
             for _ in range(500):
                 if sock.exists():
@@ -36,8 +40,15 @@ with tempfile.TemporaryDirectory(dir="/dev/shm") as temp:
                 if server.poll() is not None:
                     raise RuntimeError("nbdkit exited before socket ready")
                 time.sleep(0.01)
-            handle = lib.nbd_create()
-            assert handle and lib.nbd_connect_unix(handle, os.fsencode(sock)) == 0
+            for i in range(25):
+                handle = lib.nbd_create()
+                if handle and lib.nbd_connect_unix(handle, os.fsencode(sock)) == 0:
+                    break
+                if handle:
+                    lib.nbd_close(handle)
+                time.sleep(0.02)
+            else:
+                raise RuntimeError(lib.nbd_get_error().decode())
             buf = c.create_string_buffer(4096)
             for n in range(4):
                 before = private_kib(server.pid)
