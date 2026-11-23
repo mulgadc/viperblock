@@ -447,6 +447,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	err = vb.RecoverLocalWALs()
 	if err != nil {
+		vb.Detach()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not recover local WALs: %v", err)}
 	}
 
