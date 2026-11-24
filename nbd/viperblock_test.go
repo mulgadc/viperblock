@@ -676,3 +676,117 @@ func BenchmarkPRead(b *testing.B) {
 		})
 	}
 }
+
+type heldChunkWrite struct {
+	types.Backend
+	entered chan struct{}
+	release chan struct{}
+}
+
+var _ types.Backend = (*heldChunkWrite)(nil)
+
+func (b *heldChunkWrite) WriteCtx(ctx context.Context, kind types.FileType, id uint64, headers, data *[]byte) error {
+	if kind == types.FileTypeChunk {
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Backend.WriteCtx(ctx, kind, id, headers, data)
+}
+
+// Verifies: Q-417
+func TestColdNBDReadSurvivesPriorEpochChunkWrite(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			var key *masterkey.Key
+			if encrypted {
+				var err error
+				key, err = masterkey.New(bytes.Repeat([]byte{0x26}, masterkey.MasterKeySize))
+				require.NoError(t, err)
+			}
+
+			backendDir := t.TempDir()
+			const volumeName = "epoch-chunk"
+			const volumeSize = 128 << 20
+			newEngine := func(epoch uint64) *viperblock.VB {
+				t.Helper()
+				config := viperblock.VB{
+					VolumeName: volumeName, VolumeSize: volumeSize,
+					BaseDir: t.TempDir(), LeaseEpoch: epoch, MasterKey: key,
+					EncryptionEnabled: encrypted, WALSyncInterval: -1, ChunkUploadInterval: -1,
+				}
+				engine, err := viperblock.New(&config, "file", file.FileConfig{
+					VolumeName: volumeName, VolumeSize: volumeSize, BaseDir: backendDir,
+				})
+				require.NoError(t, err)
+				t.Cleanup(func() { detachWriteBufferVolume(engine) })
+				require.NoError(t, engine.Backend.Init())
+				return engine
+			}
+			openWriter := func(engine *viperblock.VB) *ViperBlockConnection {
+				t.Helper()
+				path := filepath.Join(engine.WAL.BaseDir, types.GetFilePath(
+					types.FileTypeWALChunk, engine.WAL.WallNum.Add(1), volumeName))
+				require.NoError(t, engine.OpenWAL(&engine.WAL, path))
+				return &ViperBlockConnection{vb: engine}
+			}
+			claim := func(engine *viperblock.VB) {
+				t.Helper()
+				require.NoError(t, engine.LoadState())
+				require.NoError(t, engine.LoadLiveCheckpoint())
+				require.NoError(t, engine.ClaimMapCtx(t.Context()))
+			}
+
+			initial := newEngine(1)
+			require.NoError(t, initial.InitMapDeltaCtx(t.Context(), true))
+			require.NoError(t, initial.SaveState())
+
+			old := newEngine(10)
+			claim(old)
+			oldConn := openWriter(old)
+			require.NoError(t, oldConn.PWrite(bytes.Repeat([]byte{0x19}, 4096), 0, 0))
+			require.NoError(t, oldConn.Flush(0))
+
+			blocker := &heldChunkWrite{
+				Backend: old.Backend, entered: make(chan struct{}), release: make(chan struct{}),
+			}
+			old.Backend = blocker
+			release := sync.OnceFunc(func() { close(blocker.release) })
+			defer release()
+			done := make(chan error, 1)
+			go func() { done <- old.DrainToBackendCtx(t.Context()) }()
+			select {
+			case <-blocker.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("older epoch did not submit its chunk")
+			}
+
+			current := newEngine(20)
+			claim(current)
+			conn := openWriter(current)
+			want := bytes.Repeat([]byte{0x42}, 4096)
+			require.NoError(t, conn.PWrite(want, 0, 0))
+			require.NoError(t, conn.Flush(0))
+			require.NoError(t, current.DrainToBackendCtx(t.Context()))
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					require.ErrorIs(t, err, viperblock.ErrMapFenced)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("older epoch chunk did not complete")
+			}
+
+			cold := newEngine(30)
+			claim(cold)
+			buf := make([]byte, len(want))
+			require.NoError(t, (&ViperBlockConnection{vb: cold}).PRead(buf, 0, 0))
+			require.True(t, bytes.Equal(want, buf), "cold read did not recover the successor's acknowledged generation")
+		})
+	}
+}
