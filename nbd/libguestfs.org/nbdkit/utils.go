@@ -37,6 +37,7 @@ package nbdkit
 
 #define NBDKIT_API_VERSION 2
 #include <nbdkit-plugin.h>
+#include <stdlib.h>
 
 // cgo cannot call varargs functions.
 void
@@ -53,19 +54,26 @@ _nbdkit_error (const char *s)
 }
 */
 import "C"
-import "syscall"
+import (
+	"syscall"
+	"unsafe"
+)
 
 // Utility functions.
 
 func Debug(s string) {
-	C._nbdkit_debug(C.CString(s))
+	message := C.CString(s)
+	defer C.free(unsafe.Pointer(message))
+	C._nbdkit_debug(message)
 }
 
 // Error is provided but plugins would rarely need to call it
 // explicitly since returning an error from a plugin callback
 // will call it implicitly.
 func Error(s string) {
-	C._nbdkit_error(C.CString(s))
+	message := C.CString(s)
+	defer C.free(unsafe.Pointer(message))
+	C._nbdkit_error(message)
 }
 
 // SetError is like Error().  Callers should not usually need to
