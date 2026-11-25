@@ -5722,7 +5722,7 @@ func (vb *VB) fetchRuns(ctx context.Context, runs ConsecutiveBlocks, data []byte
 // to requestFetchWorkers-1 extra workers, which stop taking runs once another
 // read arrives. It returns after every worker stops, with the first failure.
 func (vb *VB) fetchRunsBounded(ctx context.Context, runs ConsecutiveBlocks, data []byte) error {
-	if len(runs) < 2 || vb.readsInFlight.Load() > 1 {
+	if len(runs) < 2 || vb.readsInFlight.Load() != 1 {
 		for _, cb := range runs {
 			if err := vb.fetchRun(ctx, cb, 0, nil, data); err != nil {
 				return err
