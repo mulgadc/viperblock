@@ -449,9 +449,8 @@ func TestFragmentedRead_BadHeaderFailsBeforeDecrypt(t *testing.T) {
 }
 
 // TestFragmentedRead_FailedRunFailsTheRequestAndDrains pins that a failing or
-// short run fails the whole request, that the read waits for its other
-// fetches before returning, publishes nothing, and that the next sole read
-// still fans out.
+// short run fails the request after its other fetches end, publishes nothing,
+// and that the next sole read still fans out.
 func TestFragmentedRead_FailedRunFailsTheRequestAndDrains(t *testing.T) {
 	root, written := seedFragmentedVolume(t, "vol-frag-fail", nil)
 	cases := []struct {
