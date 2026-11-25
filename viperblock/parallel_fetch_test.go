@@ -1,11 +1,14 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,6 +73,16 @@ type fetchGate struct {
 	failErr       error
 	truncate      bool
 	corruptHeader map[uint64]bool
+	payloads      []payloadRead
+}
+
+// payloadRead is one chunk payload request as the backend saw it.
+type payloadRead struct {
+	objectID uint64
+	offset   uint32
+	length   uint32
+	// endsBefore is how many payload reads had finished when this one began.
+	endsBefore int
 }
 
 var _ types.Backend = (*fetchGate)(nil)
@@ -117,6 +130,7 @@ func (g *fetchGate) ReadCtx(ctx context.Context, fileType types.FileType, object
 		g.headerMisses++
 	}
 	g.payloadByObj[objectID]++
+	g.payloads = append(g.payloads, payloadRead{objectID, offset, length, g.ends})
 	g.starts++
 	g.inflight++
 	g.peak = max(g.peak, g.inflight)
@@ -176,6 +190,15 @@ func (g *fetchGate) readHeader(ctx context.Context, objectID uint64) ([]byte, er
 	return data, nil
 }
 
+// reset clears the gate's counters and arms a new hold at target.
+func (g *fetchGate) reset(target int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.target, g.peak, g.returned, g.late = target, 0, false, 0
+	g.starts, g.ends, g.payloads = 0, 0, nil
+	g.release, g.released, g.fellBack = make(chan struct{}), false, false
+}
+
 // markReturned records that the caller has its answer: a payload read
 // arriving after this is a worker the read did not wait for.
 func (g *fetchGate) markReturned() (inflight, starts, ends int) {
@@ -194,6 +217,17 @@ func (g *fetchGate) snapshot() (peak int, reqPeak map[int]int, fellBack bool) {
 // seedFragmentedVolume writes fragBlocks blocks as two chunks, evens then
 // odds, and returns the backend root and the bytes of each block in order.
 func seedFragmentedVolume(t *testing.T, volumeName string, key *masterkey.Key) (string, []byte) {
+	t.Helper()
+	var evens, odds []uint64
+	for block := uint64(0); block < fragBlocks; block += 2 {
+		evens, odds = append(evens, block), append(odds, block+1)
+	}
+	return seedVolumeChunks(t, volumeName, key, [][]uint64{evens, odds})
+}
+
+// seedVolumeChunks writes each list of blocks as one chunk, in order, and
+// returns the backend root and the final bytes of each block.
+func seedVolumeChunks(t *testing.T, volumeName string, key *masterkey.Key, chunks [][]uint64) (string, []byte) {
 	t.Helper()
 
 	root := t.TempDir()
@@ -220,9 +254,11 @@ func seedFragmentedVolume(t *testing.T, volumeName string, key *masterkey.Key) (
 	require.NoError(t, writer.OpenWAL(&writer.BlockToObjectWAL, filepath.Join(writer.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, writer.BlockToObjectWAL.WallNum.Load(), writer.GetVolume()))))
 
 	bs := uint64(DefaultBlockSize)
-	written := randomBlockData(fragBlocks)
-	for _, parity := range []uint64{0, 1} {
-		for block := parity; block < fragBlocks; block += 2 {
+	written := make([]byte, fragBlocks*bs)
+	for _, blocks := range chunks {
+		data := randomBlockData(uint64(len(blocks)))
+		for i, block := range blocks {
+			copy(written[block*bs:(block+1)*bs], data[uint64(i)*bs:uint64(i+1)*bs])
 			require.NoError(t, writer.Write(block, written[block*bs:(block+1)*bs]))
 		}
 		require.NoError(t, writer.Flush())
@@ -553,6 +589,208 @@ func TestFragmentedRead_CancellationDrainsAndReturnsTheBound(t *testing.T) {
 			gate.mu.Lock()
 			assert.Zero(t, gate.late, "a fetch started after its request had returned")
 			gate.mu.Unlock()
+		})
+	}
+}
+
+// chunkCallCounter counts every chunk read, header or payload, on both the
+// own-volume and the source-volume paths.
+type chunkCallCounter struct {
+	types.Backend
+	calls atomic.Int64
+}
+
+var _ types.Backend = (*chunkCallCounter)(nil)
+
+func (c *chunkCallCounter) ReadCtx(ctx context.Context, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	if fileType == types.FileTypeChunk {
+		c.calls.Add(1)
+	}
+	return c.Backend.ReadCtx(ctx, fileType, objectID, offset, length)
+}
+
+func (c *chunkCallCounter) ReadFromCtx(ctx context.Context, volume string, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	if fileType == types.FileTypeChunk {
+		c.calls.Add(1)
+	}
+	return c.Backend.ReadFromCtx(ctx, volume, fileType, objectID, offset, length)
+}
+
+// admissionRead is one cold read whose chunk fetches all need a permit.
+type admissionRead struct {
+	name string
+	open func(t *testing.T) (vb *VB, length uint64, want []byte)
+}
+
+func admissionReads() []admissionRead {
+	var reads []admissionRead
+	for _, blockStore := range []bool{true, false} {
+		reads = append(reads, admissionRead{
+			name: fmt.Sprintf("own/blockstore=%v", blockStore),
+			open: func(t *testing.T) (*VB, uint64, []byte) {
+				key := testKey(t, 0x5c)
+				root, written := seedFragmentedVolume(t, "vol-admit-own", key)
+				vb, _ := fragReader(t, root, "vol-admit-own", key, 0, blockStore, 1)
+				bs := uint64(DefaultBlockSize)
+				return vb, bs, written[:bs]
+			},
+		})
+		for _, blocks := range []uint64{1, 2} {
+			reads = append(reads, admissionRead{
+				name: fmt.Sprintf("inherited/blockstore=%v/blocks=%d", blockStore, blocks),
+				open: func(t *testing.T) (*VB, uint64, []byte) {
+					_, child, original := createInheritedCacheFixture(t)
+					child.UseBlockStore = blockStore
+					return child, blocks * uint64(child.BlockSize), bytes.Repeat(original, int(blocks))
+				},
+			})
+		}
+	}
+	return reads
+}
+
+// TestFetchAdmission_DoneContextMakesNoBackendCall pins that a read whose
+// context is done never reaches the backend, with permits free or all held,
+// and that a read waiting on a full volume ends at its deadline.
+func TestFetchAdmission_DoneContextMakesNoBackendCall(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	cases := []struct {
+		name string
+		held bool
+		ctx  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{"canceled/free", false, func() (context.Context, context.CancelFunc) { return canceled, func() {} }, context.Canceled},
+		{"canceled/held", true, func() (context.Context, context.CancelFunc) { return canceled, func() {} }, context.Canceled},
+		{"expired/free", false, func() (context.Context, context.CancelFunc) { return expired, func() {} }, context.DeadlineExceeded},
+		{"expired/held", true, func() (context.Context, context.CancelFunc) { return expired, func() {} }, context.DeadlineExceeded},
+		{"expires-waiting/held", true, func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 50*time.Millisecond)
+		}, context.DeadlineExceeded},
+	}
+	for _, read := range admissionReads() {
+		for _, tc := range cases {
+			t.Run(read.name+"/"+tc.name, func(t *testing.T) {
+				vb, length, want := read.open(t)
+				counter := &chunkCallCounter{Backend: vb.Backend}
+				vb.Backend = counter
+
+				if tc.held {
+					for range fragVolumeFetchBound {
+						require.NoError(t, vb.fetchPermits.acquire(context.Background()))
+					}
+				}
+				ctx, done := tc.ctx()
+				_, err := vb.ReadAtCtx(ctx, 0, length)
+				done()
+				require.ErrorIs(t, err, tc.want)
+				assert.Zero(t, counter.calls.Load(), "a read with a done context reached the backend")
+				if tc.held {
+					for range fragVolumeFetchBound {
+						vb.fetchPermits.release()
+					}
+				}
+
+				got, err := vb.ReadAtCtx(context.Background(), 0, length)
+				require.NoError(t, err)
+				require.Equal(t, want, got)
+				assert.Positive(t, counter.calls.Load(), "the control read never reached the backend")
+			})
+		}
+	}
+}
+
+// seedWidenableTail writes blocks 0-63 as one chunk, then rewrites odd
+// blocks 1-15 to a second chunk. A read of blocks 1-16 then has 16 runs and
+// its last run, block 16, can widen through block 63.
+func seedWidenableTail(t *testing.T, volumeName string) (string, []byte) {
+	t.Helper()
+	all := make([]uint64, fragBlocks)
+	for block := range all {
+		all[block] = uint64(block)
+	}
+	var odds []uint64
+	for block := uint64(1); block < 16; block += 2 {
+		odds = append(odds, block)
+	}
+	return seedVolumeChunks(t, volumeName, nil, [][]uint64{all, odds})
+}
+
+// TestFragmentedRead_WidenedTailRunsAfterTheOtherRuns pins that a widened tail
+// starts after the other runs end, is skipped with no readahead when an
+// earlier run fails, and that a lone widened run is one backend read.
+func TestFragmentedRead_WidenedTailRunsAfterTheOtherRuns(t *testing.T) {
+	const volumeName = "vol-frag-tail"
+	root, written := seedWidenableTail(t, volumeName)
+	bs := uint64(DefaultBlockSize)
+	const tailBlock, lastBlock = 16, fragBlocks - 1
+	plainRuns := tailBlock - 1
+
+	open := func(t *testing.T, mode fragReadMode, prime uint64) (*VB, *fetchGate) {
+		t.Helper()
+		reader, gate := fragReader(t, root, volumeName, nil, 256, mode.blockStore, 1)
+		_, err := reader.ReadAtCtx(context.Background(), prime*bs, bs)
+		require.NoError(t, err)
+		gate.reset(mode.fetchTarget())
+		return reader, gate
+	}
+
+	for _, mode := range []fragReadMode{fragReadModes[0], fragReadModes[2]} {
+		t.Run(mode.name+"/succeeds", func(t *testing.T) {
+			reader, gate := open(t, mode, 0)
+			tailObject, tailOffset := locate(t, reader, tailBlock)
+			got, err := reader.ReadAtCtx(context.Background(), bs, tailBlock*bs)
+			require.NoError(t, err)
+			require.Equal(t, written[bs:(tailBlock+1)*bs], got)
+
+			gate.mu.Lock()
+			defer gate.mu.Unlock()
+			require.Len(t, gate.payloads, tailBlock)
+			tail := gate.payloads[len(gate.payloads)-1]
+			assert.Equal(t, payloadRead{tailObject, tailOffset, (lastBlock - tailBlock + 1) * reader.blockStride(), plainRuns}, tail,
+				"the tail should widen to the chunk end and start after the other runs end")
+			assert.False(t, gate.fellBack)
+		})
+
+		t.Run(mode.name+"/earlier-run-fails", func(t *testing.T) {
+			reader, gate := open(t, mode, 0)
+			tailObject, tailOffset := locate(t, reader, tailBlock)
+			cachedBefore := reader.cachedBlocks()
+			gate.mu.Lock()
+			gate.failObject, gate.failOffset = locate(t, reader, 1)
+			gate.failErr = errInjectedRun
+			gate.mu.Unlock()
+
+			got, err := reader.ReadAtCtx(context.Background(), bs, tailBlock*bs)
+			inflight, starts, ends := gate.markReturned()
+			require.ErrorIs(t, err, errInjectedRun)
+			assert.Nil(t, got)
+			assert.Zero(t, inflight, "the read returned with backend fetches still running")
+			assert.Equal(t, starts, ends)
+			assert.Equal(t, cachedBefore, reader.cachedBlocks(), "a failed request published cache entries")
+
+			gate.mu.Lock()
+			defer gate.mu.Unlock()
+			for _, p := range gate.payloads {
+				assert.False(t, p.objectID == tailObject && p.offset == tailOffset, "the widened tail ran after an earlier run failed")
+			}
+			assert.False(t, gate.fellBack)
+		})
+
+		t.Run(mode.name+"/single-widened-run", func(t *testing.T) {
+			reader, gate := open(t, mode, tailBlock)
+			object, offset := locate(t, reader, tailBlock+1)
+			got, err := reader.ReadAtCtx(context.Background(), (tailBlock+1)*bs, bs)
+			require.NoError(t, err)
+			require.Equal(t, written[(tailBlock+1)*bs:(tailBlock+2)*bs], got)
+
+			gate.mu.Lock()
+			defer gate.mu.Unlock()
+			assert.Equal(t, []payloadRead{{object, offset, (lastBlock - tailBlock) * reader.blockStride(), 0}}, gate.payloads)
 		})
 	}
 }
