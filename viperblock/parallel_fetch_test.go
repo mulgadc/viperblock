@@ -746,6 +746,8 @@ type scriptedBackend struct {
 	onPayload func(ctx context.Context, c chunkCall) error
 	// afterHeader runs after a successful header read returns from the backend.
 	afterHeader func(c chunkCall)
+	// afterPayload runs when a payload read ends, after any backend call.
+	afterPayload func(c chunkCall)
 }
 
 var _ types.Backend = (*scriptedBackend)(nil)
@@ -784,6 +786,9 @@ func (s *scriptedBackend) chunk(ctx context.Context, objectID uint64, offset, le
 		s.mu.Lock()
 		s.inflight[req]--
 		s.mu.Unlock()
+		if s.afterPayload != nil {
+			s.afterPayload(c)
+		}
 	}()
 	s.arrived <- c
 	if s.onPayload != nil {
@@ -856,14 +861,25 @@ func (s *scriptedBackend) quietFor(req int, d time.Duration) bool {
 	}
 }
 
-// holdFor blocks until ch is closed or a token arrives, bounded by the gate
-// fallback so a broken scheduler fails the test rather than hanging it.
-func holdFor(ch <-chan struct{}) {
+// holdFor blocks a backend call until ch is closed or a token arrives. A hold
+// that outlasts the gate fallback fails the test instead of hanging it.
+func holdFor(t *testing.T, ch <-chan struct{}) {
 	timer := time.NewTimer(gateFallback)
 	defer timer.Stop()
 	select {
 	case <-ch:
 	case <-timer.C:
+		t.Errorf("a held backend call was not released within %v", gateFallback)
+	}
+}
+
+// awaitClosed waits on the test goroutine for ch, bounded by the gate fallback.
+func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(gateFallback):
+		t.Fatalf("no %s within %v", what, gateFallback)
 	}
 }
 
@@ -927,16 +943,34 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 			soloTokens := make(chan struct{})
 			compHold := make(chan struct{})
 			var serialPhase atomic.Bool
+			// Only solo calls that start after the initial group is released count.
+			var serialMu sync.Mutex
+			serial := map[chunkCall]bool{}
+			serialInflight, serialPeak, serialCalls := 0, 0, 0
 			sb.onPayload = func(_ context.Context, c chunkCall) error {
 				switch {
 				case c.req == 1 && serialPhase.Load():
-					holdFor(soloTokens)
+					serialMu.Lock()
+					serial[c] = true
+					serialInflight++
+					serialCalls++
+					serialPeak = max(serialPeak, serialInflight)
+					serialMu.Unlock()
+					holdFor(t, soloTokens)
 				case c.req == 1:
-					holdFor(soloHold)
+					holdFor(t, soloHold)
 				case c.req == 2:
-					holdFor(compHold)
+					holdFor(t, compHold)
 				}
 				return nil
+			}
+			sb.afterPayload = func(c chunkCall) {
+				serialMu.Lock()
+				if serial[c] {
+					delete(serial, c)
+					serialInflight--
+				}
+				serialMu.Unlock()
 			}
 
 			soloDone := make(chan error, 1)
@@ -963,7 +997,7 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 			// Release the sole group with runs left while the competitor is held.
 			serialPhase.Store(true)
 			close(soloHold)
-			serialPeak := 0
+			compHeld := true
 		drain:
 			for {
 				select {
@@ -972,8 +1006,9 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 						continue
 					}
 					sb.quietFor(1, quietWindow)
-					inflight, _, _, _ := sb.stat(1)
-					serialPeak = max(serialPeak, inflight)
+					if inflight, _, _, _ := sb.stat(2); inflight != 1 {
+						compHeld = false
+					}
 					select {
 					case soloTokens <- struct{}{}:
 					case <-time.After(gateFallback):
@@ -983,7 +1018,11 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 					break drain
 				}
 			}
+			serialMu.Lock()
 			assert.Equal(t, 1, serialPeak, "the sole read kept extra fetchers while a competitor was active")
+			assert.Equal(t, fragRequestBlocks-fragRequestFetchBound, serialCalls, "runs after the initial group did not all start in the serial phase")
+			serialMu.Unlock()
+			assert.True(t, compHeld, "the competitor's held call ended before the sole read finished")
 			require.Equal(t, written[:length], soloGot)
 
 			close(compHold)
@@ -1011,15 +1050,21 @@ func TestFragmentedReadInto_FailureWaitsForAHeldFetcher(t *testing.T) {
 	// The caller fetches the first run, so the held second run is a worker's.
 	holdObject, holdOffset := locate(t, reader, 1)
 	failObject, failOffset := locate(t, reader, 0)
-	held, failed, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	sb.onPayload = func(_ context.Context, c chunkCall) error {
+	// The held worker stays blocked past its cancellation until release closes.
+	held, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	sb.onPayload = func(ctx context.Context, c chunkCall) error {
 		switch {
 		case c.objectID == holdObject && c.offset == holdOffset:
 			close(held)
-			holdFor(release)
+			select {
+			case <-ctx.Done():
+				close(canceled)
+			case <-time.After(gateFallback):
+				t.Errorf("the held worker's run was not canceled within %v", gateFallback)
+			}
+			holdFor(t, release)
 		case c.objectID == failObject && c.offset == failOffset:
-			holdFor(held)
-			close(failed)
+			holdFor(t, held)
 			return errInjectedRun
 		}
 		return nil
@@ -1028,14 +1073,19 @@ func TestFragmentedReadInto_FailureWaitsForAHeldFetcher(t *testing.T) {
 	dst := make([]byte, uint64(fragRequestBlocks)*bs)
 	done := make(chan error, 1)
 	go func() { done <- reader.ReadAtInto(0, dst) }()
-	holdFor(failed)
+	awaitClosed(t, canceled, "cancellation seen by the held worker")
 	select {
 	case err := <-done:
 		t.Fatalf("ReadAtInto returned %v while a fetcher still held its buffer", err)
 	case <-time.After(quietWindow):
 	}
 	close(release)
-	err := <-done
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(gateFallback):
+		t.Fatalf("ReadAtInto did not return within %v of the release", gateFallback)
+	}
 	require.ErrorIs(t, err, errInjectedRun)
 	assert.NotErrorIs(t, err, context.Canceled, "a canceled sibling replaced the original error")
 	inflight, _, _, _ := sb.stat(0)
@@ -1090,7 +1140,7 @@ func TestFetchRuns_UntrackedCallStaysSerial(t *testing.T) {
 		held := false
 		once.Do(func() { held = true })
 		if held {
-			holdFor(first)
+			holdFor(t, first)
 		}
 		return nil
 	}
@@ -1106,4 +1156,75 @@ func TestFetchRuns_UntrackedCallStaysSerial(t *testing.T) {
 	require.Equal(t, written[:len(data)], data)
 	_, peak, _, _ := sb.stat(0)
 	assert.Equal(t, 1, peak)
+}
+
+// TestInheritedRead_FragmentedSnapshotStaysSerial pins that a read of a
+// snapshot whose blocks alternate between two source chunks fetches its
+// inherited runs one at a time, in block order, with exact bytes.
+func TestInheritedRead_FragmentedSnapshotStaysSerial(t *testing.T) {
+	for _, blockStore := range []bool{true, false} {
+		t.Run(fmt.Sprintf("blockstore=%v", blockStore), func(t *testing.T) {
+			volume := newMapVolume(t, 128<<20, testKey(t, 0x3d))
+			parent, _ := volume.create(t, 1)
+			bs := uint64(parent.BlockSize)
+			written := randomBlockData(fragRequestBlocks)
+			for _, first := range []uint64{0, 1} {
+				for block := first; block < fragRequestBlocks; block += 2 {
+					require.NoError(t, parent.WriteAt(block*bs, written[block*bs:(block+1)*bs]))
+				}
+				require.NoError(t, parent.DrainToBackend())
+			}
+			_, err := parent.CreateSnapshot("snap-frag-source")
+			require.NoError(t, err)
+			volume.name = "vol-frag-child"
+			child, _ := volume.create(t, 1)
+			require.NoError(t, child.OpenFromSnapshot("snap-frag-source"))
+			child.UseBlockStore = blockStore
+
+			var want []chunkCall
+			objects := map[uint64]bool{}
+			for block := range uint64(fragRequestBlocks) {
+				objectID, _, _, err := child.LookupBaseBlockToObject(block)
+				require.NoError(t, err)
+				objects[objectID] = true
+				want = append(want, chunkCall{req: 1, objectID: objectID})
+			}
+			require.Len(t, objects, 2, "the source blocks should alternate between two chunks")
+
+			sb := newScriptedBackend(child.Backend)
+			child.Backend = sb
+			first := make(chan struct{})
+			var once sync.Once
+			sb.onPayload = func(context.Context, chunkCall) error {
+				held := false
+				once.Do(func() { held = true })
+				if held {
+					holdFor(t, first)
+				}
+				return nil
+			}
+			done := make(chan error, 1)
+			var got []byte
+			go func() {
+				var err error
+				got, err = child.ReadAtCtx(context.WithValue(context.Background(), fragRequestKey{}, 1), 0, fragRequestBlocks*bs)
+				done <- err
+			}()
+			sb.awaitPayload(t, 1)
+			assert.True(t, sb.quietFor(1, quietWindow), "an inherited read fetched a second run while the first was held")
+			close(first)
+			require.NoError(t, <-done)
+			require.Equal(t, written, got)
+
+			var calls []chunkCall
+			for len(sb.arrived) > 0 {
+				c := <-sb.arrived
+				calls = append(calls, chunkCall{req: c.req, objectID: c.objectID})
+			}
+			require.Equal(t, want[1:], calls, "inherited runs were fetched out of block order")
+			_, peak, payloads, _ := sb.stat(1)
+			assert.Equal(t, 1, peak, "inherited runs overlapped")
+			assert.Equal(t, fragRequestBlocks, payloads)
+		})
+	}
 }
