@@ -30,11 +30,23 @@ const (
 type pfbDelayBackend struct {
 	types.Backend
 	delay time.Duration
+
+	// soloIO, when set, receives one signal per payload read made for a
+	// context carrying pfbSoloKey.
+	soloIO chan struct{}
 }
+
+type pfbSoloKey struct{}
 
 var _ types.Backend = (*pfbDelayBackend)(nil)
 
 func (d *pfbDelayBackend) wait(ctx context.Context) error {
+	if d.soloIO != nil && ctx.Value(pfbSoloKey{}) != nil {
+		select {
+		case d.soloIO <- struct{}{}:
+		default:
+		}
+	}
 	if d.delay <= 0 {
 		return nil
 	}
@@ -321,6 +333,61 @@ func BenchmarkParallelFetch(b *testing.B) {
 			halt()
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*pfbWritesPerOp), "ns/write")
 			b.ReportMetric(float64(bgReads.Load())/elapsed.Seconds(), "bg-reads/s")
+		})
+
+		// Each op starts a sole cold fragmented 1 MiB read, waits until it is in
+		// backend I/O, then times one arriving operation on another block.
+		arrival := func(caseName string, writable bool, arrive func(vb *VB, op int) error) {
+			b.Run(prefix+caseName, func(b *testing.B) {
+				b.ReportAllocs()
+				open := func() (*VB, *pfbDelayBackend) {
+					vb := pfbOpen(b, root, name, 0, delay, writable)
+					db := vb.Backend.(*pfbDelayBackend)
+					db.soloIO = make(chan struct{}, 1)
+					return vb, db
+				}
+				vb, db := open()
+				soloCtx := context.WithValue(ctx, pfbSoloKey{}, true)
+				var arrivalTotal time.Duration
+				op := 0
+				for b.Loop() {
+					if op > 0 && op%pfbFragBlocks == 0 {
+						b.StopTimer()
+						vb, db = open()
+						b.StartTimer()
+					}
+					select {
+					case <-db.soloIO:
+					default:
+					}
+					soloDone := make(chan error, 1)
+					go func() {
+						_, err := vb.ReadAtCtx(soloCtx, uint64(op%pfbWindows)*window, window)
+						soloDone <- err
+					}()
+					<-db.soloIO
+					began := time.Now()
+					if err := arrive(vb, op); err != nil {
+						b.Fatal(err)
+					}
+					arrivalTotal += time.Since(began)
+					if err := <-soloDone; err != nil {
+						b.Fatal(err)
+					}
+					op++
+				}
+				b.ReportMetric(float64(arrivalTotal.Nanoseconds())/float64(b.N), "arrival-ns/op")
+			})
+		}
+		arrival("arrival-miss-4KiB", false, func(vb *VB, op int) error {
+			block := uint64(pfbFragBlocks + op%pfbFragBlocks)
+			_, err := vb.ReadAtCtx(ctx, block*bs, bs)
+			return err
+		})
+		patch := make([]byte, 512)
+		arrival("arrival-partial-write", true, func(vb *VB, op int) error {
+			block := uint64(pfbFragBlocks + op%pfbFragBlocks)
+			return vb.WriteAt(block*bs+512, patch)
 		})
 	}
 }
