@@ -1005,9 +1005,9 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 	}
 }
 
-// TestFragmentedReadInto_FailureWaitsForAHeldFetcher pins that when a run
-// fails, ReadAtInto returns the original error only after a fetcher stuck in
-// a backend call that ignores cancellation has finished with the buffer.
+// TestFragmentedReadInto_FailureWaitsForAHeldFetcher pins that when the
+// caller's run fails, ReadAtInto returns its error only after an extra worker
+// stuck in a call that ignores cancellation has finished with the buffer.
 func TestFragmentedReadInto_FailureWaitsForAHeldFetcher(t *testing.T) {
 	const volumeName = "vol-frag-into"
 	root, _ := seedFragmentedVolume(t, volumeName, nil)
@@ -1016,8 +1016,9 @@ func TestFragmentedReadInto_FailureWaitsForAHeldFetcher(t *testing.T) {
 	reader.Backend = sb
 	bs := uint64(DefaultBlockSize)
 
-	holdObject, holdOffset := locate(t, reader, 0)
-	failObject, failOffset := locate(t, reader, 1)
+	// The caller fetches the first run, so the held second run is a worker's.
+	holdObject, holdOffset := locate(t, reader, 1)
+	failObject, failOffset := locate(t, reader, 0)
 	held, failed, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	sb.onPayload = func(_ context.Context, c chunkCall) error {
 		switch {
