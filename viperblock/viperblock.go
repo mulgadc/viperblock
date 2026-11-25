@@ -564,10 +564,6 @@ type VB struct {
 	// queue depth as seen from here.
 	readsInFlight atomic.Int64
 
-	// fetchPermits bounds the backend chunk reads this volume runs at once,
-	// shared by every request it is serving.
-	fetchPermits fetchLimiter
-
 	// gcSnapshotSafe/gcSnapshotChecked cache ensureGCSnapshotSafe's result:
 	// whether any snapshot already references this volume. Cached for the
 	// process lifetime once checked; an error leaves gcSnapshotChecked false
@@ -5624,8 +5620,14 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 
 	objectID := cb.ObjectID
 	if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, l uint32) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, l)
 	}); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -5679,50 +5681,12 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 	return nil
 }
 
-const (
-	// volumeFetchPermits caps the backend chunk reads one volume has in
-	// flight across every request it is serving.
-	volumeFetchPermits = 16
-	// requestFetchWorkers caps the runs one block-store request fetches at once.
-	requestFetchWorkers = 8
-)
+// requestFetchWorkers caps the fetchers, the caller included, that a sole
+// fragmented block-store read uses at once.
+const requestFetchWorkers = 8
 
-// fetchLimiter is a counting semaphore created on first use, so a VB built
-// without New still gets one.
-type fetchLimiter struct {
-	once  sync.Once
-	slots chan struct{}
-}
-
-// acquire fails without a permit when ctx is done, even if a slot is free.
-func (l *fetchLimiter) acquire(ctx context.Context) error {
-	l.once.Do(func() { l.slots = make(chan struct{}, volumeFetchPermits) })
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	select {
-	case l.slots <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	if err := ctx.Err(); err != nil {
-		<-l.slots
-		return err
-	}
-	return nil
-}
-
-func (l *fetchLimiter) release() {
-	<-l.slots
-}
-
-// readRunPermitted is readRun holding one of the volume's fetch permits
-// across the chunk header check and the payload read.
-func (vb *VB) readRunPermitted(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, data []byte) error {
-	if err := vb.fetchPermits.acquire(ctx); err != nil {
-		return err
-	}
-	defer vb.fetchPermits.release()
+// readRunAt is readRun on the slice of data that cb covers.
+func (vb *VB) readRunAt(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, data []byte) error {
 	start := cb.BlockPosition * uint64(vb.BlockSize)
 	end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 	return vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end])
@@ -5731,7 +5695,7 @@ func (vb *VB) readRunPermitted(ctx context.Context, cb ConsecutiveBlock, extra i
 // fetchRun logs and reads one block-store run into its slice of data.
 func (vb *VB) fetchRun(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, data []byte) error {
 	vb.logger().DebugContext(ctx, "[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
-	return vb.readRunPermitted(ctx, cb, extra, extraSeqNums, data)
+	return vb.readRunAt(ctx, cb, extra, extraSeqNums, data)
 }
 
 // fetchRuns reads every run into its own slice of data. A widened final run
@@ -5754,15 +5718,17 @@ func (vb *VB) fetchRuns(ctx context.Context, runs ConsecutiveBlocks, data []byte
 	return nil
 }
 
-// fetchRunsBounded reads runs with up to requestFetchWorkers at once and
-// returns only after every worker has stopped. The first failure cancels the
-// rest and is the error returned.
+// fetchRunsBounded reads runs in order on the caller. A sole read also gets up
+// to requestFetchWorkers-1 extra workers, which stop taking runs once another
+// read arrives. It returns after every worker stops, with the first failure.
 func (vb *VB) fetchRunsBounded(ctx context.Context, runs ConsecutiveBlocks, data []byte) error {
-	switch len(runs) {
-	case 0:
+	if len(runs) < 2 || vb.readsInFlight.Load() > 1 {
+		for _, cb := range runs {
+			if err := vb.fetchRun(ctx, cb, 0, nil, data); err != nil {
+				return err
+			}
+		}
 		return nil
-	case 1:
-		return vb.fetchRun(ctx, runs[0], 0, nil, data)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -5783,19 +5749,34 @@ func (vb *VB) fetchRunsBounded(ctx context.Context, runs ConsecutiveBlocks, data
 		mu.Unlock()
 	}
 
-	for range min(len(runs), requestFetchWorkers) {
-		wg.Go(func() {
-			for {
-				i := int(next.Add(1) - 1)
-				if i >= len(runs) {
-					return
-				}
-				if err := vb.fetchRun(runCtx, runs[i], 0, nil, data); err != nil {
-					fail(err)
-					return
-				}
+	fetch := func(extra bool) {
+		for {
+			if extra && vb.readsInFlight.Load() > 1 {
+				return
 			}
-		})
+			i := int(next.Add(1) - 1)
+			if i >= len(runs) {
+				return
+			}
+			if err := runCtx.Err(); err != nil {
+				fail(err)
+				return
+			}
+			if err := vb.fetchRun(runCtx, runs[i], 0, nil, data); err != nil {
+				fail(err)
+				return
+			}
+		}
+	}
+	// The caller owns the first run; extra workers claim from the second on.
+	next.Store(1)
+	for range min(len(runs), requestFetchWorkers) - 1 {
+		wg.Go(func() { fetch(true) })
+	}
+	if err := vb.fetchRun(runCtx, runs[0], 0, nil, data); err != nil {
+		fail(err)
+	} else {
+		fetch(false)
 	}
 	wg.Wait()
 
@@ -6817,7 +6798,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			extra, extraSeqNums = readAheadExtra, readAheadSeqNums
 		}
 
-		if err := vb.readRunPermitted(ctx, cb, extra, extraSeqNums, data); err != nil {
+		if err := vb.readRunAt(ctx, cb, extra, extraSeqNums, data); err != nil {
 			return nil, err
 		}
 	}
@@ -7475,18 +7456,19 @@ func (vb *VB) readInheritedBlock(ctx context.Context, volume string, uuid [4]byt
 }
 
 // readBaseRun checks the chunk header and reads one run from a source volume,
-// holding one of this volume's fetch permits across both reads.
+// stopping before either call once ctx is done.
 func (vb *VB) readBaseRun(ctx context.Context, sourceVolume string, cb ConsecutiveBlock, length uint32) ([]byte, error) {
-	if err := vb.fetchPermits.acquire(ctx); err != nil {
-		return nil, err
-	}
-	defer vb.fetchPermits.release()
-
 	objectID := cb.ObjectID
 	if err := vb.checkChunkMagic(sourceVolume, objectID, func(off, l uint32) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, off, l)
 	}); err != nil {
 		return nil, fmt.Errorf("ReadFrom source %s: %w", sourceVolume, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	blockData, err := vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, cb.ObjectOffset, length)
