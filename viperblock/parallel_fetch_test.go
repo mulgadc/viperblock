@@ -53,8 +53,6 @@ type fetchGate struct {
 	fellBack    bool
 	inflight    int
 	peak        int
-	reqInflight map[int]int
-	reqPeak     map[int]int
 	starts      int
 	ends        int
 	returned    bool
@@ -89,8 +87,6 @@ func newFetchGate(inner types.Backend, target int) *fetchGate {
 		Backend:       inner,
 		target:        target,
 		release:       make(chan struct{}),
-		reqInflight:   map[int]int{},
-		reqPeak:       map[int]int{},
 		arrived:       make(chan struct{}, 1024),
 		headerReads:   map[uint64]int{},
 		headerOK:      map[uint64]bool{},
@@ -118,7 +114,6 @@ func (g *fetchGate) ReadCtx(ctx context.Context, fileType types.FileType, object
 		return g.readHeader(ctx, objectID)
 	}
 
-	req, _ := ctx.Value(fragRequestKey{}).(int)
 	g.mu.Lock()
 	if g.returned {
 		g.late++
@@ -131,8 +126,6 @@ func (g *fetchGate) ReadCtx(ctx context.Context, fileType types.FileType, object
 	g.starts++
 	g.inflight++
 	g.peak = max(g.peak, g.inflight)
-	g.reqInflight[req]++
-	g.reqPeak[req] = max(g.reqPeak[req], g.reqInflight[req])
 	if g.inflight >= g.target {
 		g.openLocked()
 	}
@@ -143,7 +136,6 @@ func (g *fetchGate) ReadCtx(ctx context.Context, fileType types.FileType, object
 	defer func() {
 		g.mu.Lock()
 		g.inflight--
-		g.reqInflight[req]--
 		g.ends++
 		g.mu.Unlock()
 	}()
@@ -205,10 +197,10 @@ func (g *fetchGate) markReturned() (inflight, starts, ends int) {
 	return g.inflight, g.starts, g.ends
 }
 
-func (g *fetchGate) snapshot() (peak int, reqPeak map[int]int, fellBack bool) {
+func (g *fetchGate) snapshot() (peak int, fellBack bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.peak, maps.Clone(g.reqPeak), g.fellBack
+	return g.peak, g.fellBack
 }
 
 // seedFragmentedVolume writes fragBlocks blocks as two chunks, evens then
@@ -376,7 +368,7 @@ func TestFragmentedRead_OverlapsRunsOfOneRequest(t *testing.T) {
 				assert.Equal(t, starts, ends)
 				assert.Equal(t, fragRequestBlocks, starts, "each block is its own run")
 
-				peak, _, fellBack := gate.snapshot()
+				peak, fellBack := gate.snapshot()
 				assert.False(t, fellBack, "runs never reached the expected overlap, so the gate fell back")
 				assert.Equal(t, mode.fetchTarget(), peak,
 					"one request with %d runs should fetch %d at once", fragRequestBlocks, mode.fetchTarget())
@@ -403,8 +395,7 @@ func TestFragmentedRead_ColdEncryptedHeadersPrecedePayload(t *testing.T) {
 	got := make([][]byte, 2)
 	for r := range 2 {
 		wg.Go(func() {
-			ctx := context.WithValue(context.Background(), fragRequestKey{}, r+1)
-			got[r], errs[r] = reader.ReadAtCtx(ctx, uint64(r)*length, length)
+			got[r], errs[r] = reader.ReadAtCtx(context.Background(), uint64(r)*length, length)
 		})
 	}
 	wg.Wait()
@@ -420,7 +411,7 @@ func TestFragmentedRead_ColdEncryptedHeadersPrecedePayload(t *testing.T) {
 	assert.Len(t, headers, 2, "the request spans exactly two chunks")
 	t.Logf("header reads per chunk: %v", headers)
 
-	_, _, fellBack := gate.snapshot()
+	_, fellBack := gate.snapshot()
 	assert.False(t, fellBack, "two cold encrypted requests never overlapped")
 }
 
@@ -489,7 +480,7 @@ func TestFragmentedRead_FailedRunFailsTheRequestAndDrains(t *testing.T) {
 					got, err := mode.read(context.Background(), reader, 0, length)
 					require.NoError(t, err)
 					require.Equal(t, written[:length], got)
-					peak, _, fellBack := gate.snapshot()
+					peak, fellBack := gate.snapshot()
 					assert.False(t, fellBack, "the next request could not reach its expected overlap")
 					assert.Equal(t, mode.fetchTarget(), peak)
 				})
@@ -536,7 +527,7 @@ func TestFragmentedRead_CancellationDrainsAndAllowsTheNextSoloRead(t *testing.T)
 			got, err := reader.ReadAtCtx(context.Background(), 0, length)
 			require.NoError(t, err)
 			require.Equal(t, written[:length], got)
-			peak, _, fellBack := gate.snapshot()
+			peak, fellBack := gate.snapshot()
 			assert.False(t, fellBack, "the next sole read did not fan out after cancellation")
 			assert.Equal(t, mode.fetchTarget(), peak)
 
@@ -570,7 +561,7 @@ func (c *chunkCallCounter) ReadFromCtx(ctx context.Context, volume string, fileT
 	return c.Backend.ReadFromCtx(ctx, volume, fileType, objectID, offset, length)
 }
 
-// admissionRead is one cold read whose chunk fetches all need a permit.
+// admissionRead is one cold read whose chunk fetches all reach the backend.
 type admissionRead struct {
 	name string
 	open func(t *testing.T) (vb *VB, length uint64, want []byte)
