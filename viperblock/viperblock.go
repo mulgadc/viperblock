@@ -225,6 +225,14 @@ type VB struct {
 	// Chunk number for the next chunk to be written
 	ObjectNum atomic.Uint64
 
+	// QualifiedChunks enables qualified payload keys on the next fresh map claim.
+	// An already activated map preserves its format when this setting is false.
+	QualifiedChunks bool
+	// LaunchChunkIDs is shared by engines that resume the same launch epoch.
+	// An engine with a fresh epoch can use its local cursor.
+	LaunchChunkIDs *atomic.Uint64
+	chunkIDs       atomic.Uint64
+
 	// Object map, maps block IDs to block objects (e.g request block 1,000,000, stored as object 43 at offset 256)
 	BlocksToObject BlocksToObject
 
@@ -432,7 +440,8 @@ type VB struct {
 	// ancestors holds the flattened read chain beyond the immediate base,
 	// populated from the inherited-layers section of the flat snapshot checkpoint
 	// at OpenFromSnapshot time. Index 0 = grandparent, higher = deeper.
-	ancestors []snapshotAncestor
+	ancestors             []snapshotAncestor
+	baseSnapshotQualified bool
 
 	// Encryption-at-rest. MasterKey is supplied by the caller (NBD plugin /
 	// CLI) via masterkey.LoadShared; aead caches MasterKey.AEAD for the hot
@@ -543,7 +552,7 @@ type VB struct {
 	// candidate; entries persist until actually deleted so sweepChunks can
 	// find them. Only maintained when GCEnabled — rebuilt from the live map
 	// alone at load, so reconcileChunksOnce must close the "swept" gap once.
-	gcRefcount map[uint64]uint64
+	gcRefcount map[types.ChunkRef]uint64
 
 	// gcReconciled marks whether reconcileChunksOnce has already run for
 	// this VB instance. Set once, lazily, on the first sweep attempt.
@@ -618,11 +627,12 @@ type cachedBlock struct {
 }
 
 type inheritedCacheOrigin struct {
-	volume   string
-	uuid     [4]byte
-	nameHash [32]byte
-	objectID uint64
-	offset   uint32
+	volume     string
+	uuid       [4]byte
+	nameHash   [32]byte
+	objectID   uint64
+	chunkEpoch uint64
+	offset     uint32
 }
 
 // Cache is a bounded plaintext block cache sitting beside the authoritative
@@ -739,6 +749,7 @@ type BlockLookup struct {
 
 	StartBlock uint64
 	ObjectID   uint64
+	ChunkEpoch uint64
 
 	// SeqNum is the chunk-write generation that produced this block's
 	// ciphertext on the backend. Drives nonce + AAD reconstruction on the
@@ -813,11 +824,16 @@ func expandBlockLookup(bl BlockLookup, stride uint32) []BlockLookup {
 			StartBlock:   bl.StartBlock + uint64(i),
 			NumBlocks:    1,
 			ObjectID:     bl.ObjectID,
+			ChunkEpoch:   bl.ChunkEpoch,
 			ObjectOffset: bl.offsetAt(i, stride),
 			SeqNum:       bl.seqNumAt(i),
 		}
 	}
 	return out
+}
+
+func (bl BlockLookup) chunkRef() types.ChunkRef {
+	return types.ChunkRef{Epoch: bl.ChunkEpoch, ID: bl.ObjectID}
 }
 
 type ConsecutiveBlock struct {
@@ -827,6 +843,7 @@ type ConsecutiveBlock struct {
 	OffsetStart   uint64
 	OffsetEnd     uint64
 	ObjectID      uint64
+	ChunkEpoch    uint64
 	ObjectOffset  uint32
 	// SeqNum is the chunk-write generation that sealed this block's
 	// ciphertext, used on pre-coalesce per-block entries (NumBlocks=1)
@@ -900,7 +917,7 @@ func classifyRun(overlaps []BlockLookup, run []Block, dst []bool) []bool {
 // gcRefcount, if non-nil, is updated per removed/added entry rather than a
 // single delta, since a fracture can split one entry into zero, one, or two
 // survivors of the same ObjectID — the net change isn't always ±1.
-func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32, gcRefcount map[uint64]uint64) {
+func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint32, gcRefcount map[types.ChunkRef]uint64) {
 	newStart := newEntry.StartBlock
 	newEnd := newEntry.end()
 
@@ -914,8 +931,8 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 
 		b.lookup.remove(exStart)
 		if gcRefcount != nil {
-			if n := gcRefcount[existing.ObjectID]; n > 0 {
-				gcRefcount[existing.ObjectID] = n - 1
+			if n := gcRefcount[existing.chunkRef()]; n > 0 {
+				gcRefcount[existing.chunkRef()] = n - 1
 			}
 		}
 
@@ -926,13 +943,14 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 				StartBlock:   exStart,
 				NumBlocks:    safecast.IntToUint16(headLen),
 				ObjectID:     existing.ObjectID,
+				ChunkEpoch:   existing.ChunkEpoch,
 				ObjectOffset: existing.ObjectOffset,
 				SeqNum:       existing.seqNumAt(0),
 				SeqNums:      existing.sliceSeqNums(0, headLen),
 			}
 			b.lookup.set(head)
 			if gcRefcount != nil {
-				gcRefcount[head.ObjectID]++
+				gcRefcount[head.chunkRef()]++
 			}
 		}
 
@@ -945,20 +963,21 @@ func (b *BlocksToObject) insertCoalescedLocked(newEntry BlockLookup, stride uint
 				StartBlock:   tailStart,
 				NumBlocks:    safecast.IntToUint16(tailLen),
 				ObjectID:     existing.ObjectID,
+				ChunkEpoch:   existing.ChunkEpoch,
 				ObjectOffset: existing.offsetAt(tailOffset, stride),
 				SeqNum:       existing.seqNumAt(tailOffset),
 				SeqNums:      existing.sliceSeqNums(tailOffset, tailOffset+tailLen),
 			}
 			b.lookup.set(tail)
 			if gcRefcount != nil {
-				gcRefcount[tail.ObjectID]++
+				gcRefcount[tail.chunkRef()]++
 			}
 		}
 	}
 
 	b.lookup.set(newEntry)
 	if gcRefcount != nil {
-		gcRefcount[newEntry.ObjectID]++
+		gcRefcount[newEntry.chunkRef()]++
 	}
 }
 
@@ -993,7 +1012,7 @@ func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]
 			// prev covers a single block, so the next block number is
 			// prev.StartBlock+1 and its object offset is one stride further in.
 			if cand.StartBlock == prev.StartBlock+1 &&
-				cand.ObjectID == first.ObjectID &&
+				cand.ObjectID == first.ObjectID && cand.ChunkEpoch == first.ChunkEpoch &&
 				cand.ObjectOffset == prev.ObjectOffset+stride {
 				seqNums = append(seqNums, cand.SeqNum)
 				prev = cand
@@ -1007,6 +1026,7 @@ func coalesceBlockLookup(flat map[uint64]BlockLookup, stride uint32) map[uint64]
 			StartBlock:   first.StartBlock,
 			NumBlocks:    safecast.IntToUint16(len(seqNums)),
 			ObjectID:     first.ObjectID,
+			ChunkEpoch:   first.ChunkEpoch,
 			ObjectOffset: first.ObjectOffset,
 			SeqNum:       first.SeqNum,
 			SeqNums:      seqNums,
@@ -1455,6 +1475,8 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		GCEnabled:           config.GCEnabled,
 		LeaseEpoch:          config.LeaseEpoch,
+		QualifiedChunks:     config.QualifiedChunks,
+		LaunchChunkIDs:      config.LaunchChunkIDs,
 		MapDeleteDeferral:   config.MapDeleteDeferral,
 		ResumeEpoch:         config.ResumeEpoch,
 		ResumeHeadN:         config.ResumeHeadN,
@@ -1510,7 +1532,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 
 	vb.BlocksToObject.lookup.clear()
 	if vb.GCEnabled {
-		vb.gcRefcount = make(map[uint64]uint64)
+		vb.gcRefcount = make(map[types.ChunkRef]uint64)
 	}
 
 	// New intentionally does not touch the process-wide slog default: a
@@ -3282,8 +3304,14 @@ var blockToObjectWALMagic = [4]byte{'V', 'B', 'W', 'B'}
 // blockWalChunkSize-sized records: magic(4) + Version(2) + Timestamp(8).
 const blockCheckpointHeaderSize = 14
 
-func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
-	data = make([]byte, blockWalChunkSize)
+func (vb *VB) writeBlockWalChunk(block *BlockLookup) []byte {
+	return appendBlockRecord(nil, *block, blockWalChunkSize)
+}
+
+func appendBlockRecord(dst []byte, block BlockLookup, size int) []byte {
+	start := len(dst)
+	dst = append(dst, make([]byte, size)...)
+	data := dst[start:]
 
 	binary.BigEndian.PutUint64(data[0:8], block.StartBlock)
 	binary.BigEndian.PutUint16(data[8:10], block.NumBlocks)
@@ -3291,10 +3319,12 @@ func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
 	binary.BigEndian.PutUint32(data[18:22], block.ObjectOffset)
 	binary.BigEndian.PutUint64(data[22:30], block.SeqNum)
 
-	checksum := crc32.ChecksumIEEE(data[0:30])
-	binary.BigEndian.PutUint32(data[30:34], checksum)
-
-	return data
+	checksumOffset := size - 4
+	if size == qualifiedSnapshotBlockSize {
+		binary.BigEndian.PutUint64(data[30:38], block.ChunkEpoch)
+	}
+	binary.BigEndian.PutUint32(data[checksumOffset:], crc32.ChecksumIEEE(data[:checksumOffset]))
+	return dst
 }
 
 // decodeBlockWalChunk decodes one blockWalChunkSize-sized record and verifies
@@ -3302,8 +3332,12 @@ func (vb *VB) writeBlockWalChunk(block *BlockLookup) (data []byte) {
 // Receiver-free so the checkpoint format can be decoded without a VB — see
 // ParseBlockCheckpointBytes.
 func decodeBlockWalChunk(data []byte) (block BlockLookup, err error) {
-	if len(data) != blockWalChunkSize {
-		return block, fmt.Errorf("block record is %d bytes, want %d", len(data), blockWalChunkSize)
+	return decodeBlockRecord(data, blockWalChunkSize)
+}
+
+func decodeBlockRecord(data []byte, size int) (block BlockLookup, err error) {
+	if len(data) != size {
+		return block, fmt.Errorf("block record is %d bytes, want %d", len(data), size)
 	}
 
 	block.StartBlock = binary.BigEndian.Uint64(data[:8])
@@ -3312,22 +3346,17 @@ func decodeBlockWalChunk(data []byte) (block BlockLookup, err error) {
 	block.ObjectOffset = binary.BigEndian.Uint32(data[18:22])
 	block.SeqNum = binary.BigEndian.Uint64(data[22:30])
 
-	checksum := binary.BigEndian.Uint32(data[30:34])
+	if size == qualifiedSnapshotBlockSize {
+		block.ChunkEpoch = binary.BigEndian.Uint64(data[30:38])
+	}
+	checksumOffset := size - 4
+	checksum := binary.BigEndian.Uint32(data[checksumOffset:])
 
-	checksumValidated := crc32.ChecksumIEEE(data[:30])
+	checksumValidated := crc32.ChecksumIEEE(data[:checksumOffset])
 	if checksumValidated != checksum {
 		return block, fmt.Errorf("checksum mismatch: got %d, want %d", checksumValidated, checksum)
 	}
 
-	return block, nil
-}
-
-func (vb *VB) readBlockWalChunk(data []byte) (block BlockLookup, err error) {
-	block, err = decodeBlockWalChunk(data)
-	if err != nil {
-		vb.logger().Error("Block record decode failed", "error", err)
-		return block, err
-	}
 	return block, nil
 }
 
@@ -4059,6 +4088,38 @@ func (vb *VB) blockStride() uint32 {
 	return stride
 }
 
+func (vb *VB) nextChunkRef() (types.ChunkRef, error) {
+	if !vb.mapChain.qualified.Load() {
+		return types.ChunkRef{ID: vb.ObjectNum.Add(1) - 1}, nil
+	}
+	if vb.LeaseEpoch == 0 {
+		return types.ChunkRef{}, ErrMapNoLeaseEpoch
+	}
+	cursor := vb.LaunchChunkIDs
+	if cursor == nil {
+		cursor = &vb.chunkIDs
+	}
+	for {
+		id := cursor.Load()
+		if id == ^uint64(0) {
+			return types.ChunkRef{}, errors.New("qualified chunk identifier exhausted")
+		}
+		if cursor.CompareAndSwap(id, id+1) {
+			return types.ChunkRef{Epoch: vb.LeaseEpoch, ID: id}, nil
+		}
+	}
+}
+
+func (vb *VB) readChunk(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
+	if ref.Epoch != 0 {
+		return vb.Backend.ReadChunkFromCtx(ctx, volume, ref, offset, length)
+	}
+	if volume == vb.VolumeName {
+		return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, ref.ID, offset, length)
+	}
+	return vb.Backend.ReadFromCtx(ctx, volume, types.FileTypeChunk, ref.ID, offset, length)
+}
+
 func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBuffer *[]byte, matchedBlocks *[]Block) (err error) {
 	//runtime.LockOSThread()
 	//defer runtime.UnlockOSThread()
@@ -4066,7 +4127,11 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 	// Atomically allocate this chunk's ObjectID so concurrent consolidations
 	// never share a chunk key. The old Load-at-caller/Add-at-end split let two
 	// drains reuse an ID and overwrite a chunk (fatal AEAD mismatch on read).
-	chunkIndex := vb.ObjectNum.Add(1) - 1
+	ref, err := vb.nextChunkRef()
+	if err != nil {
+		return err
+	}
+	chunkIndex := ref.ID
 
 	//vb.logger().Info("Creating chunk file", "chunkIndex", chunkIndex, "currentWALNum", currentWALNum)
 
@@ -4096,7 +4161,11 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		bodyBuffer = &sealed
 	}
 
-	err = vb.Backend.WriteCtx(ctx, types.FileTypeChunk, chunkIndex, &headers, bodyBuffer)
+	if ref.Epoch == 0 {
+		err = vb.Backend.WriteCtx(ctx, types.FileTypeChunk, chunkIndex, &headers, bodyBuffer)
+	} else {
+		err = vb.Backend.WriteChunkCtx(ctx, ref, &headers, bodyBuffer)
+	}
 	if err != nil {
 		return err
 	}
@@ -4126,6 +4195,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			StartBlock:   first.Block,
 			NumBlocks:    safecast.IntToUint16(numBlocks),
 			ObjectID:     chunkIndex,
+			ChunkEpoch:   ref.Epoch,
 			ObjectOffset: safecast.IntToUint32(headerLen + (segStart * stride)),
 			SeqNum:       first.SeqNum,
 			SeqNums:      seqNums,
@@ -4136,7 +4206,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		// before inserting the new run. gcRefcount is passed through so
 		// surviving fragments keep their share of the old chunk's refcount,
 		// rather than always dropping it by exactly one.
-		var gcRefcount map[uint64]uint64
+		var gcRefcount map[types.ChunkRef]uint64
 		if vb.GCEnabled {
 			gcRefcount = vb.gcRefcount
 		}
@@ -4155,7 +4225,7 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 			for i := range blocks {
 				blocks[i] = first.Block + uint64(i)
 			}
-			vb.BlockStore.MarkPersistedRange(blocks, chunkIndex, newBlock.ObjectOffset, strideU32, seqNums)
+			vb.BlockStore.markPersistedRangeRef(blocks, ref, newBlock.ObjectOffset, strideU32, seqNums)
 		}
 	}
 
@@ -4215,8 +4285,8 @@ func (vb *VB) createChunkFile(ctx context.Context, currentWALNum uint64, chunkBu
 		for segStart := runStart; segStart < runEnd; {
 			if !supersedes[segStart-runStart] {
 				if vb.GCEnabled {
-					if _, tracked := vb.gcRefcount[chunkIndex]; !tracked {
-						vb.gcRefcount[chunkIndex] = 0
+					if _, tracked := vb.gcRefcount[ref]; !tracked {
+						vb.gcRefcount[ref] = 0
 					}
 				}
 				segStart++
@@ -4441,7 +4511,7 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// they're lost here. That only makes GC miss already-known garbage
 	// across a restart; it never risks deleting something still live.
 	if vb.GCEnabled {
-		vb.gcRefcount = make(map[uint64]uint64)
+		vb.gcRefcount = make(map[types.ChunkRef]uint64)
 	}
 
 	vb.logger().Debug("Loaded checkpoint", "checkpoint", checkpoint)
@@ -4481,7 +4551,7 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 	// run by its block count instead of by 1.
 	if vb.GCEnabled {
 		vb.BlocksToObject.lookup.scan(func(entry BlockLookup) bool {
-			vb.gcRefcount[entry.ObjectID]++
+			vb.gcRefcount[entry.chunkRef()]++
 			return true
 		})
 	}
@@ -4494,7 +4564,7 @@ func (vb *VB) parseBlockCheckpoint(checkpoint []byte) error {
 				blocks[i] = entry.StartBlock + uint64(i)
 				seqNums[i] = entry.seqNumAt(i)
 			}
-			vb.BlockStore.SetPersistedRange(blocks, entry.ObjectID, entry.ObjectOffset, vb.blockStride(), seqNums)
+			vb.BlockStore.setPersistedRangeRef(blocks, types.ChunkRef{Epoch: entry.ChunkEpoch, ID: entry.ObjectID}, entry.ObjectOffset, vb.blockStride(), seqNums)
 			return true
 		})
 	}
@@ -4792,6 +4862,18 @@ func parseChunkObjectID(key string) (id uint64, ok bool) {
 	return id, true
 }
 
+var qualifiedChunkKeyPattern = regexp.MustCompile(`/chunks/chunk\.(\d{20})\.(\d{20})\.bin$`)
+
+func parseChunkRef(key string) (types.ChunkRef, bool) {
+	if match := qualifiedChunkKeyPattern.FindStringSubmatch(key); match != nil {
+		epoch, epochErr := strconv.ParseUint(match[1], 10, 64)
+		id, idErr := strconv.ParseUint(match[2], 10, 64)
+		return types.ChunkRef{Epoch: epoch, ID: id}, epoch != 0 && epochErr == nil && idErr == nil
+	}
+	id, ok := parseChunkObjectID(key)
+	return types.ChunkRef{ID: id}, ok
+}
+
 // reconcileChunksOnce lists this volume's own chunks/ prefix once per VB
 // lifetime and adds any untracked chunk object to gcRefcount at zero — a
 // chunk unreferenced since before the last close is otherwise
@@ -4814,12 +4896,12 @@ func (vb *VB) reconcileChunksOnce(ctx context.Context) {
 
 	vb.BlocksToObject.mu.Lock()
 	for _, key := range keys {
-		id, ok := parseChunkObjectID(key)
-		if !ok {
+		ref, ok := parseChunkRef(key)
+		if !ok || (ref.Epoch != 0 && ref.Epoch >= vb.LeaseEpoch) {
 			continue
 		}
-		if _, tracked := vb.gcRefcount[id]; !tracked {
-			vb.gcRefcount[id] = 0
+		if _, tracked := vb.gcRefcount[ref]; !tracked {
+			vb.gcRefcount[ref] = 0
 		}
 	}
 	vb.BlocksToObject.mu.Unlock()
@@ -4856,12 +4938,23 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 	// "id < watermark" check below, so BlocksToObject.mu need not be held
 	// across the delete calls that follow.
 	watermark := vb.ObjectNum.Load()
+	qualifiedWatermark := vb.chunkIDs.Load()
+	if vb.LaunchChunkIDs != nil {
+		qualifiedWatermark = vb.LaunchChunkIDs.Load()
+	}
 
 	vb.BlocksToObject.mu.Lock()
-	var candidates []uint64
-	for id, refs := range vb.gcRefcount {
-		if refs == 0 && id >= floor && id < watermark {
-			candidates = append(candidates, id)
+	var candidates []types.ChunkRef
+	for ref, refs := range vb.gcRefcount {
+		if refs != 0 {
+			continue
+		}
+		eligible := ref.Epoch == 0 && ref.ID >= floor && ref.ID < watermark
+		if ref.Epoch != 0 && vb.mapChain.qualified.Load() {
+			eligible = ref.Epoch < vb.LeaseEpoch || (ref.Epoch == vb.LeaseEpoch && ref.ID < qualifiedWatermark)
+		}
+		if eligible {
+			candidates = append(candidates, ref)
 		}
 	}
 	if vb.IsMapDelta() {
@@ -4907,7 +5000,7 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 // sweep retries it — under-collection (a leaked chunk) is preferred over
 // losing track of a candidate. Stops handing out new deletes once ctx is
 // done; deletes already in flight are allowed to finish.
-func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) {
+func (vb *VB) deleteChunkObjects(ctx context.Context, ids []types.ChunkRef) (swept int) {
 	if len(ids) == 0 {
 		return 0
 	}
@@ -4920,7 +5013,7 @@ func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) 
 		workers = len(ids)
 	}
 
-	idChan := make(chan uint64)
+	idChan := make(chan types.ChunkRef)
 	var sweptCount atomic.Int64
 	var wg sync.WaitGroup
 
@@ -4929,7 +5022,13 @@ func (vb *VB) deleteChunkObjects(ctx context.Context, ids []uint64) (swept int) 
 		go func() {
 			defer wg.Done()
 			for id := range idChan {
-				if err := vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id); err != nil && !errors.Is(err, os.ErrNotExist) {
+				var err error
+				if id.Epoch == 0 {
+					err = vb.Backend.DeleteCtx(ctx, types.FileTypeChunk, id.ID)
+				} else {
+					err = vb.Backend.DeleteChunkCtx(ctx, id)
+				}
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
 					vb.logger().Warn("chunk GC: delete failed, will retry next sweep", "objectID", id, "err", err)
 					continue
 				}
@@ -5459,7 +5558,7 @@ func (vb *VB) recoverLocalWALs(readWAL func(string) ([]Block, uint64, error)) (e
 				blocks[i] = lookup.StartBlock + uint64(i)
 				seqNums[i] = lookup.seqNumAt(i)
 			}
-			vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
+			vb.BlockStore.setPersistedRangeRef(blocks, types.ChunkRef{Epoch: lookup.ChunkEpoch, ID: lookup.ObjectID}, lookup.ObjectOffset, stride, seqNums)
 			return true
 		})
 		vb.BlocksToObject.mu.RUnlock()
@@ -5599,8 +5698,8 @@ func (vb *VB) extendRunForReadahead(cb ConsecutiveBlock, limit int) (extra int, 
 	nextOffset := cb.ObjectOffset + uint32(cb.NumBlocks)*stride
 
 	for extra < limit {
-		objectID, objectOffset, seqNum, err := vb.LookupBlockToObject(nextBlock)
-		if err != nil || objectID != cb.ObjectID || objectOffset != nextOffset {
+		ref, objectOffset, seqNum, err := vb.lookupChunk(nextBlock)
+		if err != nil || ref.ID != cb.ObjectID || ref.Epoch != cb.ChunkEpoch || objectOffset != nextOffset {
 			break
 		}
 		seqNums = append(seqNums, seqNum)
@@ -5618,14 +5717,14 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 	fetchBlocks := int(cb.NumBlocks) + extra
 	length := safecast.IntToUint32(fetchBlocks) * vb.blockStride()
 
-	objectID := cb.ObjectID
-	if err := vb.checkChunkMagic(vb.VolumeName, objectID, func(off, l uint32) ([]byte, error) {
-		return vb.Backend.ReadCtx(ctx, types.FileTypeChunk, objectID, off, l)
+	ref := types.ChunkRef{Epoch: cb.ChunkEpoch, ID: cb.ObjectID}
+	if err := vb.checkChunkMagic(vb.VolumeName, ref, func(off, l uint32) ([]byte, error) {
+		return vb.readChunk(ctx, vb.VolumeName, ref, off, l)
 	}); err != nil {
 		return err
 	}
 
-	blockData, err := vb.Backend.ReadCtx(ctx, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, length)
+	blockData, err := vb.readChunk(ctx, vb.VolumeName, ref, cb.ObjectOffset, length)
 	if err != nil {
 		return err
 	}
@@ -5688,11 +5787,15 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 // collide with the local volume's entries. read is a function so the caller
 // can pass the right backend method — Backend.Read for self, Backend.ReadFrom
 // for source-volume reads.
-func (vb *VB) checkChunkMagic(volumeName string, objectID uint64, read func(offset, length uint32) ([]byte, error)) error {
+func (vb *VB) checkChunkMagic(volumeName string, ref types.ChunkRef, read func(offset, length uint32) ([]byte, error)) error {
 	if !vb.EncryptionEnabled {
 		return nil
 	}
-	key := fmt.Sprintf("%s:%d", volumeName, objectID)
+	key := struct {
+		volume string
+		ref    types.ChunkRef
+	}{volumeName, ref}
+	objectID := ref.ID
 	if _, ok := vb.chunkMagicChecked.Load(key); ok {
 		return nil
 	}
@@ -5763,6 +5866,11 @@ func (vb *VB) openChunkRun(ciphertext []byte, cb ConsecutiveBlock, volumeUUID [4
 // the decrypt path; on unencrypted volumes callers ignore it. Returns
 // ErrZeroBlock when the block has never been written.
 func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset uint32, seqNum uint64, err error) {
+	ref, offset, seq, err := vb.lookupChunk(block)
+	return ref.ID, offset, seq, err
+}
+
+func (vb *VB) lookupChunk(block uint64) (types.ChunkRef, uint32, uint64, error) {
 	vb.logger().Debug("LookupBlockToObject", "block", block)
 
 	vb.BlocksToObject.mu.RLock()
@@ -5776,9 +5884,9 @@ func (vb *VB) LookupBlockToObject(block uint64) (objectID uint64, objectOffset u
 	vb.logger().Debug("\tLOOKUP BLOCK TO OBJECT:", "block", block, "objectID", blockLookup.ObjectID, "found", ok)
 
 	if ok {
-		return blockLookup.ObjectID, blockLookup.offsetAt(pos, stride), blockLookup.seqNumAt(pos), nil
+		return types.ChunkRef{Epoch: blockLookup.ChunkEpoch, ID: blockLookup.ObjectID}, blockLookup.offsetAt(pos, stride), blockLookup.seqNumAt(pos), nil
 	} else {
-		return 0, 0, 0, ErrZeroBlock
+		return types.ChunkRef{}, 0, 0, ErrZeroBlock
 	}
 }
 
@@ -6555,14 +6663,14 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		// is validated against the block's current sequence number -- without
 		// it a block that was overwritten and re-persisted would be served
 		// from its stale cached copy.
-		objectID, objectOffset, seqNum, err := vb.LookupBlockToObject(currentBlock)
+		ref, objectOffset, seqNum, err := vb.lookupChunk(currentBlock)
 		if err != nil {
 			if !errors.Is(err, ErrZeroBlock) {
 				return nil, fmt.Errorf("LookupBlockToObject block %d: %w", currentBlock, err)
 			}
 			// Block not in our own map -- check snapshot base map
 			if vb.BaseBlockMap != nil {
-				baseObjectID, baseObjectOffset, baseSeqNum, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				baseRef, baseObjectOffset, baseSeqNum, baseErr := vb.lookupBaseChunk(currentBlock)
 				if baseErr == nil {
 					block := ConsecutiveBlock{
 						BlockPosition: i,
@@ -6570,7 +6678,8 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 						NumBlocks:     1,
 						OffsetStart:   start,
 						OffsetEnd:     end,
-						ObjectID:      baseObjectID,
+						ObjectID:      baseRef.ID,
+						ChunkEpoch:    baseRef.Epoch,
 						ObjectOffset:  baseObjectOffset,
 						SeqNum:        baseSeqNum,
 					}
@@ -6595,6 +6704,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 						OffsetStart:   start,
 						OffsetEnd:     end,
 						ObjectID:      lookup.ObjectID,
+						ChunkEpoch:    lookup.ChunkEpoch,
 						ObjectOffset:  lookup.offsetAt(pos, vb.blockStride()),
 						SeqNum:        lookup.seqNumAt(pos),
 					}
@@ -6617,7 +6727,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			continue
 		}
 
-		vb.logger().Debug("[READ] OBJECT ID:", "objectID", objectID, "objectOffset", objectOffset)
+		vb.logger().Debug("[READ] OBJECT ID:", "objectID", ref.ID, "objectOffset", objectOffset)
 
 		if cachedData, ok := vb.Cache.get(currentBlock, seqNum); ok {
 			copy(data[start:end], cachedData)
@@ -6630,7 +6740,8 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			NumBlocks:     1,
 			OffsetStart:   start,
 			OffsetEnd:     end,
-			ObjectID:      objectID,
+			ObjectID:      ref.ID,
+			ChunkEpoch:    ref.Epoch,
 			ObjectOffset:  objectOffset,
 			SeqNum:        seqNum,
 		})
@@ -6648,7 +6759,8 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 		j := i + 1
 		for j < len(consecutiveBlocks) &&
 			consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1 &&
-			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID &&
+			consecutiveBlocks[j].ChunkEpoch == consecutiveBlocks[j-1].ChunkEpoch {
 			j++
 		}
 		numBlocks := j - i
@@ -6671,6 +6783,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
+			ChunkEpoch:    consecutiveBlocks[i].ChunkEpoch,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
 			SeqNums:       seqNums,
 		})
@@ -7169,6 +7282,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 				OffsetStart:   start,
 				OffsetEnd:     end,
 				ObjectID:      entry.ObjectID,
+				ChunkEpoch:    entry.ChunkEpoch,
 				ObjectOffset:  entry.ObjectOffset,
 				SeqNum:        entry.SeqNum,
 			})
@@ -7176,7 +7290,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 		case BlockStateEmpty:
 			// Block not in our own map -- check snapshot base map
 			if vb.BaseBlockMap != nil {
-				objectID, objectOffset, baseSeqNum, baseErr := vb.LookupBaseBlockToObject(currentBlock)
+				baseRef, objectOffset, baseSeqNum, baseErr := vb.lookupBaseChunk(currentBlock)
 				if baseErr == nil {
 					block := ConsecutiveBlock{
 						BlockPosition: i,
@@ -7184,7 +7298,8 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 						NumBlocks:     1,
 						OffsetStart:   start,
 						OffsetEnd:     end,
-						ObjectID:      objectID,
+						ObjectID:      baseRef.ID,
+						ChunkEpoch:    baseRef.Epoch,
 						ObjectOffset:  objectOffset,
 						SeqNum:        baseSeqNum,
 					}
@@ -7213,6 +7328,7 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 						OffsetStart:   start,
 						OffsetEnd:     end,
 						ObjectID:      lookup.ObjectID,
+						ChunkEpoch:    lookup.ChunkEpoch,
 						ObjectOffset:  lookup.offsetAt(pos, vb.blockStride()),
 						SeqNum:        lookup.seqNumAt(pos),
 					}
@@ -7297,7 +7413,8 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 		j := i + 1
 		for j < len(consecutiveBlocks) &&
 			consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1 &&
-			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID &&
+			consecutiveBlocks[j].ChunkEpoch == consecutiveBlocks[j-1].ChunkEpoch {
 			j++
 		}
 		numBlocks := j - i
@@ -7317,6 +7434,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
+			ChunkEpoch:    consecutiveBlocks[i].ChunkEpoch,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
 			SeqNums:       seqNums,
 		})
@@ -7352,7 +7470,7 @@ func (vb *VB) readInheritedBlock(ctx context.Context, volume string, uuid [4]byt
 	vb.planReadAhead(block.StartBlock, 1, nil)
 	origin := inheritedCacheOrigin{
 		volume: volume, uuid: uuid, nameHash: nameHash,
-		objectID: block.ObjectID, offset: block.ObjectOffset,
+		objectID: block.ObjectID, chunkEpoch: block.ChunkEpoch, offset: block.ObjectOffset,
 	}
 	if data, ok := vb.Cache.getFrom(block.StartBlock, block.SeqNum, &origin); ok {
 		copy(dst, data)
@@ -7382,7 +7500,8 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 		j := i + 1
 		for j < len(consecutiveBlocks) &&
 			consecutiveBlocks[j].StartBlock == consecutiveBlocks[j-1].StartBlock+1 &&
-			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID {
+			consecutiveBlocks[j].ObjectID == consecutiveBlocks[j-1].ObjectID &&
+			consecutiveBlocks[j].ChunkEpoch == consecutiveBlocks[j-1].ChunkEpoch {
 			j++
 		}
 		numBlocks := j - i
@@ -7402,6 +7521,7 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 			OffsetStart:   consecutiveBlocks[i].OffsetStart,
 			OffsetEnd:     consecutiveBlocks[i].OffsetEnd,
 			ObjectID:      consecutiveBlocks[i].ObjectID,
+			ChunkEpoch:    consecutiveBlocks[i].ChunkEpoch,
 			ObjectOffset:  consecutiveBlocks[i].ObjectOffset,
 			SeqNums:       seqNums,
 		})
@@ -7420,14 +7540,14 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
-		objectID := cb.ObjectID
-		if err := vb.checkChunkMagic(sourceVolume, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, off, length)
+		ref := types.ChunkRef{Epoch: cb.ChunkEpoch, ID: cb.ObjectID}
+		if err := vb.checkChunkMagic(sourceVolume, ref, func(off, length uint32) ([]byte, error) {
+			return vb.readChunk(ctx, sourceVolume, ref, off, length)
 		}); err != nil {
 			return fmt.Errorf("ReadFrom source %s: %w", sourceVolume, err)
 		}
 
-		blockData, err := vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		blockData, err := vb.readChunk(ctx, sourceVolume, ref, cb.ObjectOffset, consecutiveBlockOffset)
 		if err != nil {
 			return fmt.Errorf("ReadFrom source %s object %d: %w", sourceVolume, cb.ObjectID, err)
 		}
@@ -7587,7 +7707,7 @@ func (vb *VB) SyncBlockStoreFromLegacy() {
 		for i := range blocks {
 			blocks[i] = lookup.StartBlock + uint64(i)
 		}
-		vb.BlockStore.SetPersistedRange(blocks, lookup.ObjectID, lookup.ObjectOffset, stride, seqNums)
+		vb.BlockStore.setPersistedRangeRef(blocks, types.ChunkRef{Epoch: lookup.ChunkEpoch, ID: lookup.ObjectID}, lookup.ObjectOffset, stride, seqNums)
 		return true
 	})
 	vb.BlocksToObject.mu.RUnlock()

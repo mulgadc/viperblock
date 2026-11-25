@@ -41,6 +41,8 @@ func resetPluginConfigState() {
 	encryption_key_file = ""
 	loadedMasterKey = nil
 	lease_epoch = 0
+	qualified_chunks = false
+	launchChunkIDs.Store(0)
 }
 
 // TestConfig_WalBaseDirRoundTrips pins that the "wal_base_dir" nbdkit param
@@ -685,6 +687,16 @@ type heldChunkWrite struct {
 
 var _ types.Backend = (*heldChunkWrite)(nil)
 
+func (b *heldChunkWrite) WriteChunkCtx(ctx context.Context, ref types.ChunkRef, headers, data *[]byte) error {
+	close(b.entered)
+	select {
+	case <-b.release:
+		return b.Backend.WriteChunkCtx(ctx, ref, headers, data)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (b *heldChunkWrite) WriteCtx(ctx context.Context, kind types.FileType, id uint64, headers, data *[]byte) error {
 	if kind == types.FileTypeChunk {
 		close(b.entered)
@@ -717,6 +729,7 @@ func TestColdNBDReadSurvivesPriorEpochChunkWrite(t *testing.T) {
 					VolumeName: volumeName, VolumeSize: volumeSize,
 					BaseDir: t.TempDir(), LeaseEpoch: epoch, MasterKey: key,
 					EncryptionEnabled: encrypted, WALSyncInterval: -1, ChunkUploadInterval: -1,
+					QualifiedChunks: epoch > 1,
 				}
 				engine, err := viperblock.New(&config, "file", file.FileConfig{
 					VolumeName: volumeName, VolumeSize: volumeSize, BaseDir: backendDir,

@@ -2,6 +2,7 @@ package viperblock
 
 import (
 	"fmt"
+	"github.com/mulgadc/viperblock/types"
 	"math/rand/v2"
 	"testing"
 )
@@ -221,7 +222,7 @@ func BenchmarkBlockLookupInsertCoalesced(b *testing.B) {
 			for i := range starts {
 				starts[i] = uint64(rng.IntN(n)) * uint64(benchRunLen)
 			}
-			gcRefcount := make(map[uint64]uint64)
+			gcRefcount := make(map[types.ChunkRef]uint64)
 
 			b.ReportAllocs()
 			b.ResetTimer()

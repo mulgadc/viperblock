@@ -34,7 +34,8 @@ const (
 	mapKindDelta byte = 2
 	mapKindHead  byte = 3
 
-	mapObjectVersion byte = 1
+	mapObjectVersion          byte = 1
+	mapQualifiedObjectVersion byte = 2
 
 	// DefaultMapDeleteDeferral is twice the volume lease TTL: an object a
 	// commit stops naming is deleted no sooner than this after it.
@@ -136,9 +137,13 @@ func (h mapHead) clone() mapHead {
 // frameMapObject wraps body with the header binding it to its kind, volume,
 // epoch and id, and a trailing CRC32C over everything before it.
 func frameMapObject(kind byte, volume string, epoch, id uint64, body []byte) []byte {
+	return frameMapObjectVersion(kind, mapObjectVersion, volume, epoch, id, body)
+}
+
+func frameMapObjectVersion(kind, version byte, volume string, epoch, id uint64, body []byte) []byte {
 	out := make([]byte, 0, 32+len(volume)+len(body))
 	out = append(out, mapObjectMagic[:]...)
-	out = append(out, kind, mapObjectVersion)
+	out = append(out, kind, version)
 	out = binary.AppendUvarint(out, safecast.IntToUint64(len(volume)))
 	out = append(out, volume...)
 	out = binary.BigEndian.AppendUint64(out, epoch)
@@ -149,6 +154,17 @@ func frameMapObject(kind byte, volume string, epoch, id uint64, body []byte) []b
 }
 
 func unframeMapObject(data []byte, kind byte, volume string, epoch, id uint64) ([]byte, error) {
+	return unframeMapObjectVersion(data, kind, mapObjectVersion, volume, epoch, id)
+}
+
+func requiredMapObjectVersion(data []byte) (byte, error) {
+	if len(data) < 6 || (data[5] != mapObjectVersion && data[5] != mapQualifiedObjectVersion) {
+		return 0, fmt.Errorf("%w: unsupported object version", ErrMapObjectCorrupt)
+	}
+	return data[5], nil
+}
+
+func unframeMapObjectVersion(data []byte, kind, version byte, volume string, epoch, id uint64) ([]byte, error) {
 	if len(data) < 4+2+1+16+1+4 {
 		return nil, fmt.Errorf("%w: %d bytes", ErrMapObjectCorrupt, len(data))
 	}
@@ -156,7 +172,7 @@ func unframeMapObject(data []byte, kind byte, volume string, epoch, id uint64) (
 	if crc32.Checksum(payload, crc32cTable) != sum {
 		return nil, fmt.Errorf("%w: crc mismatch", ErrMapObjectCorrupt)
 	}
-	if !bytes.Equal(payload[:4], mapObjectMagic[:]) || payload[4] != kind || payload[5] != mapObjectVersion {
+	if !bytes.Equal(payload[:4], mapObjectMagic[:]) || payload[4] != kind || payload[5] != version {
 		return nil, fmt.Errorf("%w: header", ErrMapObjectCorrupt)
 	}
 	p := payload[6:]
@@ -201,6 +217,10 @@ func deltaDec(prev, v uint64) uint64 {
 // a run of consecutive seqs stores its first and a flag, any other run one
 // zigzag delta per further block.
 func encodeMapRuns(runs []BlockLookup) []byte {
+	return encodeMapRunsVersion(runs, mapObjectVersion)
+}
+
+func encodeMapRunsVersion(runs []BlockLookup, version byte) []byte {
 	out := binary.AppendUvarint(nil, safecast.IntToUint64(len(runs)))
 	var prevEnd, prevObj, prevSeq uint64
 	for _, r := range runs {
@@ -210,6 +230,9 @@ func encodeMapRuns(runs []BlockLookup) []byte {
 		out = binary.AppendUvarint(out, uint64(r.ObjectOffset))
 		first := r.seqNumAt(0)
 		out = binary.AppendUvarint(out, deltaEnc(first, prevSeq))
+		if version == mapQualifiedObjectVersion {
+			out = binary.AppendUvarint(out, r.ChunkEpoch)
+		}
 		consecutive := true
 		for i := 1; i < int(r.NumBlocks); i++ {
 			if r.seqNumAt(i) != first+safecast.IntToUint64(i) {
@@ -234,6 +257,10 @@ func encodeMapRuns(runs []BlockLookup) []byte {
 }
 
 func decodeMapRuns(body []byte) ([]BlockLookup, error) {
+	return decodeMapRunsVersion(body, mapObjectVersion)
+}
+
+func decodeMapRunsVersion(body []byte, version byte) ([]BlockLookup, error) {
 	p := body
 	next := func() (uint64, error) {
 		v, n := binary.Uvarint(p)
@@ -267,6 +294,14 @@ func decodeMapRuns(body []byte) ([]BlockLookup, error) {
 			NumBlocks:    safecast.IntToUint16(safecast.Uint64ToInt(f[1])),
 			ObjectID:     deltaDec(prevObj, f[2]),
 			ObjectOffset: safecast.Uint64ToUint32(f[3]),
+		}
+		if version == mapQualifiedObjectVersion {
+			if r.ChunkEpoch, err = next(); err != nil {
+				return nil, err
+			}
+			if len(p) == 0 {
+				return nil, fmt.Errorf("%w: missing run sequence flag", ErrMapObjectCorrupt)
+			}
 		}
 		first := deltaDec(prevSeq, f[4])
 		flag := p[0]
@@ -392,7 +427,8 @@ type mapChainState struct {
 	fenced     atomic.Bool
 	// delta mirrors MapFormat == MapFormatDelta for readers outside
 	// checkpointMu, since a conversion flips the format while drains run.
-	delta atomic.Bool
+	delta     atomic.Bool
+	qualified atomic.Bool
 	// committed is set once any head of this volume is durable, and is
 	// persisted in VBState as the creation-complete signal.
 	committed atomic.Bool
@@ -408,7 +444,7 @@ type mapChainState struct {
 
 	// chunkSeen records when chunk GC first found each zero-reference chunk.
 	// Guarded by BlocksToObject.mu.
-	chunkSeen map[uint64]time.Time
+	chunkSeen map[types.ChunkRef]time.Time
 
 	// conv is a format-1 volume's conversion to format 2. Guarded by
 	// checkpointMu.
@@ -466,10 +502,17 @@ func (vb *VB) writeMapKey(ctx context.Context, key string, data []byte) error {
 	return err
 }
 
+func (vb *VB) mapObjectVersion() byte {
+	if vb.mapChain.qualified.Load() {
+		return mapQualifiedObjectVersion
+	}
+	return mapObjectVersion
+}
+
 func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body []byte) (mapObjRef, error) {
 	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
 	vb.mapChain.objN++
-	data := frameMapObject(kind, vb.VolumeName, ref.Epoch, ref.ID, body)
+	data := frameMapObjectVersion(kind, vb.mapObjectVersion(), vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
 	return ref, vb.writeMapKey(ctx, ref.key(prefix), data)
@@ -480,7 +523,7 @@ func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body [
 func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
 	n := vb.mapChain.headN
 	vb.mapChain.headN++
-	data := frameMapObject(mapKindHead, vb.VolumeName, vb.LeaseEpoch, n, encodeMapHead(h))
+	data := frameMapObjectVersion(mapKindHead, vb.mapObjectVersion(), vb.VolumeName, vb.LeaseEpoch, n, encodeMapHead(h))
 	if err := vb.writeMapKey(ctx, mapObjectKey(mapHeadPrefix, vb.LeaseEpoch, n), data); err != nil {
 		return err
 	}
@@ -528,7 +571,7 @@ func (vb *VB) InitMapDeltaCtx(ctx context.Context, publish bool) error {
 	vb.BlocksToObject.mu.RLock()
 	runs := vb.mapRunsLocked()
 	vb.BlocksToObject.mu.RUnlock()
-	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRuns(runs))
+	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRunsVersion(runs, vb.mapObjectVersion()))
 	if err != nil {
 		return fmt.Errorf("map: write first base: %w", err)
 	}
@@ -571,7 +614,7 @@ func (vb *VB) listMapHeads(ctx context.Context) ([][2]uint64, error) {
 	return heads, nil
 }
 
-func (vb *VB) readMapObject(ctx context.Context, prefix string, kind byte, ref mapObjRef) ([]byte, error) {
+func (vb *VB) readMapRuns(ctx context.Context, prefix string, kind byte, ref mapObjRef) ([]BlockLookup, error) {
 	data, err := vb.Backend.ReadKeyCtx(ctx, ref.key(prefix))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -582,7 +625,15 @@ func (vb *VB) readMapObject(ctx context.Context, prefix string, kind byte, ref m
 	if safecast.IntToUint32(len(data)) != ref.Size || crc32.Checksum(data, crc32cTable) != ref.CRC {
 		return nil, fmt.Errorf("%w: %s digest", ErrMapObjectCorrupt, ref.key(prefix))
 	}
-	return unframeMapObject(data, kind, vb.VolumeName, ref.Epoch, ref.ID)
+	version, err := requiredMapObjectVersion(data)
+	if err != nil {
+		return nil, err
+	}
+	body, err := unframeMapObjectVersion(data, kind, version, vb.VolumeName, ref.Epoch, ref.ID)
+	if err != nil {
+		return nil, err
+	}
+	return decodeMapRunsVersion(body, version)
 }
 
 // loadMapChainCtx loads the map the newest head names. A missing or corrupt
@@ -639,7 +690,14 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("map: read head %d.%d: %w", newest[0], newest[1], err)
 	}
-	body, err := unframeMapObject(headData, mapKindHead, vb.VolumeName, newest[0], newest[1])
+	version, err := requiredMapObjectVersion(headData)
+	if err != nil {
+		return err
+	}
+	if resume && version == mapQualifiedObjectVersion && vb.LaunchChunkIDs == nil {
+		return fmt.Errorf("%w: qualified resume requires the launch allocation cursor", ErrMapEpochNotNewer)
+	}
+	body, err := unframeMapObjectVersion(headData, mapKindHead, version, vb.VolumeName, newest[0], newest[1])
 	if err != nil {
 		return err
 	}
@@ -650,22 +708,14 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	if vb.MapCreationEpoch != 0 && h.Creation != vb.MapCreationEpoch {
 		return fmt.Errorf("%w: head creation %d, VBState creation %d", ErrMapLineage, h.Creation, vb.MapCreationEpoch)
 	}
-	baseBody, err := vb.readMapObject(ctx, mapBasePrefix, mapKindBase, h.Base)
-	if err != nil {
-		return err
-	}
-	baseRuns, err := decodeMapRuns(baseBody)
+	baseRuns, err := vb.readMapRuns(ctx, mapBasePrefix, mapKindBase, h.Base)
 	if err != nil {
 		return err
 	}
 	deltas := make([][]BlockLookup, 0, len(h.Deltas))
 	var deltaBytes uint64
 	for _, ref := range h.Deltas {
-		db, derr := vb.readMapObject(ctx, mapDeltaPrefix, mapKindDelta, ref)
-		if derr != nil {
-			return derr
-		}
-		runs, derr := decodeMapRuns(db)
+		runs, derr := vb.readMapRuns(ctx, mapDeltaPrefix, mapKindDelta, ref)
 		if derr != nil {
 			return derr
 		}
@@ -687,6 +737,7 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 			vb.BlocksToObject.insertCoalescedLocked(r, stride, nil)
 		}
 	}
+	vb.mapChain.qualified.Store(version == mapQualifiedObjectVersion)
 	vb.finishMapLoadLocked()
 	if vb.MapCreationEpoch == 0 {
 		vb.MapCreationEpoch = h.Creation
@@ -717,13 +768,13 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 // Caller holds BlocksToObject.mu for writing.
 func (vb *VB) finishMapLoadLocked() {
 	if vb.GCEnabled {
-		vb.gcRefcount = make(map[uint64]uint64)
+		vb.gcRefcount = make(map[types.ChunkRef]uint64)
 	}
 	var maxObjectID, maxSeqNum uint64
 	haveObject := false
 	vb.BlocksToObject.lookup.scan(func(entry BlockLookup) bool {
 		if vb.GCEnabled {
-			vb.gcRefcount[entry.ObjectID]++
+			vb.gcRefcount[entry.chunkRef()]++
 		}
 		if !haveObject || entry.ObjectID > maxObjectID {
 			maxObjectID, haveObject = entry.ObjectID, true
@@ -738,7 +789,7 @@ func (vb *VB) finishMapLoadLocked() {
 				blocks[i] = entry.StartBlock + uint64(i)
 				seqNums[i] = entry.seqNumAt(i)
 			}
-			vb.BlockStore.SetPersistedRange(blocks, entry.ObjectID, entry.ObjectOffset, vb.blockStride(), seqNums)
+			vb.BlockStore.setPersistedRangeRef(blocks, types.ChunkRef{Epoch: entry.ChunkEpoch, ID: entry.ObjectID}, entry.ObjectOffset, vb.blockStride(), seqNums)
 		}
 		return true
 	})
@@ -768,8 +819,13 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("map: claim deadline passed: %w", err)
 	}
+	wasQualified := vb.mapChain.qualified.Load()
+	if vb.QualifiedChunks {
+		vb.mapChain.qualified.Store(true)
+	}
 	advanceAtomicTo(&vb.ObjectNum, vb.ObjectNum.Load()+mapClaimObjectGap)
 	if err := vb.putMapHead(ctx, vb.mapChain.head); err != nil {
+		vb.mapChain.qualified.Store(wasQualified)
 		return fmt.Errorf("map: claim head: %w", err)
 	}
 	vb.mapChain.claimed = true
@@ -872,7 +928,7 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 		recordWALOp(context.Background(), "checkpoint", vb.VolumeName, outcome, time.Since(start))
 	}()
 
-	ref, err := vb.putMapObject(ctx, mapDeltaPrefix, mapKindDelta, encodeMapRuns(batch))
+	ref, err := vb.putMapObject(ctx, mapDeltaPrefix, mapKindDelta, encodeMapRunsVersion(batch, vb.mapObjectVersion()))
 	if err != nil {
 		return fmt.Errorf("map: write delta: %w", err)
 	}
@@ -904,7 +960,7 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 			vb.BlocksToObject.dirty.Store(true)
 		}
 	}()
-	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRuns(runs))
+	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRunsVersion(runs, vb.mapObjectVersion()))
 	if err != nil {
 		return fmt.Errorf("map: write base: %w", err)
 	}
@@ -1011,7 +1067,8 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 		runs = append(runs, bl)
 		return true
 	})
-	body := encodeMapRuns(runs)
+	version := vb.mapObjectVersion()
+	body := encodeMapRunsVersion(runs, version)
 
 	// The base is written outside checkpointMu, so drains keep committing;
 	// only the head that publishes it is composed and written under it.
@@ -1019,7 +1076,7 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
 	vb.mapChain.objN++
 	vb.checkpointMu.Unlock()
-	data := frameMapObject(mapKindBase, vb.VolumeName, ref.Epoch, ref.ID, body)
+	data := frameMapObjectVersion(mapKindBase, version, vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
 	if err := vb.writeMapKey(ctx, ref.key(mapBasePrefix), data); err != nil {
@@ -1191,12 +1248,12 @@ func (vb *VB) requeueMapDeletes(keys []string) {
 // mapChunkCandidatesLocked filters chunk GC candidates for a format-2 volume
 // to those first seen at zero references at least the deferral ago.
 // Caller holds BlocksToObject.mu.
-func (vb *VB) mapChunkCandidatesLocked(candidates []uint64) []uint64 {
+func (vb *VB) mapChunkCandidatesLocked(candidates []types.ChunkRef) []types.ChunkRef {
 	if vb.mapChain.chunkSeen == nil {
-		vb.mapChain.chunkSeen = make(map[uint64]time.Time)
+		vb.mapChain.chunkSeen = make(map[types.ChunkRef]time.Time)
 	}
 	now := vb.mapNow()
-	live := make(map[uint64]bool, len(candidates))
+	live := make(map[types.ChunkRef]bool, len(candidates))
 	out := candidates[:0]
 	for _, id := range candidates {
 		live[id] = true

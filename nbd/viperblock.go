@@ -110,14 +110,30 @@ var use_shardwal bool = false
 
 // lease_epoch orders this launch's map heads above every earlier launch's.
 var lease_epoch uint64
+var qualified_chunks bool
+
+// launchChunkIDs reserves qualified payload IDs across all opens under lease_epoch.
+var launchChunkIDs atomic.Uint64
 
 // mapClaimed records that this process has claimed its epoch, so a later
 // connection resumes the heads it wrote instead of refusing them.
 var mapClaimed atomic.Bool
 
-// mapHeadN and mapObjN carry a closed connection's map counters to the next
-// connection, ambiguous writes included, so no head number is reused.
+// mapHeadN and mapObjN carry map counters across opens, ambiguous writes included.
 var mapHeadN, mapObjN atomic.Uint64
+
+// The volume lock serializes this update with the next engine's Open.
+func rememberMapCounters(vb *viperblock.VB) {
+	if !vb.IsMapDelta() {
+		return
+	}
+	headN, objN := vb.MapCounters()
+	mapHeadN.Store(max(mapHeadN.Load(), headN))
+	mapObjN.Store(max(mapObjN.Load(), objN))
+	// This engine may have converted the volume during its connection.
+	mapClaimed.Store(true)
+}
+
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -226,6 +242,10 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 			return err
 		}
 		return nil
+	} else if key == "qualified_chunks" {
+		var err error
+		qualified_chunks, err = strconv.ParseBool(value)
+		return err
 	} else if key == "gc_enabled" {
 		gc_enabled = value == "true" || value == "1"
 		return nil
@@ -357,11 +377,13 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role:        "nbdkit",
-		LeaseEpoch:  lease_epoch,
-		ResumeEpoch: mapClaimed.Load(),
-		ResumeHeadN: mapHeadN.Load(),
-		ResumeObjN:  mapObjN.Load(),
+		Role:            "nbdkit",
+		LeaseEpoch:      lease_epoch,
+		QualifiedChunks: qualified_chunks,
+		LaunchChunkIDs:  &launchChunkIDs,
+		ResumeEpoch:     mapClaimed.Load(),
+		ResumeHeadN:     mapHeadN.Load(),
+		ResumeObjN:      mapObjN.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -447,6 +469,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	err = vb.RecoverLocalWALs()
 	if err != nil {
+		rememberMapCounters(vb)
 		vb.Detach()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not recover local WALs: %v", err)}
 	}
@@ -690,15 +713,6 @@ func (c *ViperBlockConnection) Close() {
 		slog.Error("Close: DrainToBackend failed", "err", err)
 	}
 
-	defer func() {
-		h, o := c.vb.MapCounters()
-		mapHeadN.Store(max(mapHeadN.Load(), h))
-		mapObjN.Store(max(mapObjN.Load(), o))
-		// A volume this connection converted has heads under this epoch.
-		if c.vb.IsMapDelta() {
-			mapClaimed.Store(true)
-		}
-	}()
 	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
 	} else if err := viperblock.WriteSealReceipt(base_dir, volume); err != nil {
@@ -706,6 +720,7 @@ func (c *ViperBlockConnection) Close() {
 		// costs the consumer a WARN it would otherwise have skipped.
 		slog.Error("Close: could not write seal receipt", "err", err)
 	}
+	rememberMapCounters(c.vb)
 	activeVB = nil
 
 	// Release the volume lock last, after the VB is fully drained and

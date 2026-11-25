@@ -35,8 +35,24 @@ var ErrBackendConfig = errors.New("viperblock: backend config type mismatch")
 // attempt cannot fix, such as a rejected request or a missing DNS name.
 var ErrBackendNonRetryable = errors.New("viperblock: non-retryable backend error")
 
+// ChunkRef names a chunk within one volume. Epoch zero names the legacy key.
+type ChunkRef struct {
+	Epoch uint64
+	ID    uint64
+}
+
+func (r ChunkRef) Key(volume string) string {
+	if r.Epoch == 0 {
+		return GetFilePath(FileTypeChunk, r.ID, volume)
+	}
+	return fmt.Sprintf("%s/chunks/chunk.%020d.%020d.bin", volume, r.Epoch, r.ID)
+}
+
 type Backend interface {
 	Init() error
+	ReadChunkFromCtx(ctx context.Context, volume string, ref ChunkRef, offset, length uint32) ([]byte, error)
+	WriteChunkCtx(ctx context.Context, ref ChunkRef, headers, data *[]byte) error
+	DeleteChunkCtx(ctx context.Context, ref ChunkRef) error
 	InitCtx(ctx context.Context) error
 	Open(fname string) error
 	Read(fileType FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error)

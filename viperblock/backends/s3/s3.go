@@ -421,20 +421,26 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 
 func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
+	return backend.readAtKey(ctx, backend.config.VolumeName, types.GetFilePath(fileType, objectId, backend.config.VolumeName), offset, length)
+}
+
+func (backend *Backend) ReadChunkFromCtx(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
+	return backend.readAtKey(ctx, volume, ref.Key(volume), offset, length)
+}
+
+func (backend *Backend) readAtKey(ctx context.Context, volume, filename string, offset, length uint32) (data []byte, err error) {
 	start := time.Now()
 	defer func() {
 		outcome := "success"
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+		telemetry.RecordBackendIO(ctx, "read", "s3", volume, outcome, len(data), time.Since(start))
 	}()
 
 	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
-
-	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	// Fetch the object from S3 with a byte range
 	requestObject := &s3.GetObjectInput{
@@ -494,6 +500,14 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	return backend.writeAtKey(ctx, types.GetFilePath(fileType, objectId, backend.config.VolumeName), headers, data)
+}
+
+func (backend *Backend) WriteChunkCtx(ctx context.Context, ref types.ChunkRef, headers, data *[]byte) error {
+	return backend.writeAtKey(ctx, ref.Key(backend.config.VolumeName), headers, data)
+}
+
+func (backend *Backend) writeAtKey(ctx context.Context, filename string, headers, data *[]byte) (err error) {
 	start := time.Now()
 	bodyLen := 0
 	defer func() {
@@ -507,8 +521,6 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	if backend.config.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
-
-	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	// Combine headers and data to match file backend behavior
 	// The BlockLookup offsets include header size, so we must write headers+data
@@ -632,6 +644,14 @@ func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err er
 // backend's own volume. wrapNotFound is required here because predastore,
 // unlike real S3, errors on deleting an already-missing key.
 func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
+	return backend.deleteAtKey(ctx, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+}
+
+func (backend *Backend) DeleteChunkCtx(ctx context.Context, ref types.ChunkRef) error {
+	return backend.deleteAtKey(ctx, ref.Key(backend.config.VolumeName))
+}
+
+func (backend *Backend) deleteAtKey(ctx context.Context, filename string) (err error) {
 	start := time.Now()
 	defer func() {
 		outcome := "success"
@@ -644,8 +664,6 @@ func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, 
 	if backend.config.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
-
-	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	_, err = backend.config.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(backend.config.Bucket),
