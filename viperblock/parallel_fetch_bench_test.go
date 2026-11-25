@@ -29,6 +29,7 @@ const (
 // compares how fetches are scheduled rather than local disk speed.
 type pfbDelayBackend struct {
 	types.Backend
+
 	delay time.Duration
 
 	// soloIO, when set, receives one signal per payload read made for a

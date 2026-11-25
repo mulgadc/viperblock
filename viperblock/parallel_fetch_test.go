@@ -542,6 +542,7 @@ func TestFragmentedRead_CancellationDrainsAndAllowsTheNextSoloRead(t *testing.T)
 // own-volume and the source-volume paths.
 type chunkCallCounter struct {
 	types.Backend
+
 	calls atomic.Int64
 }
 
