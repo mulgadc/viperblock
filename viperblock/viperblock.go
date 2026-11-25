@@ -564,6 +564,10 @@ type VB struct {
 	// queue depth as seen from here.
 	readsInFlight atomic.Int64
 
+	// fetchPermits bounds the backend chunk reads this volume runs at once,
+	// shared by every request it is serving.
+	fetchPermits fetchLimiter
+
 	// gcSnapshotSafe/gcSnapshotChecked cache ensureGCSnapshotSafe's result:
 	// whether any snapshot already references this volume. Cached for the
 	// process lifetime once checked; an error leaves gcSnapshotChecked false
@@ -5675,6 +5679,129 @@ func (vb *VB) readRun(ctx context.Context, cb ConsecutiveBlock, extra int, extra
 	return nil
 }
 
+const (
+	// volumeFetchPermits caps the backend chunk reads one volume has in
+	// flight across every request it is serving.
+	volumeFetchPermits = 16
+	// requestFetchWorkers caps the runs one block-store request fetches at once.
+	requestFetchWorkers = 8
+)
+
+// fetchLimiter is a counting semaphore created on first use, so a VB built
+// without New still gets one.
+type fetchLimiter struct {
+	once  sync.Once
+	slots chan struct{}
+}
+
+// acquire fails without a permit when ctx is done, even if a slot is free.
+func (l *fetchLimiter) acquire(ctx context.Context) error {
+	l.once.Do(func() { l.slots = make(chan struct{}, volumeFetchPermits) })
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case l.slots <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		<-l.slots
+		return err
+	}
+	return nil
+}
+
+func (l *fetchLimiter) release() {
+	<-l.slots
+}
+
+// readRunPermitted is readRun holding one of the volume's fetch permits
+// across the chunk header check and the payload read.
+func (vb *VB) readRunPermitted(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, data []byte) error {
+	if err := vb.fetchPermits.acquire(ctx); err != nil {
+		return err
+	}
+	defer vb.fetchPermits.release()
+	start := cb.BlockPosition * uint64(vb.BlockSize)
+	end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
+	return vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end])
+}
+
+// fetchRun logs and reads one block-store run into its slice of data.
+func (vb *VB) fetchRun(ctx context.Context, cb ConsecutiveBlock, extra int, extraSeqNums []uint64, data []byte) error {
+	vb.logger().DebugContext(ctx, "[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
+	return vb.readRunPermitted(ctx, cb, extra, extraSeqNums, data)
+}
+
+// fetchRuns reads every run into its own slice of data. A widened final run
+// publishes its readahead to the cache itself, so it is read only after the
+// others succeed.
+func (vb *VB) fetchRuns(ctx context.Context, runs ConsecutiveBlocks, data []byte, extra int, extraSeqNums []uint64) error {
+	if len(runs) == 0 {
+		return nil
+	}
+	plain := runs
+	if extra > 0 {
+		plain = runs[:len(runs)-1]
+	}
+	if err := vb.fetchRunsBounded(ctx, plain, data); err != nil {
+		return err
+	}
+	if extra > 0 {
+		return vb.fetchRun(ctx, runs[len(runs)-1], extra, extraSeqNums, data)
+	}
+	return nil
+}
+
+// fetchRunsBounded reads runs with up to requestFetchWorkers at once and
+// returns only after every worker has stopped. The first failure cancels the
+// rest and is the error returned.
+func (vb *VB) fetchRunsBounded(ctx context.Context, runs ConsecutiveBlocks, data []byte) error {
+	switch len(runs) {
+	case 0:
+		return nil
+	case 1:
+		return vb.fetchRun(ctx, runs[0], 0, nil, data)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		next     atomic.Int64
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+
+	for range min(len(runs), requestFetchWorkers) {
+		wg.Go(func() {
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(runs) {
+					return
+				}
+				if err := vb.fetchRun(runCtx, runs[i], 0, nil, data); err != nil {
+					fail(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	return firstErr
+}
+
 // checkChunkMagic preflights the first 4 bytes of a chunk file before the
 // body decrypt path runs, so a pre-encryption volume opened under
 // EncryptionEnabled=true fails with a dedicated, actionable
@@ -6685,15 +6812,12 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 	for idx, cb := range consecutiveBlocksToRead {
 		vb.logger().Debug("[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks, "offsetStart", cb.OffsetStart, "offsetEnd", cb.OffsetEnd, "objectID", cb.ObjectID, "objectOffset", cb.ObjectOffset)
 
-		start := cb.BlockPosition * uint64(vb.BlockSize)
-		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
-
 		extra, extraSeqNums := 0, []uint64(nil)
 		if idx == len(consecutiveBlocksToRead)-1 {
 			extra, extraSeqNums = readAheadExtra, readAheadSeqNums
 		}
 
-		if err := vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end]); err != nil {
+		if err := vb.readRunPermitted(ctx, cb, extra, extraSeqNums, data); err != nil {
 			return nil, err
 		}
 	}
@@ -7328,23 +7452,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 		readAheadExtra, readAheadSeqNums = vb.planReadAhead(stream.block, stream.blockRequests, consecutiveBlocksToRead)
 	}
 
-	for idx, cb := range consecutiveBlocksToRead {
-		vb.logger().DebugContext(ctx, "[READ] READING CONSECUTIVE BLOCK:", "startBlock", cb.StartBlock, "numBlocks", cb.NumBlocks)
-
-		start := cb.BlockPosition * uint64(vb.BlockSize)
-		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
-
-		extra, extraSeqNums := 0, []uint64(nil)
-		if idx == len(consecutiveBlocksToRead)-1 {
-			extra, extraSeqNums = readAheadExtra, readAheadSeqNums
-		}
-
-		if err := vb.readRun(ctx, cb, extra, extraSeqNums, data[start:end]); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return vb.fetchRuns(ctx, consecutiveBlocksToRead, data, readAheadExtra, readAheadSeqNums)
 }
 
 // readInheritedBlock serves a single resolved source block without fragmenting larger reads.
@@ -7364,6 +7472,28 @@ func (vb *VB) readInheritedBlock(ctx context.Context, volume string, uuid [4]byt
 	storedOrigin := origin
 	vb.Cache.putFrom(block.StartBlock, block.SeqNum, dst, &storedOrigin)
 	return dst, nil
+}
+
+// readBaseRun checks the chunk header and reads one run from a source volume,
+// holding one of this volume's fetch permits across both reads.
+func (vb *VB) readBaseRun(ctx context.Context, sourceVolume string, cb ConsecutiveBlock, length uint32) ([]byte, error) {
+	if err := vb.fetchPermits.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer vb.fetchPermits.release()
+
+	objectID := cb.ObjectID
+	if err := vb.checkChunkMagic(sourceVolume, objectID, func(off, l uint32) ([]byte, error) {
+		return vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, off, l)
+	}); err != nil {
+		return nil, fmt.Errorf("ReadFrom source %s: %w", sourceVolume, err)
+	}
+
+	blockData, err := vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, cb.ObjectOffset, length)
+	if err != nil {
+		return nil, fmt.Errorf("ReadFrom source %s object %d: %w", sourceVolume, objectID, err)
+	}
+	return blockData, nil
 }
 
 // fetchBaseBlocksFromBackend fetches blocks from the source volume's backend storage.
@@ -7420,16 +7550,9 @@ func (vb *VB) fetchBaseBlocksFromBackend(ctx context.Context, sourceVolume strin
 		start := cb.BlockPosition * uint64(vb.BlockSize)
 		end := start + uint64(cb.NumBlocks)*uint64(vb.BlockSize)
 
-		objectID := cb.ObjectID
-		if err := vb.checkChunkMagic(sourceVolume, objectID, func(off, length uint32) ([]byte, error) {
-			return vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, objectID, off, length)
-		}); err != nil {
-			return fmt.Errorf("ReadFrom source %s: %w", sourceVolume, err)
-		}
-
-		blockData, err := vb.Backend.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, cb.ObjectID, cb.ObjectOffset, consecutiveBlockOffset)
+		blockData, err := vb.readBaseRun(ctx, sourceVolume, cb, consecutiveBlockOffset)
 		if err != nil {
-			return fmt.Errorf("ReadFrom source %s object %d: %w", sourceVolume, cb.ObjectID, err)
+			return err
 		}
 
 		expectedLen := int(consecutiveBlockOffset)
