@@ -3,6 +3,7 @@ package viperblock
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,11 @@ const (
 	pfbWindow      = 256
 	pfbWindows     = pfbFragBlocks / pfbWindow
 	pfbWritesPerOp = 256
+
+	// pfbSoloWidth is the most fetches a sole read keeps in flight on any arm.
+	pfbSoloWidth = 8
+	pfbQuiet     = 25 * time.Millisecond
+	pfbStall     = 10 * time.Second
 )
 
 // pfbDelayBackend adds a fixed delay to every chunk read, so the benchmark
@@ -31,21 +37,40 @@ type pfbDelayBackend struct {
 	types.Backend
 
 	delay time.Duration
-
-	// soloIO, when set, receives one signal per payload read made for a
-	// context carrying pfbSoloKey.
-	soloIO chan struct{}
+	gate  atomic.Pointer[pfbSoloGate]
 }
 
 type pfbSoloKey struct{}
 
+// pfbSoloGate holds every chunk payload read of the tagged sole read until
+// release closes, and signals each held read and each untagged read.
+type pfbSoloGate struct {
+	held    chan struct{}
+	other   chan struct{}
+	release chan struct{}
+}
+
+func newPfbSoloGate() *pfbSoloGate {
+	return &pfbSoloGate{
+		held:    make(chan struct{}, pfbBlocks),
+		other:   make(chan struct{}, pfbBlocks),
+		release: make(chan struct{}),
+	}
+}
+
 var _ types.Backend = (*pfbDelayBackend)(nil)
 
-func (d *pfbDelayBackend) wait(ctx context.Context) error {
-	if d.soloIO != nil && ctx.Value(pfbSoloKey{}) != nil {
-		select {
-		case d.soloIO <- struct{}{}:
-		default:
+func (d *pfbDelayBackend) wait(ctx context.Context, length uint32) error {
+	if g := d.gate.Load(); g != nil && length != 4 {
+		if ctx.Value(pfbSoloKey{}) == nil {
+			g.other <- struct{}{}
+		} else {
+			g.held <- struct{}{}
+			select {
+			case <-g.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 	if d.delay <= 0 {
@@ -67,7 +92,7 @@ func (d *pfbDelayBackend) Read(fileType types.FileType, objectID uint64, offset,
 
 func (d *pfbDelayBackend) ReadCtx(ctx context.Context, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
 	if fileType == types.FileTypeChunk {
-		if err := d.wait(ctx); err != nil {
+		if err := d.wait(ctx, length); err != nil {
 			return nil, err
 		}
 	}
@@ -76,22 +101,25 @@ func (d *pfbDelayBackend) ReadCtx(ctx context.Context, fileType types.FileType, 
 
 func (d *pfbDelayBackend) ReadFromCtx(ctx context.Context, volume string, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
 	if fileType == types.FileTypeChunk {
-		if err := d.wait(ctx); err != nil {
+		if err := d.wait(ctx, length); err != nil {
 			return nil, err
 		}
 	}
 	return d.Backend.ReadFromCtx(ctx, volume, fileType, objectID, offset, length)
 }
 
+// pfbConfig disables every background task, so no engine uploads to the
+// backend while it is open or after it is retired.
 func pfbConfig(name, baseDir string, cacheBlocks int) VB {
 	return VB{
-		VolumeName:      name,
-		VolumeSize:      pfbVolumeBytes,
-		BaseDir:         baseDir,
-		WALSyncInterval: -1,
-		GCEnabled:       false,
-		GCInterval:      -1,
-		Cache:           Cache{Config: CacheConfig{Size: cacheBlocks}},
+		VolumeName:          name,
+		VolumeSize:          pfbVolumeBytes,
+		BaseDir:             baseDir,
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCEnabled:           false,
+		GCInterval:          -1,
+		Cache:               Cache{Config: CacheConfig{Size: cacheBlocks}},
 	}
 }
 
@@ -99,6 +127,37 @@ func pfbOpenWALs(b *testing.B, vb *VB) {
 	b.Helper()
 	require.NoError(b, vb.OpenWAL(&vb.WAL, filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(b, vb.OpenWAL(&vb.BlockToObjectWAL, filepath.Join(vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+}
+
+// pfbRetire closes a writable engine's WAL files without a drain, so its
+// buffered writes never reach the backend.
+func pfbRetire(vb *VB) {
+	for _, w := range []*WAL{&vb.WAL, &vb.BlockToObjectWAL} {
+		w.mu.Lock()
+		for _, f := range w.DB {
+			_ = f.Close()
+		}
+		w.DB = nil
+		w.mu.Unlock()
+	}
+}
+
+// pfbFixture records the size and modification time of every backend file.
+func pfbFixture(b *testing.B, root string) map[string]string {
+	b.Helper()
+	files := map[string]string{}
+	require.NoError(b, filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		files[path] = fmt.Sprintf("%d %d", info.Size(), info.ModTime().UnixNano())
+		return nil
+	}))
+	return files
 }
 
 // pfbSeed writes the even then the odd fragmented blocks, then the contiguous
@@ -144,9 +203,20 @@ func pfbOpen(b *testing.B, root, name string, cacheBlocks int, delay time.Durati
 	require.NoError(b, vb.LoadBlockState())
 	if writable {
 		pfbOpenWALs(b, vb)
+		b.Cleanup(func() { pfbRetire(vb) })
 	}
 	vb.Backend = &pfbDelayBackend{Backend: fb, delay: delay}
 	return vb
+}
+
+// pfbAwait waits for one signal on ch and fails the benchmark after pfbStall.
+func pfbAwait(b *testing.B, ch <-chan struct{}, what string) {
+	b.Helper()
+	select {
+	case <-ch:
+	case <-time.After(pfbStall):
+		b.Fatalf("no %s within %v", what, pfbStall)
+	}
 }
 
 // pfbConcurrent runs n reads at once and fails the benchmark on any error.
@@ -278,15 +348,17 @@ func BenchmarkParallelFetch(b *testing.B) {
 		// Each op is pfbWritesPerOp partial writes to distinct persisted blocks,
 		// so every write's RMW read misses, while 16 readers keep fragmented
 		// 1 MiB reads in flight on the same volume.
+		writeRoot := pfbSeed(b, name)
 		b.Run(prefix+"partial-write-under-frag-load", func(b *testing.B) {
 			b.ReportAllocs()
+			fixture := pfbFixture(b, writeRoot)
 			patch := make([]byte, 512)
 			var vb *VB
 			var stop chan struct{}
 			var wg sync.WaitGroup
 			var bgReads atomic.Int64
 			start := func() {
-				vb = pfbOpen(b, root, name, 0, delay, true)
+				vb = pfbOpen(b, writeRoot, name, 0, delay, true)
 				stop = make(chan struct{})
 				for j := range 16 {
 					wg.Go(func() {
@@ -308,6 +380,7 @@ func BenchmarkParallelFetch(b *testing.B) {
 			halt := func() {
 				close(stop)
 				wg.Wait()
+				pfbRetire(vb)
 			}
 			groups := pfbFragBlocks / pfbWritesPerOp
 			start()
@@ -332,61 +405,106 @@ func BenchmarkParallelFetch(b *testing.B) {
 			b.StopTimer()
 			elapsed := time.Since(began)
 			halt()
+			require.Equal(b, fixture, pfbFixture(b, writeRoot), "a writable engine changed the backend fixture")
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*pfbWritesPerOp), "ns/write")
 			b.ReportMetric(float64(bgReads.Load())/elapsed.Seconds(), "bg-reads/s")
 		})
 
-		// Each op starts a sole cold fragmented 1 MiB read, waits until it is in
-		// backend I/O, then times one arriving operation on another block.
-		arrival := func(caseName string, writable bool, arrive func(vb *VB, op int) error) {
+		// Each op starts a sole cold fragmented 1 MiB read and holds its chunk
+		// payload reads. Once the held group is complete, it starts one timed
+		// operation and releases the group when that operation reaches the backend.
+		arrival := func(caseName string, opRoot string, writable bool, arrive func(vb *VB, op int) error) {
 			b.Run(prefix+caseName, func(b *testing.B) {
 				b.ReportAllocs()
+				fixture := pfbFixture(b, opRoot)
 				open := func() (*VB, *pfbDelayBackend) {
-					vb := pfbOpen(b, root, name, 0, delay, writable)
-					db := vb.Backend.(*pfbDelayBackend)
-					db.soloIO = make(chan struct{}, 1)
-					return vb, db
+					vb := pfbOpen(b, opRoot, name, 0, delay, writable)
+					return vb, vb.Backend.(*pfbDelayBackend)
 				}
 				vb, db := open()
 				soloCtx := context.WithValue(ctx, pfbSoloKey{}, true)
 				var arrivalTotal time.Duration
+				widths := map[int]int{}
 				op := 0
 				for b.Loop() {
 					if op > 0 && op%pfbFragBlocks == 0 {
 						b.StopTimer()
+						if writable {
+							pfbRetire(vb)
+						}
 						vb, db = open()
 						b.StartTimer()
 					}
-					select {
-					case <-db.soloIO:
-					default:
-					}
+					gate := newPfbSoloGate()
+					db.gate.Store(gate)
 					soloDone := make(chan error, 1)
 					go func() {
 						_, err := vb.ReadAtCtx(soloCtx, uint64(op%pfbWindows)*window, window)
 						soloDone <- err
 					}()
-					<-db.soloIO
+
+					b.StopTimer()
+					pfbAwait(b, gate.held, "held solo fetch")
+					width := 1
+				settle:
+					for width < pfbSoloWidth {
+						select {
+						case <-gate.held:
+							width++
+						case <-time.After(pfbQuiet):
+							break settle
+						}
+					}
+					if width != 1 && width != pfbSoloWidth {
+						close(gate.release)
+						b.Fatalf("the sole read held %d fetches; want 1 or %d", width, pfbSoloWidth)
+					}
+					widths[width]++
+					b.StartTimer()
+
 					began := time.Now()
-					if err := arrive(vb, op); err != nil {
-						b.Fatal(err)
+					arrived := make(chan error, 1)
+					go func() { arrived <- arrive(vb, op) }()
+					pfbAwait(b, gate.other, "arriving backend read")
+					close(gate.release)
+					select {
+					case err := <-arrived:
+						if err != nil {
+							b.Fatal(err)
+						}
+					case <-time.After(pfbStall):
+						b.Fatalf("arriving operation did not finish within %v", pfbStall)
 					}
 					arrivalTotal += time.Since(began)
-					if err := <-soloDone; err != nil {
-						b.Fatal(err)
+					select {
+					case err := <-soloDone:
+						if err != nil {
+							b.Fatal(err)
+						}
+					case <-time.After(pfbStall):
+						b.Fatalf("sole read did not finish within %v", pfbStall)
 					}
+					db.gate.Store(nil)
 					op++
+				}
+				if writable {
+					pfbRetire(vb)
+				}
+				require.Equal(b, fixture, pfbFixture(b, opRoot), "a writable engine changed the backend fixture")
+				require.Len(b, widths, 1, "the sole read changed width between ops: %v", widths)
+				for width := range widths {
+					b.ReportMetric(float64(width), "solo-width")
 				}
 				b.ReportMetric(float64(arrivalTotal.Nanoseconds())/float64(b.N), "arrival-ns/op")
 			})
 		}
-		arrival("arrival-miss-4KiB", false, func(vb *VB, op int) error {
+		arrival("arrival-miss-4KiB", root, false, func(vb *VB, op int) error {
 			block := uint64(pfbFragBlocks + op%pfbFragBlocks)
 			_, err := vb.ReadAtCtx(ctx, block*bs, bs)
 			return err
 		})
 		patch := make([]byte, 512)
-		arrival("arrival-partial-write", true, func(vb *VB, op int) error {
+		arrival("arrival-partial-write", pfbSeed(b, name), true, func(vb *VB, op int) error {
 			block := uint64(pfbFragBlocks + op%pfbFragBlocks)
 			return vb.WriteAt(block*bs+512, patch)
 		})
