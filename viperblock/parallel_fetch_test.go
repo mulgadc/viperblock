@@ -19,12 +19,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The fan-out a default block-store read may reach: per request, and across
-// every request one volume is serving at once. Legacy reads stay serial.
-const (
-	fragRequestFetchBound = 8
-	fragVolumeFetchBound  = 16
-)
+// fragRequestFetchBound is the fan-out a sole default block-store read may
+// reach. Competing, legacy and inherited reads stay serial.
+const fragRequestFetchBound = 8
 
 const (
 	fragVolumeBytes = 16 << 20
@@ -391,55 +388,13 @@ func TestFragmentedRead_OverlapsRunsOfOneRequest(t *testing.T) {
 	}
 }
 
-// TestFragmentedRead_BoundIsSharedAcrossRequests pins that simultaneous
-// requests to one volume share one fetch bound, rather than each bringing
-// its own, and that the bound is returned for the next round.
-func TestFragmentedRead_BoundIsSharedAcrossRequests(t *testing.T) {
-	const requests = 4
-	root, written := seedFragmentedVolume(t, "vol-frag-shared", nil)
-	reader, gate := fragReader(t, root, "vol-frag-shared", nil, 0, true, fragVolumeFetchBound)
-	bs := uint64(DefaultBlockSize)
-	length := uint64(fragRequestBlocks) * bs
-
-	for round := range 2 {
-		if round > 0 {
-			gate.mu.Lock()
-			gate.release, gate.released, gate.peak = make(chan struct{}), false, 0
-			gate.reqPeak = map[int]int{}
-			gate.mu.Unlock()
-		}
-		var wg sync.WaitGroup
-		errs := make([]error, requests)
-		got := make([][]byte, requests)
-		for r := range requests {
-			wg.Go(func() {
-				ctx := context.WithValue(context.Background(), fragRequestKey{}, r+1)
-				got[r], errs[r] = reader.ReadAtCtx(ctx, uint64(r)*length, length)
-			})
-		}
-		wg.Wait()
-
-		for r := range requests {
-			require.NoErrorf(t, errs[r], "round %d request %d", round, r)
-			require.Equalf(t, written[uint64(r)*length:uint64(r+1)*length], got[r], "round %d request %d bytes", round, r)
-		}
-		peak, reqPeak, fellBack := gate.snapshot()
-		assert.Falsef(t, fellBack, "round %d: the volume bound was never reached", round)
-		assert.Equalf(t, fragVolumeFetchBound, peak,
-			"round %d: %d requests of %d runs should share %d fetches", round, requests, fragRequestBlocks, fragVolumeFetchBound)
-		for r, p := range reqPeak {
-			assert.LessOrEqualf(t, p, fragRequestFetchBound, "round %d request %d exceeded the per-request bound", round, r)
-		}
-	}
-}
-
 // TestFragmentedRead_ColdEncryptedHeadersPrecedePayload pins that, with two
 // requests touching the same cold chunks, no run is fetched before its chunk
 // header has been checked. Duplicate header reads are logged, not asserted.
 func TestFragmentedRead_ColdEncryptedHeadersPrecedePayload(t *testing.T) {
 	key := testKey(t, 0x6b)
 	root, written := seedFragmentedVolume(t, "vol-frag-hdr", key)
-	reader, gate := fragReader(t, root, "vol-frag-hdr", key, 0, true, 2*fragRequestFetchBound)
+	reader, gate := fragReader(t, root, "vol-frag-hdr", key, 0, true, 2)
 	bs := uint64(DefaultBlockSize)
 	length := uint64(fragRequestBlocks) * bs
 
@@ -465,9 +420,8 @@ func TestFragmentedRead_ColdEncryptedHeadersPrecedePayload(t *testing.T) {
 	assert.Len(t, headers, 2, "the request spans exactly two chunks")
 	t.Logf("header reads per chunk: %v", headers)
 
-	peak, _, fellBack := gate.snapshot()
+	_, _, fellBack := gate.snapshot()
 	assert.False(t, fellBack, "two cold encrypted requests never overlapped")
-	assert.Equal(t, 2*fragRequestFetchBound, peak)
 }
 
 // TestFragmentedRead_BadHeaderFailsBeforeDecrypt pins that a chunk whose
@@ -496,7 +450,8 @@ func TestFragmentedRead_BadHeaderFailsBeforeDecrypt(t *testing.T) {
 
 // TestFragmentedRead_FailedRunFailsTheRequestAndDrains pins that a failing or
 // short run fails the whole request, that the read waits for its other
-// fetches before returning, publishes nothing, and leaves the bound whole.
+// fetches before returning, publishes nothing, and that the next sole read
+// still fans out.
 func TestFragmentedRead_FailedRunFailsTheRequestAndDrains(t *testing.T) {
 	root, written := seedFragmentedVolume(t, "vol-frag-fail", nil)
 	cases := []struct {
@@ -527,7 +482,7 @@ func TestFragmentedRead_FailedRunFailsTheRequestAndDrains(t *testing.T) {
 					assert.Zero(t, reader.cachedBlocks(), "a failed request published cache entries")
 				})
 
-				t.Run("bound-returned", func(t *testing.T) {
+				t.Run("next-solo-read", func(t *testing.T) {
 					gate.mu.Lock()
 					gate.failErr, gate.returned, gate.peak = nil, false, 0
 					gate.release, gate.released, gate.fellBack = make(chan struct{}), false, false
@@ -549,10 +504,10 @@ func TestFragmentedRead_FailedRunFailsTheRequestAndDrains(t *testing.T) {
 	}
 }
 
-// TestFragmentedRead_CancellationDrainsAndReturnsTheBound pins that
+// TestFragmentedRead_CancellationDrainsAndAllowsTheNextSoloRead pins that
 // cancelling a request ends its held fetches, returns only after they end,
-// publishes nothing, and leaves the bound whole for the next request.
-func TestFragmentedRead_CancellationDrainsAndReturnsTheBound(t *testing.T) {
+// publishes nothing, and that the next sole read still fans out.
+func TestFragmentedRead_CancellationDrainsAndAllowsTheNextSoloRead(t *testing.T) {
 	root, written := seedFragmentedVolume(t, "vol-frag-cancel", nil)
 	for _, mode := range []fragReadMode{fragReadModes[0], fragReadModes[2]} {
 		t.Run(mode.name, func(t *testing.T) {
@@ -583,7 +538,7 @@ func TestFragmentedRead_CancellationDrainsAndReturnsTheBound(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, written[:length], got)
 			peak, _, fellBack := gate.snapshot()
-			assert.False(t, fellBack, "the bound was not returned after cancellation")
+			assert.False(t, fellBack, "the next sole read did not fan out after cancellation")
 			assert.Equal(t, mode.fetchTarget(), peak)
 
 			gate.mu.Lock()
@@ -650,8 +605,7 @@ func admissionReads() []admissionRead {
 }
 
 // TestFetchAdmission_DoneContextMakesNoBackendCall pins that a read whose
-// context is done never reaches the backend, with permits free or all held,
-// and that a read waiting on a full volume ends at its deadline.
+// context is already canceled or past its deadline never reaches the backend.
 func TestFetchAdmission_DoneContextMakesNoBackendCall(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -660,17 +614,11 @@ func TestFetchAdmission_DoneContextMakesNoBackendCall(t *testing.T) {
 
 	cases := []struct {
 		name string
-		held bool
-		ctx  func() (context.Context, context.CancelFunc)
+		ctx  context.Context
 		want error
 	}{
-		{"canceled/free", false, func() (context.Context, context.CancelFunc) { return canceled, func() {} }, context.Canceled},
-		{"canceled/held", true, func() (context.Context, context.CancelFunc) { return canceled, func() {} }, context.Canceled},
-		{"expired/free", false, func() (context.Context, context.CancelFunc) { return expired, func() {} }, context.DeadlineExceeded},
-		{"expired/held", true, func() (context.Context, context.CancelFunc) { return expired, func() {} }, context.DeadlineExceeded},
-		{"expires-waiting/held", true, func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), 50*time.Millisecond)
-		}, context.DeadlineExceeded},
+		{"canceled", canceled, context.Canceled},
+		{"expired", expired, context.DeadlineExceeded},
 	}
 	for _, read := range admissionReads() {
 		for _, tc := range cases {
@@ -679,21 +627,9 @@ func TestFetchAdmission_DoneContextMakesNoBackendCall(t *testing.T) {
 				counter := &chunkCallCounter{Backend: vb.Backend}
 				vb.Backend = counter
 
-				if tc.held {
-					for range fragVolumeFetchBound {
-						require.NoError(t, vb.fetchPermits.acquire(context.Background()))
-					}
-				}
-				ctx, done := tc.ctx()
-				_, err := vb.ReadAtCtx(ctx, 0, length)
-				done()
+				_, err := vb.ReadAtCtx(tc.ctx, 0, length)
 				require.ErrorIs(t, err, tc.want)
 				assert.Zero(t, counter.calls.Load(), "a read with a done context reached the backend")
-				if tc.held {
-					for range fragVolumeFetchBound {
-						vb.fetchPermits.release()
-					}
-				}
 
 				got, err := vb.ReadAtCtx(context.Background(), 0, length)
 				require.NoError(t, err)
@@ -791,6 +727,352 @@ func TestFragmentedRead_WidenedTailRunsAfterTheOtherRuns(t *testing.T) {
 			gate.mu.Lock()
 			defer gate.mu.Unlock()
 			assert.Equal(t, []payloadRead{{object, offset, (lastBlock - tailBlock) * reader.blockStride(), 0}}, gate.payloads)
+		})
+	}
+}
+
+// chunkCall is one chunk read as the backend saw it.
+type chunkCall struct {
+	req      int
+	objectID uint64
+	offset   uint32
+	header   bool
+}
+
+// scriptedBackend passes every chunk read to test hooks, tagged with the
+// request id in its context, and tracks payload reads in flight per request.
+type scriptedBackend struct {
+	types.Backend
+
+	mu       sync.Mutex
+	inflight map[int]int
+	peak     map[int]int
+	payloads map[int]int
+	headers  map[int]int
+	arrived  chan chunkCall
+
+	// onPayload may block; a non-nil error fails the read without the backend.
+	onPayload func(ctx context.Context, c chunkCall) error
+	// afterHeader runs after a successful header read returns from the backend.
+	afterHeader func(c chunkCall)
+}
+
+var _ types.Backend = (*scriptedBackend)(nil)
+
+func newScriptedBackend(inner types.Backend) *scriptedBackend {
+	return &scriptedBackend{
+		Backend:  inner,
+		inflight: map[int]int{},
+		peak:     map[int]int{},
+		payloads: map[int]int{},
+		headers:  map[int]int{},
+		arrived:  make(chan chunkCall, 4096),
+	}
+}
+
+func (s *scriptedBackend) chunk(ctx context.Context, objectID uint64, offset, length uint32, read func() ([]byte, error)) ([]byte, error) {
+	req, _ := ctx.Value(fragRequestKey{}).(int)
+	c := chunkCall{req: req, objectID: objectID, offset: offset, header: offset == 0 && length == 4}
+	if c.header {
+		data, err := read()
+		s.mu.Lock()
+		s.headers[req]++
+		s.mu.Unlock()
+		if err == nil && s.afterHeader != nil {
+			s.afterHeader(c)
+		}
+		return data, err
+	}
+
+	s.mu.Lock()
+	s.payloads[req]++
+	s.inflight[req]++
+	s.peak[req] = max(s.peak[req], s.inflight[req])
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.inflight[req]--
+		s.mu.Unlock()
+	}()
+	s.arrived <- c
+	if s.onPayload != nil {
+		if err := s.onPayload(ctx, c); err != nil {
+			return nil, err
+		}
+	}
+	return read()
+}
+
+func (s *scriptedBackend) Read(fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	return s.ReadCtx(context.Background(), fileType, objectID, offset, length)
+}
+
+func (s *scriptedBackend) ReadCtx(ctx context.Context, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	if fileType != types.FileTypeChunk {
+		return s.Backend.ReadCtx(ctx, fileType, objectID, offset, length)
+	}
+	return s.chunk(ctx, objectID, offset, length, func() ([]byte, error) {
+		return s.Backend.ReadCtx(ctx, fileType, objectID, offset, length)
+	})
+}
+
+func (s *scriptedBackend) ReadFromCtx(ctx context.Context, volume string, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	if fileType != types.FileTypeChunk {
+		return s.Backend.ReadFromCtx(ctx, volume, fileType, objectID, offset, length)
+	}
+	return s.chunk(ctx, objectID, offset, length, func() ([]byte, error) {
+		return s.Backend.ReadFromCtx(ctx, volume, fileType, objectID, offset, length)
+	})
+}
+
+func (s *scriptedBackend) stat(req int) (inflight, peak, payloads, headers int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inflight[req], s.peak[req], s.payloads[req], s.headers[req]
+}
+
+// awaitPayload waits for the next payload read of req, skipping other requests.
+func (s *scriptedBackend) awaitPayload(t *testing.T, req int) chunkCall {
+	t.Helper()
+	timer := time.NewTimer(gateFallback)
+	defer timer.Stop()
+	for {
+		select {
+		case c := <-s.arrived:
+			if c.req == req {
+				return c
+			}
+		case <-timer.C:
+			t.Fatalf("request %d made no payload read within %v", req, gateFallback)
+		}
+	}
+}
+
+// quietFor reports whether req starts no payload read within d. Absence can
+// only be shown over a window, so callers keep d short.
+func (s *scriptedBackend) quietFor(req int, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		select {
+		case c := <-s.arrived:
+			if c.req == req {
+				return false
+			}
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+// holdFor blocks until ch is closed or a token arrives, bounded by the gate
+// fallback so a broken scheduler fails the test rather than hanging it.
+func holdFor(ch <-chan struct{}) {
+	timer := time.NewTimer(gateFallback)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+	}
+}
+
+const quietWindow = 25 * time.Millisecond
+
+func openFragWALs(t *testing.T, vb *VB) {
+	t.Helper()
+	require.NoError(t, vb.OpenWAL(&vb.WAL, filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
+	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, filepath.Join(vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
+}
+
+// TestFragmentedRead_SoloFanOutYieldsToCompetitors pins that a sole read fans
+// out to the per-request bound, that a competitor arriving meanwhile runs its
+// own fetches serially, and that the sole read finishes serially after that.
+func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
+	const volumeName = "vol-frag-solo"
+	root, written := seedFragmentedVolume(t, volumeName, nil)
+	bs := uint64(DefaultBlockSize)
+	length := uint64(fragRequestBlocks) * bs
+	patch := bytes.Repeat([]byte{0xa5}, 512)
+	const rmwBlock = 41
+
+	competitors := []struct {
+		name  string
+		run   func(ctx context.Context, vb *VB) error
+		check func(t *testing.T, vb *VB)
+	}{
+		{"fragmented-read", func(ctx context.Context, vb *VB) error {
+			got, err := vb.ReadAtCtx(ctx, 2*length, length)
+			if err == nil && !bytes.Equal(written[2*length:3*length], got) {
+				return errors.New("competitor bytes differ")
+			}
+			return err
+		}, nil},
+		{"single-run-read", func(ctx context.Context, vb *VB) error {
+			got, err := vb.ReadAtCtx(ctx, 40*bs, bs)
+			if err == nil && !bytes.Equal(written[40*bs:41*bs], got) {
+				return errors.New("competitor bytes differ")
+			}
+			return err
+		}, nil},
+		{"partial-write-rmw", func(ctx context.Context, vb *VB) error {
+			return vb.WriteAtCtx(ctx, rmwBlock*bs+512, patch)
+		}, func(t *testing.T, vb *VB) {
+			want := bytes.Clone(written[rmwBlock*bs : (rmwBlock+1)*bs])
+			copy(want[512:], patch)
+			got, err := vb.ReadAtCtx(context.Background(), rmwBlock*bs, bs)
+			require.NoError(t, err)
+			require.Equal(t, want, got, "the RMW lost the bytes around its patch")
+		}},
+	}
+
+	for _, comp := range competitors {
+		t.Run(comp.name, func(t *testing.T) {
+			reader, _ := fragReader(t, root, volumeName, nil, 0, true, 1)
+			openFragWALs(t, reader)
+			sb := newScriptedBackend(reader.Backend)
+			reader.Backend = sb
+
+			soloHold := make(chan struct{})
+			soloTokens := make(chan struct{})
+			compHold := make(chan struct{})
+			var serialPhase atomic.Bool
+			sb.onPayload = func(_ context.Context, c chunkCall) error {
+				switch {
+				case c.req == 1 && serialPhase.Load():
+					holdFor(soloTokens)
+				case c.req == 1:
+					holdFor(soloHold)
+				case c.req == 2:
+					holdFor(compHold)
+				}
+				return nil
+			}
+
+			soloDone := make(chan error, 1)
+			var soloGot []byte
+			go func() {
+				var err error
+				soloGot, err = reader.ReadAtCtx(context.WithValue(context.Background(), fragRequestKey{}, 1), 0, length)
+				soloDone <- err
+			}()
+			for range fragRequestFetchBound {
+				sb.awaitPayload(t, 1)
+			}
+			assert.True(t, sb.quietFor(1, quietWindow), "a sole read fanned out past the per-request bound")
+
+			compDone := make(chan error, 1)
+			go func() {
+				compDone <- comp.run(context.WithValue(context.Background(), fragRequestKey{}, 2), reader)
+			}()
+			sb.awaitPayload(t, 2)
+			sb.quietFor(2, quietWindow)
+			_, compPeak, _, _ := sb.stat(2)
+			assert.Equal(t, 1, compPeak, "a competitor of a sole read fanned out")
+
+			// Release the sole group with runs left while the competitor is held.
+			serialPhase.Store(true)
+			close(soloHold)
+			serialPeak := 0
+		drain:
+			for {
+				select {
+				case c := <-sb.arrived:
+					if c.req != 1 {
+						continue
+					}
+					sb.quietFor(1, quietWindow)
+					inflight, _, _, _ := sb.stat(1)
+					serialPeak = max(serialPeak, inflight)
+					select {
+					case soloTokens <- struct{}{}:
+					case <-time.After(gateFallback):
+					}
+				case err := <-soloDone:
+					require.NoError(t, err)
+					break drain
+				}
+			}
+			assert.Equal(t, 1, serialPeak, "the sole read kept extra fetchers while a competitor was active")
+			require.Equal(t, written[:length], soloGot)
+
+			close(compHold)
+			require.NoError(t, <-compDone)
+			_, compPeak, _, _ = sb.stat(2)
+			assert.Equal(t, 1, compPeak, "a competitor of a sole read fanned out")
+			if comp.check != nil {
+				comp.check(t, reader)
+			}
+		})
+	}
+}
+
+// TestFragmentedReadInto_FailureWaitsForAHeldFetcher pins that when a run
+// fails, ReadAtInto returns the original error only after a fetcher stuck in
+// a backend call that ignores cancellation has finished with the buffer.
+func TestFragmentedReadInto_FailureWaitsForAHeldFetcher(t *testing.T) {
+	const volumeName = "vol-frag-into"
+	root, _ := seedFragmentedVolume(t, volumeName, nil)
+	reader, _ := fragReader(t, root, volumeName, nil, 0, true, 1)
+	sb := newScriptedBackend(reader.Backend)
+	reader.Backend = sb
+	bs := uint64(DefaultBlockSize)
+
+	holdObject, holdOffset := locate(t, reader, 0)
+	failObject, failOffset := locate(t, reader, 1)
+	held, failed, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	sb.onPayload = func(_ context.Context, c chunkCall) error {
+		switch {
+		case c.objectID == holdObject && c.offset == holdOffset:
+			close(held)
+			holdFor(release)
+		case c.objectID == failObject && c.offset == failOffset:
+			holdFor(held)
+			close(failed)
+			return errInjectedRun
+		}
+		return nil
+	}
+
+	dst := make([]byte, uint64(fragRequestBlocks)*bs)
+	done := make(chan error, 1)
+	go func() { done <- reader.ReadAtInto(0, dst) }()
+	holdFor(failed)
+	select {
+	case err := <-done:
+		t.Fatalf("ReadAtInto returned %v while a fetcher still held its buffer", err)
+	case <-time.After(quietWindow):
+	}
+	close(release)
+	err := <-done
+	require.ErrorIs(t, err, errInjectedRun)
+	assert.NotErrorIs(t, err, context.Canceled, "a canceled sibling replaced the original error")
+	inflight, _, _, _ := sb.stat(0)
+	assert.Zero(t, inflight, "ReadAtInto returned with a backend call still running")
+}
+
+// TestFetch_CancelDuringHeaderMakesNoPayloadCall pins that a request canceled
+// while its chunk header read succeeds does not go on to fetch the payload,
+// on own-volume and inherited reads.
+func TestFetch_CancelDuringHeaderMakesNoPayloadCall(t *testing.T) {
+	for _, read := range admissionReads() {
+		t.Run(read.name, func(t *testing.T) {
+			vb, length, want := read.open(t)
+			sb := newScriptedBackend(vb.Backend)
+			vb.Backend = sb
+			ctx, cancel := context.WithCancel(context.WithValue(context.Background(), fragRequestKey{}, 1))
+			defer cancel()
+			sb.afterHeader = func(chunkCall) { cancel() }
+
+			_, err := vb.ReadAtCtx(ctx, 0, length)
+			require.ErrorIs(t, err, context.Canceled)
+			_, _, payloads, headers := sb.stat(1)
+			require.Positive(t, headers, "the read never checked a chunk header")
+			assert.Zero(t, payloads, "a canceled read fetched a payload after its header check")
+
+			sb.afterHeader = nil
+			got, err := vb.ReadAtCtx(context.Background(), 0, length)
+			require.NoError(t, err)
+			require.Equal(t, want, got)
 		})
 	}
 }
