@@ -46,18 +46,18 @@ type fragRequestKey struct{}
 type fetchGate struct {
 	types.Backend
 
-	mu          sync.Mutex
-	target      int
-	release     chan struct{}
-	released    bool
-	fellBack    bool
-	inflight    int
-	peak        int
-	starts      int
-	ends        int
-	returned    bool
-	late        int
-	arrived     chan struct{}
+	mu       sync.Mutex
+	target   int
+	release  chan struct{}
+	released bool
+	fellBack bool
+	inflight int
+	peak     int
+	starts   int
+	ends     int
+	returned bool
+	late     int
+	arrived  chan struct{}
 
 	headerReads   map[uint64]int
 	headerOK      map[uint64]bool
