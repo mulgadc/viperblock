@@ -1076,3 +1076,42 @@ func TestFetch_CancelDuringHeaderMakesNoPayloadCall(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchRuns_UntrackedCallStaysSerial pins that fan-out needs exactly one
+// tracked read: a direct call with no read in flight fetches its runs serially.
+func TestFetchRuns_UntrackedCallStaysSerial(t *testing.T) {
+	const volumeName = "vol-frag-untracked"
+	root, written := seedFragmentedVolume(t, volumeName, nil)
+	reader, _ := fragReader(t, root, volumeName, nil, 0, true, 1)
+	sb := newScriptedBackend(reader.Backend)
+	reader.Backend = sb
+	bs := uint64(DefaultBlockSize)
+
+	runs := make(ConsecutiveBlocks, fragRequestBlocks)
+	for i := range runs {
+		objectID, offset := locate(t, reader, uint64(i))
+		runs[i] = ConsecutiveBlock{BlockPosition: uint64(i), StartBlock: uint64(i), NumBlocks: 1, ObjectID: objectID, ObjectOffset: offset}
+	}
+	first := make(chan struct{})
+	var once sync.Once
+	sb.onPayload = func(context.Context, chunkCall) error {
+		held := false
+		once.Do(func() { held = true })
+		if held {
+			holdFor(first)
+		}
+		return nil
+	}
+
+	require.Zero(t, reader.readsInFlight.Load())
+	data := make([]byte, uint64(fragRequestBlocks)*bs)
+	done := make(chan error, 1)
+	go func() { done <- reader.fetchRunsBounded(context.Background(), runs, data) }()
+	sb.awaitPayload(t, 0)
+	assert.True(t, sb.quietFor(0, quietWindow), "an untracked call fanned out")
+	close(first)
+	require.NoError(t, <-done)
+	require.Equal(t, written[:len(data)], data)
+	_, peak, _, _ := sb.stat(0)
+	assert.Equal(t, 1, peak)
+}
