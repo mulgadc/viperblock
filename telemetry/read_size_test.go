@@ -126,11 +126,6 @@ func childOnly(t *testing.T) *sdkmetric.ManualReader {
 	return reader
 }
 
-type sample struct {
-	fileType, source, volume string
-	size                     float64
-}
-
 func collect(t *testing.T, reader *sdkmetric.ManualReader) (map[string]metricdata.Aggregation, []metricdata.HistogramDataPoint[int64]) {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
