@@ -893,3 +893,29 @@ func TestMapDelta_ResumeStartsAtTheEarlierEnginesCounters(t *testing.T) {
 	assert.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN+7),
 		"a number the earlier engine may have sent is never reused")
 }
+
+func TestMapClaimRetryKeepsConsumedHeadWhenPreviousEpochIsVisible(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	seed.Detach()
+
+	first, fault := mv.engine(t, 6)
+	require.NoError(t, first.LoadState())
+	require.NoError(t, first.LoadLiveCheckpoint())
+	fault.failHead.Store(true)
+	require.Error(t, first.ClaimMapCtx(t.Context()))
+	headN, objN := first.MapCounters()
+	require.EqualValues(t, 1, headN)
+	first.Detach()
+
+	retry, _ := mv.engine(t, 6)
+	retry.ResumeEpoch = true
+	retry.ResumeHeadN = headN
+	retry.ResumeObjN = objN
+	require.NoError(t, retry.LoadState())
+	require.NoError(t, retry.LoadLiveCheckpoint())
+	require.NoError(t, retry.ClaimMapCtx(t.Context()))
+
+	require.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN))
+	require.NotContains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, 0))
+}
