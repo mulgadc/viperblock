@@ -588,6 +588,8 @@ In-memory storage for unit tests and benchmarks. All data is lost on process exi
 
 Stores chunks in any S3-compatible object storage. Designed to work with [Predastore](https://github.com/mulgadc/predastore) as part of the Spinifex stack, but compatible with AWS S3 or other implementations.
 
+A chunk PUT carries the CRC64NVME of its body in `x-amz-checksum-crc64nvme` and the header `X-Spinifex-Ebs: true`, on a plain body with `UNSIGNED-PAYLOAD`. Predastore then checks the chunk with that checksum and computes no MD5, because nothing reads a chunk's ETag; its ETag is not an MD5. Any endpoint must accept both headers: AWS S3 verifies the checksum and ignores the second header. Checkpoints, snapshot markers and config are sent without either.
+
 Key optimizations:
 - **HTTP/2**: Connection multiplexing reduces TLS handshake overhead
 - **Connection pooling**: 200 max idle connections per host, 120s idle timeout

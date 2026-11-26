@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +28,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/minio/crc64nvme"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -421,21 +424,29 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 
 func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
-	return backend.readAtKey(ctx, backend.config.VolumeName, types.GetFilePath(fileType, objectId, backend.config.VolumeName), offset, length)
+	return backend.readAtKey(ctx, fileType, backend.config.VolumeName, types.GetFilePath(fileType, objectId, backend.config.VolumeName), offset, length)
 }
 
 func (backend *Backend) ReadChunkFromCtx(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
-	return backend.readAtKey(ctx, volume, ref.Key(volume), offset, length)
+	return backend.readAtKey(ctx, types.FileTypeChunk, volume, ref.Key(volume), offset, length)
 }
 
-func (backend *Backend) readAtKey(ctx context.Context, volume, filename string, offset, length uint32) (data []byte, err error) {
+func (backend *Backend) readAtKey(ctx context.Context, fileType types.FileType, volume, filename string, offset, length uint32) (data []byte, err error) {
 	start := time.Now()
+	served := -1
 	defer func() {
 		outcome := "success"
 		if err != nil {
 			outcome = "error"
 		}
 		telemetry.RecordBackendIO(ctx, "read", "s3", volume, outcome, len(data), time.Since(start))
+		if served >= 0 {
+			origin := "own"
+			if volume != backend.config.VolumeName {
+				origin = "inherited"
+			}
+			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), origin, volume, served)
+		}
 	}()
 
 	if backend.config.s3Client == nil {
@@ -466,6 +477,9 @@ func (backend *Backend) readAtKey(ctx context.Context, volume, filename string, 
 	defer textResult.Body.Close()
 
 	res, err := io.ReadAll(textResult.Body)
+	if telemetry.ReadSizeOn() {
+		served = requestedSize(length, len(res))
+	}
 
 	if err != nil {
 		return nil, err
@@ -500,14 +514,14 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
-	return backend.writeAtKey(ctx, types.GetFilePath(fileType, objectId, backend.config.VolumeName), headers, data)
+	return backend.writeAtKey(ctx, fileType, types.GetFilePath(fileType, objectId, backend.config.VolumeName), headers, data)
 }
 
 func (backend *Backend) WriteChunkCtx(ctx context.Context, ref types.ChunkRef, headers, data *[]byte) error {
-	return backend.writeAtKey(ctx, ref.Key(backend.config.VolumeName), headers, data)
+	return backend.writeAtKey(ctx, types.FileTypeChunk, ref.Key(backend.config.VolumeName), headers, data)
 }
 
-func (backend *Backend) writeAtKey(ctx context.Context, filename string, headers, data *[]byte) (err error) {
+func (backend *Backend) writeAtKey(ctx context.Context, fileType types.FileType, filename string, headers, data *[]byte) (err error) {
 	start := time.Now()
 	bodyLen := 0
 	defer func() {
@@ -540,14 +554,7 @@ func (backend *Backend) writeAtKey(ctx context.Context, filename string, headers
 	}
 	bodyLen = len(body)
 
-	// Create a new S3 object
-	object := &s3.PutObjectInput{
-		Bucket: aws.String(backend.config.Bucket),
-		Key:    aws.String(filename),
-		Body:   bytes.NewReader(body),
-	}
-
-	_, err = backend.config.s3Client.PutObject(ctx, object)
+	_, err = backend.putObject(ctx, fileType, filename, body)
 
 	if err != nil {
 		err = classifyWriteErr(err)
@@ -556,6 +563,27 @@ func (backend *Backend) writeAtKey(ctx context.Context, filename string, headers
 	}
 
 	return nil
+}
+
+// ebsOptIn tells predastore a chunk carries its CRC64NVME and that nothing
+// reads its ETag, so it is checked with that checksum instead of hashed with MD5.
+var ebsOptIn = smithyhttp.AddHeaderValue("X-Spinifex-Ebs", "true")
+
+// putObject stores one buffered object. A chunk also carries its CRC64NVME,
+// which costs a fraction of a millisecond here and spares the server an MD5.
+func (backend *Backend) putObject(ctx context.Context, fileType types.FileType, key string, body []byte) (*s3.PutObjectOutput, error) {
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(body),
+	}
+	if fileType != types.FileTypeChunk {
+		return backend.config.s3Client.PutObject(ctx, in)
+	}
+	sum := make([]byte, 8)
+	binary.BigEndian.PutUint64(sum, crc64nvme.Checksum(body))
+	in.ChecksumCRC64NVME = aws.String(base64.StdEncoding.EncodeToString(sum))
+	return backend.config.s3Client.PutObject(ctx, in, s3.WithAPIOptions(ebsOptIn))
 }
 
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
@@ -587,6 +615,9 @@ func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, file
 	defer textResult.Body.Close()
 
 	res, err := io.ReadAll(textResult.Body)
+	if telemetry.ReadSizeOn() {
+		telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "inherited", volumeName, requestedSize(length, len(res)))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -620,13 +651,7 @@ func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileT
 		body = *data
 	}
 
-	object := &s3.PutObjectInput{
-		Bucket: aws.String(backend.config.Bucket),
-		Key:    aws.String(filename),
-		Body:   bytes.NewReader(body),
-	}
-
-	_, err = backend.config.s3Client.PutObject(ctx, object)
+	_, err = backend.putObject(ctx, fileType, filename, body)
 	if err != nil {
 		err = classifyWriteErr(err)
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
@@ -822,12 +847,16 @@ func (backend *Backend) GetHost() string {
 // ReadKeyCtx reads the whole object at key, relative to this backend's volume.
 func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte, err error) {
 	start := time.Now()
+	served := -1
 	defer func() {
 		outcome := "success"
 		if err != nil {
 			outcome = "error"
 		}
 		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+		if served >= 0 {
+			telemetry.RecordBackendReadSize(ctx, "map", "own", backend.config.VolumeName, served)
+		}
 	}()
 	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -840,7 +869,45 @@ func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte
 		return nil, classifyReadErr(err)
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	data, err = io.ReadAll(out.Body)
+	if telemetry.ReadSizeOn() {
+		served = len(data)
+	}
+	return data, err
+}
+
+// requestedSize is the size a read-size sample records: the requested range
+// length, or the bytes returned for a whole-object read.
+func requestedSize(length uint32, returned int) int {
+	if length > 0 {
+		return int(length)
+	}
+	return returned
+}
+
+// fileTypeName is the read-size histogram's name for an object type.
+func fileTypeName(t types.FileType) string {
+	switch t {
+	case types.FileTypeConfig:
+		return "config"
+	case types.FileTypeChunk:
+		return "chunk"
+	case types.FileTypeBlockCheckpoint:
+		return "checkpoint"
+	case types.FileTypeWALChunk:
+		return "wal_chunk"
+	case types.FileTypeWALBlock:
+		return "wal_block"
+	case types.FileTypeSSHAuthKey:
+		return "ssh_auth_key"
+	case types.FileTypeWALChunkShard:
+		return "wal_chunk_shard"
+	case types.FileTypeBlockCheckpointLive:
+		return "checkpoint_live"
+	case types.FileTypeSnapshotMarker:
+		return "snapshot_marker"
+	}
+	return "other"
 }
 
 // WriteKeyCtx writes data at key, relative to this backend's volume.

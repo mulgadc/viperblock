@@ -51,7 +51,7 @@ test:
 COVERPROFILE ?= coverage.out
 test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
-	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/... $(_COVQ)
+	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./viperblock/... ./telemetry/... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
 
 # NBD plugin and nbdkit binding tests. Both live in their own modules, and the
@@ -68,7 +68,7 @@ test-nbd:
 # too and needs a budget covering both.
 test-integration:
 	@echo -e "\n....Running integration tests for $(GO_PROJECT_NAME)...."
-	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 600s ./viperblock/... $(_RACEQ)
+	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 600s ./viperblock/... ./telemetry/... $(_RACEQ)
 
 # Run unit tests with race detector.
 #
@@ -79,7 +79,7 @@ test-integration:
 # looked like a hang.
 test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
-	$(_Q)LOG_IGNORE=1 go test -race -timeout 900s ./viperblock/... $(_RACEQ)
+	$(_Q)LOG_IGNORE=1 go test -race -timeout 900s ./viperblock/... ./telemetry/... $(_RACEQ)
 
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover
