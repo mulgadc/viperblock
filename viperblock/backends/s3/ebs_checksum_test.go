@@ -91,3 +91,27 @@ func TestChunkWritesCarryCRC64NVMEAndTheEBSOptIn(t *testing.T) {
 		}
 	}
 }
+
+// TestMetadataWritesKeepTheirRequest pins that only chunks opt in: a config
+// write goes out as it did before, with no checksum and no opt-in.
+func TestMetadataWritesKeepTheirRequest(t *testing.T) {
+	srv, puts := putCapturingServer(t)
+	backend, err := New(S3Config{
+		VolumeName: "vol-crc64nvme0000",
+		Bucket:     "bucket",
+		Region:     "us-east-1",
+		AccessKey:  "crc-access",
+		SecretKey:  "crc-secret",
+		Host:       srv.URL,
+	})
+	require.NoError(t, err)
+	require.NoError(t, backend.InitCtx(context.Background()))
+
+	data := []byte(`{"volume":"vol-crc64nvme0000"}`)
+	require.NoError(t, backend.WriteCtx(context.Background(), types.FileTypeConfig, 0, nil, &data))
+
+	got := puts()
+	require.Len(t, got, 1)
+	assert.Empty(t, got[0].header.Get("X-Spinifex-Ebs"))
+	assert.Empty(t, got[0].header.Get("X-Amz-Checksum-Crc64nvme"))
+}

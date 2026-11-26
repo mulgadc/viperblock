@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +28,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/minio/crc64nvme"
 	"github.com/mulgadc/viperblock/telemetry"
 	"github.com/mulgadc/viperblock/types"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -528,14 +531,7 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	}
 	bodyLen = len(body)
 
-	// Create a new S3 object
-	object := &s3.PutObjectInput{
-		Bucket: aws.String(backend.config.Bucket),
-		Key:    aws.String(filename),
-		Body:   bytes.NewReader(body),
-	}
-
-	_, err = backend.config.s3Client.PutObject(ctx, object)
+	_, err = backend.putObject(ctx, fileType, filename, body)
 
 	if err != nil {
 		err = classifyWriteErr(err)
@@ -544,6 +540,27 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	}
 
 	return nil
+}
+
+// ebsOptIn tells predastore a chunk carries its CRC64NVME and that nothing
+// reads its ETag, so it is checked with that checksum instead of hashed with MD5.
+var ebsOptIn = smithyhttp.AddHeaderValue("X-Spinifex-Ebs", "true")
+
+// putObject stores one buffered object. A chunk also carries its CRC64NVME,
+// which costs a fraction of a millisecond here and spares the server an MD5.
+func (backend *Backend) putObject(ctx context.Context, fileType types.FileType, key string, body []byte) (*s3.PutObjectOutput, error) {
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(backend.config.Bucket),
+		Key:    aws.String(key),
+		Body:   bytes.NewReader(body),
+	}
+	if fileType != types.FileTypeChunk {
+		return backend.config.s3Client.PutObject(ctx, in)
+	}
+	sum := make([]byte, 8)
+	binary.BigEndian.PutUint64(sum, crc64nvme.Checksum(body))
+	in.ChecksumCRC64NVME = aws.String(base64.StdEncoding.EncodeToString(sum))
+	return backend.config.s3Client.PutObject(ctx, in, s3.WithAPIOptions(ebsOptIn))
 }
 
 func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
@@ -608,13 +625,7 @@ func (backend *Backend) WriteToCtx(ctx context.Context, volumeName string, fileT
 		body = *data
 	}
 
-	object := &s3.PutObjectInput{
-		Bucket: aws.String(backend.config.Bucket),
-		Key:    aws.String(filename),
-		Body:   bytes.NewReader(body),
-	}
-
-	_, err = backend.config.s3Client.PutObject(ctx, object)
+	_, err = backend.putObject(ctx, fileType, filename, body)
 	if err != nil {
 		err = classifyWriteErr(err)
 		backend.log.ErrorContext(ctx, "Error writing object", "error", err)
