@@ -429,7 +429,7 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 			outcome = "error"
 		}
 		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
-		if served >= 0 && telemetry.ReadSizeOn() {
+		if served >= 0 {
 			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "own", backend.config.VolumeName, served)
 		}
 	}()
@@ -464,11 +464,13 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 	defer textResult.Body.Close()
 
 	res, err := io.ReadAll(textResult.Body)
+	if telemetry.ReadSizeOn() {
+		served = requestedSize(length, len(res))
+	}
 
 	if err != nil {
 		return nil, err
 	}
-	served = requestedSize(length, len(res))
 
 	// A ranged GET whose range starts inside the object but runs past its end
 	// is answered with a CLAMPED 206 -- a short body with a matching
@@ -557,12 +559,6 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 
 func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READFROM] Reading object", "volumeName", volumeName, "objectId", objectId, "offset", offset, "length", length)
-	served := -1
-	defer func() {
-		if served >= 0 && telemetry.ReadSizeOn() {
-			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "inherited", volumeName, served)
-		}
-	}()
 
 	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -586,10 +582,12 @@ func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, file
 	defer textResult.Body.Close()
 
 	res, err := io.ReadAll(textResult.Body)
+	if telemetry.ReadSizeOn() {
+		telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "inherited", volumeName, requestedSize(length, len(res)))
+	}
 	if err != nil {
 		return nil, err
 	}
-	served = requestedSize(length, len(res))
 
 	return res, nil
 }
@@ -770,14 +768,15 @@ func (backend *Backend) GetHost() string {
 // ReadKeyCtx reads the whole object at key, relative to this backend's volume.
 func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte, err error) {
 	start := time.Now()
+	served := -1
 	defer func() {
 		outcome := "success"
 		if err != nil {
 			outcome = "error"
 		}
 		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
-		if err == nil && telemetry.ReadSizeOn() {
-			telemetry.RecordBackendReadSize(ctx, "map", "own", backend.config.VolumeName, len(data))
+		if served >= 0 {
+			telemetry.RecordBackendReadSize(ctx, "map", "own", backend.config.VolumeName, served)
 		}
 	}()
 	if backend.config.s3Client == nil {
@@ -791,7 +790,11 @@ func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte
 		return nil, classifyReadErr(err)
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	data, err = io.ReadAll(out.Body)
+	if telemetry.ReadSizeOn() {
+		served = len(data)
+	}
+	return data, err
 }
 
 // requestedSize is the size a read-size sample records: the requested range

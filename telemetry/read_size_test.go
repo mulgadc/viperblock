@@ -37,6 +37,19 @@ var wantBounds = []float64{4, 4096, 4112, 16384, 65536, 262144, 1048576, 2097152
 type objectTransport struct {
 	objects map[string][]byte
 	short   map[string]bool
+	broken  map[string]bool
+}
+
+// brokenBody delivers half of its bytes and then fails, as a connection that
+// drops mid-transfer does.
+type brokenBody struct{ r io.Reader }
+
+func (b *brokenBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err == io.EOF {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, err
 }
 
 func (o *objectTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -58,7 +71,11 @@ func (o *objectTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	h := http.Header{"Content-Range": {fmt.Sprintf("bytes %d-%d/%d", start, end, len(body))}}
-	return respond(r, http.StatusPartialContent, body[start:end+1], h), nil
+	resp := respond(r, http.StatusPartialContent, body[start:end+1], h)
+	if o.broken[key] {
+		resp.Body = io.NopCloser(&brokenBody{r: bytes.NewReader(body[start : start+(end-start+1)/2])})
+	}
+	return resp, nil
 }
 
 func respond(r *http.Request, status int, body []byte, h http.Header) *http.Response {
@@ -284,4 +301,32 @@ func TestReadSizeChildOff(t *testing.T) {
 	if len(points) != 0 {
 		t.Fatalf("switch off recorded %d %s points: %+v", len(points), readSizeName, points)
 	}
+}
+
+// A GET whose body fails part way through is still counted at the size it
+// asked for, and the caller still gets the transfer error.
+func TestReadSizeChildBrokenBody(t *testing.T) {
+	reader := childOnly(t)
+	tr := readerObjects()
+	tr.broken = map[string]bool{
+		types.GetFilePath(types.FileTypeChunk, 1, readerVolume): true,
+		types.GetFilePath(types.FileTypeChunk, 3, sourceVolume): true,
+	}
+	tr.objects[types.GetFilePath(types.FileTypeChunk, 3, sourceVolume)] = bytes.Repeat([]byte{5}, 8192)
+	b := newBackend(t, tr)
+	ctx := context.Background()
+
+	if _, err := b.ReadCtx(ctx, types.FileTypeChunk, 1, 0, 4096); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("broken ReadCtx err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if _, err := b.ReadFromCtx(ctx, sourceVolume, types.FileTypeChunk, 3, 0, 4096); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("broken ReadFromCtx err = %v, want io.ErrUnexpectedEOF", err)
+	}
+	_, points := collect(t, reader)
+	wantSamples(t, pointFor(t, points, "chunk", "own", readerVolume), 4096)
+	wantSamples(t, pointFor(t, points, "chunk", "inherited", sourceVolume), 4096)
+}
+
+func TestReadSizeHistogramBrokenBody(t *testing.T) {
+	runChild(t, "TestReadSizeChildBrokenBody", true)
 }

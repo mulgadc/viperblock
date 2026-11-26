@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/mulgadc/viperblock/types"
@@ -56,7 +57,7 @@ func benchBackend(b *testing.B) *s3backend.Backend {
 }
 
 // BenchmarkS3ReadCtx measures one object-store read through the S3 backend at
-// the sizes a guest issues: a 4 KiB block, a whole chunk, and concurrent blocks.
+// the sizes a guest issues: a 4 KiB block, a whole chunk, and 16 readers of blocks.
 // It lives here because this test binary starts no store in the background.
 func BenchmarkS3ReadCtx(b *testing.B) {
 	ctx := context.Background()
@@ -78,16 +79,22 @@ func BenchmarkS3ReadCtx(b *testing.B) {
 			}
 		}
 	})
-	b.Run("4KiB-parallel", func(b *testing.B) {
+	b.Run("4KiB-16-readers", func(b *testing.B) {
+		const readers = 16
 		backend := benchBackend(b)
 		b.ReportAllocs()
-		b.SetParallelism(16)
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				if _, err := backend.ReadCtx(ctx, types.FileTypeChunk, 1, 10, 4096); err != nil {
-					b.Fatal(err)
+		b.ResetTimer()
+		var wg sync.WaitGroup
+		for r := range readers {
+			wg.Go(func() {
+				for i := r; i < b.N; i += readers {
+					if _, err := backend.ReadCtx(ctx, types.FileTypeChunk, 1, 10, 4096); err != nil {
+						b.Error(err)
+						return
+					}
 				}
-			}
-		})
+			})
+		}
+		wg.Wait()
 	})
 }
