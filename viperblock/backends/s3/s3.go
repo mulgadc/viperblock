@@ -190,6 +190,7 @@ type Backend struct {
 }
 
 var _ types.Backend = (*Backend)(nil)
+var _ types.MapHeadAuthority = (*Backend)(nil)
 
 func New(config any) (backend *Backend, err error) {
 	cfg, ok := config.(S3Config)
