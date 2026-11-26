@@ -1,6 +1,7 @@
 package viperblock
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -158,4 +159,39 @@ func TestQualifiedChunkSameLaunchAllocatesAfterFailedRecovery(t *testing.T) {
 	require.NoError(t, cold.LoadState())
 	require.NoError(t, cold.LoadLiveCheckpoint())
 	require.Equal(t, expected, readBlocks(t, cold, 0, 1))
+}
+
+func TestQualifiedActivationRefusesMapWithPendingLegacyOverwrite(t *testing.T) {
+	ctx := t.Context()
+	mv := newMapVolume(t, volumeSize, nil)
+	dormant, _ := mv.create(t, 5)
+	acknowledged := randomBlockData(1)
+	writeDrain(t, dormant, 0, acknowledged)
+	ref, _, _, err := dormant.lookupChunk(0)
+	require.NoError(t, err)
+	require.Zero(t, ref.Epoch)
+	dormant.Detach()
+
+	activator, _ := mv.engine(t, 6)
+	activator.QualifiedChunks = true
+	require.NoError(t, activator.LoadState())
+	require.NoError(t, activator.LoadLiveCheckpoint())
+
+	before := mv.mapKeys(t, mapHeadPrefix)
+	if err := activator.ClaimMapCtx(ctx); err != nil {
+		require.Equal(t, before, mv.mapKeys(t, mapHeadPrefix), "activation must publish no head")
+		require.Equal(t, acknowledged, readBlocks(t, activator, 0, 1))
+		return
+	}
+
+	// Complete a legacy PUT that was submitted against this numeric key before
+	// the activation claim. The current head still names that old key.
+	headers := dormant.ChunkHeader()
+	late := randomBlockData(1)
+	require.NoError(t, dormant.Backend.WriteCtx(ctx, types.FileTypeChunk, ref.ID, &headers, &late))
+	cold, _ := mv.engine(t, 7)
+	require.NoError(t, cold.LoadState())
+	require.NoError(t, cold.LoadLiveCheckpoint())
+	require.True(t, bytes.Equal(acknowledged, readBlocks(t, cold, 0, 1)),
+		"an activated map exposed a delayed legacy PUT at its retained numeric reference")
 }
