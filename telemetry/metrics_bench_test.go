@@ -101,3 +101,54 @@ func BenchmarkRecordBackendIO(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkRecordBackendReadSize measures the read-size histogram as each
+// backend read calls it. Run without VIPERBLOCK_READ_SIZE_METRICS it measures
+// the disabled guard; run with it set to 1 it measures the recording.
+func BenchmarkRecordBackendReadSize(b *testing.B) {
+	ctx := context.Background()
+	record := func() {
+		if ReadSizeOn() {
+			RecordBackendReadSize(ctx, "chunk", "own", "vol-bench", 4096)
+		}
+	}
+	if !ReadSizeOn() {
+		b.Run("off", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				record()
+			}
+		})
+		return
+	}
+	fresh := func(b *testing.B) {
+		readSizeOnce = sync.Once{}
+		b.Cleanup(func() { readSizeOnce = sync.Once{} })
+	}
+	b.Run("on/noop", func(b *testing.B) {
+		withNoopProvider(b)
+		fresh(b)
+		b.ReportAllocs()
+		for b.Loop() {
+			record()
+		}
+	})
+	b.Run("on/sdk", func(b *testing.B) {
+		withManualReader(b)
+		fresh(b)
+		b.ReportAllocs()
+		for b.Loop() {
+			record()
+		}
+	})
+	b.Run("on/sdk-parallel", func(b *testing.B) {
+		withManualReader(b)
+		fresh(b)
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				record()
+			}
+		})
+	})
+}
