@@ -753,6 +753,52 @@ func (backend *Backend) ListObjectsCtx(ctx context.Context, prefix string) (keys
 	return keys, nil
 }
 
+const (
+	mapHeadReadModeHeader = "X-Predastore-Read-Mode"
+	latestMapHeadMode     = "latest-map-head"
+)
+
+func (backend *Backend) LatestMapHeadCtx(ctx context.Context, prefix string) (string, error) {
+	if backend.config.s3Client == nil {
+		return "", fmt.Errorf("S3 client not initialized")
+	}
+
+	confirmed := false
+	out, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(backend.config.Bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(1),
+	}, func(options *s3.Options) {
+		options.APIOptions = append(options.APIOptions,
+			smithyhttp.AddHeaderValue(mapHeadReadModeHeader, latestMapHeadMode),
+			func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("ConfirmLatestMapHead",
+					func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (middleware.DeserializeOutput, middleware.Metadata, error) {
+						result, md, err := next.HandleDeserialize(ctx, in)
+						resp, ok := result.RawResponse.(*smithyhttp.Response)
+						confirmed = ok && resp != nil && resp.Header.Get(mapHeadReadModeHeader) == latestMapHeadMode
+						return result, md, err
+					}), middleware.Before)
+			},
+		)
+	})
+	if err != nil {
+		return "", err
+	}
+	if !confirmed || aws.ToBool(out.IsTruncated) || aws.ToString(out.NextContinuationToken) != "" ||
+		len(out.Contents) > 1 || len(out.CommonPrefixes) > 0 {
+		return "", fmt.Errorf("S3 endpoint did not confirm a bounded map-head lookup")
+	}
+	if len(out.Contents) == 0 {
+		return "", nil
+	}
+	key := aws.ToString(out.Contents[0].Key)
+	if !strings.HasPrefix(key, prefix) {
+		return "", fmt.Errorf("S3 map-head response returned a key outside its prefix")
+	}
+	return key, nil
+}
+
 func (backend *Backend) Sync() {
 }
 

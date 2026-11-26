@@ -111,6 +111,7 @@ var use_shardwal bool = false
 // lease_epoch orders this launch's map heads above every earlier launch's.
 var lease_epoch uint64
 var qualified_chunks bool
+var authoritative_map_heads bool
 
 // launchChunkIDs reserves qualified payload IDs across all opens under lease_epoch.
 var launchChunkIDs atomic.Uint64
@@ -246,6 +247,10 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		var err error
 		qualified_chunks, err = strconv.ParseBool(value)
 		return err
+	} else if key == "authoritative_map_heads" {
+		var err error
+		authoritative_map_heads, err = strconv.ParseBool(value)
+		return err
 	} else if key == "gc_enabled" {
 		gc_enabled = value == "true" || value == "1"
 		return nil
@@ -377,13 +382,14 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role:            "nbdkit",
-		LeaseEpoch:      lease_epoch,
-		QualifiedChunks: qualified_chunks,
-		LaunchChunkIDs:  &launchChunkIDs,
-		ResumeEpoch:     mapClaimed.Load(),
-		ResumeHeadN:     mapHeadN.Load(),
-		ResumeObjN:      mapObjN.Load(),
+		Role:                  "nbdkit",
+		LeaseEpoch:            lease_epoch,
+		QualifiedChunks:       qualified_chunks,
+		AuthoritativeMapHeads: authoritative_map_heads,
+		LaunchChunkIDs:        &launchChunkIDs,
+		ResumeEpoch:           mapClaimed.Load(),
+		ResumeHeadN:           mapHeadN.Load(),
+		ResumeObjN:            mapObjN.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,

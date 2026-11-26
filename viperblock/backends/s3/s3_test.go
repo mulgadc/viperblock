@@ -509,3 +509,50 @@ func TestReadCtx_FullObjectMatchingContentLengthSucceeds(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, full, got)
 }
+
+func TestLatestMapHeadRequiresBoundedConfirmedResponse(t *testing.T) {
+	const prefix = "vol/map/head."
+	const head = prefix + "00000000000000000009.00000000000000000000"
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		truncated bool
+		key       string
+		want      string
+		wantError bool
+	}{
+		{name: "confirmed", mode: latestMapHeadMode, key: head, want: head},
+		{name: "confirmed empty", mode: latestMapHeadMode},
+		{name: "old gate", key: head, wantError: true},
+		{name: "truncated", mode: latestMapHeadMode, key: head, truncated: true, wantError: true},
+		{name: "wrong prefix", mode: latestMapHeadMode, key: "other/map/head.1", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := newTestBackend(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				assert.Equal(t, latestMapHeadMode, req.Header.Get(mapHeadReadModeHeader))
+				assert.Contains(t, req.Header.Get("Authorization"), "x-predastore-read-mode")
+				assert.Equal(t, prefix, req.URL.Query().Get("prefix"))
+				assert.Equal(t, "1", req.URL.Query().Get("max-keys"))
+
+				body := fmt.Sprintf("<ListBucketResult><IsTruncated>%t</IsTruncated>", tc.truncated)
+				if tc.key != "" {
+					body += "<Contents><Key>" + tc.key + "</Key></Contents>"
+				}
+				body += "</ListBucketResult>"
+				header := http.Header{}
+				header.Set(mapHeadReadModeHeader, tc.mode)
+				return &http.Response{
+					StatusCode: http.StatusOK, Header: header,
+					Body: io.NopCloser(bytes.NewBufferString(body)), Request: req,
+				}, nil
+			}))
+			got, err := backend.LatestMapHeadCtx(t.Context(), prefix)
+			if tc.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}

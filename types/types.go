@@ -48,6 +48,11 @@ func (r ChunkRef) Key(volume string) string {
 	return fmt.Sprintf("%s/chunks/chunk.%020d.%020d.bin", volume, r.Epoch, r.ID)
 }
 
+// MapHeadAuthority provides a confirmed lookup of the greatest map-head key.
+type MapHeadAuthority interface {
+	LatestMapHeadCtx(ctx context.Context, prefix string) (string, error)
+}
+
 type Backend interface {
 	Init() error
 	ReadChunkFromCtx(ctx context.Context, volume string, ref ChunkRef, offset, length uint32) ([]byte, error)

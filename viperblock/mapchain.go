@@ -596,6 +596,30 @@ func (vb *VB) mapRunsLocked() []BlockLookup {
 }
 
 // listMapHeads returns every committed head's (epoch, n), unordered.
+// Cap authority discovery even for an internal caller without a deadline.
+const mapHeadAuthorityTimeout = 10 * time.Second
+
+var ErrMapHeadAuthority = errors.New("map: authoritative head discovery unavailable")
+
+func (vb *VB) authoritativeMapHead(ctx context.Context) ([2]uint64, error) {
+	authority, ok := vb.Backend.(types.MapHeadAuthority)
+	if !ok {
+		return [2]uint64{}, ErrMapHeadAuthority
+	}
+	key, err := authority.LatestMapHeadCtx(ctx, vb.VolumeName+"/"+mapHeadPrefix)
+	if err != nil {
+		return [2]uint64{}, fmt.Errorf("%w: %w", ErrMapHeadAuthority, err)
+	}
+	if key == "" {
+		return [2]uint64{}, ErrMapHeadMissing
+	}
+	epoch, id, ok := parseMapObjectKey(key, mapHeadPrefix)
+	if !ok || epoch == 0 || key != vb.VolumeName+"/"+mapObjectKey(mapHeadPrefix, epoch, id) {
+		return [2]uint64{}, fmt.Errorf("%w: invalid key %q", ErrMapHeadAuthority, key)
+	}
+	return [2]uint64{epoch, id}, nil
+}
+
 func (vb *VB) listMapHeads(ctx context.Context) ([][2]uint64, error) {
 	// Listed by directory, which every backend supports, then filtered.
 	keys, err := vb.Backend.ListObjectsCtx(ctx, vb.VolumeName+"/map/")
@@ -639,13 +663,13 @@ func (vb *VB) readMapRuns(ctx context.Context, prefix string, kind byte, ref map
 // loadMapChainCtx loads the map the newest head names. A missing or corrupt
 // object fails the open: an older head is never used instead, because the
 // WAL and chunks only the newer map protects may already be gone.
-func (vb *VB) loadMapChainCtx(ctx context.Context) error {
+func (vb *VB) newestListedMapHead(ctx context.Context) ([2]uint64, error) {
 	heads, err := vb.listMapHeads(ctx)
 	if err != nil {
-		return err
+		return [2]uint64{}, err
 	}
 	if len(heads) == 0 {
-		return ErrMapHeadMissing
+		return [2]uint64{}, ErrMapHeadMissing
 	}
 	newest := heads[0]
 	for _, h := range heads[1:] {
@@ -661,9 +685,43 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 			if errors.Is(perr, os.ErrNotExist) {
 				break
 			}
-			return fmt.Errorf("map: probe head: %w", perr)
+			return [2]uint64{}, fmt.Errorf("map: probe head: %w", perr)
 		}
 		newest[1]++
+	}
+	return newest, nil
+}
+
+func (vb *VB) readLatestMapHead(ctx context.Context) ([2]uint64, []byte, error) {
+	lookup := vb.newestListedMapHead
+	attempts := 1
+	if vb.AuthoritativeMapHeads {
+		lookup = vb.authoritativeMapHead
+		attempts = 2 // A fresher head may have replaced the selected one before the exact read.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mapHeadAuthorityTimeout)
+		defer cancel()
+	}
+	for attempt := range attempts {
+		head, err := lookup(ctx)
+		if err != nil {
+			return head, nil, err
+		}
+		data, err := vb.Backend.ReadKeyCtx(ctx, mapObjectKey(mapHeadPrefix, head[0], head[1]))
+		if err == nil {
+			return head, data, nil
+		}
+		if attempt+1 == attempts || !errors.Is(err, os.ErrNotExist) {
+			return head, nil, fmt.Errorf("map: read head %d.%d: %w", head[0], head[1], err)
+		}
+	}
+	return [2]uint64{}, nil, ErrMapHeadMissing
+}
+
+func (vb *VB) loadMapChainCtx(ctx context.Context) error {
+	newest, headData, err := vb.readLatestMapHead(ctx)
+	if err != nil {
+		return err
 	}
 	resume := vb.ResumeEpoch && vb.LeaseEpoch != 0 && newest[0] == vb.LeaseEpoch
 	if vb.LeaseEpoch != 0 && newest[0] >= vb.LeaseEpoch && !resume {
@@ -686,13 +744,12 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 		}
 	}
 
-	headData, err := vb.Backend.ReadKeyCtx(ctx, mapObjectKey(mapHeadPrefix, newest[0], newest[1]))
-	if err != nil {
-		return fmt.Errorf("map: read head %d.%d: %w", newest[0], newest[1], err)
-	}
 	version, err := requiredMapObjectVersion(headData)
 	if err != nil {
 		return err
+	}
+	if version == mapQualifiedObjectVersion && vb.Backend.GetBackendType() == "s3" && !vb.AuthoritativeMapHeads {
+		return ErrMapHeadAuthority
 	}
 	if resume && version == mapQualifiedObjectVersion && vb.LaunchChunkIDs == nil {
 		return fmt.Errorf("%w: qualified resume requires the launch allocation cursor", ErrMapEpochNotNewer)
@@ -818,6 +875,9 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	// leave the claim landing after an older writer's deletes come due.
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("map: claim deadline passed: %w", err)
+	}
+	if vb.QualifiedChunks && vb.Backend.GetBackendType() == "s3" && !vb.AuthoritativeMapHeads {
+		return ErrMapHeadAuthority
 	}
 	wasQualified := vb.mapChain.qualified.Load()
 	if vb.QualifiedChunks {
@@ -1159,20 +1219,32 @@ func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, bound 
 // higherEpochHeadExists reports whether a later launch has committed. A
 // writer that finds one deletes nothing and fences itself.
 func (vb *VB) higherEpochHeadExists(ctx context.Context) (bool, error) {
-	heads, err := vb.listMapHeads(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, h := range heads {
-		if h[0] > vb.LeaseEpoch {
-			if vb.mapChain.fenced.CompareAndSwap(false, true) {
-				vb.logger().Error("map: a newer lease holder has committed; fencing this writer",
-					"volume", vb.VolumeName, "epoch", vb.LeaseEpoch, "newer", h[0])
-			}
-			return true, nil
+	var newest uint64
+	if vb.AuthoritativeMapHeads {
+		ctx, cancel := context.WithTimeout(ctx, mapHeadAuthorityTimeout)
+		defer cancel()
+		head, err := vb.authoritativeMapHead(ctx)
+		if err != nil {
+			return false, err
+		}
+		newest = head[0]
+	} else {
+		heads, err := vb.listMapHeads(ctx)
+		if err != nil {
+			return false, err
+		}
+		for _, head := range heads {
+			newest = max(newest, head[0])
 		}
 	}
-	return false, nil
+	if newest <= vb.LeaseEpoch {
+		return false, nil
+	}
+	if vb.mapChain.fenced.CompareAndSwap(false, true) {
+		vb.logger().Error("map: a newer lease holder has committed; fencing this writer",
+			"volume", vb.VolumeName, "epoch", vb.LeaseEpoch, "newer", newest)
+	}
+	return true, nil
 }
 
 // maybeProcessMapDeletes runs any deferred map deletes that have come due,

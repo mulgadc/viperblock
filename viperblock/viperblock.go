@@ -318,6 +318,10 @@ type VB struct {
 	// LeaseEpoch orders this launch's map heads above every earlier
 	// launch's. A format-2 volume can be read without one, never committed.
 	LeaseEpoch uint64
+
+	// AuthoritativeMapHeads requires confirmed Predastore map-head discovery.
+	AuthoritativeMapHeads bool
+
 	// MapDeleteDeferral overrides DefaultMapDeleteDeferral; tests shorten it.
 	MapDeleteDeferral time.Duration
 	// ResumeEpoch lets an open continue a head this process wrote under the
@@ -1485,6 +1489,9 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: walBaseDir, WALMagic: walMagic},
 		BlockToObjectWAL:    WAL{BaseDir: walBaseDir, WALMagic: blockToObjectWALMagic},
+
+		AuthoritativeMapHeads: config.AuthoritativeMapHeads,
+
 		Cache: Cache{
 			lru: lruCache,
 			Config: CacheConfig{
