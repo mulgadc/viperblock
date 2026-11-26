@@ -43,8 +43,11 @@ func (s *streamCounter) ReadCtx(ctx context.Context, fileType types.FileType, ob
 }
 
 type streamRun struct {
-	streamReads, streamBytes, otherReads int64
-	elapsed                              time.Duration
+	streamReads, streamBytes int64
+	// neighbourReads counts each neighbour's reads that completed while the
+	// stream was running.
+	neighbourReads []int64
+	elapsed        time.Duration
 }
 
 // readStreamBeside reads the whole volume as a depth-1 stream of 64 KiB
@@ -56,6 +59,8 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 	sc := &streamCounter{Backend: counter.Backend, delay: time.Millisecond}
 	reader.Backend = sc
 
+	var streaming atomic.Bool
+	during := make([]atomic.Int64, neighbours)
 	stop := make(chan struct{})
 	started := make(chan struct{}, neighbours)
 	var wg sync.WaitGroup
@@ -71,6 +76,9 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 				block := rng.Uint64N(readAmpVolumeBytes / uint64(DefaultBlockSize))
 				_, err := reader.ReadAtCtx(context.Background(), block*uint64(DefaultBlockSize), uint64(DefaultBlockSize))
 				assert.NoError(t, err)
+				if streaming.Load() {
+					during[n].Add(1)
+				}
 				if i == 0 {
 					started <- struct{}{}
 				}
@@ -82,6 +90,7 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 	}
 
 	ctx := context.WithValue(context.Background(), streamKey{}, true)
+	streaming.Store(true)
 	start := time.Now()
 	got := make([]byte, 0, readAmpVolumeBytes)
 	for off := uint64(0); off < readAmpVolumeBytes; off += readAmpRequestBytes {
@@ -90,11 +99,16 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 		got = append(got, data...)
 	}
 	elapsed := time.Since(start)
+	streaming.Store(false)
 	close(stop)
 	wg.Wait()
 	require.Equal(t, written, got, "the stream came back wrong")
 
-	return streamRun{streamReads: sc.streamReads.Load(), streamBytes: sc.streamBytes.Load(), otherReads: sc.otherReads.Load(), elapsed: elapsed}
+	run := streamRun{streamReads: sc.streamReads.Load(), streamBytes: sc.streamBytes.Load(), elapsed: elapsed}
+	for n := range during {
+		run.neighbourReads = append(run.neighbourReads, during[n].Load())
+	}
+	return run
 }
 
 // TestSequentialStream_KeepsReadaheadBesideRandomReaders: a depth-1 stream
@@ -108,14 +122,37 @@ func TestSequentialStream_KeepsReadaheadBesideRandomReaders(t *testing.T) {
 	t.Logf("alone: %d stream reads in %v", alone.streamReads, alone.elapsed)
 	for _, neighbours := range []int{1, 2} {
 		run := readStreamBeside(t, root, volumeName, written, neighbours)
-		t.Logf("beside %d random readers: %d stream reads in %v, %d neighbour reads",
-			neighbours, run.streamReads, run.elapsed, run.otherReads)
-		// The neighbours must overlap the stream for the comparison to mean
-		// anything: at 1 ms a read, they make dozens while it runs.
-		require.GreaterOrEqual(t, run.otherReads, int64(10*neighbours), "the neighbours did not overlap the stream")
+		t.Logf("beside %d random readers: %d stream reads in %v, neighbour reads during it %v",
+			neighbours, run.streamReads, run.elapsed, run.neighbourReads)
+		// Each neighbour must overlap the stream for the comparison to mean
+		// anything: at 1 ms a read, each makes dozens while it runs.
+		for n, reads := range run.neighbourReads {
+			require.GreaterOrEqualf(t, reads, int64(10), "neighbour %d did not overlap the stream", n)
+		}
 		assert.LessOrEqualf(t, run.streamReads, 2*alone.streamReads,
 			"beside %d random readers the stream lost its read-ahead", neighbours)
 	}
+}
+
+// TestReadahead_ARequestWhereARecentStreamEndedIsWidened pins the limit of
+// following several streams: a read that starts exactly where one of the last
+// few ended is taken as continuing it, even with another read in between.
+func TestReadahead_ARequestWhereARecentStreamEndedIsWidened(t *testing.T) {
+	const volumeName = "vol-readahead-interleaved"
+	root, written := seedSequentialVolume(t, volumeName, nil)
+	reader, counter := coldReaderVB(t, root, volumeName, nil)
+	bs := uint64(DefaultBlockSize)
+
+	for _, block := range []uint64{100, 900} {
+		_, err := reader.ReadAtCtx(context.Background(), block*bs, bs)
+		require.NoError(t, err)
+	}
+	before := counter.bytes.Load()
+	data, err := reader.ReadAtCtx(context.Background(), 101*bs, bs)
+	require.NoError(t, err)
+	require.Equal(t, written[101*bs:102*bs], data)
+	assert.Greater(t, counter.bytes.Load()-before, int64(bs),
+		"block 101 after 100 and 900 was not taken as continuing the stream at 100")
 }
 
 // TestRandomRead_InterleavedIsNotWidened reads random blocks, so a request
