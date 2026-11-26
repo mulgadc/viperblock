@@ -55,6 +55,21 @@ Use our source of truth to compare
 sudo qemu-nbd --connect=/dev/nbd1 ~/isos/noble-server-cloudimg-amd64.img 
 ```
 
+# Measuring the backend read mix
+
+Set `VIPERBLOCK_READ_SIZE_METRICS=1` in the environment of the process that serves the volume, the same way `OTEL_EXPORTER_OTLP_*` is set, and restart it.
+Each object-store read is then recorded in the `viperblock.backend.read.size` histogram, in bytes, with these attributes:
+
+- `file_type`: `chunk`, `checkpoint`, `config`, `map` and the other object kinds.
+- `source`: `own` for the volume's own objects, `inherited` for a snapshot or AMI base it reads through.
+- `volume.name`: the volume whose object was read.
+
+The size is the requested range length, or the object's length for a whole-object read.
+A read that the object store answered short is counted at the size it asked for.
+The buckets end at 4 B (the encrypted-chunk header probe), 4 KiB, 4,112 B (one encrypted block), 16 KiB, 64 KiB, 256 KiB, 1 MiB, 2 MiB, 4 MiB and 4,194,314 B (a whole chunk object).
+The histogram goes out with the other viperblock metrics, so it needs an OTLP endpoint.
+Without the variable nothing is recorded, and the read path is unchanged.
+
 # Viperblock debugging
 
 Note, mount volume for read only use.

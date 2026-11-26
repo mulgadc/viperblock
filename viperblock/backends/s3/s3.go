@@ -422,12 +422,16 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
 	start := time.Now()
+	served := -1
 	defer func() {
 		outcome := "success"
 		if err != nil {
 			outcome = "error"
 		}
 		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+		if served >= 0 && telemetry.ReadSizeOn() {
+			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "own", backend.config.VolumeName, served)
+		}
 	}()
 
 	if backend.config.s3Client == nil {
@@ -464,6 +468,7 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 	if err != nil {
 		return nil, err
 	}
+	served = requestedSize(length, len(res))
 
 	// A ranged GET whose range starts inside the object but runs past its end
 	// is answered with a CLAMPED 206 -- a short body with a matching
@@ -552,6 +557,12 @@ func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, obj
 
 func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READFROM] Reading object", "volumeName", volumeName, "objectId", objectId, "offset", offset, "length", length)
+	served := -1
+	defer func() {
+		if served >= 0 && telemetry.ReadSizeOn() {
+			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "inherited", volumeName, served)
+		}
+	}()
 
 	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -578,6 +589,7 @@ func (backend *Backend) ReadFromCtx(ctx context.Context, volumeName string, file
 	if err != nil {
 		return nil, err
 	}
+	served = requestedSize(length, len(res))
 
 	return res, nil
 }
@@ -764,6 +776,9 @@ func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte
 			outcome = "error"
 		}
 		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+		if err == nil && telemetry.ReadSizeOn() {
+			telemetry.RecordBackendReadSize(ctx, "map", "own", backend.config.VolumeName, len(data))
+		}
 	}()
 	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
@@ -777,6 +792,40 @@ func (backend *Backend) ReadKeyCtx(ctx context.Context, key string) (data []byte
 	}
 	defer out.Body.Close()
 	return io.ReadAll(out.Body)
+}
+
+// requestedSize is the size a read-size sample records: the requested range
+// length, or the bytes returned for a whole-object read.
+func requestedSize(length uint32, returned int) int {
+	if length > 0 {
+		return int(length)
+	}
+	return returned
+}
+
+// fileTypeName is the read-size histogram's name for an object type.
+func fileTypeName(t types.FileType) string {
+	switch t {
+	case types.FileTypeConfig:
+		return "config"
+	case types.FileTypeChunk:
+		return "chunk"
+	case types.FileTypeBlockCheckpoint:
+		return "checkpoint"
+	case types.FileTypeWALChunk:
+		return "wal_chunk"
+	case types.FileTypeWALBlock:
+		return "wal_block"
+	case types.FileTypeSSHAuthKey:
+		return "ssh_auth_key"
+	case types.FileTypeWALChunkShard:
+		return "wal_chunk_shard"
+	case types.FileTypeBlockCheckpointLive:
+		return "checkpoint_live"
+	case types.FileTypeSnapshotMarker:
+		return "snapshot_marker"
+	}
+	return "other"
 }
 
 // WriteKeyCtx writes data at key, relative to this backend's volume.
