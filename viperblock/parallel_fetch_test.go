@@ -223,11 +223,12 @@ func seedVolumeChunks(t *testing.T, volumeName string, key *masterkey.Key, chunk
 	vbconfig := VB{
 		VolumeName:      volumeName,
 		VolumeSize:      fragVolumeBytes,
-		BaseDir:         filepath.Join(root, "viperblock"),
-		WALSyncInterval: -1,
-		GCEnabled:       false,
-		GCInterval:      -1,
-		Cache:           Cache{Config: CacheConfig{Size: 0}},
+		BaseDir:             filepath.Join(root, "viperblock"),
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCEnabled:           false,
+		GCInterval:          -1,
+		Cache:               Cache{Config: CacheConfig{Size: 0}},
 
 		MasterKey:         key,
 		EncryptionEnabled: key != nil,
@@ -265,11 +266,12 @@ func fragReader(t *testing.T, root, volumeName string, key *masterkey.Key, cache
 	vbconfig := VB{
 		VolumeName:      volumeName,
 		VolumeSize:      fragVolumeBytes,
-		BaseDir:         filepath.Join(t.TempDir(), "viperblock"),
-		WALSyncInterval: -1,
-		GCEnabled:       false,
-		GCInterval:      -1,
-		Cache:           Cache{Config: CacheConfig{Size: cacheBlocks}},
+		BaseDir:             filepath.Join(t.TempDir(), "viperblock"),
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCEnabled:           false,
+		GCInterval:          -1,
+		Cache:               Cache{Config: CacheConfig{Size: cacheBlocks}},
 
 		MasterKey:         key,
 		EncryptionEnabled: key != nil,
@@ -280,7 +282,10 @@ func fragReader(t *testing.T, root, volumeName string, key *masterkey.Key, cache
 		BaseDir:    root,
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, vb.RemoveLocalFiles()) })
+	t.Cleanup(func() {
+		closeFragWALs(vb)
+		assert.NoError(t, vb.RemoveLocalFiles())
+	})
 
 	fb, ok := vb.Backend.(*file.Backend)
 	require.True(t, ok)
@@ -506,14 +511,26 @@ func TestFragmentedRead_CancellationDrainsAndAllowsTheNextSoloRead(t *testing.T)
 			length := uint64(fragRequestBlocks) * bs
 
 			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			done := make(chan error, 1)
 			go func() {
 				_, err := reader.ReadAtCtx(ctx, 0, length)
 				done <- err
 			}()
-			<-gate.arrived
+			select {
+			case <-gate.arrived:
+			case err := <-done:
+				t.Fatalf("the read returned %v before its first backend call", err)
+			case <-time.After(gateFallback):
+				t.Fatalf("the read made no backend call within %v", gateFallback)
+			}
 			cancel()
-			err := <-done
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(gateFallback):
+				t.Fatalf("the canceled read did not return within %v", gateFallback)
+			}
 			inflight, starts, ends := gate.markReturned()
 			require.ErrorIs(t, err, context.Canceled)
 			assert.Zero(t, inflight, "the read returned with backend fetches still running")
@@ -727,6 +744,7 @@ type chunkCall struct {
 	req      int
 	objectID uint64
 	offset   uint32
+	length   uint32
 	header   bool
 }
 
@@ -765,7 +783,7 @@ func newScriptedBackend(inner types.Backend) *scriptedBackend {
 
 func (s *scriptedBackend) chunk(ctx context.Context, objectID uint64, offset, length uint32, read func() ([]byte, error)) ([]byte, error) {
 	req, _ := ctx.Value(fragRequestKey{}).(int)
-	c := chunkCall{req: req, objectID: objectID, offset: offset, header: offset == 0 && length == 4}
+	c := chunkCall{req: req, objectID: objectID, offset: offset, length: length, header: offset == 0 && length == 4}
 	if c.header {
 		data, err := read()
 		s.mu.Lock()
@@ -885,6 +903,19 @@ func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 }
 
 const quietWindow = 25 * time.Millisecond
+
+// closeFragWALs closes a reader's local WAL files without a drain, so its
+// buffered writes never reach the seeded backend.
+func closeFragWALs(vb *VB) {
+	for _, w := range []*WAL{&vb.WAL, &vb.BlockToObjectWAL} {
+		w.mu.Lock()
+		for _, f := range w.DB {
+			_ = f.Close()
+		}
+		w.DB = nil
+		w.mu.Unlock()
+	}
+}
 
 func openFragWALs(t *testing.T, vb *VB) {
 	t.Helper()
@@ -1190,10 +1221,10 @@ func TestInheritedRead_FragmentedSnapshotStaysSerial(t *testing.T) {
 			var want []chunkCall
 			objects := map[uint64]bool{}
 			for block := range uint64(fragRequestBlocks) {
-				objectID, _, _, err := child.LookupBaseBlockToObject(block)
+				objectID, offset, _, err := child.LookupBaseBlockToObject(block)
 				require.NoError(t, err)
 				objects[objectID] = true
-				want = append(want, chunkCall{req: 1, objectID: objectID})
+				want = append(want, chunkCall{req: 1, objectID: objectID, offset: offset, length: child.blockStride()})
 			}
 			require.Len(t, objects, 2, "the source blocks should alternate between two chunks")
 
@@ -1216,18 +1247,16 @@ func TestInheritedRead_FragmentedSnapshotStaysSerial(t *testing.T) {
 				got, err = child.ReadAtCtx(context.WithValue(context.Background(), fragRequestKey{}, 1), 0, fragRequestBlocks*bs)
 				done <- err
 			}()
-			sb.awaitPayload(t, 1)
+			calls := []chunkCall{sb.awaitPayload(t, 1)}
 			assert.True(t, sb.quietFor(1, quietWindow), "an inherited read fetched a second run while the first was held")
 			close(first)
 			require.NoError(t, <-done)
 			require.Equal(t, written, got)
 
-			var calls []chunkCall
 			for len(sb.arrived) > 0 {
-				c := <-sb.arrived
-				calls = append(calls, chunkCall{req: c.req, objectID: c.objectID})
+				calls = append(calls, <-sb.arrived)
 			}
-			require.Equal(t, want[1:], calls, "inherited runs were fetched out of block order")
+			require.Equal(t, want, calls, "inherited runs were not fetched one per block in block order")
 			_, peak, payloads, _ := sb.stat(1)
 			assert.Equal(t, 1, peak, "inherited runs overlapped")
 			assert.Equal(t, fragRequestBlocks, payloads)
