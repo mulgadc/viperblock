@@ -209,16 +209,6 @@ func pfbOpen(b *testing.B, root, name string, cacheBlocks int, delay time.Durati
 	return vb
 }
 
-// pfbAwait waits for one signal on ch and fails the benchmark after pfbStall.
-func pfbAwait(b *testing.B, ch <-chan struct{}, what string) {
-	b.Helper()
-	select {
-	case <-ch:
-	case <-time.After(pfbStall):
-		b.Fatalf("no %s within %v", what, pfbStall)
-	}
-}
-
 // pfbConcurrent runs n reads at once and fails the benchmark on any error.
 func pfbConcurrent(b *testing.B, n int, read func(j int) error) {
 	var wg sync.WaitGroup
@@ -422,9 +412,40 @@ func BenchmarkParallelFetch(b *testing.B) {
 					return vb, vb.Backend.(*pfbDelayBackend)
 				}
 				vb, db := open()
-				soloCtx := context.WithValue(ctx, pfbSoloKey{}, true)
+				soloCtx, cancelSolo := context.WithCancel(context.WithValue(ctx, pfbSoloKey{}, true))
+				defer cancelSolo()
 				var arrivalTotal time.Duration
 				widths := map[int]int{}
+
+				// Every failure releases and cancels the held solo fetches and joins
+				// both callers before the benchmark stops and its fixture is retired.
+				var gate *pfbSoloGate
+				var soloDone, arrived chan error
+				released := false
+				release := func() {
+					if !released {
+						released = true
+						close(gate.release)
+					}
+				}
+				abort := func(format string, args ...any) {
+					release()
+					cancelSolo()
+					stall := time.After(pfbStall)
+					for soloDone != nil || arrived != nil {
+						select {
+						case <-soloDone:
+							soloDone = nil
+						case <-arrived:
+							arrived = nil
+						case <-stall:
+							b.Fatalf(format+" (a caller did not stop within %v)", append(args, pfbStall)...)
+						}
+					}
+					db.gate.Store(nil)
+					b.Fatalf(format, args...)
+				}
+
 				op := 0
 				for b.Loop() {
 					if op > 0 && op%pfbFragBlocks == 0 {
@@ -435,16 +456,23 @@ func BenchmarkParallelFetch(b *testing.B) {
 						vb, db = open()
 						b.StartTimer()
 					}
-					gate := newPfbSoloGate()
+					gate, released, arrived = newPfbSoloGate(), false, nil
 					db.gate.Store(gate)
-					soloDone := make(chan error, 1)
+					soloDone = make(chan error, 1)
 					go func() {
 						_, err := vb.ReadAtCtx(soloCtx, uint64(op%pfbWindows)*window, window)
 						soloDone <- err
 					}()
 
 					b.StopTimer()
-					pfbAwait(b, gate.held, "held solo fetch")
+					select {
+					case <-gate.held:
+					case err := <-soloDone:
+						soloDone = nil
+						abort("the sole read returned %v before its first held fetch", err)
+					case <-time.After(pfbStall):
+						abort("no held solo fetch within %v", pfbStall)
+					}
 					width := 1
 				settle:
 					for width < pfbSoloWidth {
@@ -456,33 +484,51 @@ func BenchmarkParallelFetch(b *testing.B) {
 						}
 					}
 					if width != 1 && width != pfbSoloWidth {
-						close(gate.release)
-						b.Fatalf("the sole read held %d fetches; want 1 or %d", width, pfbSoloWidth)
+						abort("the sole read held %d fetches; want 1 or %d", width, pfbSoloWidth)
 					}
 					widths[width]++
 					b.StartTimer()
 
 					began := time.Now()
-					arrived := make(chan error, 1)
+					arrived = make(chan error, 1)
 					go func() { arrived <- arrive(vb, op) }()
-					pfbAwait(b, gate.other, "arriving backend read")
-					close(gate.release)
+					// A fast arrival can reach the backend and finish before this
+					// select runs, so a finished arrival checks for its backend signal.
+					var arriveErr error
+					finished := false
 					select {
-					case err := <-arrived:
-						if err != nil {
-							b.Fatal(err)
+					case <-gate.other:
+					case arriveErr = <-arrived:
+						arrived, finished = nil, true
+						select {
+						case <-gate.other:
+						default:
+							abort("the arriving operation returned %v before it reached the backend", arriveErr)
 						}
 					case <-time.After(pfbStall):
-						b.Fatalf("arriving operation did not finish within %v", pfbStall)
+						abort("no arriving backend read within %v", pfbStall)
+					}
+					release()
+					if !finished {
+						select {
+						case arriveErr = <-arrived:
+							arrived = nil
+						case <-time.After(pfbStall):
+							abort("the arriving operation did not finish within %v", pfbStall)
+						}
+					}
+					if arriveErr != nil {
+						abort("arriving operation: %v", arriveErr)
 					}
 					arrivalTotal += time.Since(began)
 					select {
 					case err := <-soloDone:
+						soloDone = nil
 						if err != nil {
-							b.Fatal(err)
+							abort("sole read: %v", err)
 						}
 					case <-time.After(pfbStall):
-						b.Fatalf("sole read did not finish within %v", pfbStall)
+						abort("the sole read did not finish within %v", pfbStall)
 					}
 					db.gate.Store(nil)
 					op++
