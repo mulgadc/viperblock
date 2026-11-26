@@ -546,6 +546,7 @@ func TestLatestMapHeadRequiresBoundedConfirmedResponse(t *testing.T) {
 					Body: io.NopCloser(bytes.NewBufferString(body)), Request: req,
 				}, nil
 			}))
+			backend.config.Bucket = "predastore"
 			got, err := backend.LatestMapHeadCtx(t.Context(), prefix)
 			if tc.wantError {
 				require.Error(t, err)

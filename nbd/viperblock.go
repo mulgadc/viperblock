@@ -111,7 +111,6 @@ var use_shardwal bool = false
 // lease_epoch orders this launch's map heads above every earlier launch's.
 var lease_epoch uint64
 var qualified_chunks bool
-var authoritative_map_heads bool
 
 // launchChunkIDs reserves qualified payload IDs across all opens under lease_epoch.
 var launchChunkIDs atomic.Uint64
@@ -247,10 +246,6 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 		var err error
 		qualified_chunks, err = strconv.ParseBool(value)
 		return err
-	} else if key == "authoritative_map_heads" {
-		var err error
-		authoritative_map_heads, err = strconv.ParseBool(value)
-		return err
 	} else if key == "gc_enabled" {
 		gc_enabled = value == "true" || value == "1"
 		return nil
@@ -382,14 +377,13 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		WALBaseDir: wal_base_dir,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role:                  "nbdkit",
-		LeaseEpoch:            lease_epoch,
-		QualifiedChunks:       qualified_chunks,
-		AuthoritativeMapHeads: authoritative_map_heads,
-		LaunchChunkIDs:        &launchChunkIDs,
-		ResumeEpoch:           mapClaimed.Load(),
-		ResumeHeadN:           mapHeadN.Load(),
-		ResumeObjN:            mapObjN.Load(),
+		Role:            "nbdkit",
+		LeaseEpoch:      lease_epoch,
+		QualifiedChunks: qualified_chunks,
+		LaunchChunkIDs:  &launchChunkIDs,
+		ResumeEpoch:     mapClaimed.Load(),
+		ResumeHeadN:     mapHeadN.Load(),
+		ResumeObjN:      mapObjN.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -432,36 +426,19 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	var walNum uint64
 
-	// First, fetch the state from the remote backend
-	err = vb.LoadState()
-
-	if err != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load state: %v", err)}
-	}
-
-	// Mint + persist VolumeUUID now, single-threaded, before WAL recovery or any
-	// served write seals a block. A lazy mint under concurrent boot load lets a
-	// drain read a half-written UUID (or seal recovery chunks under the zero
-	// UUID), corrupting a block with a durable AEAD tag failure.
-	if err = vb.EnsureVolumeUUID(); err != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not mint volume UUID: %v", err)}
-	}
-
-	// Load the LIVE checkpoint, not the numbered one. Runtime drains rewrite the
-	// live checkpoint on every chunk upload but only bump the numbered checkpoint
-	// on a clean Close — which a killed nbdkit VB (qemu reconnect) never reaches.
-	// Loading the stale numbered map here would reconcile ObjectNum too low, so
-	// recovery/drains would reuse a live chunk ID and overwrite it, leaving a
-	// durable AEAD tag failure. LoadLiveCheckpoint falls back to the numbered
-	// checkpoint when no live one exists yet (brand-new volume).
-	// One deadline covers the load and the claim, so a format-2 volume's first
-	// head under this launch's epoch lands within it, or the open fails.
+	// Share one deadline through discovery and claim. Load the published map
+	// before writing startup state or replaying the local WAL.
 	claimCtx, cancelClaim := context.WithTimeout(context.Background(), mapClaimTimeout)
-	err = vb.LoadLiveCheckpointCtx(claimCtx)
-
+	err = vb.LoadStateAndLiveCheckpointCtx(claimCtx)
 	if err != nil {
 		cancelClaim()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
+	}
+
+	// Mint the UUID before recovery or guest I/O can seal a block.
+	if err = vb.EnsureVolumeUUID(); err != nil {
+		cancelClaim()
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not mint volume UUID: %v", err)}
 	}
 
 	err = vb.ClaimMapCtx(claimCtx)

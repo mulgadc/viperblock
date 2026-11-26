@@ -783,7 +783,15 @@ const (
 	latestMapHeadMode     = "latest-map-head"
 )
 
+// MapHeadAuthorityRequired follows the reserved Spinifex EBS bucket name.
+func (backend *Backend) MapHeadAuthorityRequired() bool {
+	return backend.config.Bucket == "predastore"
+}
+
 func (backend *Backend) LatestMapHeadCtx(ctx context.Context, prefix string) (string, error) {
+	if !backend.MapHeadAuthorityRequired() {
+		return "", fmt.Errorf("map-head authority is reserved for the predastore bucket")
+	}
 	if backend.config.s3Client == nil {
 		return "", fmt.Errorf("S3 client not initialized")
 	}

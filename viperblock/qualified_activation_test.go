@@ -33,6 +33,8 @@ func (b omitMapEpochFromList) ListObjectsCtx(ctx context.Context, prefix string)
 	}), nil
 }
 
+func (omitMapEpochFromList) MapHeadAuthorityRequired() bool { return true }
+
 func (b omitMapEpochFromList) LatestMapHeadCtx(ctx context.Context, prefix string) (string, error) {
 	if b.queries != nil {
 		b.queries.Add(1)
@@ -67,7 +69,6 @@ func TestQualifiedActivationDoesNotRevertWhenListingOmitsEpoch(t *testing.T) {
 
 	t.Run("unconfirmed authority stops before claim", func(t *testing.T) {
 		successor, _ := mv.engine(t, 7)
-		successor.AuthoritativeMapHeads = true
 		successor.Backend = omitMapEpochFromList{
 			Backend: successor.Backend, epoch: 6, authorityErr: context.DeadlineExceeded,
 		}
@@ -78,14 +79,12 @@ func TestQualifiedActivationDoesNotRevertWhenListingOmitsEpoch(t *testing.T) {
 	})
 
 	successor, _ := mv.engine(t, 7)
-	successor.AuthoritativeMapHeads = true
 	successor.Backend = omitMapEpochFromList{Backend: successor.Backend, epoch: 6}
 	require.NoError(t, successor.LoadState())
 	require.NoError(t, successor.LoadLiveCheckpoint())
 	require.NoError(t, successor.ClaimMapCtx(ctx))
 
 	cold, _ := mv.engine(t, 8)
-	cold.AuthoritativeMapHeads = true
 	cold.Backend = omitMapEpochFromList{Backend: cold.Backend}
 	require.NoError(t, cold.LoadState())
 	require.NoError(t, cold.LoadLiveCheckpoint())
@@ -129,7 +128,6 @@ func TestMapAuthorityCleanupFailsClosed(t *testing.T) {
 			mv.clock.advance(DefaultMapDeleteDeferral)
 
 			var queries, deletes atomic.Int64
-			old.AuthoritativeMapHeads = true
 			old.Backend = omitMapEpochFromList{
 				Backend: old.Backend, epoch: 6, authorityErr: test.authorityErr,
 				queries: &queries, deletes: &deletes,
@@ -142,7 +140,6 @@ func TestMapAuthorityCleanupFailsClosed(t *testing.T) {
 
 			cold, _ := mv.engine(t, 7)
 			cold.WAL.BaseDir = t.TempDir()
-			cold.AuthoritativeMapHeads = true
 			cold.Backend = omitMapEpochFromList{Backend: cold.Backend}
 			require.NoError(t, cold.LoadState())
 			require.NoError(t, cold.LoadLiveCheckpoint())

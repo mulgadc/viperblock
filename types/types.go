@@ -50,6 +50,7 @@ func (r ChunkRef) Key(volume string) string {
 
 // MapHeadAuthority provides a confirmed lookup of the greatest map-head key.
 type MapHeadAuthority interface {
+	MapHeadAuthorityRequired() bool
 	LatestMapHeadCtx(ctx context.Context, prefix string) (string, error)
 }
 

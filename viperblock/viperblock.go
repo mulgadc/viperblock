@@ -319,9 +319,6 @@ type VB struct {
 	// launch's. A format-2 volume can be read without one, never committed.
 	LeaseEpoch uint64
 
-	// AuthoritativeMapHeads requires confirmed Predastore map-head discovery.
-	AuthoritativeMapHeads bool
-
 	// MapDeleteDeferral overrides DefaultMapDeleteDeferral; tests shorten it.
 	MapDeleteDeferral time.Duration
 	// ResumeEpoch lets an open continue a head this process wrote under the
@@ -1489,8 +1486,6 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		Writes:              Blocks{},
 		WAL:                 WAL{BaseDir: walBaseDir, WALMagic: walMagic},
 		BlockToObjectWAL:    WAL{BaseDir: walBaseDir, WALMagic: blockToObjectWALMagic},
-
-		AuthoritativeMapHeads: config.AuthoritativeMapHeads,
 
 		Cache: Cache{
 			lru: lruCache,
@@ -6401,6 +6396,16 @@ func (vb *VB) InitBackendForRead(ctx context.Context) error {
 // LoadStateCtx is LoadState with a caller-supplied context threaded through
 // the backend state fetch.
 func (vb *VB) LoadStateCtx(ctx context.Context) error {
+	return vb.loadStateCtx(ctx, false)
+}
+
+// LoadStateAndLiveCheckpointCtx loads the published map before startup can
+// reserve nonces or persist a new volume UUID.
+func (vb *VB) LoadStateAndLiveCheckpointCtx(ctx context.Context) error {
+	return vb.loadStateCtx(ctx, true)
+}
+
+func (vb *VB) loadStateCtx(ctx context.Context, loadCheckpoint bool) error {
 	state, err := vb.selectPersistedState(ctx)
 	if err != nil {
 		return err
@@ -6465,6 +6470,14 @@ func (vb *VB) LoadStateCtx(ctx context.Context) error {
 		vb.VolumeUUID = state.VolumeUUID
 		vb.SeqNum.Store(state.SeqNumHighWater)
 		vb.seqNumHighWater.Store(state.SeqNumHighWater)
+	}
+	if loadCheckpoint {
+		if err := vb.LoadLiveCheckpointCtx(ctx); err != nil {
+			return err
+		}
+	}
+	if vb.EncryptionEnabled {
+		advanceAtomicTo(&vb.seqNumHighWater, vb.SeqNum.Load())
 		if err := vb.bumpSeqNumHighWater(ctx); err != nil {
 			return fmt.Errorf("LoadState: reserve initial SeqNum window: %w", err)
 		}

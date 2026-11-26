@@ -42,7 +42,6 @@ func resetPluginConfigState() {
 	loadedMasterKey = nil
 	lease_epoch = 0
 	qualified_chunks = false
-	authoritative_map_heads = false
 	launchChunkIDs.Store(0)
 }
 

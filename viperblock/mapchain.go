@@ -601,6 +601,30 @@ const mapHeadAuthorityTimeout = 10 * time.Second
 
 var ErrMapHeadAuthority = errors.New("map: authoritative head discovery unavailable")
 
+func (vb *VB) mapHeadAuthorityRequired() (bool, error) {
+	if backend, ok := vb.Backend.(types.MapHeadAuthority); ok {
+		return backend.MapHeadAuthorityRequired(), nil
+	}
+	if vb.Backend.GetBackendType() == "s3" {
+		return false, ErrMapHeadAuthority
+	}
+	return false, nil
+}
+
+func (vb *VB) checkQualifiedMapBackend() error {
+	if vb.Backend.GetBackendType() != "s3" {
+		return nil
+	}
+	required, err := vb.mapHeadAuthorityRequired()
+	if err != nil {
+		return err
+	}
+	if !required {
+		return fmt.Errorf("%w: qualified S3 volumes require the predastore bucket", ErrMapHeadAuthority)
+	}
+	return nil
+}
+
 func (vb *VB) authoritativeMapHead(ctx context.Context) ([2]uint64, error) {
 	authority, ok := vb.Backend.(types.MapHeadAuthority)
 	if !ok {
@@ -695,7 +719,11 @@ func (vb *VB) newestListedMapHead(ctx context.Context) ([2]uint64, error) {
 func (vb *VB) readLatestMapHead(ctx context.Context) ([2]uint64, []byte, error) {
 	lookup := vb.newestListedMapHead
 	attempts := 1
-	if vb.AuthoritativeMapHeads {
+	required, err := vb.mapHeadAuthorityRequired()
+	if err != nil {
+		return [2]uint64{}, nil, err
+	}
+	if required {
 		lookup = vb.authoritativeMapHead
 		attempts = 2 // A fresher head may have replaced the selected one before the exact read.
 		var cancel context.CancelFunc
@@ -748,8 +776,10 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if version == mapQualifiedObjectVersion && vb.Backend.GetBackendType() == "s3" && !vb.AuthoritativeMapHeads {
-		return ErrMapHeadAuthority
+	if version == mapQualifiedObjectVersion {
+		if err := vb.checkQualifiedMapBackend(); err != nil {
+			return err
+		}
 	}
 	if resume && version == mapQualifiedObjectVersion && vb.LaunchChunkIDs == nil {
 		return fmt.Errorf("%w: qualified resume requires the launch allocation cursor", ErrMapEpochNotNewer)
@@ -876,8 +906,10 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("map: claim deadline passed: %w", err)
 	}
-	if vb.QualifiedChunks && vb.Backend.GetBackendType() == "s3" && !vb.AuthoritativeMapHeads {
-		return ErrMapHeadAuthority
+	if vb.QualifiedChunks {
+		if err := vb.checkQualifiedMapBackend(); err != nil {
+			return err
+		}
 	}
 	wasQualified := vb.mapChain.qualified.Load()
 	if vb.QualifiedChunks {
@@ -1220,7 +1252,11 @@ func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, bound 
 // writer that finds one deletes nothing and fences itself.
 func (vb *VB) higherEpochHeadExists(ctx context.Context) (bool, error) {
 	var newest uint64
-	if vb.AuthoritativeMapHeads {
+	required, err := vb.mapHeadAuthorityRequired()
+	if err != nil {
+		return false, err
+	}
+	if required {
 		ctx, cancel := context.WithTimeout(ctx, mapHeadAuthorityTimeout)
 		defer cancel()
 		head, err := vb.authoritativeMapHead(ctx)
