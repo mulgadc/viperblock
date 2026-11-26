@@ -5655,8 +5655,8 @@ func (t *readAheadTracker) reset() {
 
 // planReadAhead records a request against the stream and returns the trailing
 // blocks its final run may carry with it, along with their SeqNums. The caller
-// calls done once the request's fetch has finished.
-func (vb *VB) planReadAhead(block, blockRequests uint64, runs []ConsecutiveBlock) (extra int, seqNums []uint64, done func()) {
+// passes ticket to vb.readAhead.end once the request's fetch has finished.
+func (vb *VB) planReadAhead(block, blockRequests uint64, runs []ConsecutiveBlock) (extra int, seqNums []uint64, ticket readAheadTicket) {
 	// Never prefetch more than the cache can hold: blocks fetched only to be
 	// evicted before the request that wanted them are read, decrypted and
 	// thrown away. Volumes opened with a small cache get a small readahead.
@@ -5672,13 +5672,12 @@ func (vb *VB) planReadAhead(block, blockRequests uint64, runs []ConsecutiveBlock
 	// with another request already being served is covering that gap itself,
 	// and prefetching under it only duplicates traffic it has in flight.
 	widen, ticket := vb.readAhead.begin(block, blockRequests, limit)
-	done = func() { vb.readAhead.end(ticket) }
 	if !widen {
-		return 0, nil, done
+		return 0, nil, ticket
 	}
 
 	extra, seqNums = vb.extendRunForReadahead(runs[len(runs)-1], limit)
-	return extra, seqNums, done
+	return extra, seqNums, ticket
 }
 
 // extendRunForReadahead grows a run forward through the same chunk, returning
@@ -6880,8 +6879,8 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 
 	// Readahead applies to the final run only, since that is the one a
 	// continuing stream reads off the end of.
-	readAheadExtra, readAheadSeqNums, readAheadDone := vb.planReadAhead(block, blockRequests, consecutiveBlocksToRead)
-	defer readAheadDone()
+	readAheadExtra, readAheadSeqNums, readAheadTicket := vb.planReadAhead(block, blockRequests, consecutiveBlocksToRead)
+	defer vb.readAhead.end(readAheadTicket)
 
 	// Next, read our consecutive blocks from the backend
 	for idx, cb := range consecutiveBlocksToRead {
@@ -7455,8 +7454,8 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 		// Served without touching the backend. The stream position still has to
 		// advance, or the cached stretch looks like the end of the stream and
 		// the request after it starts over.
-		_, _, done := vb.planReadAhead(stream.block, stream.blockRequests, nil)
-		done()
+		_, _, ticket := vb.planReadAhead(stream.block, stream.blockRequests, nil)
+		vb.readAhead.end(ticket)
 	}
 
 	// Fetch blocks from the source volume's backend (snapshot fallback)
@@ -7525,9 +7524,9 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 
 	readAheadExtra, readAheadSeqNums := 0, []uint64(nil)
 	if stream != nil {
-		var done func()
-		readAheadExtra, readAheadSeqNums, done = vb.planReadAhead(stream.block, stream.blockRequests, consecutiveBlocksToRead)
-		defer done()
+		var ticket readAheadTicket
+		readAheadExtra, readAheadSeqNums, ticket = vb.planReadAhead(stream.block, stream.blockRequests, consecutiveBlocksToRead)
+		defer vb.readAhead.end(ticket)
 	}
 
 	return vb.fetchRuns(ctx, consecutiveBlocksToRead, data, readAheadExtra, readAheadSeqNums)
@@ -7535,8 +7534,8 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 
 // readInheritedBlock serves a single resolved source block without fragmenting larger reads.
 func (vb *VB) readInheritedBlock(ctx context.Context, volume string, uuid [4]byte, nameHash [32]byte, block ConsecutiveBlock, dst []byte) ([]byte, error) {
-	_, _, done := vb.planReadAhead(block.StartBlock, 1, nil)
-	done()
+	_, _, ticket := vb.planReadAhead(block.StartBlock, 1, nil)
+	vb.readAhead.end(ticket)
 	origin := inheritedCacheOrigin{
 		volume: volume, uuid: uuid, nameHash: nameHash,
 		objectID: block.ObjectID, offset: block.ObjectOffset,

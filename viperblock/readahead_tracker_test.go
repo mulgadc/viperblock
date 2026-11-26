@@ -107,6 +107,7 @@ func TestReadAheadTracker_AReusedSlotIsNotReleasedByAnOldTicket(t *testing.T) {
 // failNextChunk fails the next chunk read once armed.
 type failNextChunk struct {
 	types.Backend
+
 	armed atomic.Bool
 }
 
