@@ -115,8 +115,8 @@ var qualified_chunks bool
 // launchChunkIDs reserves qualified payload IDs across all opens under lease_epoch.
 var launchChunkIDs atomic.Uint64
 
-// mapClaimed records that this process has claimed its epoch, so a later
-// connection resumes the heads it wrote instead of refusing them.
+// mapClaimed records that this process consumed a head ordinal, so a later
+// connection can resume its epoch even if the backend reply was lost.
 var mapClaimed atomic.Bool
 
 // mapHeadN and mapObjN carry map counters across opens, ambiguous writes included.
@@ -441,13 +441,16 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not mint volume UUID: %v", err)}
 	}
 
+	previousHead, _ := vb.MapCounters()
 	err = vb.ClaimMapCtx(claimCtx)
 	cancelClaim()
-	if err != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
+	nextHead, _ := vb.MapCounters()
+	if err == nil || nextHead > previousHead {
+		rememberMapCounters(vb)
 	}
-	if vb.IsMapDelta() {
-		mapClaimed.Store(true)
+	if err != nil {
+		vb.Detach()
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
 	}
 
 	err = vb.RecoverLocalWALs()

@@ -3,6 +3,7 @@ package viperblock
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -154,6 +155,40 @@ func BenchmarkQualifiedPredastoreSweep(b *testing.B) {
 					vb.mapChain.chunkSeen[ref] = firstSeen
 				}
 				vb.sweepChunks(b.Context())
+			}
+		})
+	}
+}
+
+func BenchmarkLandedMapClaimReconnect(b *testing.B) {
+	silenceVBLogs()
+	for _, objectCount := range []int{16, 1024} {
+		b.Run(strconv.Itoa(objectCount)+"-objects", func(b *testing.B) {
+			mv := newMapVolume(b, volumeSize, nil)
+			seed, _ := mv.create(b, 5)
+			seed.Detach()
+			writer := claimQualified(b, mv, 6)
+			headN, objN := writer.MapCounters()
+			for n := range objectCount {
+				require.NoError(b, writer.Backend.WriteKeyCtx(
+					b.Context(), mapObjectKey(mapDeltaPrefix, 6, uint64(n)), []byte("unreferenced delta")))
+			}
+			writer.Detach()
+
+			reader, _ := mv.engine(b, 6)
+			reader.ResumeEpoch = true
+			reader.ResumeHeadN = headN
+			reader.ResumeObjN = objN
+			reader.LaunchChunkIDs = &atomic.Uint64{}
+			require.NoError(b, reader.LoadState())
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := reader.LoadLiveCheckpointCtx(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+				if err := reader.ClaimMapCtx(b.Context()); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}

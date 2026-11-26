@@ -840,6 +840,10 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	vb.mapChain.lastBase = vb.mapNow()
 	vb.mapChain.pending = nil
 	vb.mapChain.committed.Store(true)
+	if vb.ResumeEpoch {
+		vb.mapChain.headN = vb.ResumeHeadN
+		vb.mapChain.objN = vb.ResumeObjN
+	}
 	if resume {
 		// The earlier engine's counters cover writes it sent but cannot know
 		// landed, so they win over what the listing shows.
