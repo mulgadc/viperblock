@@ -67,6 +67,8 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 	stop := make(chan struct{})
 	started := make(chan struct{}, neighbours)
 	var wg sync.WaitGroup
+	stopNeighbours := sync.OnceFunc(func() { close(stop); wg.Wait() })
+	defer stopNeighbours()
 	for n := range neighbours {
 		wg.Go(func() {
 			rng := rand.New(rand.NewPCG(uint64(n), 1))
@@ -104,8 +106,7 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 	}
 	elapsed := time.Since(start)
 	streaming.Store(false)
-	close(stop)
-	wg.Wait()
+	stopNeighbours()
 	require.Equal(t, written[:streamHalfBytes], got, "the stream came back wrong")
 
 	run := streamRun{streamReads: sc.streamReads.Load(), streamBytes: sc.streamBytes.Load(), elapsed: elapsed}
@@ -164,10 +165,14 @@ func BenchmarkSequentialStream(b *testing.B) {
 	for _, neighbours := range []int{0, 1, 2} {
 		b.Run(fmt.Sprintf("depth1-beside-%d", neighbours), func(b *testing.B) {
 			var bytes int64
+			var streamTime time.Duration
 			for b.Loop() {
-				bytes += readStreamBeside(b, root, volumeName, written, neighbours).streamBytes
+				run := readStreamBeside(b, root, volumeName, written, neighbours)
+				bytes += run.streamBytes
+				streamTime += run.elapsed
 			}
 			b.ReportMetric(float64(bytes)/float64(b.N)/streamHalfBytes, "backend-bytes/stream-byte")
+			b.ReportMetric(streamTime.Seconds()/float64(b.N), "stream-sec/op")
 		})
 	}
 	b.Run("depth16", func(b *testing.B) {
