@@ -134,27 +134,6 @@ func TestSequentialStream_KeepsReadaheadBesideRandomReaders(t *testing.T) {
 	}
 }
 
-// TestReadahead_ARequestWhereARecentStreamEndedIsWidened pins the limit of
-// following several streams: a read that starts exactly where one of the last
-// few ended is taken as continuing it, even with another read in between.
-func TestReadahead_ARequestWhereARecentStreamEndedIsWidened(t *testing.T) {
-	const volumeName = "vol-readahead-interleaved"
-	root, written := seedSequentialVolume(t, volumeName, nil)
-	reader, counter := coldReaderVB(t, root, volumeName, nil)
-	bs := uint64(DefaultBlockSize)
-
-	for _, block := range []uint64{100, 900} {
-		_, err := reader.ReadAtCtx(context.Background(), block*bs, bs)
-		require.NoError(t, err)
-	}
-	before := counter.bytes.Load()
-	data, err := reader.ReadAtCtx(context.Background(), 101*bs, bs)
-	require.NoError(t, err)
-	require.Equal(t, written[101*bs:102*bs], data)
-	assert.Greater(t, counter.bytes.Load()-before, int64(bs),
-		"block 101 after 100 and 900 was not taken as continuing the stream at 100")
-}
-
 // TestRandomRead_InterleavedIsNotWidened reads random blocks, so a request
 // that is widened must have started where one of the last few ended by chance.
 func TestRandomRead_InterleavedIsNotWidened(t *testing.T) {
