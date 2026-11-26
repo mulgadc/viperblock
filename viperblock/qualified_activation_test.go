@@ -150,3 +150,22 @@ func TestMapAuthorityCleanupFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestPredastoreMapHeadAuthorityDoesNotRequireLaunchFlag(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	previous := randomBlockData(1)
+	writeDrain(t, seed, 0, previous)
+	seed.Detach()
+
+	activated := claimQualified(t, mv, 6)
+	latest := randomBlockData(1)
+	writeDrain(t, activated, 0, latest)
+	activated.Detach()
+
+	successor, _ := mv.engine(t, 7)
+	successor.Backend = omitMapEpochFromList{Backend: successor.Backend, epoch: 6}
+	require.NoError(t, successor.LoadState())
+	require.NoError(t, successor.LoadLiveCheckpoint())
+	require.Equal(t, latest, readBlocks(t, successor, 0, 1))
+}
