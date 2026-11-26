@@ -37,6 +37,26 @@ func BenchmarkChunkIdentity(b *testing.B) {
 	}
 }
 
+func BenchmarkFirstQualifiedClaim(b *testing.B) {
+	silenceVBLogs()
+	ctx := b.Context()
+	mv := newMapVolume(b, volumeSize, nil)
+	seed, _ := mv.create(b, 5)
+	seed.Detach()
+	vb, _ := mv.engine(b, 6)
+	vb.QualifiedChunks = true
+	require.NoError(b, vb.LoadState())
+	require.NoError(b, vb.LoadLiveCheckpoint())
+	b.ReportAllocs()
+	for b.Loop() {
+		vb.mapChain.claimed = false
+		vb.mapChain.qualified.Store(false)
+		if err := vb.ClaimMapCtx(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func benchmarkChunkIdentity(b *testing.B, operation string, size uint64, qualified bool) {
 	ctx := context.Background()
 	mv := newMapVolume(b, max(volumeSize, size), nil)

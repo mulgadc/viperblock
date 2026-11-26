@@ -906,14 +906,19 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("map: claim deadline passed: %w", err)
 	}
-	if vb.QualifiedChunks {
-		if err := vb.checkQualifiedMapBackend(); err != nil {
-			return err
-		}
-	}
 	wasQualified := vb.mapChain.qualified.Load()
-	if vb.QualifiedChunks {
-		vb.mapChain.qualified.Store(true)
+	if vb.QualifiedChunks && !wasQualified && vb.SnapshotID == "" {
+		vb.BlocksToObject.mu.RLock()
+		empty := vb.BlocksToObject.lookup.len() == 0
+		vb.BlocksToObject.mu.RUnlock()
+		// A delayed legacy PUT can still overwrite a numeric chunk. Only
+		// activate while the live map has no references to those keys.
+		if empty {
+			if err := vb.checkQualifiedMapBackend(); err != nil {
+				return err
+			}
+			vb.mapChain.qualified.Store(true)
+		}
 	}
 	advanceAtomicTo(&vb.ObjectNum, vb.ObjectNum.Load()+mapClaimObjectGap)
 	if err := vb.putMapHead(ctx, vb.mapChain.head); err != nil {

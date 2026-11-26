@@ -59,7 +59,6 @@ func TestQualifiedActivationDoesNotRevertWhenListingOmitsEpoch(t *testing.T) {
 	ctx := t.Context()
 	mv := newMapVolume(t, volumeSize, nil)
 	seed, _ := mv.create(t, 5)
-	writeDrain(t, seed, 0, randomBlockData(1))
 	seed.Detach()
 
 	activated := claimQualified(t, mv, 6)
@@ -121,7 +120,8 @@ func TestMapAuthorityCleanupFailsClosed(t *testing.T) {
 			writeDrain(t, old, 0, randomBlockData(1))
 			old.sweepChunks(t.Context())
 
-			newer := claimQualified(t, mv, 6)
+			newer, _, err := mv.open(t, 6)
+			require.NoError(t, err)
 			expected := randomBlockData(1)
 			writeDrain(t, newer, 1, expected)
 			newer.Detach()
@@ -151,8 +151,6 @@ func TestMapAuthorityCleanupFailsClosed(t *testing.T) {
 func TestPredastoreMapHeadAuthorityDoesNotRequireLaunchFlag(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
 	seed, _ := mv.create(t, 5)
-	previous := randomBlockData(1)
-	writeDrain(t, seed, 0, previous)
 	seed.Detach()
 
 	activated := claimQualified(t, mv, 6)

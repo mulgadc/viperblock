@@ -1,7 +1,6 @@
 package viperblock
 
 import (
-	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -25,15 +24,23 @@ func claimQualified(t testing.TB, mv *mapVolume, epoch uint64) *VB {
 	return vb
 }
 
-func TestQualifiedChunkSnapshotCopyAndDescendant(t *testing.T) {
+func TestRetainedMixedQualifiedSnapshotCopyAndDescendant(t *testing.T) {
 	ctx := context.Background()
 	mv := newMapVolume(t, volumeSize, nil)
-	legacy, _ := mv.create(t, 5)
+	seed, _ := mv.create(t, 5)
 	legacyBytes := randomBlockData(1)
-	writeDrain(t, legacy, 0, legacyBytes)
-	legacy.Detach()
+	writeDrain(t, seed, 0, legacyBytes)
+	seed.Detach()
 
-	source := claimQualified(t, mv, 6)
+	source, _ := mv.engine(t, 6)
+	require.NoError(t, source.LoadState())
+	require.NoError(t, source.LoadLiveCheckpoint())
+	// Reproduce a mixed head written by the preceding candidate.
+	source.mapChain.qualified.Store(true)
+	source.LaunchChunkIDs = &atomic.Uint64{}
+	require.NoError(t, source.ClaimMapCtx(ctx))
+	require.NoError(t, source.RecoverLocalWALs())
+	openMapWALs(t, source)
 	qualifiedBytes := randomBlockData(1)
 	writeDrain(t, source, 1, qualifiedBytes)
 	_, err := source.CreateSnapshot("source-snapshot")
@@ -161,15 +168,12 @@ func TestQualifiedChunkSameLaunchAllocatesAfterFailedRecovery(t *testing.T) {
 	require.Equal(t, expected, readBlocks(t, cold, 0, 1))
 }
 
-func TestQualifiedActivationRefusesMapWithPendingLegacyOverwrite(t *testing.T) {
+func TestQualifiedActivationKeepsPopulatedMapDormant(t *testing.T) {
 	ctx := t.Context()
 	mv := newMapVolume(t, volumeSize, nil)
 	dormant, _ := mv.create(t, 5)
 	acknowledged := randomBlockData(1)
 	writeDrain(t, dormant, 0, acknowledged)
-	ref, _, _, err := dormant.lookupChunk(0)
-	require.NoError(t, err)
-	require.Zero(t, ref.Epoch)
 	dormant.Detach()
 
 	activator, _ := mv.engine(t, 6)
@@ -177,21 +181,79 @@ func TestQualifiedActivationRefusesMapWithPendingLegacyOverwrite(t *testing.T) {
 	require.NoError(t, activator.LoadState())
 	require.NoError(t, activator.LoadLiveCheckpoint())
 
-	before := mv.mapKeys(t, mapHeadPrefix)
-	if err := activator.ClaimMapCtx(ctx); err != nil {
-		require.Equal(t, before, mv.mapKeys(t, mapHeadPrefix), "activation must publish no head")
-		require.Equal(t, acknowledged, readBlocks(t, activator, 0, 1))
-		return
-	}
-
-	// Complete a legacy PUT that was submitted against this numeric key before
-	// the activation claim. The current head still names that old key.
-	headers := dormant.ChunkHeader()
-	late := randomBlockData(1)
-	require.NoError(t, dormant.Backend.WriteCtx(ctx, types.FileTypeChunk, ref.ID, &headers, &late))
+	require.NoError(t, activator.ClaimMapCtx(ctx))
 	cold, _ := mv.engine(t, 7)
 	require.NoError(t, cold.LoadState())
 	require.NoError(t, cold.LoadLiveCheckpoint())
-	require.True(t, bytes.Equal(acknowledged, readBlocks(t, cold, 0, 1)),
-		"an activated map exposed a delayed legacy PUT at its retained numeric reference")
+	require.Equal(t, acknowledged, readBlocks(t, cold, 0, 1))
+	require.False(t, cold.mapChain.qualified.Load(), "a populated map must remain dormant")
+}
+
+func TestQualifiedActivationIsolatesEmptyMapFromLegacyPut(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	dormant, _ := mv.create(t, 5)
+	dormant.Detach()
+
+	writer := claimQualified(t, mv, 6)
+	expected := randomBlockData(1)
+	writeDrain(t, writer, 0, expected)
+	ref, _, _, err := writer.lookupChunk(0)
+	require.NoError(t, err)
+	require.EqualValues(t, 6, ref.Epoch)
+	writer.Detach()
+
+	headers := dormant.ChunkHeader()
+	late := randomBlockData(1)
+	require.NoError(t, dormant.Backend.WriteCtx(t.Context(), types.FileTypeChunk, ref.ID, &headers, &late))
+	cold, _ := mv.engine(t, 7)
+	require.NoError(t, cold.LoadState())
+	require.NoError(t, cold.LoadLiveCheckpoint())
+	require.Equal(t, expected, readBlocks(t, cold, 0, 1))
+}
+
+func TestQualifiedActivationKeepsEmptyCloneDormant(t *testing.T) {
+	for _, populated := range []bool{false, true} {
+		name := "empty parent"
+		if populated {
+			name = "populated parent"
+		}
+		t.Run(name, func(t *testing.T) {
+			mv := newMapVolume(t, volumeSize, nil)
+			parent, _ := mv.create(t, 5)
+			expected := make([]byte, parent.BlockSize)
+			if populated {
+				expected = randomBlockData(1)
+				writeDrain(t, parent, 0, expected)
+			}
+			_, err := parent.CreateSnapshot("parent")
+			require.NoError(t, err)
+
+			cloneVolume := *mv
+			cloneVolume.name = "vol-clone"
+			seed, _ := cloneVolume.create(t, 5)
+			require.NoError(t, seed.OpenFromSnapshot("parent"))
+			require.NoError(t, seed.SaveState())
+			seed.Detach()
+
+			clone, _ := cloneVolume.engine(t, 6)
+			clone.QualifiedChunks = true
+			require.NoError(t, clone.LoadState())
+			require.NoError(t, clone.LoadLiveCheckpoint())
+			require.NoError(t, clone.ClaimMapCtx(t.Context()))
+
+			cold, _ := cloneVolume.engine(t, 7)
+			require.NoError(t, cold.LoadState())
+			require.NoError(t, cold.LoadLiveCheckpoint())
+			require.Equal(t, "parent", cold.SnapshotID)
+			require.False(t, cold.mapChain.qualified.Load())
+			data := make([]byte, cold.BlockSize)
+			err = cold.ReadAtInto(0, data)
+			if populated {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, ErrZeroBlock)
+			}
+			require.Equal(t, expected, data)
+		})
+	}
 }
