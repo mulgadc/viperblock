@@ -42,6 +42,9 @@ func (s *streamCounter) ReadCtx(ctx context.Context, fileType types.FileType, ob
 	return s.Backend.ReadCtx(ctx, fileType, objectID, offset, length)
 }
 
+// streamHalfBytes is the part of the volume the stream reads.
+const streamHalfBytes = readAmpVolumeBytes / 2
+
 type streamRun struct {
 	streamReads, streamBytes int64
 	// neighbourReads counts each neighbour's reads that completed while the
@@ -50,9 +53,9 @@ type streamRun struct {
 	elapsed        time.Duration
 }
 
-// readStreamBeside reads the whole volume as a depth-1 stream of 64 KiB
-// requests on a cold reader, while neighbours depth-1 random 4 KiB readers
-// run until it ends. Every neighbour has made a read before the stream starts.
+// readStreamBeside reads the first half of the volume as a depth-1 stream of
+// 64 KiB requests on a cold reader, while neighbours depth-1 random 4 KiB readers
+// of the other half run until it ends, so they never cache the stream's blocks.
 func readStreamBeside(t testing.TB, root, volumeName string, written []byte, neighbours int) streamRun {
 	t.Helper()
 	reader, counter := coldReaderVB(t, root, volumeName, nil)
@@ -73,7 +76,8 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 					return
 				default:
 				}
-				block := rng.Uint64N(readAmpVolumeBytes / uint64(DefaultBlockSize))
+				half := streamHalfBytes / uint64(DefaultBlockSize)
+				block := half + rng.Uint64N(half)
 				_, err := reader.ReadAtCtx(context.Background(), block*uint64(DefaultBlockSize), uint64(DefaultBlockSize))
 				assert.NoError(t, err)
 				if streaming.Load() {
@@ -92,8 +96,8 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 	ctx := context.WithValue(context.Background(), streamKey{}, true)
 	streaming.Store(true)
 	start := time.Now()
-	got := make([]byte, 0, readAmpVolumeBytes)
-	for off := uint64(0); off < readAmpVolumeBytes; off += readAmpRequestBytes {
+	got := make([]byte, 0, streamHalfBytes)
+	for off := uint64(0); off < streamHalfBytes; off += readAmpRequestBytes {
 		data, err := reader.ReadAtCtx(ctx, off, readAmpRequestBytes)
 		require.NoError(t, err)
 		got = append(got, data...)
@@ -102,7 +106,7 @@ func readStreamBeside(t testing.TB, root, volumeName string, written []byte, nei
 	streaming.Store(false)
 	close(stop)
 	wg.Wait()
-	require.Equal(t, written, got, "the stream came back wrong")
+	require.Equal(t, written[:streamHalfBytes], got, "the stream came back wrong")
 
 	run := streamRun{streamReads: sc.streamReads.Load(), streamBytes: sc.streamBytes.Load(), elapsed: elapsed}
 	for n := range during {
@@ -152,8 +156,8 @@ func TestRandomRead_InterleavedIsNotWidened(t *testing.T) {
 		"random reads were widened")
 }
 
-// BenchmarkSequentialStream times one 16 MiB stream of 64 KiB reads at 1 ms a
-// chunk read: depth 1 alone and beside random readers, and depth 16.
+// BenchmarkSequentialStream times a stream of 64 KiB reads at 1 ms a chunk
+// read: 8 MiB at depth 1, alone and beside random readers, and 16 MiB at depth 16.
 func BenchmarkSequentialStream(b *testing.B) {
 	const volumeName = "vol-readahead-bench"
 	root, written := seedSequentialVolume(b, volumeName, nil)
@@ -163,7 +167,7 @@ func BenchmarkSequentialStream(b *testing.B) {
 			for b.Loop() {
 				bytes += readStreamBeside(b, root, volumeName, written, neighbours).streamBytes
 			}
-			b.ReportMetric(float64(bytes)/float64(b.N)/readAmpVolumeBytes, "backend-bytes/stream-byte")
+			b.ReportMetric(float64(bytes)/float64(b.N)/streamHalfBytes, "backend-bytes/stream-byte")
 		})
 	}
 	b.Run("depth16", func(b *testing.B) {
