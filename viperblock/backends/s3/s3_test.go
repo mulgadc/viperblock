@@ -556,3 +556,23 @@ func TestLatestMapHeadRequiresBoundedConfirmedResponse(t *testing.T) {
 		})
 	}
 }
+
+func TestExternalBucketUsesNativeMapHeadListing(t *testing.T) {
+	const prefix = "vol/map/head."
+	var requests int
+	backend := newTestBackend(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		assert.Empty(t, req.Header.Get(mapHeadReadModeHeader))
+		body := "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: http.Header{},
+			Body: io.NopCloser(bytes.NewBufferString(body)), Request: req,
+		}, nil
+	}))
+	_, err := backend.LatestMapHeadCtx(t.Context(), prefix)
+	require.Error(t, err)
+	require.Zero(t, requests, "the Predastore extension stays off the external S3 wire")
+	_, err = backend.ListObjectsCtx(t.Context(), prefix)
+	require.NoError(t, err)
+	require.Equal(t, 1, requests)
+}
