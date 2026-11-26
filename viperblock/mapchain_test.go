@@ -934,3 +934,55 @@ func TestStoppedCompactionCannotReserveAnOrdinal(t *testing.T) {
 	require.Equal(t, object, afterObject, "stopped compaction must not reserve a new key")
 	require.Equal(t, before, mv.mapKeys(t, mapBasePrefix))
 }
+
+type heldClaimBackend struct {
+	types.Backend
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *heldClaimBackend) WriteKeyCtx(ctx context.Context, key string, data []byte) error {
+	if strings.HasPrefix(key, mapHeadPrefix) {
+		close(b.entered)
+		<-b.release
+	}
+	return b.Backend.WriteKeyCtx(ctx, key, data)
+}
+
+func TestMapCounterSampleDoesNotWaitForHeldClaim(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	seed.Detach()
+	writer, _ := mv.engine(t, 6)
+	require.NoError(t, writer.LoadState())
+	require.NoError(t, writer.LoadLiveCheckpoint())
+
+	backend := &heldClaimBackend{
+		Backend: writer.Backend, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	writer.Backend = backend
+	release := sync.OnceFunc(func() { close(backend.release) })
+	defer release()
+	done := make(chan error, 1)
+	go func() { done <- writer.ClaimMapCtx(t.Context()) }()
+
+	select {
+	case <-backend.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("claim did not reach the held backend")
+	}
+	sampled := make(chan uint64, 1)
+	go func() {
+		head, _ := writer.MapCounters()
+		sampled <- head
+	}()
+	select {
+	case head := <-sampled:
+		require.EqualValues(t, 1, head)
+	case <-time.After(time.Second):
+		t.Fatal("sampling consumed ordinals waited for the held PUT")
+	}
+	release()
+	require.NoError(t, <-done)
+}
