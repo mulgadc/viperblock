@@ -120,8 +120,8 @@ func (vb *VB) maybeStartConversion() {
 	c.started = vb.mapNow()
 	// A reconnect in the same process continues the earlier engine's
 	// numbering, so a head an abandoned conversion wrote is never reused.
-	vb.mapChain.headN = max(vb.mapChain.headN, vb.ResumeHeadN)
-	vb.mapChain.objN = max(vb.mapChain.objN, vb.ResumeObjN)
+	vb.mapChain.headN.Store(max(vb.mapChain.headN.Load(), vb.ResumeHeadN))
+	vb.mapChain.objN.Store(max(vb.mapChain.objN.Load(), vb.ResumeObjN))
 	vb.mapChain.bg.Go(func() {
 		bgCtx, cancel := vb.mapBackgroundCtx()
 		defer cancel()
@@ -148,8 +148,7 @@ func (vb *VB) writeConversionBase(parent context.Context, snap *extentIndex[Bloc
 	body := encodeMapRuns(runs)
 
 	vb.checkpointMu.Lock()
-	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
-	vb.mapChain.objN++
+	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN.Add(1) - 1}
 	vb.checkpointMu.Unlock()
 	data := frameMapObject(mapKindBase, vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))

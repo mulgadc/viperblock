@@ -134,6 +134,28 @@ func rememberMapCounters(vb *viperblock.VB) {
 	mapClaimed.Store(true)
 }
 
+func closeStartupWALs(vb *viperblock.VB) {
+	for _, wal := range []*viperblock.WAL{&vb.WAL, &vb.BlockToObjectWAL} {
+		for _, file := range wal.DB {
+			if err := file.Close(); err != nil {
+				slog.Warn("failed to close startup WAL", "err", err)
+			}
+		}
+		wal.DB = nil
+	}
+	if vb.ShardedWAL != nil {
+		for _, shard := range vb.ShardedWAL.Shards {
+			if shard.DB == nil {
+				continue
+			}
+			if err := shard.DB.Close(); err != nil {
+				slog.Warn("failed to close startup WAL shard", "err", err)
+			}
+			shard.DB = nil
+		}
+	}
+}
+
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -371,10 +393,13 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	}
 
 	vbconfig := viperblock.VB{
-		VolumeName: volume,
-		VolumeSize: size,
-		BaseDir:    base_dir,
-		WALBaseDir: wal_base_dir,
+		VolumeName:          volume,
+		VolumeSize:          size,
+		BaseDir:             base_dir,
+		WALBaseDir:          wal_base_dir,
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCInterval:          -1,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
 		Role:            "nbdkit",
@@ -405,6 +430,16 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
+
+	defer func() {
+		if !success {
+			vb.Detach()
+			if mapClaimed.Load() {
+				rememberMapCounters(vb)
+			}
+			closeStartupWALs(vb)
+		}
+	}()
 
 	// Apply nbdkit config override for sharded WAL
 	vb.UseShardedWAL = use_shardwal
@@ -449,14 +484,11 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 		rememberMapCounters(vb)
 	}
 	if err != nil {
-		vb.Detach()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
 	}
 
 	err = vb.RecoverLocalWALs()
 	if err != nil {
-		rememberMapCounters(vb)
-		vb.Detach()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not recover local WALs: %v", err)}
 	}
 
@@ -482,6 +514,13 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
 	}
+
+	vb.WALSyncInterval = viperblock.DefaultWALSyncInterval
+	vb.ChunkUploadInterval = viperblock.DefaultChunkUploadInterval
+	vb.GCInterval = viperblock.DefaultGCInterval
+	vb.StartWALSyncer()
+	vb.StartChunkUploader()
+	vb.StartChunkGC()
 
 	activeVB = vb
 	snapshotListenerDone = startSnapshotListener(vb, filepath.Join(base_dir, volume, "snapshot.sock"))

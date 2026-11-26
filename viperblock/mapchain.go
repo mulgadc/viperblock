@@ -403,8 +403,8 @@ func decodeMapHead(body []byte) (mapHead, error) {
 // guarded by VB.checkpointMu unless noted.
 type mapChainState struct {
 	head       mapHead
-	headN      uint64
-	objN       uint64
+	headN      atomic.Uint64
+	objN       atomic.Uint64
 	claimed    bool
 	pending    []BlockLookup
 	baseBytes  uint64
@@ -510,8 +510,7 @@ func (vb *VB) mapObjectVersion() byte {
 }
 
 func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body []byte) (mapObjRef, error) {
-	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
-	vb.mapChain.objN++
+	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN.Add(1) - 1}
 	data := frameMapObjectVersion(kind, vb.mapObjectVersion(), vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
@@ -521,8 +520,17 @@ func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body [
 // putMapHead writes the next head of this launch's epoch. Its number is
 // consumed whether or not the write succeeds, so no name is ever reused.
 func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
-	n := vb.mapChain.headN
-	vb.mapChain.headN++
+	return vb.putMapHeadFor(ctx, h, false)
+}
+
+func (vb *VB) putMapHeadFor(ctx context.Context, h mapHead, background bool) error {
+	if background && vb.mapChain.closing.Load() {
+		return context.Canceled
+	}
+	n := vb.mapChain.headN.Add(1) - 1
+	if background && vb.mapChain.closing.Load() {
+		return context.Canceled
+	}
 	data := frameMapObjectVersion(mapKindHead, vb.mapObjectVersion(), vb.VolumeName, vb.LeaseEpoch, n, encodeMapHead(h))
 	if err := vb.writeMapKey(ctx, mapObjectKey(mapHeadPrefix, vb.LeaseEpoch, n), data); err != nil {
 		return err
@@ -534,9 +542,7 @@ func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
 // MapCounters reports the next head number and object id this engine would
 // use, ambiguous writes included, for a later engine of the same process.
 func (vb *VB) MapCounters() (headN, objN uint64) {
-	vb.checkpointMu.Lock()
-	defer vb.checkpointMu.Unlock()
-	return vb.mapChain.headN, vb.mapChain.objN
+	return vb.mapChain.headN.Load(), vb.mapChain.objN.Load()
 }
 
 // InitMapDeltaCtx makes a new volume format 2 under its creation epoch: the
@@ -841,14 +847,14 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	vb.mapChain.pending = nil
 	vb.mapChain.committed.Store(true)
 	if vb.ResumeEpoch {
-		vb.mapChain.headN = vb.ResumeHeadN
-		vb.mapChain.objN = vb.ResumeObjN
+		vb.mapChain.headN.Store(vb.ResumeHeadN)
+		vb.mapChain.objN.Store(vb.ResumeObjN)
 	}
 	if resume {
 		// The earlier engine's counters cover writes it sent but cannot know
 		// landed, so they win over what the listing shows.
-		vb.mapChain.headN = max(newest[1]+1, vb.ResumeHeadN)
-		vb.mapChain.objN = max(resumeObjN, vb.ResumeObjN)
+		vb.mapChain.headN.Store(max(newest[1]+1, vb.ResumeHeadN))
+		vb.mapChain.objN.Store(max(resumeObjN, vb.ResumeObjN))
 		vb.mapChain.claimed = true
 	}
 	return nil
@@ -1097,11 +1103,11 @@ type mapPruneBound struct {
 }
 
 func (vb *VB) mapPruneBoundLocked() mapPruneBound {
-	return mapPruneBound{objN: vb.mapChain.objN, headN: vb.mapChain.headN}
+	return mapPruneBound{objN: vb.mapChain.objN.Load(), headN: vb.mapChain.headN.Load()}
 }
 
-// stopMapBackground stops new background passes and waits for running ones,
-// so no head is written after the caller returns.
+// stopMapBackground stops new background reservations and cancels passes
+// that have already started.
 func (vb *VB) stopMapBackground() {
 	// Publication checks closing under checkpointMu, so nothing publishes
 	// after this returns; a pass still unwinding writes only orphans.
@@ -1174,9 +1180,15 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 	// The base is written outside checkpointMu, so drains keep committing;
 	// only the head that publishes it is composed and written under it.
 	vb.checkpointMu.Lock()
-	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
-	vb.mapChain.objN++
+	if vb.mapChain.closing.Load() || ctx.Err() != nil {
+		vb.checkpointMu.Unlock()
+		return
+	}
+	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN.Add(1) - 1}
 	vb.checkpointMu.Unlock()
+	if vb.mapChain.closing.Load() || ctx.Err() != nil {
+		return
+	}
 	data := frameMapObjectVersion(mapKindBase, version, vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
@@ -1198,7 +1210,7 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 	}
 	prev := vb.mapChain.head
 	next := mapHead{Creation: prev.Creation, Base: base, Deltas: slices.Clone(prev.Deltas[idx+1:])}
-	if err := vb.putMapHead(ctx, next); err != nil {
+	if err := vb.putMapHeadFor(ctx, next, true); err != nil {
 		vb.logger().Warn("map: base head write failed", "volume", vb.VolumeName, "err", err)
 		return
 	}
