@@ -221,8 +221,8 @@ func seedVolumeChunks(t *testing.T, volumeName string, key *masterkey.Key, chunk
 
 	root := t.TempDir()
 	vbconfig := VB{
-		VolumeName:      volumeName,
-		VolumeSize:      fragVolumeBytes,
+		VolumeName:          volumeName,
+		VolumeSize:          fragVolumeBytes,
 		BaseDir:             filepath.Join(root, "viperblock"),
 		WALSyncInterval:     -1,
 		ChunkUploadInterval: -1,
@@ -264,8 +264,8 @@ func fragReader(t *testing.T, root, volumeName string, key *masterkey.Key, cache
 	t.Helper()
 
 	vbconfig := VB{
-		VolumeName:      volumeName,
-		VolumeSize:      fragVolumeBytes,
+		VolumeName:          volumeName,
+		VolumeSize:          fragVolumeBytes,
 		BaseDir:             filepath.Join(t.TempDir(), "viperblock"),
 		WALSyncInterval:     -1,
 		ChunkUploadInterval: -1,
