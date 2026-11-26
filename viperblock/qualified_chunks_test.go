@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -256,4 +257,70 @@ func TestQualifiedActivationKeepsEmptyCloneDormant(t *testing.T) {
 			require.Equal(t, expected, data)
 		})
 	}
+}
+
+type hiddenQualifiedSnapshot struct {
+	omitMapEpochFromList
+	name    string
+	deletes atomic.Int64
+}
+
+func (b *hiddenQualifiedSnapshot) ListPrefixesCtx(ctx context.Context, prefix string) ([]string, error) {
+	names, err := b.Backend.ListPrefixesCtx(ctx, prefix)
+	return slices.DeleteFunc(names, func(name string) bool { return name == b.name }), err
+}
+
+func (b *hiddenQualifiedSnapshot) DeleteChunkCtx(ctx context.Context, ref types.ChunkRef) error {
+	b.deletes.Add(1)
+	return b.Backend.DeleteChunkCtx(ctx, ref)
+}
+
+func TestQualifiedPredastoreGCProtectsSnapshotMissingFromList(t *testing.T) {
+	ctx := t.Context()
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	seed.Detach()
+
+	source := claimQualified(t, mv, 6)
+	pinned := randomBlockData(1)
+	writeDrain(t, source, 0, pinned)
+	_, err := source.CreateSnapshot("snap-pinned")
+	require.NoError(t, err)
+	source.Detach()
+
+	writer := claimQualified(t, mv, 7)
+	latest := randomBlockData(1)
+	writeDrain(t, writer, 0, latest)
+	writer.Detach()
+
+	sweeper := claimQualified(t, mv, 8)
+	backend := &hiddenQualifiedSnapshot{
+		omitMapEpochFromList: omitMapEpochFromList{Backend: sweeper.Backend},
+		name:                 "snap-pinned",
+	}
+	sweeper.Backend = backend
+	names, err := backend.Backend.ListPrefixesCtx(ctx, snapPrefix)
+	require.NoError(t, err)
+	require.Contains(t, names, backend.name)
+	names, err = backend.ListPrefixesCtx(ctx, snapPrefix)
+	require.NoError(t, err)
+	require.NotContains(t, names, backend.name)
+	marker, err := sweeper.readSnapshotMarker(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, marker)
+
+	sweeper.runGCSweep(ctx)
+	mv.clock.advance(DefaultMapDeleteDeferral)
+	sweeper.runGCSweep(ctx)
+
+	restore := createCloneVB(t, sweeper, backend.name)
+	restored, err := restore.ReadAt(0, uint64(restore.BlockSize))
+	require.NoError(t, err, "snapshot lost the chunk hidden from LIST")
+	require.Equal(t, pinned, restored)
+	require.Zero(t, backend.deletes.Load(), "the reserved-bucket sweep must issue no deletes")
+
+	cold, _ := mv.engine(t, 9)
+	require.NoError(t, cold.LoadState())
+	require.NoError(t, cold.LoadLiveCheckpoint())
+	require.Equal(t, latest, readBlocks(t, cold, 0, 1))
 }
