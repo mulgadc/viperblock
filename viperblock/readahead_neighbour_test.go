@@ -134,7 +134,13 @@ func TestSequentialStream_KeepsReadaheadBesideRandomReaders(t *testing.T) {
 		for n, reads := range run.neighbourReads {
 			require.GreaterOrEqualf(t, reads, int64(10), "neighbour %d did not overlap the stream", n)
 		}
-		assert.LessOrEqualf(t, run.streamReads, 2*alone.streamReads,
+		// Under -race the stream is slowed against its neighbours; the bound
+		// stays far below one read per request, the failure this pins.
+		bound := 2 * alone.streamReads
+		if raceDetector {
+			bound = 4 * alone.streamReads
+		}
+		assert.LessOrEqualf(t, run.streamReads, bound,
 			"beside %d random readers the stream lost its read-ahead", neighbours)
 	}
 }
