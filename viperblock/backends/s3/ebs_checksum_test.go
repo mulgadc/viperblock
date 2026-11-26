@@ -23,13 +23,13 @@ type capturedPut struct {
 	body   []byte
 }
 
-// putCapturingServer records every PUT it is sent and answers anything else as
-// an empty bucket listing, which is all Init asks for.
+// putCapturingServer records every PUT it is sent over TLS, where the SDK would
+// add a trailer if it chose to, and answers anything else as an empty listing.
 func putCapturingServer(t *testing.T) (*httptest.Server, func() []capturedPut) {
 	t.Helper()
 	var mu sync.Mutex
 	var puts []capturedPut
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
@@ -67,6 +67,7 @@ func TestChunkWritesCarryCRC64NVMEAndTheEBSOptIn(t *testing.T) {
 		AccessKey:  "crc-access",
 		SecretKey:  "crc-secret",
 		Host:       srv.URL,
+		HTTPClient: srv.Client(),
 	})
 	require.NoError(t, err)
 	require.NoError(t, backend.InitCtx(context.Background()))
@@ -77,11 +78,15 @@ func TestChunkWritesCarryCRC64NVMEAndTheEBSOptIn(t *testing.T) {
 	require.NoError(t, backend.WriteCtx(ctx, types.FileTypeChunk, 1, &headers, &data))
 	require.NoError(t, backend.WriteToCtx(ctx, "vol-other00000000", types.FileTypeChunk, 2, &headers, &data))
 
+	want := append(append([]byte(nil), headers...), data...)
 	got := puts()
 	require.Len(t, got, 2)
 	for _, p := range got {
-		assert.Equal(t, crc64Base64(p.body), p.header.Get("X-Amz-Checksum-Crc64nvme"),
-			"the checksum is over the bytes on the wire, header included")
+		require.True(t, bytes.Equal(want, p.body), "the body is the chunk header then its blocks")
+		assert.Equal(t, []string{crc64Base64(want)}, p.header.Values("X-Amz-Checksum-Crc64nvme"),
+			"one checksum, over the chunk header and blocks")
+		assert.Equal(t, "UNSIGNED-PAYLOAD", p.header.Get("X-Amz-Content-Sha256"))
+		assert.Empty(t, p.header.Get("Content-Encoding"), "a plain body, not aws-chunked")
 		assert.Equal(t, "true", p.header.Get("X-Spinifex-Ebs"))
 		assert.Empty(t, p.header.Get("X-Amz-Trailer"), "a buffered body needs no trailer")
 		for name := range p.header {
@@ -103,6 +108,7 @@ func TestMetadataWritesKeepTheirRequest(t *testing.T) {
 		AccessKey:  "crc-access",
 		SecretKey:  "crc-secret",
 		Host:       srv.URL,
+		HTTPClient: srv.Client(),
 	})
 	require.NoError(t, err)
 	require.NoError(t, backend.InitCtx(context.Background()))
