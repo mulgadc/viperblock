@@ -919,3 +919,18 @@ func TestMapClaimRetryKeepsConsumedHeadWhenPreviousEpochIsVisible(t *testing.T) 
 	require.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN))
 	require.NotContains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, 0))
 }
+
+func TestStoppedCompactionCannotReserveAnOrdinal(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.create(t, 5)
+	vb.StopMapBackground()
+
+	before := mv.mapKeys(t, mapBasePrefix)
+	head, object := vb.MapCounters()
+	vb.writeMapBase(t.Context(), &extentIndex[BlockLookup]{}, mapObjRef{})
+
+	afterHead, afterObject := vb.MapCounters()
+	require.Equal(t, head, afterHead)
+	require.Equal(t, object, afterObject, "stopped compaction must not reserve a new key")
+	require.Equal(t, before, mv.mapKeys(t, mapBasePrefix))
+}
