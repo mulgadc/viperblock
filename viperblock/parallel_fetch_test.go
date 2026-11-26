@@ -873,8 +873,9 @@ func holdFor(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-// awaitClosed waits on the test goroutine for ch, bounded by the gate fallback.
-func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
+// awaitSignal waits on the test goroutine for one signal or the close of ch,
+// bounded by the gate fallback.
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
 	case <-ch:
@@ -940,6 +941,7 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 			reader.Backend = sb
 
 			soloHold := make(chan struct{})
+			initialHeld := make(chan struct{}, fragRequestBlocks)
 			soloTokens := make(chan struct{})
 			compHold := make(chan struct{})
 			var serialPhase atomic.Bool
@@ -958,6 +960,7 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 					serialMu.Unlock()
 					holdFor(t, soloTokens)
 				case c.req == 1:
+					initialHeld <- struct{}{}
 					holdFor(t, soloHold)
 				case c.req == 2:
 					holdFor(t, compHold)
@@ -982,6 +985,9 @@ func TestFragmentedRead_SoloFanOutYieldsToCompetitors(t *testing.T) {
 			}()
 			for range fragRequestFetchBound {
 				sb.awaitPayload(t, 1)
+			}
+			for range fragRequestFetchBound {
+				awaitSignal(t, initialHeld, "initial solo call held")
 			}
 			assert.True(t, sb.quietFor(1, quietWindow), "a sole read fanned out past the per-request bound")
 
@@ -1073,7 +1079,7 @@ func TestFragmentedReadInto_FailureWaitsForAHeldFetcher(t *testing.T) {
 	dst := make([]byte, uint64(fragRequestBlocks)*bs)
 	done := make(chan error, 1)
 	go func() { done <- reader.ReadAtInto(0, dst) }()
-	awaitClosed(t, canceled, "cancellation seen by the held worker")
+	awaitSignal(t, canceled, "cancellation seen by the held worker")
 	select {
 	case err := <-done:
 		t.Fatalf("ReadAtInto returned %v while a fetcher still held its buffer", err)
