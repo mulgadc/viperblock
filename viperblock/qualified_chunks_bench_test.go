@@ -2,7 +2,11 @@ package viperblock
 
 import (
 	"context"
+	"strconv"
 	"testing"
+	"time"
+
+	"github.com/mulgadc/viperblock/types"
 
 	"github.com/stretchr/testify/require"
 )
@@ -120,4 +124,37 @@ func benchmarkChunkIdentity(b *testing.B, operation string, size uint64, qualifi
 		}
 	}
 	require.Equal(b, data, dst)
+}
+
+type qualifiedSweepBenchBackend struct {
+	omitMapEpochFromList
+}
+
+func (qualifiedSweepBenchBackend) DeleteChunkCtx(context.Context, types.ChunkRef) error {
+	return nil
+}
+
+func BenchmarkQualifiedPredastoreSweep(b *testing.B) {
+	silenceVBLogs()
+	for _, count := range []int{1, 128} {
+		b.Run(strconv.Itoa(count)+"-candidates", func(b *testing.B) {
+			mv := newMapVolume(b, volumeSize, nil)
+			seed, _ := mv.create(b, 5)
+			seed.Detach()
+			vb := claimQualified(b, mv, 6)
+			vb.Backend = qualifiedSweepBenchBackend{omitMapEpochFromList{Backend: vb.Backend}}
+			vb.gcReconciled.Store(true)
+			firstSeen := mv.clock.get().Add(-DefaultMapDeleteDeferral)
+			vb.mapChain.chunkSeen = make(map[types.ChunkRef]time.Time, count)
+			b.ReportAllocs()
+			for b.Loop() {
+				for id := range count {
+					ref := types.ChunkRef{Epoch: 5, ID: uint64(id)}
+					vb.gcRefcount[ref] = 0
+					vb.mapChain.chunkSeen[ref] = firstSeen
+				}
+				vb.sweepChunks(b.Context())
+			}
+		})
+	}
 }

@@ -4971,6 +4971,15 @@ func (vb *VB) sweepChunks(ctx context.Context) {
 		}
 	}
 
+	if len(candidates) > 0 && vb.mapChain.qualified.Load() {
+		required, err := vb.mapHeadAuthorityRequired()
+		if required || err != nil {
+			// Live head authority cannot prove the absence of a snapshot.
+			vb.logger().Warn("chunk GC: qualified Predastore chunks retained", "volume", vb.VolumeName)
+			return
+		}
+	}
+
 	// Last check before anything is deleted, and deliberately here rather than
 	// at the top of the sweep: the caller has already made this sweep's live
 	// checkpoint durable, so any snapshot that froze an older map than that

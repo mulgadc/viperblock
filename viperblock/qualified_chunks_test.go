@@ -261,6 +261,7 @@ func TestQualifiedActivationKeepsEmptyCloneDormant(t *testing.T) {
 
 type hiddenQualifiedSnapshot struct {
 	omitMapEpochFromList
+
 	name    string
 	deletes atomic.Int64
 }
@@ -323,4 +324,24 @@ func TestQualifiedPredastoreGCProtectsSnapshotMissingFromList(t *testing.T) {
 	require.NoError(t, cold.LoadState())
 	require.NoError(t, cold.LoadLiveCheckpoint())
 	require.Equal(t, latest, readBlocks(t, cold, 0, 1))
+}
+
+func TestQualifiedPredastoreGCRetainsNewerWriterFence(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	seed.Detach()
+	old := claimQualified(t, mv, 6)
+	writeDrain(t, old, 0, randomBlockData(1))
+	writeDrain(t, old, 0, randomBlockData(1))
+	old.runGCSweep(t.Context())
+	require.NotEmpty(t, old.mapChain.chunkSeen)
+
+	newer := claimQualified(t, mv, 7)
+	writeDrain(t, newer, 0, randomBlockData(1))
+	newer.Detach()
+	old.Backend = omitMapEpochFromList{Backend: old.Backend, epoch: 7}
+	mv.clock.advance(DefaultMapDeleteDeferral)
+	old.sweepChunks(t.Context())
+
+	require.ErrorIs(t, old.Write(0, randomBlockData(1)), ErrMapFenced)
 }
