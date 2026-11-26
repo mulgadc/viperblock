@@ -44,14 +44,14 @@ func (b *chunkReadCounter) ReadCtx(ctx context.Context, fileType types.FileType,
 // seedSequentialVolume writes readAmpVolumeBytes and pushes it all into
 // chunks, returning the root the backend is stored under and the bytes
 // written, so a reader can be checked against them rather than only counted.
-func seedSequentialVolume(t *testing.T, volumeName string, key *masterkey.Key) (string, []byte) {
+func seedSequentialVolume(t testing.TB, volumeName string, key *masterkey.Key) (string, []byte) {
 	t.Helper()
 	return seedVolume(t, volumeName, key, readAmpVolumeBytes)
 }
 
 // seedVolume writes writeBytes of a readAmpVolumeBytes volume, leaving the
 // rest of it never written and so sparse.
-func seedVolume(t *testing.T, volumeName string, key *masterkey.Key, writeBytes uint64) (string, []byte) {
+func seedVolume(t testing.TB, volumeName string, key *masterkey.Key, writeBytes uint64) (string, []byte) {
 	t.Helper()
 
 	root := t.TempDir()
@@ -96,7 +96,7 @@ func seedVolume(t *testing.T, volumeName string, key *masterkey.Key, writeBytes 
 
 // coldReaderVB opens volumeName with an empty local directory and a cold
 // cache, which is what every new NBD connection gets.
-func coldReaderVB(t *testing.T, backendRoot, volumeName string, key *masterkey.Key) (*VB, *chunkReadCounter) {
+func coldReaderVB(t testing.TB, backendRoot, volumeName string, key *masterkey.Key) (*VB, *chunkReadCounter) {
 	t.Helper()
 
 	vbconfig := VB{
