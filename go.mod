@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.116.0
 	github.com/aws/smithy-go v1.28.9
 	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/minio/crc64nvme v1.1.1
 	github.com/mulgadc/bluebottle v1.26.0
 	github.com/mulgadc/predastore v1.26.0
 	github.com/stretchr/testify v1.12.1
@@ -59,7 +60,6 @@ require (
 	github.com/klauspost/reedsolomon v1.14.2 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
-	github.com/minio/crc64nvme v1.1.1 // indirect
 	github.com/nats-io/nats.go v1.56.0 // indirect
 	github.com/nats-io/nkeys v0.4.17 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
