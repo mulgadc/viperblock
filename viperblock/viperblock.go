@@ -5537,19 +5537,9 @@ type streamRequest struct {
 	blockRequests uint64
 }
 
-// readAheadStreams is how many streams the tracker follows, and
-// readAheadCandidates how many recent single reads it keeps, any of which a
-// second continuation makes a stream.
-const (
-	readAheadStreams    = 4
-	readAheadCandidates = 8
-)
-
-// Tiers of the tracker: candidates replace candidates, streams replace streams.
-const (
-	tierCandidate = iota
-	tierStream
-)
+// readAheadStreams is how many interleaved streams the tracker follows, so a
+// random reader beside a sequential one does not erase the stream's position.
+const readAheadStreams = 4
 
 // readAheadTracker follows where each of a few readers has got to, so that a
 // request starting exactly where an earlier one ended can be recognised as
@@ -5557,130 +5547,84 @@ const (
 type readAheadTracker struct {
 	mu sync.Mutex
 
-	candidates [readAheadCandidates]readAheadStream
-	streams    [readAheadStreams]readAheadStream
-	tick       uint64
-	// streaming counts requests being served that continued a position.
+	streams [readAheadStreams]readAheadStream
+	tick    uint64
+	// streaming counts requests being served that continued a stream.
 	streaming int
 }
 
-// readAheadStream is one followed position: where it goes next, and how many
+// readAheadStream is one followed stream: where it goes next, and how many
 // requests that set that position are still being served.
 type readAheadStream struct {
 	next      uint64
 	serving   int
 	gen       uint64
 	used      uint64
-	continued int
+	continued bool
 }
 
-// readAheadTicket is what end needs to undo begin. A tier below zero names no
-// position.
+// readAheadTicket is what end needs to undo begin; a negative slot names none.
 type readAheadTicket struct {
-	tier, slot int
-	gen        uint64
-	continued  bool
+	slot      int
+	gen       uint64
+	continued bool
 }
 
 // begin records a request for blockRequests blocks from block. It widens only a
-// request continuing a stream or the latest position while nothing it would read
-// is in flight and no other continuing request is served. end must follow.
+// request continuing the latest position or one already continued, while its
+// predecessor and every other continuing request are done. end must follow.
 func (t *readAheadTracker) begin(block, blockRequests uint64, limit int, create bool) (widen bool, ticket readAheadTicket) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// busy: a served request ends at block, or inside what widening would
-	// read, which a queue served out of order leaves ahead of the stream.
-	tier, slot, busy := -1, -1, false
-	latest := t.tick
-	window := block + blockRequests + uint64(max(limit, 0))
-	for tr := range 2 {
-		slots := t.slots(tr)
-		for i := range slots {
-			p := &slots[i]
-			if p.serving > 0 && p.next >= block && p.next <= window {
-				busy = true
-			}
-			if p.next != block {
-				continue
-			}
-			if tier < 0 || tr > tier || p.used > t.slots(tier)[slot].used {
-				tier, slot = tr, i
-			}
+	slot := -1
+	for i := range t.streams {
+		if t.streams[i].next == block {
+			slot = i
+			break
 		}
 	}
-	continued := tier >= 0
-	free := -1
-	if !continued && create {
-		free = t.oldest(tierCandidate)
+	continued := slot >= 0
+	// A request that read no backend only advances a stream it continues, so
+	// cache hits never push a stream out.
+	if !continued && !create {
+		return false, readAheadTicket{slot: -1}
 	}
-	if !continued && free < 0 {
-		return false, readAheadTicket{tier: -1}
-	}
+	latest := t.tick
 	t.tick++
 	if continued {
-		p := &t.slots(tier)[slot]
-		widen = limit > 0 && !busy && t.streaming == 0 && (tier == tierStream || p.used == latest)
+		st := &t.streams[slot]
+		widen = limit > 0 && t.streaming == 0 && st.serving == 0 && (st.continued || st.used == latest)
+		st.continued = true
 		t.streaming++
-		if p.continued++; tier == tierCandidate && p.continued >= 2 {
-			p.next = noStreamPosition
-			tier, slot = tierStream, t.oldest(tierStream)
-			t.slots(tier)[slot] = readAheadStream{gen: t.tick, continued: 2}
-		}
 	} else {
-		tier, slot = tierCandidate, free
-		t.slots(tier)[slot] = readAheadStream{gen: t.tick}
+		slot = t.oldest()
+		t.streams[slot] = readAheadStream{gen: t.tick}
 	}
-	next := block + blockRequests
-	for i := range t.candidates {
-		c := &t.candidates[i]
-		if (tier != tierCandidate || i != slot) && c.next == next && c.serving == 0 {
-			c.next = noStreamPosition
-		}
-	}
-	p := &t.slots(tier)[slot]
-	p.next = next
-	p.serving++
-	p.used = t.tick
-	return widen, readAheadTicket{tier: tier, slot: slot, gen: p.gen, continued: continued}
+	st := &t.streams[slot]
+	st.next = block + blockRequests
+	st.serving++
+	st.used = t.tick
+	return widen, readAheadTicket{slot: slot, gen: st.gen, continued: continued}
 }
 
-// oldest picks the slot of a tier to reuse: the least recently used stream, or
-// the least recently used candidate with no request being served, or -1 when
-// every candidate is served, so a served request's position is never lost.
-func (t *readAheadTracker) oldest(tier int) int {
-	slots := t.slots(tier)
-	pick := -1
-	for i := range slots {
-		if tier == tierCandidate && slots[i].serving > 0 {
+// oldest picks the slot to reuse: the least recently used, preferring one with
+// no request being served.
+func (t *readAheadTracker) oldest() int {
+	pick := 0
+	for i := 1; i < len(t.streams); i++ {
+		s, p := t.streams[i], t.streams[pick]
+		if (s.serving == 0) != (p.serving == 0) {
+			if s.serving == 0 {
+				pick = i
+			}
 			continue
 		}
-		if pick < 0 || slots[i].used < slots[pick].used {
+		if s.used < p.used {
 			pick = i
 		}
 	}
 	return pick
-}
-
-// hasRuns reports whether a read has inherited runs to fetch.
-func hasRuns(base ConsecutiveBlocks, ancestors []ConsecutiveBlocks) bool {
-	if len(base) > 0 {
-		return true
-	}
-	for _, runs := range ancestors {
-		if len(runs) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// slots returns a tier's positions.
-func (t *readAheadTracker) slots(tier int) []readAheadStream {
-	if tier == tierStream {
-		return t.streams[:]
-	}
-	return t.candidates[:]
 }
 
 // end marks a request begun with ticket as served.
@@ -5690,23 +5634,20 @@ func (t *readAheadTracker) end(ticket readAheadTicket) {
 	if ticket.continued {
 		t.streaming--
 	}
-	if ticket.tier < 0 {
+	if ticket.slot < 0 {
 		return
 	}
-	if p := &t.slots(ticket.tier)[ticket.slot]; p.gen == ticket.gen && p.serving > 0 {
-		p.serving--
+	if st := &t.streams[ticket.slot]; st.gen == ticket.gen && st.serving > 0 {
+		st.serving--
 	}
 }
 
-// reset forgets every position.
+// reset forgets every stream.
 func (t *readAheadTracker) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for tr := range 2 {
-		slots := t.slots(tr)
-		for i := range slots {
-			slots[i] = readAheadStream{next: noStreamPosition}
-		}
+	for i := range t.streams {
+		t.streams[i] = readAheadStream{next: noStreamPosition}
 	}
 }
 
@@ -6936,8 +6877,7 @@ func (vb *VB) read(ctx context.Context, block uint64, blockLen uint64) (data []b
 
 	// Readahead applies to the final run only, since that is the one a
 	// continuing stream reads off the end of.
-	readAheadExtra, readAheadSeqNums, readAheadTicket := vb.planReadAhead(block, blockRequests, consecutiveBlocksToRead,
-		len(consecutiveBlocksToRead) > 0 || hasRuns(baseConsecutiveBlocks, ancestorConsBlocks))
+	readAheadExtra, readAheadSeqNums, readAheadTicket := vb.planReadAhead(block, blockRequests, consecutiveBlocksToRead, len(consecutiveBlocksToRead) > 0)
 	defer vb.readAhead.end(readAheadTicket)
 
 	// Next, read our consecutive blocks from the backend
@@ -7511,10 +7451,10 @@ func (vb *VB) readBlockStore(ctx context.Context, block uint64, blockLen uint64,
 			return nil, err
 		}
 	} else {
-		// No own-volume read. The stream position still has to advance, or a
-		// cached stretch looks like the end of the stream and the request after
-		// it starts over; inherited runs make it a backend read.
-		_, _, ticket := vb.planReadAhead(stream.block, stream.blockRequests, nil, hasRuns(baseConsecutiveBlocks, ancestorConsBlocks))
+		// Served without touching the backend. The stream position still has to
+		// advance, or the cached stretch looks like the end of the stream and
+		// the request after it starts over.
+		_, _, ticket := vb.planReadAhead(stream.block, stream.blockRequests, nil, false)
 		defer vb.readAhead.end(ticket)
 	}
 
@@ -7583,7 +7523,7 @@ func (vb *VB) fetchConsecutiveBlocksFromBackend(ctx context.Context, consecutive
 	}
 
 	readAheadExtra, readAheadSeqNums := 0, []uint64(nil)
-	ticket = readAheadTicket{tier: -1}
+	ticket = readAheadTicket{slot: -1}
 	if stream != nil {
 		readAheadExtra, readAheadSeqNums, ticket = vb.planReadAhead(stream.block, stream.blockRequests, consecutiveBlocksToRead, true)
 	}
