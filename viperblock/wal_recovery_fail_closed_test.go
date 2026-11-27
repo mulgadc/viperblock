@@ -127,6 +127,8 @@ func TestFormat1ReopenRetainsWALWithTornRecord(t *testing.T) {
 	}
 }
 
+var errLiveCheckpoint = errors.New("injected live checkpoint write failure")
+
 // liveCheckpointFailBackend fails every live-checkpoint write while fail is set.
 type liveCheckpointFailBackend struct {
 	types.Backend
@@ -138,20 +140,25 @@ var _ types.Backend = (*liveCheckpointFailBackend)(nil)
 
 func (b *liveCheckpointFailBackend) WriteCtx(ctx context.Context, typ types.FileType, id uint64, headers, data *[]byte) error {
 	if typ == types.FileTypeBlockCheckpointLive && b.fail.Load() {
-		return errors.New("injected live checkpoint write failure")
+		return errLiveCheckpoint
 	}
 	return b.Backend.WriteCtx(ctx, typ, id, headers, data)
 }
 
-// A stale live checkpoint outranks the numbered one on the next open, so a
-// recovery that cannot refresh it must keep the WAL.
+// A stale live checkpoint outranks the numbered one on the next live open, so
+// recovery must keep the WAL until the live checkpoint names its blocks, even
+// on a seal retry whose numbered checkpoint already does.
 func TestFormat1RecoveryRetainsWALWhenLiveCheckpointFails(t *testing.T) {
 	volume := newMapVolume(t, 128<<20, nil)
 	writer, _ := volume.engine(t, 1)
 	require.NoError(t, writer.SaveState())
-	require.NoError(t, writer.SaveLiveCheckpoint())
 	openMapWALs(t, writer)
 	t.Cleanup(func() { detachConsolidationVolume(writer) })
+	stale := bytes.Repeat([]byte{0x11}, 8192)
+	require.NoError(t, writer.WriteAt(0, stale))
+	require.NoError(t, writer.DrainToBackend())
+	_, err := writer.Backend.ReadCtx(t.Context(), types.FileTypeBlockCheckpointLive, 0, 0, 0)
+	require.NoError(t, err, "the older live checkpoint must exist")
 	want := bytes.Repeat([]byte{0x5c}, 8192)
 	require.NoError(t, writer.WriteAt(0, want))
 	require.NoError(t, writer.Flush())
@@ -160,27 +167,20 @@ func TestFormat1RecoveryRetainsWALWhenLiveCheckpointFails(t *testing.T) {
 	require.NoError(t, err)
 	detachConsolidationVolume(writer)
 
-	open := func(epoch uint64) (*VB, *liveCheckpointFailBackend) {
-		vb, _ := volume.engine(t, epoch)
-		require.NoError(t, vb.LoadState())
-		require.NoError(t, vb.LoadLiveCheckpoint())
-		require.NoError(t, vb.ClaimMapCtx(t.Context()))
-		failing := &liveCheckpointFailBackend{Backend: vb.Backend}
-		vb.Backend = failing
-		return vb, failing
-	}
-
-	failed, failing := open(2)
+	failed, _ := sealReader(t, volume, 2)
+	failing := &liveCheckpointFailBackend{Backend: failed.Backend}
 	failing.fail.Store(true)
+	failed.Backend = failing
 	failedErr := failed.RecoverLocalWALs()
-	assert.Error(t, failedErr)
+	assert.ErrorIs(t, failedErr, errLiveCheckpoint)
 	checkWALRetained(t, walName, walBytes)
 	failed.Detach()
 	if failedErr == nil {
 		return
 	}
 
-	retry, _ := open(3)
+	// The retry loads the numbered checkpoint the failed attempt wrote.
+	retry, _ := sealReader(t, volume, 3)
 	require.NoError(t, retry.RecoverLocalWALs())
 	retry.Detach()
 
@@ -189,7 +189,7 @@ func TestFormat1RecoveryRetainsWALWhenLiveCheckpointFails(t *testing.T) {
 	require.NoError(t, fresh.LoadLiveCheckpoint())
 	got, err := fresh.ReadAt(0, uint64(len(want)))
 	require.NoError(t, err)
-	require.Equal(t, want, got)
+	require.True(t, bytes.Equal(want, got), "a live-checkpoint reader must see the recovered writes")
 }
 
 // The provider seal closes the volume when recovery succeeds, and a clean
@@ -234,6 +234,20 @@ func TestSealRetainsWALWithDamagedHeader(t *testing.T) {
 			assert.Zero(t, writes.count.Load())
 		})
 	}
+	t.Run("unreadable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores file permissions")
+		}
+		volume, walName, walBytes := setup(t)
+		reader, writes := sealReader(t, volume, 2)
+		require.NoError(t, os.Chmod(walName, 0))
+		err := seal(t, reader, reader.RecoverLocalWALs)
+		require.NoError(t, os.Chmod(walName, 0o600))
+
+		assert.ErrorIs(t, err, os.ErrPermission)
+		checkWALRetained(t, walName, walBytes)
+		assert.Zero(t, writes.count.Load())
+	})
 	t.Run("readError", func(t *testing.T) {
 		volume, walName, walBytes := setup(t)
 		reader, writes := sealReader(t, volume, 2)
