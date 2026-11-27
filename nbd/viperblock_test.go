@@ -1032,3 +1032,21 @@ func TestSnapshotListenerRefusesOverlappingDrain(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 	require.EqualValues(t, 2, drains.Load())
 }
+
+func BenchmarkSnapshotListenerReadyDrain(b *testing.B) {
+	dir, err := os.MkdirTemp("", "vb-drain-bench-")
+	require.NoError(b, err)
+	b.Cleanup(func() { require.NoError(b, os.RemoveAll(dir)) })
+	path := filepath.Join(dir, "snapshot.sock")
+	snapshotListenerDone = startSnapshotListener(func() error { return nil }, path)
+	b.Cleanup(stopSnapshotListener)
+	b.ReportAllocs()
+	for b.Loop() {
+		conn, err := net.Dial("unix", path)
+		require.NoError(b, err)
+		reply, err := io.ReadAll(conn)
+		require.NoError(b, err)
+		require.Equal(b, "OK\n", string(reply))
+		require.NoError(b, conn.Close())
+	}
+}

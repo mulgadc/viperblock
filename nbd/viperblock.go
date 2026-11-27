@@ -553,6 +553,7 @@ func startSnapshotListener(drain func() error, sockPath string) chan struct{} {
 		return done
 	}
 	snapshotListener = ln
+	var draining atomic.Bool
 
 	go func() {
 		defer close(done)
@@ -563,9 +564,18 @@ func startSnapshotListener(drain func() error, sockPath string) chan struct{} {
 				// Listener closed — normal shutdown path
 				return
 			}
+			// A timed-out client can leave a drain in flight. Refuse
+			// overlap before queuing work behind the engine's drain lock.
+			if !draining.CompareAndSwap(false, true) {
+				_, _ = conn.Write([]byte("ERR\n"))
+				_ = conn.Close()
+				continue
+			}
 			go func(c net.Conn) {
 				defer c.Close()
-				if err := drain(); err != nil {
+				err := drain()
+				draining.Store(false)
+				if err != nil {
 					slog.Error("snapshot socket: DrainToBackend failed", "err", err)
 					_, _ = c.Write([]byte("ERR\n"))
 					return
