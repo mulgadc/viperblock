@@ -993,15 +993,28 @@ var _ types.Backend = (*pendingProbeBackend)(nil)
 
 func (p *pendingProbeBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectID uint64, headers *[]byte, data *[]byte) error {
 	if fileType == types.FileTypeChunk {
-		pending := p.vb.PendingBytes()
-		for {
-			peak := p.peak.Load()
-			if pending <= peak || p.peak.CompareAndSwap(peak, pending) {
-				break
-			}
-		}
+		p.observe()
 	}
 	return p.Backend.WriteCtx(ctx, fileType, objectID, headers, data)
+}
+
+// observe records the engine's current buffered write bytes if they are the
+// most seen so far.
+func (p *pendingProbeBackend) observe() {
+	pending := p.vb.PendingBytes()
+	for {
+		peak := p.peak.Load()
+		if pending <= peak || p.peak.CompareAndSwap(peak, pending) {
+			return
+		}
+	}
+}
+
+// probeZeroBench installs a pending-byte probe on vb and returns it.
+func probeZeroBench(vb *viperblock.VB) *pendingProbeBackend {
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+	return probe
 }
 
 func TestZeroBoundsPendingBytesPerChunk(t *testing.T) {
@@ -1030,6 +1043,7 @@ func TestZeroBoundsPendingBytesPerChunk(t *testing.T) {
 
 	conn := &ViperBlockConnection{vb: vb}
 	require.NoError(t, conn.Zero(count, offset, 0))
+	t.Logf("peak pending bytes %d", probe.peak.Load())
 	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+chunkBytes+int(vb.BlockSize)),
 		"a zero request must be buffered a chunk at a time, under backpressure")
 
@@ -1072,6 +1086,7 @@ func TestZeroParallelBoundsPendingBytesPerRequest(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
+	t.Logf("peak pending bytes %d", probe.peak.Load())
 	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+requests*(chunkBytes+int(vb.BlockSize))),
 		"each in-flight zero request may hold at most one chunk past the mark")
 
@@ -1128,6 +1143,7 @@ func TestZeroWithBlockLargerThanChunk(t *testing.T) {
 	offset, count := 1<<20+300, 30<<20
 	conn := &ViperBlockConnection{vb: vb}
 	require.NoError(t, conn.Zero(uint32(count), uint64(offset), 0)) //nolint:gosec // G115: small constants
+	t.Logf("peak pending bytes %d", probe.peak.Load())
 	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+blockSize),
 		"a request may hold at most one engine block past the mark")
 
@@ -1192,6 +1208,11 @@ func BenchmarkZero(b *testing.B) {
 			}
 			conn := &ViperBlockConnection{vb: newVolume()}
 			defer func() { detachWriteBufferVolume(conn.vb) }()
+			// The peak is sampled at each chunk upload and after each request,
+			// so it includes what earlier requests in the window left buffered.
+			probe := probeZeroBench(conn.vb)
+			var peak uint64
+			defer func() { b.ReportMetric(float64(max(peak, probe.peak.Load())), "peak-pending-B") }()
 			// Keep both the dirty set and temporary disk use bounded.
 			window := max(16<<20, size)
 			offset := 0
@@ -1203,13 +1224,16 @@ func BenchmarkZero(b *testing.B) {
 					detachWriteBufferVolume(conn.vb)
 					conn.vb = nil
 					require.NoError(b, os.RemoveAll(root))
+					peak = max(peak, probe.peak.Load())
 					conn.vb = newVolume()
+					probe = probeZeroBench(conn.vb)
 					offset = 0
 					b.StartTimer()
 				}
 				if err := conn.Zero(uint32(size), uint64(offset), 0); err != nil { //nolint:gosec // G115: size is under 4 GiB
 					b.Fatal(err)
 				}
+				probe.observe()
 				offset += size
 			}
 		})
@@ -1234,6 +1258,9 @@ func BenchmarkZeroParallel(b *testing.B) {
 			}
 			conn := &ViperBlockConnection{vb: newVolume()}
 			defer func() { detachWriteBufferVolume(conn.vb) }()
+			probe := probeZeroBench(conn.vb)
+			var peak uint64
+			defer func() { b.ReportMetric(float64(max(peak, probe.peak.Load())), "peak-pending-B") }()
 			window := max(16<<20, callers*size)
 			offset := 0
 			b.SetBytes(int64(callers * size))
@@ -1244,7 +1271,9 @@ func BenchmarkZeroParallel(b *testing.B) {
 					detachWriteBufferVolume(conn.vb)
 					conn.vb = nil
 					require.NoError(b, os.RemoveAll(root))
+					peak = max(peak, probe.peak.Load())
 					conn.vb = newVolume()
+					probe = probeZeroBench(conn.vb)
 					offset = 0
 					b.StartTimer()
 				}
@@ -1261,6 +1290,7 @@ func BenchmarkZeroParallel(b *testing.B) {
 						b.Fatal(err)
 					}
 				}
+				probe.observe()
 				offset += callers * size
 			}
 		})
