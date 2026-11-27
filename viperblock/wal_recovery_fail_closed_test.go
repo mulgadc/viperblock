@@ -13,6 +13,7 @@ import (
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/viperblock/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,11 +55,14 @@ func sealReader(t *testing.T, volume *mapVolume, epoch uint64) (*VB, *scanChunkW
 	return reader, writes
 }
 
-func requireWALRetained(t *testing.T, walName string, want []byte) {
+// checkWALRetained reports, without stopping the test, whether the WAL is
+// still on disk with the expected bytes, so a base run shows every symptom.
+func checkWALRetained(t *testing.T, walName string, want []byte) {
 	t.Helper()
 	got, err := os.ReadFile(walName)
-	require.NoError(t, err, "recovery removed the only copy of acknowledged writes")
-	require.Equal(t, want, got)
+	if assert.NoError(t, err, "recovery removed the only copy of acknowledged writes") {
+		assert.Equal(t, want, got)
+	}
 }
 
 func TestFormat1ReopenRetainsWALWithBadMidFileRecord(t *testing.T) {
@@ -69,9 +73,9 @@ func TestFormat1ReopenRetainsWALWithBadMidFileRecord(t *testing.T) {
 		damaged[reader.WALHeaderSize()+(28+int(reader.BlockSize))+24] ^= 0xff
 		require.NoError(t, os.WriteFile(walName, damaged, 0o600))
 
-		require.ErrorIs(t, reader.RecoverLocalWALs(), ErrIntegrity)
-		requireWALRetained(t, walName, damaged)
-		require.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
+		assert.ErrorIs(t, reader.RecoverLocalWALs(), ErrIntegrity)
+		checkWALRetained(t, walName, damaged)
+		assert.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
 	})
 	t.Run("readError", func(t *testing.T) {
 		volume, walName, walBytes := format1WALVolume(t)
@@ -84,10 +88,10 @@ func TestFormat1ReopenRetainsWALWithBadMidFileRecord(t *testing.T) {
 			require.Equal(t, walName, path)
 			return reader.readWALRecoveryRecords(io.MultiReader(bytes.NewReader(firstRecord), iotest.ErrReader(failedRead)), path)
 		})
-		require.ErrorIs(t, err, ErrIntegrity)
-		require.ErrorIs(t, err, failedRead)
-		requireWALRetained(t, walName, walBytes)
-		require.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
+		assert.ErrorIs(t, err, ErrIntegrity)
+		assert.ErrorIs(t, err, failedRead)
+		checkWALRetained(t, walName, walBytes)
+		assert.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
 	})
 }
 
@@ -115,10 +119,10 @@ func TestFormat1ReopenRetainsWALWithTornRecord(t *testing.T) {
 
 			reader, writes := sealReader(t, volume, 2)
 			err = reader.RecoverLocalWALs()
-			require.ErrorIs(t, err, ErrIntegrity)
-			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
-			requireWALRetained(t, wal.Name(), damaged)
-			require.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
+			assert.ErrorIs(t, err, ErrIntegrity)
+			assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			checkWALRetained(t, wal.Name(), damaged)
+			assert.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
 		})
 	}
 }
@@ -168,9 +172,13 @@ func TestFormat1RecoveryRetainsWALWhenLiveCheckpointFails(t *testing.T) {
 
 	failed, failing := open(2)
 	failing.fail.Store(true)
-	require.Error(t, failed.RecoverLocalWALs())
-	requireWALRetained(t, walName, walBytes)
+	failedErr := failed.RecoverLocalWALs()
+	assert.Error(t, failedErr)
+	checkWALRetained(t, walName, walBytes)
 	failed.Detach()
+	if failedErr == nil {
+		return
+	}
 
 	retry, _ := open(3)
 	require.NoError(t, retry.RecoverLocalWALs())
@@ -221,9 +229,9 @@ func TestSealRetainsWALWithDamagedHeader(t *testing.T) {
 			reader, writes := sealReader(t, volume, 2)
 			require.True(t, reader.IsMapDelta())
 
-			require.Error(t, seal(t, reader, reader.RecoverLocalWALs))
-			requireWALRetained(t, walName, damaged)
-			require.Zero(t, writes.count.Load())
+			assert.Error(t, seal(t, reader, reader.RecoverLocalWALs))
+			checkWALRetained(t, walName, damaged)
+			assert.Zero(t, writes.count.Load())
 		})
 	}
 	t.Run("readError", func(t *testing.T) {
@@ -237,8 +245,8 @@ func TestSealRetainsWALWithDamagedHeader(t *testing.T) {
 				return nil, 0, fmt.Errorf("failed to read WAL header: %w", failedRead)
 			})
 		})
-		require.ErrorIs(t, err, failedRead)
-		requireWALRetained(t, walName, walBytes)
-		require.Zero(t, writes.count.Load())
+		assert.ErrorIs(t, err, failedRead)
+		checkWALRetained(t, walName, walBytes)
+		assert.Zero(t, writes.count.Load())
 	})
 }
