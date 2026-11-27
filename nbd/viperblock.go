@@ -110,14 +110,51 @@ var use_shardwal bool = false
 
 // lease_epoch orders this launch's map heads above every earlier launch's.
 var lease_epoch uint64
+var qualified_chunks bool
 
-// mapClaimed records that this process has claimed its epoch, so a later
-// connection resumes the heads it wrote instead of refusing them.
+// launchChunkIDs reserves qualified payload IDs across all opens under lease_epoch.
+var launchChunkIDs atomic.Uint64
+
+// mapClaimed records that this process consumed a head ordinal, so a later
+// connection can resume its epoch even if the backend reply was lost.
 var mapClaimed atomic.Bool
 
-// mapHeadN and mapObjN carry a closed connection's map counters to the next
-// connection, ambiguous writes included, so no head number is reused.
+// mapHeadN and mapObjN carry map counters across opens, ambiguous writes included.
 var mapHeadN, mapObjN atomic.Uint64
+
+// The volume lock serializes this update with the next engine's Open.
+func rememberMapCounters(vb *viperblock.VB) {
+	if !vb.IsMapDelta() {
+		return
+	}
+	headN, objN := vb.MapCounters()
+	mapHeadN.Store(max(mapHeadN.Load(), headN))
+	mapObjN.Store(max(mapObjN.Load(), objN))
+	mapClaimed.Store(true)
+}
+
+func closeStartupWALs(vb *viperblock.VB) {
+	for _, wal := range []*viperblock.WAL{&vb.WAL, &vb.BlockToObjectWAL} {
+		for _, file := range wal.DB {
+			if err := file.Close(); err != nil {
+				slog.Warn("failed to close startup WAL", "err", err)
+			}
+		}
+		wal.DB = nil
+	}
+	if vb.ShardedWAL != nil {
+		for _, shard := range vb.ShardedWAL.Shards {
+			if shard.DB == nil {
+				continue
+			}
+			if err := shard.DB.Close(); err != nil {
+				slog.Warn("failed to close startup WAL shard", "err", err)
+			}
+			shard.DB = nil
+		}
+	}
+}
+
 var encryption_key_file string
 
 // gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
@@ -226,6 +263,10 @@ func (p *ViperBlockPlugin) Config(key string, value string) error {
 			return err
 		}
 		return nil
+	} else if key == "qualified_chunks" {
+		var err error
+		qualified_chunks, err = strconv.ParseBool(value)
+		return err
 	} else if key == "gc_enabled" {
 		gc_enabled = value == "true" || value == "1"
 		return nil
@@ -308,6 +349,15 @@ func (p *ViperBlockPlugin) AfterFork() error {
 }
 
 func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+	return p.open(readonly, func(cfg *viperblock.VB, backend s3.S3Config) (*viperblock.VB, error) {
+		return viperblock.New(cfg, "s3", backend)
+	}, (*viperblock.VB).OpenWAL)
+}
+
+func (p *ViperBlockPlugin) open(readonly bool,
+	newVolume func(*viperblock.VB, s3.S3Config) (*viperblock.VB, error),
+	openBlockWAL func(*viperblock.VB, *viperblock.WAL, string) error,
+) (nbdkit.ConnectionInterface, error) {
 
 	// Admission control: at most one Open() proceeds past this point per
 	// volume. Acquired before viperblock.New() so a second concurrent
@@ -351,17 +401,22 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	}
 
 	vbconfig := viperblock.VB{
-		VolumeName: volume,
-		VolumeSize: size,
-		BaseDir:    base_dir,
-		WALBaseDir: wal_base_dir,
+		VolumeName:          volume,
+		VolumeSize:          size,
+		BaseDir:             base_dir,
+		WALBaseDir:          wal_base_dir,
+		WALSyncInterval:     -1,
+		ChunkUploadInterval: -1,
+		GCInterval:          -1,
 		// Data-path engine. Recorded on the volume-open metric so a volume
 		// simultaneously held by a control-plane import is visible.
-		Role:        "nbdkit",
-		LeaseEpoch:  lease_epoch,
-		ResumeEpoch: mapClaimed.Load(),
-		ResumeHeadN: mapHeadN.Load(),
-		ResumeObjN:  mapObjN.Load(),
+		Role:            "nbdkit",
+		LeaseEpoch:      lease_epoch,
+		QualifiedChunks: qualified_chunks,
+		LaunchChunkIDs:  &launchChunkIDs,
+		ResumeEpoch:     mapClaimed.Load(),
+		ResumeHeadN:     mapHeadN.Load(),
+		ResumeObjN:      mapObjN.Load(),
 		Cache: viperblock.Cache{
 			Config: viperblock.CacheConfig{
 				Size: cache_size,
@@ -379,10 +434,20 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	// Credentials on cfg are deliberately not logged.
 	slog.Info("creating viperblock backend", "backend", "s3", "volume", cfg.VolumeName,
 		"bucket", cfg.Bucket, "region", cfg.Region, "endpoint", cfg.Host)
-	vb, err := viperblock.New(&vbconfig, "s3", cfg)
+	vb, err := newVolume(&vbconfig, cfg)
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
+
+	defer func() {
+		if !success {
+			vb.Detach()
+			if mapClaimed.Load() {
+				rememberMapCounters(vb)
+			}
+			closeStartupWALs(vb)
+		}
+	}()
 
 	// Apply nbdkit config override for sharded WAL
 	vb.UseShardedWAL = use_shardwal
@@ -404,50 +469,34 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 
 	var walNum uint64
 
-	// First, fetch the state from the remote backend
-	err = vb.LoadState()
-
-	if err != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load state: %v", err)}
-	}
-
-	// Mint + persist VolumeUUID now, single-threaded, before WAL recovery or any
-	// served write seals a block. A lazy mint under concurrent boot load lets a
-	// drain read a half-written UUID (or seal recovery chunks under the zero
-	// UUID), corrupting a block with a durable AEAD tag failure.
-	if err = vb.EnsureVolumeUUID(); err != nil {
-		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not mint volume UUID: %v", err)}
-	}
-
-	// Load the LIVE checkpoint, not the numbered one. Runtime drains rewrite the
-	// live checkpoint on every chunk upload but only bump the numbered checkpoint
-	// on a clean Close — which a killed nbdkit VB (qemu reconnect) never reaches.
-	// Loading the stale numbered map here would reconcile ObjectNum too low, so
-	// recovery/drains would reuse a live chunk ID and overwrite it, leaving a
-	// durable AEAD tag failure. LoadLiveCheckpoint falls back to the numbered
-	// checkpoint when no live one exists yet (brand-new volume).
-	// One deadline covers the load and the claim, so a format-2 volume's first
-	// head under this launch's epoch lands within it, or the open fails.
+	// Share one deadline through discovery and claim. Load the published map
+	// before writing startup state or replaying the local WAL.
 	claimCtx, cancelClaim := context.WithTimeout(context.Background(), mapClaimTimeout)
-	err = vb.LoadLiveCheckpointCtx(claimCtx)
-
+	err = vb.LoadStateAndLiveCheckpointCtx(claimCtx)
 	if err != nil {
 		cancelClaim()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not load block state: %v", err)}
 	}
 
+	// Mint the UUID before recovery or guest I/O can seal a block.
+	if err = vb.EnsureVolumeUUID(); err != nil {
+		cancelClaim()
+		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not mint volume UUID: %v", err)}
+	}
+
+	previousHead, _ := vb.MapCounters()
 	err = vb.ClaimMapCtx(claimCtx)
 	cancelClaim()
+	nextHead, _ := vb.MapCounters()
+	if err == nil || nextHead > previousHead {
+		rememberMapCounters(vb)
+	}
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not claim block map: %v", err)}
-	}
-	if vb.IsMapDelta() {
-		mapClaimed.Store(true)
 	}
 
 	err = vb.RecoverLocalWALs()
 	if err != nil {
-		vb.Detach()
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not recover local WALs: %v", err)}
 	}
 
@@ -468,11 +517,18 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	}
 
 	// Open the block to object WAL
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
+	err = openBlockWAL(vb, &vb.BlockToObjectWAL, filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
 
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
 	}
+
+	vb.WALSyncInterval = viperblock.DefaultWALSyncInterval
+	vb.ChunkUploadInterval = viperblock.DefaultChunkUploadInterval
+	vb.GCInterval = viperblock.DefaultGCInterval
+	vb.StartWALSyncer()
+	vb.StartChunkUploader()
+	vb.StartChunkGC()
 
 	activeVB = vb
 	snapshotListenerDone = startSnapshotListener(vb, filepath.Join(base_dir, volume, "snapshot.sock"))
@@ -682,7 +738,7 @@ func (c *ViperBlockConnection) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
-	// No conversion flips on a closing drain, and none starts.
+	// Stop background map reservations before draining.
 	c.vb.StopMapBackground()
 	// DrainToBackend before Close so the live checkpoint is current. Close
 	// will also flush WAL chunks, but does not save the live checkpoint.
@@ -690,15 +746,6 @@ func (c *ViperBlockConnection) Close() {
 		slog.Error("Close: DrainToBackend failed", "err", err)
 	}
 
-	defer func() {
-		h, o := c.vb.MapCounters()
-		mapHeadN.Store(max(mapHeadN.Load(), h))
-		mapObjN.Store(max(mapObjN.Load(), o))
-		// A volume this connection converted has heads under this epoch.
-		if c.vb.IsMapDelta() {
-			mapClaimed.Store(true)
-		}
-	}()
 	if err := c.vb.CloseCtx(ctx); err != nil {
 		slog.Error("Could not close VB", "err", err)
 	} else if err := viperblock.WriteSealReceipt(base_dir, volume); err != nil {
@@ -706,6 +753,7 @@ func (c *ViperBlockConnection) Close() {
 		// costs the consumer a WARN it would otherwise have skipped.
 		slog.Error("Close: could not write seal receipt", "err", err)
 	}
+	rememberMapCounters(c.vb)
 	activeVB = nil
 
 	// Release the volume lock last, after the VB is fully drained and
@@ -750,7 +798,7 @@ func (p *ViperBlockPlugin) Unload() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
-	// No conversion flips on this closing drain either.
+	// Stop background map reservations before draining.
 	activeVB.StopMapBackground()
 	if err := activeVB.DrainToBackendCtx(ctx); err != nil {
 		slog.Error("Unload: DrainToBackend failed", "err", err)

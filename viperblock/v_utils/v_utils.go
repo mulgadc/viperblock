@@ -4,10 +4,12 @@ package v_utils
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/safecast"
@@ -61,8 +63,8 @@ func (p *progressReporter) finish() {
 	p.progress(p.total, p.total)
 }
 
-// ImportDiskImage imports a disk image to the S3 backend. progress, when non-nil,
-// receives throttled byte-count updates so each caller can render its own way.
+// ImportDiskImage imports a disk image to S3 under the supplied writer lease.
+// A non-nil progress callback receives throttled byte-count updates.
 func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename string, progress ProgressFunc) error {
 	// Confirm filename can be opened
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0)
@@ -156,23 +158,36 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 		return fmt.Errorf("failed to initialize backend: %w", err)
 	}
 
-	// A missing state object is expected for a new import. Every other error
-	// means an existing volume could not be inspected and must fail closed.
-	if err := vb.LoadState(); err != nil && !errors.Is(err, viperblock.ErrStateNotFound) {
+	ctx := context.Background()
+	if vb.LeaseEpoch == 0 {
+		return viperblock.ErrMapNoLeaseEpoch
+	}
+	switch err := vb.LoadStateAndLiveCheckpointCtx(ctx); {
+	case errors.Is(err, viperblock.ErrStateNotFound):
+		if err := vb.InitMapDeltaCtx(ctx, true); err != nil {
+			return fmt.Errorf("failed to initialize block map: %w", err)
+		}
+	case err != nil:
 		return fmt.Errorf("failed to load state: %w", err)
+	default:
+		if err := vb.ClaimMapCtx(ctx); err != nil {
+			return fmt.Errorf("failed to claim block map: %w", err)
+		}
+		if err := vb.RecoverLocalWALs(); err != nil {
+			return fmt.Errorf("failed to recover WAL: %w", err)
+		}
 	}
 
-	err = vb.LoadBlockState()
-
-	if err != nil {
-		return fmt.Errorf("failed to load block state: %w", err)
+	walNum := vb.WAL.WallNum.Add(1)
+	if vb.UseShardedWAL {
+		vb.ShardedWAL.WallNum.Store(walNum)
+		err = vb.OpenShardedWAL()
+	} else {
+		walPath := filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, walNum, vb.GetVolume()))
+		err = vb.OpenWAL(&vb.WAL, walPath)
 	}
-
-	// Open the chunk WAL
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume())))
-
 	if err != nil {
-		return fmt.Errorf("failed to load WAL: %w", err)
+		return fmt.Errorf("failed to open WAL: %w", err)
 	}
 
 	// Open the block to object WAL
@@ -253,7 +268,7 @@ func ImportDiskImage(s3Config *s3.S3Config, vbConfig *viperblock.VB, filename st
 			if err := vb.Flush(); err != nil {
 				return fmt.Errorf("failed to flush at block %d: %w", block, err)
 			}
-			if err := vb.WriteWALToChunk(true); err != nil {
+			if err := vb.DrainToBackendCtx(ctx); err != nil {
 				return fmt.Errorf("failed to write WAL to chunk at block %d: %w", block, err)
 			}
 		}

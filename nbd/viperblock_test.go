@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"github.com/mulgadc/viperblock/types"
 	"github.com/mulgadc/viperblock/viperblock"
 	"github.com/mulgadc/viperblock/viperblock/backends/file"
+	"github.com/mulgadc/viperblock/viperblock/backends/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -41,6 +43,8 @@ func resetPluginConfigState() {
 	encryption_key_file = ""
 	loadedMasterKey = nil
 	lease_epoch = 0
+	qualified_chunks = false
+	launchChunkIDs.Store(0)
 }
 
 // TestConfig_WalBaseDirRoundTrips pins that the "wal_base_dir" nbdkit param
@@ -675,4 +679,295 @@ func BenchmarkPRead(b *testing.B) {
 			require.Equal(b, seed, dst)
 		})
 	}
+}
+
+type heldChunkWrite struct {
+	types.Backend
+	entered chan struct{}
+	release chan struct{}
+}
+
+var _ types.Backend = (*heldChunkWrite)(nil)
+
+func (b *heldChunkWrite) WriteChunkCtx(ctx context.Context, ref types.ChunkRef, headers, data *[]byte) error {
+	close(b.entered)
+	select {
+	case <-b.release:
+		return b.Backend.WriteChunkCtx(ctx, ref, headers, data)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *heldChunkWrite) WriteCtx(ctx context.Context, kind types.FileType, id uint64, headers, data *[]byte) error {
+	if kind == types.FileTypeChunk {
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Backend.WriteCtx(ctx, kind, id, headers, data)
+}
+
+// Verifies: Q-417
+func TestColdNBDReadSurvivesPriorEpochChunkWrite(t *testing.T) {
+	for _, encrypted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
+			var key *masterkey.Key
+			if encrypted {
+				var err error
+				key, err = masterkey.New(bytes.Repeat([]byte{0x26}, masterkey.MasterKeySize))
+				require.NoError(t, err)
+			}
+
+			backendDir := t.TempDir()
+			const volumeName = "epoch-chunk"
+			const volumeSize = 128 << 20
+			newEngine := func(epoch uint64) *viperblock.VB {
+				t.Helper()
+				config := viperblock.VB{
+					VolumeName: volumeName, VolumeSize: volumeSize,
+					BaseDir: t.TempDir(), LeaseEpoch: epoch, MasterKey: key,
+					EncryptionEnabled: encrypted, WALSyncInterval: -1, ChunkUploadInterval: -1,
+					QualifiedChunks: epoch > 1,
+				}
+				engine, err := viperblock.New(&config, "file", file.FileConfig{
+					VolumeName: volumeName, VolumeSize: volumeSize, BaseDir: backendDir,
+				})
+				require.NoError(t, err)
+				t.Cleanup(func() { detachWriteBufferVolume(engine) })
+				require.NoError(t, engine.Backend.Init())
+				return engine
+			}
+			openWriter := func(engine *viperblock.VB) *ViperBlockConnection {
+				t.Helper()
+				path := filepath.Join(engine.WAL.BaseDir, types.GetFilePath(
+					types.FileTypeWALChunk, engine.WAL.WallNum.Add(1), volumeName))
+				require.NoError(t, engine.OpenWAL(&engine.WAL, path))
+				return &ViperBlockConnection{vb: engine}
+			}
+			claim := func(engine *viperblock.VB) {
+				t.Helper()
+				require.NoError(t, engine.LoadState())
+				require.NoError(t, engine.LoadLiveCheckpoint())
+				require.NoError(t, engine.ClaimMapCtx(t.Context()))
+			}
+
+			initial := newEngine(1)
+			require.NoError(t, initial.InitMapDeltaCtx(t.Context(), true))
+			require.NoError(t, initial.SaveState())
+
+			old := newEngine(10)
+			claim(old)
+			oldConn := openWriter(old)
+			require.NoError(t, oldConn.PWrite(bytes.Repeat([]byte{0x19}, 4096), 0, 0))
+			require.NoError(t, oldConn.Flush(0))
+
+			blocker := &heldChunkWrite{
+				Backend: old.Backend, entered: make(chan struct{}), release: make(chan struct{}),
+			}
+			old.Backend = blocker
+			release := sync.OnceFunc(func() { close(blocker.release) })
+			defer release()
+			done := make(chan error, 1)
+			go func() { done <- old.DrainToBackendCtx(t.Context()) }()
+			select {
+			case <-blocker.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("older epoch did not submit its chunk")
+			}
+
+			current := newEngine(20)
+			claim(current)
+			conn := openWriter(current)
+			want := bytes.Repeat([]byte{0x42}, 4096)
+			require.NoError(t, conn.PWrite(want, 0, 0))
+			require.NoError(t, conn.Flush(0))
+			require.NoError(t, current.DrainToBackendCtx(t.Context()))
+
+			release()
+			select {
+			case err := <-done:
+				if err != nil {
+					require.ErrorIs(t, err, viperblock.ErrMapFenced)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("older epoch chunk did not complete")
+			}
+
+			cold := newEngine(30)
+			claim(cold)
+			buf := make([]byte, len(want))
+			require.NoError(t, (&ViperBlockConnection{vb: cold}).PRead(buf, 0, 0))
+			require.True(t, bytes.Equal(want, buf), "cold read did not recover the successor's acknowledged generation")
+		})
+	}
+}
+
+type heldCompactionWrite struct {
+	types.Backend
+	entered  chan string
+	release  chan struct{}
+	finished chan error
+}
+
+var _ types.Backend = (*heldCompactionWrite)(nil)
+
+func (b *heldCompactionWrite) WriteKeyCtx(ctx context.Context, key string, data []byte) error {
+	if !strings.HasPrefix(key, "map/base.") {
+		return b.Backend.WriteKeyCtx(ctx, key, data)
+	}
+	b.entered <- key
+	<-b.release
+	err := b.Backend.WriteKeyCtx(context.WithoutCancel(ctx), key, data)
+	b.finished <- err
+	return err
+}
+
+func TestOpenRetryAfterReplayWithHeldCompaction(t *testing.T) {
+	resetPluginConfigState()
+	t.Cleanup(resetPluginConfigState)
+	resetCounters := func() {
+		mapClaimed.Store(false)
+		mapHeadN.Store(0)
+		mapObjN.Store(0)
+	}
+	resetCounters()
+	t.Cleanup(resetCounters)
+	previousSharding := use_shardwal
+	t.Cleanup(func() { use_shardwal = previousSharding })
+	use_shardwal = false
+
+	root := t.TempDir()
+	seed := newWriteBufferVolume(t, root, 5, nil)
+	openWriteBufferWAL(t, seed)
+	// Fill the delta chain so the next replay commit starts compaction.
+	seedData := bytes.Repeat([]byte{0x31}, int(seed.BlockSize))
+	for range 512 {
+		require.NoError(t, seed.Write(0, seedData))
+		require.NoError(t, seed.DrainToBackend())
+	}
+	replayed := bytes.Repeat([]byte{0x72}, int(seed.BlockSize))
+	require.NoError(t, seed.Write(1, replayed))
+	require.NoError(t, seed.Flush())
+	replayedWAL := filepath.Join(seed.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, seed.WAL.WallNum.Load(), seed.GetVolume()))
+	require.FileExists(t, replayedWAL)
+	detachWriteBufferVolume(seed)
+
+	volume, base_dir, size, lease_epoch = seed.GetVolume(), seed.BaseDir, seed.VolumeSize, 6
+	fileConfig := file.FileConfig{
+		VolumeName: volume, VolumeSize: size, BaseDir: filepath.Join(root, "backend"),
+	}
+	held := &heldCompactionWrite{
+		entered: make(chan string, 1), release: make(chan struct{}), finished: make(chan error, 1),
+	}
+	release := sync.OnceFunc(func() { close(held.release) })
+	t.Cleanup(release)
+	newVolume := func(cfg *viperblock.VB, _ s3.S3Config) (*viperblock.VB, error) {
+		return viperblock.New(cfg, "file", fileConfig)
+	}
+	newFailingVolume := func(cfg *viperblock.VB, backend s3.S3Config) (*viperblock.VB, error) {
+		vb, err := newVolume(cfg, backend)
+		if err == nil {
+			held.Backend = vb.Backend
+			vb.Backend = held
+		}
+		return vb, err
+	}
+
+	var failedChunkWAL *os.File
+	var heldKey string
+	failBlockWAL := func(vb *viperblock.VB, wal *viperblock.WAL, path string) error {
+		select {
+		case heldKey = <-held.entered:
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("replay did not start background compaction")
+		}
+		failedChunkWAL = vb.WAL.DB[0]
+		if err := os.MkdirAll(path, 0700); err != nil {
+			return err
+		}
+		defer os.Remove(path)
+		return vb.OpenWAL(wal, path)
+	}
+
+	type openResult struct {
+		connection nbdkit.ConnectionInterface
+		err        error
+	}
+	plugin := &ViperBlockPlugin{}
+	openWhileHeld := func(factory func(*viperblock.VB, s3.S3Config) (*viperblock.VB, error),
+		openWAL func(*viperblock.VB, *viperblock.WAL, string) error,
+	) openResult {
+		t.Helper()
+		result := make(chan openResult, 1)
+		go func() {
+			conn, err := plugin.open(false, factory, openWAL)
+			result <- openResult{conn, err}
+		}()
+		select {
+		case opened := <-result:
+			return opened
+		case <-time.After(10 * time.Second):
+			release()
+			<-result
+			t.Fatal("Open waited for held compaction")
+			return openResult{}
+		}
+	}
+
+	failed := openWhileHeld(newFailingVolume, failBlockWAL)
+	require.ErrorContains(t, failed.err, "Could not open Block WAL: open WAL file")
+	require.NotEmpty(t, heldKey)
+	require.NotNil(t, failedChunkWAL)
+	_, err := failedChunkWAL.Stat()
+	require.ErrorIs(t, err, os.ErrClosed)
+	require.NoFileExists(t, replayedWAL)
+	failedHead, failedObject := mapHeadN.Load(), mapObjN.Load()
+	var heldEpoch, heldObject uint64
+	_, err = fmt.Sscanf(heldKey, "map/base.%d.%d", &heldEpoch, &heldObject)
+	require.NoError(t, err)
+	require.Equal(t, lease_epoch, heldEpoch)
+	require.Positive(t, failedHead)
+	require.Greater(t, failedObject, heldObject)
+
+	reopened := openWhileHeld(newVolume, (*viperblock.VB).OpenWAL)
+	require.NoError(t, reopened.err)
+	retry := reopened.connection.(*ViperBlockConnection)
+	closeRetry := sync.OnceFunc(retry.Close)
+	t.Cleanup(closeRetry)
+	head, object := retry.vb.MapCounters()
+	require.GreaterOrEqual(t, head, failedHead)
+	require.GreaterOrEqual(t, object, failedObject)
+
+	newData := bytes.Repeat([]byte{0xa8}, int(seed.BlockSize))
+	blockSize := uint64(seed.BlockSize)
+	require.NoError(t, retry.PWrite(newData, 2*blockSize, 0))
+	require.NoError(t, retry.vb.DrainToBackend())
+	head, object = retry.vb.MapCounters()
+	require.Greater(t, head, failedHead)
+	require.Greater(t, object, failedObject)
+	release()
+	select {
+	case err := <-held.finished:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held compaction PUT did not finish")
+	}
+	closeRetry()
+
+	reader, err := viperblock.New(&viperblock.VB{
+		BaseDir: t.TempDir(), VolumeName: volume, VolumeSize: size, LeaseEpoch: 7,
+		WALSyncInterval: -1, ChunkUploadInterval: -1, GCInterval: -1,
+	}, "file", fileConfig)
+	require.NoError(t, err)
+	t.Cleanup(reader.Detach)
+	require.NoError(t, reader.Backend.Init())
+	require.NoError(t, reader.LoadStateAndLiveCheckpointCtx(t.Context()))
+	cold := &ViperBlockConnection{vb: reader, readonly: true}
+	got := make([]byte, 2*blockSize)
+	require.NoError(t, cold.PRead(got, blockSize, 0))
+	require.Equal(t, append(replayed, newData...), got)
 }

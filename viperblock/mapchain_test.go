@@ -829,6 +829,24 @@ func waitDeletesIdle(vb *VB, ch chan struct{}) {
 	drainSignals(ch)
 }
 
+func TestVolumeOpenRejectsFormatOneBeforeWriting(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	writer, _ := mv.engine(t, 5)
+	writer.MapFormat = MapFormatLegacy
+	require.NoError(t, writer.SaveState())
+	writer.Detach()
+
+	reader, backend := mv.engine(t, 6)
+	key := types.GetFilePath(types.FileTypeConfig, 0, reader.GetVolume())
+	before, err := backend.ReadCtx(t.Context(), types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err, key)
+	require.ErrorContains(t, reader.LoadStateAndLiveCheckpointCtx(t.Context()), "unsupported block-map format")
+	after, err := backend.ReadCtx(t.Context(), types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err, key)
+	require.Equal(t, before, after)
+	require.Empty(t, mv.mapKeys(t, mapHeadPrefix))
+}
+
 // A head from one creation attempt never pairs with another attempt's VBState.
 func TestMapDelta_HeadFromAnotherCreationFailsTheOpen(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
@@ -892,4 +910,97 @@ func TestMapDelta_ResumeStartsAtTheEarlierEnginesCounters(t *testing.T) {
 	writeDrain(t, again, 2, randomBlockData(1))
 	assert.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN+7),
 		"a number the earlier engine may have sent is never reused")
+}
+
+func TestMapClaimRetryKeepsConsumedHeadWhenPreviousEpochIsVisible(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	seed.Detach()
+
+	first, fault := mv.engine(t, 6)
+	require.NoError(t, first.LoadState())
+	require.NoError(t, first.LoadLiveCheckpoint())
+	fault.failHead.Store(true)
+	require.Error(t, first.ClaimMapCtx(t.Context()))
+	headN, objN := first.MapCounters()
+	require.EqualValues(t, 1, headN)
+	first.Detach()
+
+	retry, _ := mv.engine(t, 6)
+	retry.ResumeEpoch = true
+	retry.ResumeHeadN = headN
+	retry.ResumeObjN = objN
+	require.NoError(t, retry.LoadState())
+	require.NoError(t, retry.LoadLiveCheckpoint())
+	require.NoError(t, retry.ClaimMapCtx(t.Context()))
+
+	require.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, headN))
+	require.NotContains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, 0))
+}
+
+func TestStoppedCompactionCannotReserveAnOrdinal(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.create(t, 5)
+	vb.StopMapBackground()
+
+	before := mv.mapKeys(t, mapBasePrefix)
+	head, object := vb.MapCounters()
+	vb.writeMapBase(t.Context(), &extentIndex[BlockLookup]{}, mapObjRef{})
+
+	afterHead, afterObject := vb.MapCounters()
+	require.Equal(t, head, afterHead)
+	require.Equal(t, object, afterObject, "stopped compaction must not reserve a new key")
+	require.Equal(t, before, mv.mapKeys(t, mapBasePrefix))
+}
+
+type heldClaimBackend struct {
+	types.Backend
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *heldClaimBackend) WriteKeyCtx(ctx context.Context, key string, data []byte) error {
+	if strings.HasPrefix(key, mapHeadPrefix) {
+		close(b.entered)
+		<-b.release
+	}
+	return b.Backend.WriteKeyCtx(ctx, key, data)
+}
+
+func TestMapCounterSampleDoesNotWaitForHeldClaim(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	seed, _ := mv.create(t, 5)
+	seed.Detach()
+	writer, _ := mv.engine(t, 6)
+	require.NoError(t, writer.LoadState())
+	require.NoError(t, writer.LoadLiveCheckpoint())
+
+	backend := &heldClaimBackend{
+		Backend: writer.Backend, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	writer.Backend = backend
+	release := sync.OnceFunc(func() { close(backend.release) })
+	defer release()
+	done := make(chan error, 1)
+	go func() { done <- writer.ClaimMapCtx(t.Context()) }()
+
+	select {
+	case <-backend.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("claim did not reach the held backend")
+	}
+	sampled := make(chan uint64, 1)
+	go func() {
+		head, _ := writer.MapCounters()
+		sampled <- head
+	}()
+	select {
+	case head := <-sampled:
+		require.EqualValues(t, 1, head)
+	case <-time.After(time.Second):
+		t.Fatal("sampling consumed ordinals waited for the held PUT")
+	}
+	release()
+	require.NoError(t, <-done)
 }

@@ -247,6 +247,21 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 	//filename := fmt.Sprintf("%s/%s/chunk.%08d.bin", backend.config.BaseDir, backend.config.VolumeName, objectId)
 
 	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+	return backend.writeAtPath(filename, headers, data)
+}
+
+func (backend *Backend) WriteChunkCtx(ctx context.Context, ref types.ChunkRef, headers, data *[]byte) error {
+	start := time.Now()
+	err := backend.writeAtPath(filepath.Join(backend.config.BaseDir, ref.Key(backend.config.VolumeName)), headers, data)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "write", "file", backend.config.VolumeName, outcome, writeLen(headers, data), time.Since(start))
+	return err
+}
+
+func (backend *Backend) writeAtPath(filename string, headers, data *[]byte) error {
 	var h, d []byte
 	if headers != nil {
 		h = *headers
@@ -416,9 +431,24 @@ func (backend *Backend) SetConfig(config any) error {
 	return nil
 }
 
-func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
-	filename := fmt.Sprintf("%s/%s", backend.config.BaseDir, types.GetFilePath(fileType, objectId, volumeName))
+func (backend *Backend) ReadFrom(volumeName string, fileType types.FileType, objectId uint64, offset, length uint32) ([]byte, error) {
+	return readAtPath(filepath.Join(backend.config.BaseDir, types.GetFilePath(fileType, objectId, volumeName)), offset, length)
+}
 
+func (backend *Backend) ReadChunkFromCtx(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
+	start := time.Now()
+	data, err := readAtPath(filepath.Join(backend.config.BaseDir, ref.Key(volume)), offset, length)
+	if volume == backend.config.VolumeName {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		telemetry.RecordBackendIO(ctx, "read", "file", volume, outcome, len(data), time.Since(start))
+	}
+	return data, err
+}
+
+func readAtPath(filename string, offset, length uint32) (data []byte, err error) {
 	f, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 	if err != nil {
 		return nil, err
@@ -488,6 +518,17 @@ func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err er
 func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
 	start := time.Now()
 	err = backend.Delete(fileType, objectId)
+	outcome := "success"
+	if err != nil {
+		outcome = "error"
+	}
+	telemetry.RecordBackendIO(ctx, "delete", "file", backend.config.VolumeName, outcome, 0, time.Since(start))
+	return err
+}
+
+func (backend *Backend) DeleteChunkCtx(ctx context.Context, ref types.ChunkRef) error {
+	start := time.Now()
+	err := os.Remove(filepath.Join(backend.config.BaseDir, ref.Key(backend.config.VolumeName)))
 	outcome := "success"
 	if err != nil {
 		outcome = "error"

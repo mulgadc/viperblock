@@ -33,7 +33,7 @@ import (
 //
 // HasFlatSection marks checkpoints that carry an inherited-blocks section after
 // the own-blocks entries. When true, BlockCount is exact and the section starts
-// at headerSize + BlockCount*blockWalChunkSize bytes into the checkpoint.
+// at headerSize + BlockCount times the record size into the checkpoint.
 type SnapshotState struct {
 	SnapshotID           string    `json:"SnapshotID"`
 	SourceVolumeName     string    `json:"SourceVolumeName"`
@@ -52,6 +52,10 @@ type SnapshotState struct {
 // flatSectionMagic is the 4-byte header that identifies the inherited-blocks
 // section appended after own-block entries in a flat snapshot checkpoint.
 var flatSectionMagic = [4]byte{'F', 'L', 'A', 'T'}
+var qualifiedSnapshotMagic = [4]byte{'V', 'B', 'S', 'Q'}
+
+const qualifiedSnapshotVersion = 2
+const qualifiedSnapshotBlockSize = blockWalChunkSize + 8
 
 // InheritedLayer carries the block map and source identity for one ancestor
 // level decoded from a flat snapshot's inherited-blocks section.
@@ -166,11 +170,19 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 	// coalesced map entries — sum each entry's NumBlocks rather than len().
 	var blockCount uint64
 	checkpoint := vb.BlockToObjectWALHeader()
+	sectionVersion := byte(1)
+	recordSize := blockWalChunkSize
+	if vb.mapChain.qualified.Load() || vb.baseSnapshotQualified {
+		copy(checkpoint[:4], qualifiedSnapshotMagic[:])
+		binary.BigEndian.PutUint16(checkpoint[4:6], qualifiedSnapshotVersion)
+		sectionVersion = qualifiedSnapshotVersion
+		recordSize = qualifiedSnapshotBlockSize
+	}
 	stride := vb.blockStride()
 	vb.BlocksToObject.lookup.scan(func(block BlockLookup) bool {
 		blockCount += uint64(block.NumBlocks)
 		for _, single := range expandBlockLookup(block, stride) {
-			checkpoint = append(checkpoint, vb.writeBlockWalChunk(&single)...)
+			checkpoint = appendBlockRecord(checkpoint, single, recordSize)
 		}
 		return true
 	})
@@ -178,7 +190,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 
 	hasFlatSection := vb.BaseBlockMap != nil
 	if hasFlatSection {
-		flatBytes, err := vb.buildFlatSection()
+		flatBytes, err := vb.buildFlatSection(sectionVersion, recordSize)
 		if err != nil {
 			return nil, fmt.Errorf("build flat section: %w", err)
 		}
@@ -258,6 +270,7 @@ func (vb *VB) CreateSnapshot(snapshotID string) (*SnapshotState, error) {
 // InheritedLayers is non-nil for flat snapshots and carries the decoded
 // inherited-blocks section (all ancestor layers, no further I/O needed).
 type SnapshotIdentity struct {
+	qualified            bool
 	SourceVolumeName     string
 	SourceVolumeUUID     [4]byte
 	SourceVolumeNameHash [32]byte
@@ -362,10 +375,20 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	}
 
 	headers := checkpoint[:headerSize]
-	if !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]) {
+	version := binary.BigEndian.Uint16(headers[4:6])
+	sectionVersion := byte(1)
+	recordSize := blockWalChunkSize
+	switch {
+	case bytes.Equal(headers[:4], qualifiedSnapshotMagic[:]):
+		if version != qualifiedSnapshotVersion {
+			return nil, ident, fmt.Errorf("qualified snapshot checkpoint version %d is unsupported", version)
+		}
+		ident.qualified = true
+		sectionVersion = qualifiedSnapshotVersion
+		recordSize = qualifiedSnapshotBlockSize
+	case !bytes.Equal(headers[:4], vb.BlockToObjectWAL.WALMagic[:]):
 		return nil, ident, fmt.Errorf("snapshot checkpoint magic mismatch")
-	}
-	if binary.BigEndian.Uint16(headers[4:6]) != vb.Version {
+	case version != vb.Version:
 		return nil, ident, fmt.Errorf("snapshot checkpoint version mismatch")
 	}
 
@@ -374,13 +397,16 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 	dataSize := len(checkpoint) - headerSize
 	ownBlocksSize := dataSize
 	if snap.HasFlatSection {
-		if snap.BlockCount > math.MaxInt/blockWalChunkSize {
+		if snap.BlockCount > safecast.IntToUint64(math.MaxInt/recordSize) {
 			return nil, ident, fmt.Errorf("snapshot BlockCount %d overflows addressable size", snap.BlockCount)
 		}
-		ownBlocksSize = int(snap.BlockCount) * blockWalChunkSize
+		ownBlocksSize = safecast.Uint64ToInt(snap.BlockCount) * recordSize
 	}
-	if ownBlocksSize%blockWalChunkSize != 0 {
-		return nil, ident, fmt.Errorf("snapshot checkpoint has %d trailing bytes (own-blocks section %d bytes is not a multiple of %d-byte entries)", ownBlocksSize%blockWalChunkSize, ownBlocksSize, blockWalChunkSize)
+	if ownBlocksSize > dataSize {
+		return nil, ident, fmt.Errorf("snapshot checkpoint own-blocks section truncated")
+	}
+	if ownBlocksSize%recordSize != 0 {
+		return nil, ident, fmt.Errorf("snapshot checkpoint has %d trailing bytes (own-blocks section %d bytes is not a multiple of %d-byte entries)", ownBlocksSize%recordSize, ownBlocksSize, recordSize)
 	}
 
 	// 5. Deserialize own block lookup entries
@@ -388,13 +414,13 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 
 	offset := headerSize
 	end := headerSize + ownBlocksSize
-	for offset+blockWalChunkSize <= end {
-		block, err := vb.readBlockWalChunk(checkpoint[offset : offset+blockWalChunkSize])
+	for offset+recordSize <= end {
+		block, err := decodeBlockRecord(checkpoint[offset:offset+recordSize], recordSize)
 		if err != nil {
 			return nil, ident, fmt.Errorf("failed to read snapshot block entry at offset %d: %w", offset, err)
 		}
 		baseMap.lookup.set(block)
-		offset += blockWalChunkSize
+		offset += recordSize
 	}
 
 	// 6. Validate block count against metadata
@@ -404,7 +430,7 @@ func (vb *VB) LoadSnapshotBlockMap(snapshotID string) (*BlocksToObject, Snapshot
 
 	// 7. Parse the flat inherited-blocks section if present
 	if snap.HasFlatSection {
-		layers, err := parseFlatSection(checkpoint[end:])
+		layers, err := parseFlatSection(checkpoint[end:], sectionVersion, recordSize)
 		if err != nil {
 			return nil, ident, fmt.Errorf("snapshot %s flat section: %w", snapshotID, err)
 		}
@@ -598,6 +624,7 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 	}
 
 	vb.BaseBlockMap = baseMap
+	vb.baseSnapshotQualified = ident.qualified
 	vb.SourceVolumeName = ident.SourceVolumeName
 	vb.SnapshotID = snapshotID
 	vb.SourceVolumeUUID = ident.SourceVolumeUUID
@@ -631,8 +658,13 @@ func (vb *VB) OpenFromSnapshot(snapshotID string) error {
 // The SeqNum return drives source-volume nonce + AAD reconstruction for
 // encrypted clones; on unencrypted volumes callers ignore it.
 func (vb *VB) LookupBaseBlockToObject(block uint64) (uint64, uint32, uint64, error) {
+	ref, offset, seq, err := vb.lookupBaseChunk(block)
+	return ref.ID, offset, seq, err
+}
+
+func (vb *VB) lookupBaseChunk(block uint64) (types.ChunkRef, uint32, uint64, error) {
 	if vb.BaseBlockMap == nil {
-		return 0, 0, 0, ErrZeroBlock
+		return types.ChunkRef{}, 0, 0, ErrZeroBlock
 	}
 
 	vb.BaseBlockMap.mu.RLock()
@@ -640,9 +672,9 @@ func (vb *VB) LookupBaseBlockToObject(block uint64) (uint64, uint32, uint64, err
 	vb.BaseBlockMap.mu.RUnlock()
 
 	if !ok {
-		return 0, 0, 0, ErrZeroBlock
+		return types.ChunkRef{}, 0, 0, ErrZeroBlock
 	}
-	return lookup.ObjectID, lookup.offsetAt(pos, vb.blockStride()), lookup.seqNumAt(pos), nil
+	return types.ChunkRef{Epoch: lookup.ChunkEpoch, ID: lookup.ObjectID}, lookup.offsetAt(pos, vb.blockStride()), lookup.seqNumAt(pos), nil
 }
 
 // buildFlatSection serialises all inherited ancestor blocks into a binary
@@ -654,7 +686,7 @@ func (vb *VB) LookupBaseBlockToObject(block uint64) (uint64, uint32, uint64, err
 //	For each source:
 //	  nameLen[2] name[N] uuid[4] nameHash[32] numBlocks[4]
 //	  [BlockWalChunk × numBlocks]
-func (vb *VB) buildFlatSection() ([]byte, error) {
+func (vb *VB) buildFlatSection(version byte, recordSize int) ([]byte, error) {
 	type sourceGroup struct {
 		name     string
 		uuid     [4]byte
@@ -711,7 +743,7 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 
 	var buf []byte
 	buf = append(buf, flatSectionMagic[:]...)
-	buf = append(buf, 1)                   // version
+	buf = append(buf, version)
 	buf = append(buf, uint8(len(sources))) //nolint:gosec // G115: bounded above
 	for _, src := range sources {
 		nameBytes := []byte(src.name)
@@ -731,21 +763,23 @@ func (vb *VB) buildFlatSection() ([]byte, error) {
 		binary.BigEndian.PutUint32(numBlocksBuf, uint32(len(src.blocks))) //nolint:gosec // G115: bounded above
 		buf = append(buf, numBlocksBuf...)
 		for i := range src.blocks {
-			buf = append(buf, vb.writeBlockWalChunk(&src.blocks[i])...)
+			buf = appendBlockRecord(buf, src.blocks[i], recordSize)
 		}
 	}
 	return buf, nil
 }
 
 // parseFlatSection decodes the inherited-blocks section produced by buildFlatSection.
-func parseFlatSection(data []byte) ([]InheritedLayer, error) {
+func parseFlatSection(data []byte, version byte, recordSize int) ([]InheritedLayer, error) {
 	if len(data) < 6 {
 		return nil, fmt.Errorf("flat section too short (%d bytes)", len(data))
 	}
 	if [4]byte(data[0:4]) != flatSectionMagic {
 		return nil, fmt.Errorf("flat section magic mismatch")
 	}
-	// data[4] = version (reserved, must be 1)
+	if data[4] != version {
+		return nil, fmt.Errorf("flat section version %d, want %d", data[4], version)
+	}
 	numSources := int(data[5])
 	offset := 6
 
@@ -774,18 +808,16 @@ func parseFlatSection(data []byte) ([]InheritedLayer, error) {
 		offset += 4
 
 		bm := &BlocksToObject{}
-		// Reuse a zero-value VB just to call readBlockWalChunk (pure function on data).
-		var tmp VB
 		for j := range numBlocks {
-			if offset+blockWalChunkSize > len(data) {
+			if offset+recordSize > len(data) {
 				return nil, fmt.Errorf("flat section: source %d: block %d: truncated", i, j)
 			}
-			block, err := tmp.readBlockWalChunk(data[offset : offset+blockWalChunkSize])
+			block, err := decodeBlockRecord(data[offset:offset+recordSize], recordSize)
 			if err != nil {
 				return nil, fmt.Errorf("flat section: source %d: block %d: %w", i, j, err)
 			}
 			bm.lookup.set(block)
-			offset += blockWalChunkSize
+			offset += recordSize
 		}
 		layers = append(layers, InheritedLayer{
 			Blocks:               bm,

@@ -76,11 +76,12 @@ func TestChunkWritesCarryCRC64NVMEAndTheEBSOptIn(t *testing.T) {
 	data := bytes.Repeat([]byte{7}, 4<<20)
 	ctx := context.Background()
 	require.NoError(t, backend.WriteCtx(ctx, types.FileTypeChunk, 1, &headers, &data))
+	require.NoError(t, backend.WriteChunkCtx(ctx, types.ChunkRef{Epoch: 10, ID: 1}, &headers, &data))
 	require.NoError(t, backend.WriteToCtx(ctx, "vol-other00000000", types.FileTypeChunk, 2, &headers, &data))
 
 	want := append(append([]byte(nil), headers...), data...)
 	got := puts()
-	require.Len(t, got, 2)
+	require.Len(t, got, 3)
 	for _, p := range got {
 		require.True(t, bytes.Equal(want, p.body), "the body is the chunk header then its blocks")
 		assert.Equal(t, []string{crc64Base64(want)}, p.header.Values("X-Amz-Checksum-Crc64nvme"),

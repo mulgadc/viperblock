@@ -34,7 +34,8 @@ const (
 	mapKindDelta byte = 2
 	mapKindHead  byte = 3
 
-	mapObjectVersion byte = 1
+	mapObjectVersion          byte = 1
+	mapQualifiedObjectVersion byte = 2
 
 	// DefaultMapDeleteDeferral is twice the volume lease TTL: an object a
 	// commit stops naming is deleted no sooner than this after it.
@@ -136,9 +137,13 @@ func (h mapHead) clone() mapHead {
 // frameMapObject wraps body with the header binding it to its kind, volume,
 // epoch and id, and a trailing CRC32C over everything before it.
 func frameMapObject(kind byte, volume string, epoch, id uint64, body []byte) []byte {
+	return frameMapObjectVersion(kind, mapObjectVersion, volume, epoch, id, body)
+}
+
+func frameMapObjectVersion(kind, version byte, volume string, epoch, id uint64, body []byte) []byte {
 	out := make([]byte, 0, 32+len(volume)+len(body))
 	out = append(out, mapObjectMagic[:]...)
-	out = append(out, kind, mapObjectVersion)
+	out = append(out, kind, version)
 	out = binary.AppendUvarint(out, safecast.IntToUint64(len(volume)))
 	out = append(out, volume...)
 	out = binary.BigEndian.AppendUint64(out, epoch)
@@ -149,6 +154,17 @@ func frameMapObject(kind byte, volume string, epoch, id uint64, body []byte) []b
 }
 
 func unframeMapObject(data []byte, kind byte, volume string, epoch, id uint64) ([]byte, error) {
+	return unframeMapObjectVersion(data, kind, mapObjectVersion, volume, epoch, id)
+}
+
+func requiredMapObjectVersion(data []byte) (byte, error) {
+	if len(data) < 6 || (data[5] != mapObjectVersion && data[5] != mapQualifiedObjectVersion) {
+		return 0, fmt.Errorf("%w: unsupported object version", ErrMapObjectCorrupt)
+	}
+	return data[5], nil
+}
+
+func unframeMapObjectVersion(data []byte, kind, version byte, volume string, epoch, id uint64) ([]byte, error) {
 	if len(data) < 4+2+1+16+1+4 {
 		return nil, fmt.Errorf("%w: %d bytes", ErrMapObjectCorrupt, len(data))
 	}
@@ -156,7 +172,7 @@ func unframeMapObject(data []byte, kind byte, volume string, epoch, id uint64) (
 	if crc32.Checksum(payload, crc32cTable) != sum {
 		return nil, fmt.Errorf("%w: crc mismatch", ErrMapObjectCorrupt)
 	}
-	if !bytes.Equal(payload[:4], mapObjectMagic[:]) || payload[4] != kind || payload[5] != mapObjectVersion {
+	if !bytes.Equal(payload[:4], mapObjectMagic[:]) || payload[4] != kind || payload[5] != version {
 		return nil, fmt.Errorf("%w: header", ErrMapObjectCorrupt)
 	}
 	p := payload[6:]
@@ -201,6 +217,10 @@ func deltaDec(prev, v uint64) uint64 {
 // a run of consecutive seqs stores its first and a flag, any other run one
 // zigzag delta per further block.
 func encodeMapRuns(runs []BlockLookup) []byte {
+	return encodeMapRunsVersion(runs, mapObjectVersion)
+}
+
+func encodeMapRunsVersion(runs []BlockLookup, version byte) []byte {
 	out := binary.AppendUvarint(nil, safecast.IntToUint64(len(runs)))
 	var prevEnd, prevObj, prevSeq uint64
 	for _, r := range runs {
@@ -210,6 +230,9 @@ func encodeMapRuns(runs []BlockLookup) []byte {
 		out = binary.AppendUvarint(out, uint64(r.ObjectOffset))
 		first := r.seqNumAt(0)
 		out = binary.AppendUvarint(out, deltaEnc(first, prevSeq))
+		if version == mapQualifiedObjectVersion {
+			out = binary.AppendUvarint(out, r.ChunkEpoch)
+		}
 		consecutive := true
 		for i := 1; i < int(r.NumBlocks); i++ {
 			if r.seqNumAt(i) != first+safecast.IntToUint64(i) {
@@ -234,6 +257,10 @@ func encodeMapRuns(runs []BlockLookup) []byte {
 }
 
 func decodeMapRuns(body []byte) ([]BlockLookup, error) {
+	return decodeMapRunsVersion(body, mapObjectVersion)
+}
+
+func decodeMapRunsVersion(body []byte, version byte) ([]BlockLookup, error) {
 	p := body
 	next := func() (uint64, error) {
 		v, n := binary.Uvarint(p)
@@ -267,6 +294,14 @@ func decodeMapRuns(body []byte) ([]BlockLookup, error) {
 			NumBlocks:    safecast.IntToUint16(safecast.Uint64ToInt(f[1])),
 			ObjectID:     deltaDec(prevObj, f[2]),
 			ObjectOffset: safecast.Uint64ToUint32(f[3]),
+		}
+		if version == mapQualifiedObjectVersion {
+			if r.ChunkEpoch, err = next(); err != nil {
+				return nil, err
+			}
+			if len(p) == 0 {
+				return nil, fmt.Errorf("%w: missing run sequence flag", ErrMapObjectCorrupt)
+			}
 		}
 		first := deltaDec(prevSeq, f[4])
 		flag := p[0]
@@ -368,8 +403,8 @@ func decodeMapHead(body []byte) (mapHead, error) {
 // guarded by VB.checkpointMu unless noted.
 type mapChainState struct {
 	head       mapHead
-	headN      uint64
-	objN       uint64
+	headN      atomic.Uint64
+	objN       atomic.Uint64
 	claimed    bool
 	pending    []BlockLookup
 	baseBytes  uint64
@@ -390,9 +425,9 @@ type mapChainState struct {
 	// deleteBusy is set while deferred deletes are processed.
 	deleteBusy atomic.Bool
 	fenced     atomic.Bool
-	// delta mirrors MapFormat == MapFormatDelta for readers outside
-	// checkpointMu, since a conversion flips the format while drains run.
-	delta atomic.Bool
+	// delta identifies an initialized format-2 map.
+	delta     atomic.Bool
+	qualified atomic.Bool
 	// committed is set once any head of this volume is durable, and is
 	// persisted in VBState as the creation-complete signal.
 	committed atomic.Bool
@@ -408,11 +443,7 @@ type mapChainState struct {
 
 	// chunkSeen records when chunk GC first found each zero-reference chunk.
 	// Guarded by BlocksToObject.mu.
-	chunkSeen map[uint64]time.Time
-
-	// conv is a format-1 volume's conversion to format 2. Guarded by
-	// checkpointMu.
-	conv mapConversion
+	chunkSeen map[types.ChunkRef]time.Time
 }
 
 type deferredMapDelete struct {
@@ -436,6 +467,13 @@ func (vb *VB) mapDeleteDeferral() time.Duration {
 
 // IsMapDelta reports whether this volume persists its map as format 2.
 func (vb *VB) IsMapDelta() bool { return vb.mapChain.delta.Load() }
+
+func (vb *VB) persistedMapFormat() uint8 {
+	if vb.IsMapDelta() {
+		return MapFormatDelta
+	}
+	return vb.MapFormat
+}
 
 // setMapDelta switches the in-memory volume to format 2, so installs record
 // their runs for the next delta.
@@ -466,10 +504,16 @@ func (vb *VB) writeMapKey(ctx context.Context, key string, data []byte) error {
 	return err
 }
 
+func (vb *VB) mapObjectVersion() byte {
+	if vb.mapChain.qualified.Load() {
+		return mapQualifiedObjectVersion
+	}
+	return mapObjectVersion
+}
+
 func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body []byte) (mapObjRef, error) {
-	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
-	vb.mapChain.objN++
-	data := frameMapObject(kind, vb.VolumeName, ref.Epoch, ref.ID, body)
+	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN.Add(1) - 1}
+	data := frameMapObjectVersion(kind, vb.mapObjectVersion(), vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
 	return ref, vb.writeMapKey(ctx, ref.key(prefix), data)
@@ -478,9 +522,18 @@ func (vb *VB) putMapObject(ctx context.Context, prefix string, kind byte, body [
 // putMapHead writes the next head of this launch's epoch. Its number is
 // consumed whether or not the write succeeds, so no name is ever reused.
 func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
-	n := vb.mapChain.headN
-	vb.mapChain.headN++
-	data := frameMapObject(mapKindHead, vb.VolumeName, vb.LeaseEpoch, n, encodeMapHead(h))
+	return vb.putMapHeadFor(ctx, h, false)
+}
+
+func (vb *VB) putMapHeadFor(ctx context.Context, h mapHead, background bool) error {
+	if background && vb.mapChain.closing.Load() {
+		return context.Canceled
+	}
+	n := vb.mapChain.headN.Add(1) - 1
+	if background && vb.mapChain.closing.Load() {
+		return context.Canceled
+	}
+	data := frameMapObjectVersion(mapKindHead, vb.mapObjectVersion(), vb.VolumeName, vb.LeaseEpoch, n, encodeMapHead(h))
 	if err := vb.writeMapKey(ctx, mapObjectKey(mapHeadPrefix, vb.LeaseEpoch, n), data); err != nil {
 		return err
 	}
@@ -491,9 +544,7 @@ func (vb *VB) putMapHead(ctx context.Context, h mapHead) error {
 // MapCounters reports the next head number and object id this engine would
 // use, ambiguous writes included, for a later engine of the same process.
 func (vb *VB) MapCounters() (headN, objN uint64) {
-	vb.checkpointMu.Lock()
-	defer vb.checkpointMu.Unlock()
-	return vb.mapChain.headN, vb.mapChain.objN
+	return vb.mapChain.headN.Load(), vb.mapChain.objN.Load()
 }
 
 // InitMapDeltaCtx makes a new volume format 2 under its creation epoch: the
@@ -528,7 +579,7 @@ func (vb *VB) InitMapDeltaCtx(ctx context.Context, publish bool) error {
 	vb.BlocksToObject.mu.RLock()
 	runs := vb.mapRunsLocked()
 	vb.BlocksToObject.mu.RUnlock()
-	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRuns(runs))
+	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRunsVersion(runs, vb.mapObjectVersion()))
 	if err != nil {
 		return fmt.Errorf("map: write first base: %w", err)
 	}
@@ -553,6 +604,54 @@ func (vb *VB) mapRunsLocked() []BlockLookup {
 }
 
 // listMapHeads returns every committed head's (epoch, n), unordered.
+// Cap authority discovery even for an internal caller without a deadline.
+const mapHeadAuthorityTimeout = 10 * time.Second
+
+var ErrMapHeadAuthority = errors.New("map: authoritative head discovery unavailable")
+
+func (vb *VB) mapHeadAuthorityRequired() (bool, error) {
+	if backend, ok := vb.Backend.(types.MapHeadAuthority); ok {
+		return backend.MapHeadAuthorityRequired(), nil
+	}
+	if vb.Backend.GetBackendType() == "s3" {
+		return false, ErrMapHeadAuthority
+	}
+	return false, nil
+}
+
+func (vb *VB) checkQualifiedMapBackend() error {
+	if vb.Backend.GetBackendType() != "s3" {
+		return nil
+	}
+	required, err := vb.mapHeadAuthorityRequired()
+	if err != nil {
+		return err
+	}
+	if !required {
+		return fmt.Errorf("%w: qualified S3 volumes require the predastore bucket", ErrMapHeadAuthority)
+	}
+	return nil
+}
+
+func (vb *VB) authoritativeMapHead(ctx context.Context) ([2]uint64, error) {
+	authority, ok := vb.Backend.(types.MapHeadAuthority)
+	if !ok {
+		return [2]uint64{}, ErrMapHeadAuthority
+	}
+	key, err := authority.LatestMapHeadCtx(ctx, vb.VolumeName+"/"+mapHeadPrefix)
+	if err != nil {
+		return [2]uint64{}, fmt.Errorf("%w: %w", ErrMapHeadAuthority, err)
+	}
+	if key == "" {
+		return [2]uint64{}, ErrMapHeadMissing
+	}
+	epoch, id, ok := parseMapObjectKey(key, mapHeadPrefix)
+	if !ok || epoch == 0 || key != vb.VolumeName+"/"+mapObjectKey(mapHeadPrefix, epoch, id) {
+		return [2]uint64{}, fmt.Errorf("%w: invalid key %q", ErrMapHeadAuthority, key)
+	}
+	return [2]uint64{epoch, id}, nil
+}
+
 func (vb *VB) listMapHeads(ctx context.Context) ([][2]uint64, error) {
 	// Listed by directory, which every backend supports, then filtered.
 	keys, err := vb.Backend.ListObjectsCtx(ctx, vb.VolumeName+"/map/")
@@ -571,7 +670,7 @@ func (vb *VB) listMapHeads(ctx context.Context) ([][2]uint64, error) {
 	return heads, nil
 }
 
-func (vb *VB) readMapObject(ctx context.Context, prefix string, kind byte, ref mapObjRef) ([]byte, error) {
+func (vb *VB) readMapRuns(ctx context.Context, prefix string, kind byte, ref mapObjRef) ([]BlockLookup, error) {
 	data, err := vb.Backend.ReadKeyCtx(ctx, ref.key(prefix))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -582,19 +681,27 @@ func (vb *VB) readMapObject(ctx context.Context, prefix string, kind byte, ref m
 	if safecast.IntToUint32(len(data)) != ref.Size || crc32.Checksum(data, crc32cTable) != ref.CRC {
 		return nil, fmt.Errorf("%w: %s digest", ErrMapObjectCorrupt, ref.key(prefix))
 	}
-	return unframeMapObject(data, kind, vb.VolumeName, ref.Epoch, ref.ID)
+	version, err := requiredMapObjectVersion(data)
+	if err != nil {
+		return nil, err
+	}
+	body, err := unframeMapObjectVersion(data, kind, version, vb.VolumeName, ref.Epoch, ref.ID)
+	if err != nil {
+		return nil, err
+	}
+	return decodeMapRunsVersion(body, version)
 }
 
 // loadMapChainCtx loads the map the newest head names. A missing or corrupt
 // object fails the open: an older head is never used instead, because the
 // WAL and chunks only the newer map protects may already be gone.
-func (vb *VB) loadMapChainCtx(ctx context.Context) error {
+func (vb *VB) newestListedMapHead(ctx context.Context) ([2]uint64, error) {
 	heads, err := vb.listMapHeads(ctx)
 	if err != nil {
-		return err
+		return [2]uint64{}, err
 	}
 	if len(heads) == 0 {
-		return ErrMapHeadMissing
+		return [2]uint64{}, ErrMapHeadMissing
 	}
 	newest := heads[0]
 	for _, h := range heads[1:] {
@@ -610,9 +717,47 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 			if errors.Is(perr, os.ErrNotExist) {
 				break
 			}
-			return fmt.Errorf("map: probe head: %w", perr)
+			return [2]uint64{}, fmt.Errorf("map: probe head: %w", perr)
 		}
 		newest[1]++
+	}
+	return newest, nil
+}
+
+func (vb *VB) readLatestMapHead(ctx context.Context) ([2]uint64, []byte, error) {
+	lookup := vb.newestListedMapHead
+	attempts := 1
+	required, err := vb.mapHeadAuthorityRequired()
+	if err != nil {
+		return [2]uint64{}, nil, err
+	}
+	if required {
+		lookup = vb.authoritativeMapHead
+		attempts = 2 // A fresher head may have replaced the selected one before the exact read.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mapHeadAuthorityTimeout)
+		defer cancel()
+	}
+	for attempt := range attempts {
+		head, err := lookup(ctx)
+		if err != nil {
+			return head, nil, err
+		}
+		data, err := vb.Backend.ReadKeyCtx(ctx, mapObjectKey(mapHeadPrefix, head[0], head[1]))
+		if err == nil {
+			return head, data, nil
+		}
+		if attempt+1 == attempts || !errors.Is(err, os.ErrNotExist) {
+			return head, nil, fmt.Errorf("map: read head %d.%d: %w", head[0], head[1], err)
+		}
+	}
+	return [2]uint64{}, nil, ErrMapHeadMissing
+}
+
+func (vb *VB) loadMapChainCtx(ctx context.Context) error {
+	newest, headData, err := vb.readLatestMapHead(ctx)
+	if err != nil {
+		return err
 	}
 	resume := vb.ResumeEpoch && vb.LeaseEpoch != 0 && newest[0] == vb.LeaseEpoch
 	if vb.LeaseEpoch != 0 && newest[0] >= vb.LeaseEpoch && !resume {
@@ -635,11 +780,19 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 		}
 	}
 
-	headData, err := vb.Backend.ReadKeyCtx(ctx, mapObjectKey(mapHeadPrefix, newest[0], newest[1]))
+	version, err := requiredMapObjectVersion(headData)
 	if err != nil {
-		return fmt.Errorf("map: read head %d.%d: %w", newest[0], newest[1], err)
+		return err
 	}
-	body, err := unframeMapObject(headData, mapKindHead, vb.VolumeName, newest[0], newest[1])
+	if version == mapQualifiedObjectVersion {
+		if err := vb.checkQualifiedMapBackend(); err != nil {
+			return err
+		}
+	}
+	if resume && version == mapQualifiedObjectVersion && vb.LaunchChunkIDs == nil {
+		return fmt.Errorf("%w: qualified resume requires the launch allocation cursor", ErrMapEpochNotNewer)
+	}
+	body, err := unframeMapObjectVersion(headData, mapKindHead, version, vb.VolumeName, newest[0], newest[1])
 	if err != nil {
 		return err
 	}
@@ -650,22 +803,14 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	if vb.MapCreationEpoch != 0 && h.Creation != vb.MapCreationEpoch {
 		return fmt.Errorf("%w: head creation %d, VBState creation %d", ErrMapLineage, h.Creation, vb.MapCreationEpoch)
 	}
-	baseBody, err := vb.readMapObject(ctx, mapBasePrefix, mapKindBase, h.Base)
-	if err != nil {
-		return err
-	}
-	baseRuns, err := decodeMapRuns(baseBody)
+	baseRuns, err := vb.readMapRuns(ctx, mapBasePrefix, mapKindBase, h.Base)
 	if err != nil {
 		return err
 	}
 	deltas := make([][]BlockLookup, 0, len(h.Deltas))
 	var deltaBytes uint64
 	for _, ref := range h.Deltas {
-		db, derr := vb.readMapObject(ctx, mapDeltaPrefix, mapKindDelta, ref)
-		if derr != nil {
-			return derr
-		}
-		runs, derr := decodeMapRuns(db)
+		runs, derr := vb.readMapRuns(ctx, mapDeltaPrefix, mapKindDelta, ref)
 		if derr != nil {
 			return derr
 		}
@@ -687,6 +832,7 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 			vb.BlocksToObject.insertCoalescedLocked(r, stride, nil)
 		}
 	}
+	vb.mapChain.qualified.Store(version == mapQualifiedObjectVersion)
 	vb.finishMapLoadLocked()
 	if vb.MapCreationEpoch == 0 {
 		vb.MapCreationEpoch = h.Creation
@@ -702,11 +848,15 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 	vb.mapChain.lastBase = vb.mapNow()
 	vb.mapChain.pending = nil
 	vb.mapChain.committed.Store(true)
+	if vb.ResumeEpoch {
+		vb.mapChain.headN.Store(vb.ResumeHeadN)
+		vb.mapChain.objN.Store(vb.ResumeObjN)
+	}
 	if resume {
 		// The earlier engine's counters cover writes it sent but cannot know
 		// landed, so they win over what the listing shows.
-		vb.mapChain.headN = max(newest[1]+1, vb.ResumeHeadN)
-		vb.mapChain.objN = max(resumeObjN, vb.ResumeObjN)
+		vb.mapChain.headN.Store(max(newest[1]+1, vb.ResumeHeadN))
+		vb.mapChain.objN.Store(max(resumeObjN, vb.ResumeObjN))
 		vb.mapChain.claimed = true
 	}
 	return nil
@@ -717,13 +867,13 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 // Caller holds BlocksToObject.mu for writing.
 func (vb *VB) finishMapLoadLocked() {
 	if vb.GCEnabled {
-		vb.gcRefcount = make(map[uint64]uint64)
+		vb.gcRefcount = make(map[types.ChunkRef]uint64)
 	}
 	var maxObjectID, maxSeqNum uint64
 	haveObject := false
 	vb.BlocksToObject.lookup.scan(func(entry BlockLookup) bool {
 		if vb.GCEnabled {
-			vb.gcRefcount[entry.ObjectID]++
+			vb.gcRefcount[entry.chunkRef()]++
 		}
 		if !haveObject || entry.ObjectID > maxObjectID {
 			maxObjectID, haveObject = entry.ObjectID, true
@@ -738,7 +888,7 @@ func (vb *VB) finishMapLoadLocked() {
 				blocks[i] = entry.StartBlock + uint64(i)
 				seqNums[i] = entry.seqNumAt(i)
 			}
-			vb.BlockStore.SetPersistedRange(blocks, entry.ObjectID, entry.ObjectOffset, vb.blockStride(), seqNums)
+			vb.BlockStore.setPersistedRangeRef(blocks, types.ChunkRef{Epoch: entry.ChunkEpoch, ID: entry.ObjectID}, entry.ObjectOffset, vb.blockStride(), seqNums)
 		}
 		return true
 	})
@@ -761,37 +911,44 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
 	if vb.mapChain.claimed {
-		return vb.repairConvertedStateLocked(ctx)
+		return nil
 	}
 	// The caller's deadline runs from before the load, so a slow load cannot
 	// leave the claim landing after an older writer's deletes come due.
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("map: claim deadline passed: %w", err)
 	}
+	wasQualified := vb.mapChain.qualified.Load()
+	if vb.QualifiedChunks && !wasQualified && vb.SnapshotID == "" {
+		vb.BlocksToObject.mu.RLock()
+		empty := vb.BlocksToObject.lookup.len() == 0
+		vb.BlocksToObject.mu.RUnlock()
+		// A delayed legacy PUT can still overwrite a numeric chunk. Only
+		// activate while the live map has no references to those keys.
+		if empty {
+			if err := vb.checkQualifiedMapBackend(); err != nil {
+				return err
+			}
+			vb.mapChain.qualified.Store(true)
+		}
+	}
 	advanceAtomicTo(&vb.ObjectNum, vb.ObjectNum.Load()+mapClaimObjectGap)
 	if err := vb.putMapHead(ctx, vb.mapChain.head); err != nil {
+		vb.mapChain.qualified.Store(wasQualified)
 		return fmt.Errorf("map: claim head: %w", err)
 	}
 	vb.mapChain.claimed = true
-	return vb.repairConvertedStateLocked(ctx)
+	return nil
 }
 
-// persistMapCtx makes the in-memory map durable in the volume's format. It
-// never converts a format-1 volume: only an ordinary drain does that.
+// persistMapCtx commits the in-memory block map.
 func (vb *VB) persistMapCtx(ctx context.Context) error {
-	return vb.persistMapForCtx(ctx, false)
-}
-
-func (vb *VB) persistMapForCtx(ctx context.Context, drain bool) error {
 	if !vb.IsMapDelta() {
-		return vb.persistFormatOneCtx(ctx, drain)
+		return vb.SaveLiveCheckpointCtx(ctx)
 	}
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
-	if err := vb.commitMapDeltaLocked(ctx); err != nil {
-		return err
-	}
-	return vb.finishConversionLocked(ctx)
+	return vb.commitMapDeltaLocked(ctx)
 }
 
 func (vb *VB) mapBaseDueLocked() bool {
@@ -872,7 +1029,7 @@ func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
 		recordWALOp(context.Background(), "checkpoint", vb.VolumeName, outcome, time.Since(start))
 	}()
 
-	ref, err := vb.putMapObject(ctx, mapDeltaPrefix, mapKindDelta, encodeMapRuns(batch))
+	ref, err := vb.putMapObject(ctx, mapDeltaPrefix, mapKindDelta, encodeMapRunsVersion(batch, vb.mapObjectVersion()))
 	if err != nil {
 		return fmt.Errorf("map: write delta: %w", err)
 	}
@@ -904,7 +1061,7 @@ func (vb *VB) commitMapBaseLocked(ctx context.Context, runs []BlockLookup) error
 			vb.BlocksToObject.dirty.Store(true)
 		}
 	}()
-	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRuns(runs))
+	base, err := vb.putMapObject(ctx, mapBasePrefix, mapKindBase, encodeMapRunsVersion(runs, vb.mapObjectVersion()))
 	if err != nil {
 		return fmt.Errorf("map: write base: %w", err)
 	}
@@ -940,11 +1097,11 @@ type mapPruneBound struct {
 }
 
 func (vb *VB) mapPruneBoundLocked() mapPruneBound {
-	return mapPruneBound{objN: vb.mapChain.objN, headN: vb.mapChain.headN}
+	return mapPruneBound{objN: vb.mapChain.objN.Load(), headN: vb.mapChain.headN.Load()}
 }
 
-// stopMapBackground stops new background passes and waits for running ones,
-// so no head is written after the caller returns.
+// stopMapBackground stops new background reservations and cancels passes
+// that have already started.
 func (vb *VB) stopMapBackground() {
 	// Publication checks closing under checkpointMu, so nothing publishes
 	// after this returns; a pass still unwinding writes only orphans.
@@ -964,8 +1121,7 @@ func (vb *VB) stopMapBackground() {
 	}
 }
 
-// StopMapBackground stops background map work and any conversion before a
-// close's final drain, so that drain never flips a format-1 volume.
+// StopMapBackground stops new background map work before the final drain.
 func (vb *VB) StopMapBackground() { vb.stopMapBackground() }
 
 // waitMapBackground waits for every background pass to return. Only tests
@@ -1011,15 +1167,22 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 		runs = append(runs, bl)
 		return true
 	})
-	body := encodeMapRuns(runs)
+	version := vb.mapObjectVersion()
+	body := encodeMapRunsVersion(runs, version)
 
 	// The base is written outside checkpointMu, so drains keep committing;
 	// only the head that publishes it is composed and written under it.
 	vb.checkpointMu.Lock()
-	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN}
-	vb.mapChain.objN++
+	if vb.mapChain.closing.Load() || ctx.Err() != nil {
+		vb.checkpointMu.Unlock()
+		return
+	}
+	ref := mapObjRef{Epoch: vb.LeaseEpoch, ID: vb.mapChain.objN.Add(1) - 1}
 	vb.checkpointMu.Unlock()
-	data := frameMapObject(mapKindBase, vb.VolumeName, ref.Epoch, ref.ID, body)
+	if vb.mapChain.closing.Load() || ctx.Err() != nil {
+		return
+	}
+	data := frameMapObjectVersion(mapKindBase, version, vb.VolumeName, ref.Epoch, ref.ID, body)
 	ref.Size = safecast.IntToUint32(len(data))
 	ref.CRC = crc32.Checksum(data, crc32cTable)
 	if err := vb.writeMapKey(ctx, ref.key(mapBasePrefix), data); err != nil {
@@ -1040,7 +1203,7 @@ func (vb *VB) writeMapBase(parent context.Context, snap *extentIndex[BlockLookup
 	}
 	prev := vb.mapChain.head
 	next := mapHead{Creation: prev.Creation, Base: base, Deltas: slices.Clone(prev.Deltas[idx+1:])}
-	if err := vb.putMapHead(ctx, next); err != nil {
+	if err := vb.putMapHeadFor(ctx, next, true); err != nil {
 		vb.logger().Warn("map: base head write failed", "volume", vb.VolumeName, "err", err)
 		return
 	}
@@ -1102,20 +1265,36 @@ func (vb *VB) scheduleMapPrune(ctx context.Context, newest, prev mapHead, bound 
 // higherEpochHeadExists reports whether a later launch has committed. A
 // writer that finds one deletes nothing and fences itself.
 func (vb *VB) higherEpochHeadExists(ctx context.Context) (bool, error) {
-	heads, err := vb.listMapHeads(ctx)
+	var newest uint64
+	required, err := vb.mapHeadAuthorityRequired()
 	if err != nil {
 		return false, err
 	}
-	for _, h := range heads {
-		if h[0] > vb.LeaseEpoch {
-			if vb.mapChain.fenced.CompareAndSwap(false, true) {
-				vb.logger().Error("map: a newer lease holder has committed; fencing this writer",
-					"volume", vb.VolumeName, "epoch", vb.LeaseEpoch, "newer", h[0])
-			}
-			return true, nil
+	if required {
+		ctx, cancel := context.WithTimeout(ctx, mapHeadAuthorityTimeout)
+		defer cancel()
+		head, err := vb.authoritativeMapHead(ctx)
+		if err != nil {
+			return false, err
+		}
+		newest = head[0]
+	} else {
+		heads, err := vb.listMapHeads(ctx)
+		if err != nil {
+			return false, err
+		}
+		for _, head := range heads {
+			newest = max(newest, head[0])
 		}
 	}
-	return false, nil
+	if newest <= vb.LeaseEpoch {
+		return false, nil
+	}
+	if vb.mapChain.fenced.CompareAndSwap(false, true) {
+		vb.logger().Error("map: a newer lease holder has committed; fencing this writer",
+			"volume", vb.VolumeName, "epoch", vb.LeaseEpoch, "newer", newest)
+	}
+	return true, nil
 }
 
 // maybeProcessMapDeletes runs any deferred map deletes that have come due,
@@ -1191,12 +1370,12 @@ func (vb *VB) requeueMapDeletes(keys []string) {
 // mapChunkCandidatesLocked filters chunk GC candidates for a format-2 volume
 // to those first seen at zero references at least the deferral ago.
 // Caller holds BlocksToObject.mu.
-func (vb *VB) mapChunkCandidatesLocked(candidates []uint64) []uint64 {
+func (vb *VB) mapChunkCandidatesLocked(candidates []types.ChunkRef) []types.ChunkRef {
 	if vb.mapChain.chunkSeen == nil {
-		vb.mapChain.chunkSeen = make(map[uint64]time.Time)
+		vb.mapChain.chunkSeen = make(map[types.ChunkRef]time.Time)
 	}
 	now := vb.mapNow()
-	live := make(map[uint64]bool, len(candidates))
+	live := make(map[types.ChunkRef]bool, len(candidates))
 	out := candidates[:0]
 	for _, id := range candidates {
 		live[id] = true
