@@ -5235,9 +5235,9 @@ func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
 	return vb.parseBlockCheckpoint(checkpoint)
 }
 
-// readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.
-// Format 2 rejects an incomplete or invalid record; format 1 retains its
-// legacy prefix replay for short tails.
+// readWALFileForRecovery opens a WAL file read-only and returns all its blocks.
+// Every format rejects an incomplete or invalid record with ErrIntegrity, so
+// recovery never replays a prefix and drops the rest.
 func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -5276,15 +5276,12 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 }
 
 func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uint64, error) {
-	strict := vb.IsMapDelta()
 	var blocks []Block
 	var maxSeqNum uint64
 
 	// Encrypted WAL records are 40+BlockSize (24-byte header + ciphertext +
 	// 16-byte tag); unencrypted records are 28+BlockSize (24-byte header +
-	// CRC32 + plaintext). Both record sizes are fixed, so a tail tear shows
-	// up as ErrUnexpectedEOF and stops replay at the last fully-written
-	// record (same fail-tolerant posture as the legacy CRC path).
+	// CRC32 + plaintext). Both sizes are fixed, so a torn tail is ErrUnexpectedEOF.
 	if vb.EncryptionEnabled {
 		recordSize := 40 + int(vb.BlockSize)
 		record := make([]byte, recordSize)
@@ -5292,16 +5289,10 @@ func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uin
 		initAAD(&aad, vb.volumeNameHash)
 		for {
 			if _, err := io.ReadFull(f, record); err != nil {
-				if err == io.EOF || (!strict && err == io.ErrUnexpectedEOF) {
+				if err == io.EOF {
 					break
 				}
-				if strict {
-					return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: read record: %w", filename, ErrIntegrity, err)
-				}
-				// Any other I/O error means we can't be sure whether
-				// the remainder is a tear or tamper; keep the WAL for
-				// retry rather than dropping records on the floor.
-				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: read record: %w", filename, err)
+				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: read record: %w", filename, ErrIntegrity, err)
 			}
 
 			seqNum := binary.BigEndian.Uint64(record[0:8])
@@ -5335,11 +5326,8 @@ func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uin
 	for {
 		record := make([]byte, recordSize)
 		if _, err := io.ReadFull(f, record); err != nil {
-			if strict && err != io.EOF {
+			if err != io.EOF {
 				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: read record: %w", filename, ErrIntegrity, err)
-			}
-			if err != io.EOF && err != io.ErrUnexpectedEOF {
-				vb.logger().Warn("WAL recovery: I/O error reading record, stopping", "file", filename, "error", err, "valid_records_so_far", len(blocks))
 			}
 			break
 		}
@@ -5350,11 +5338,7 @@ func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uin
 		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, record[28:])
 
 		if checksumValidated != checksum {
-			if strict {
-				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: WAL checksum mismatch on block %d", filename, ErrIntegrity, binary.BigEndian.Uint64(record[8:16]))
-			}
-			vb.logger().Warn("WAL recovery: checksum mismatch, stopping read", "file", filename, "valid_records_so_far", len(blocks))
-			break
+			return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: WAL checksum mismatch on block %d", filename, ErrIntegrity, binary.BigEndian.Uint64(record[8:16]))
 		}
 
 		seqNum := binary.BigEndian.Uint64(record[:8])
@@ -5447,8 +5431,7 @@ func (vb *VB) recoverLocalWALs(readWAL func(string) ([]Block, uint64, error)) (e
 				}
 				continue
 			}
-			vb.logger().Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
-			continue
+			return fmt.Errorf("WAL recovery: cannot read %s: %w", fname, err)
 		}
 		successFiles = append(successFiles, fname)
 		allBlocks = append(allBlocks, blocks...)
@@ -5599,8 +5582,8 @@ func (vb *VB) recoverLocalWALs(readWAL func(string) ([]Block, uint64, error)) (e
 	// the live checkpoint over the numbered one just saved above, and the
 	// recovered WAL files are removed below, so a stale live checkpoint here
 	// would silently lose this recovery's blocks on a second crash.
-	if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
-		vb.logger().Warn("WAL recovery: SaveLiveCheckpoint failed", "err", cpErr)
+	if err := vb.SaveLiveCheckpoint(); err != nil {
+		return fmt.Errorf("WAL recovery: failed to save live checkpoint: %w", err)
 	}
 
 	// Remove only successfully-read WAL files (keep failed ones for retry)
