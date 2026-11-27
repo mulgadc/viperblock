@@ -354,10 +354,17 @@ func reopenWriteBufferVolume(t *testing.T, root string, key *masterkey.Key) *vip
 
 func newWriteBufferVolume(t testing.TB, root string, epoch uint64, key *masterkey.Key) *viperblock.VB {
 	t.Helper()
+	return newSizedWriteBufferVolume(t, root, epoch, key, 128<<20, 0)
+}
+
+// newSizedWriteBufferVolume is newWriteBufferVolume with a chosen volume size
+// and block size; a zero block size uses the engine default.
+func newSizedWriteBufferVolume(t testing.TB, root string, epoch uint64, key *masterkey.Key, size uint64, blockSize uint32) *viperblock.VB {
+	t.Helper()
 	backendDir := filepath.Join(root, "backend")
 	require.NoError(t, os.MkdirAll(backendDir, 0700))
 	config := viperblock.VB{
-		VolumeName: "borrowed-buf", VolumeSize: 128 << 20,
+		VolumeName: "borrowed-buf", VolumeSize: size, BlockSize: blockSize,
 		BaseDir: filepath.Join(root, "local"), LeaseEpoch: epoch,
 		WALSyncInterval: -1, ChunkUploadInterval: -1,
 		MasterKey: key, EncryptionEnabled: key != nil,
@@ -1033,6 +1040,69 @@ func TestZeroBoundsPendingBytesPerChunk(t *testing.T) {
 	require.Equal(t, pattern[offset+count:], got[offset+count:], "bytes after the range changed")
 }
 
+// The plugin runs in nbdkit's parallel thread model, so several requests can
+// each add a chunk before any of them waits. The bound is one chunk per request.
+func TestZeroParallelBoundsPendingBytesPerRequest(t *testing.T) {
+	const (
+		maxPending = 4 << 20
+		chunkBytes = 4 << 20
+		requests   = 4
+		count      = 24 << 20
+	)
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	vb.MaxPendingBytes = maxPending
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+	pattern := bytes.Repeat([]byte{0x3c}, requests*count)
+	require.NoError(t, vb.WriteAt(0, pattern))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.DrainToBackend())
+	probe.peak.Store(0)
+
+	conn := &ViperBlockConnection{vb: vb}
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Go(func() { errs <- conn.Zero(count, uint64(i*count), 0) }) //nolint:gosec // G115: i*count is under the volume size
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+requests*(chunkBytes+int(vb.BlockSize))),
+		"each in-flight zero request may hold at most one chunk past the mark")
+
+	got := make([]byte, len(pattern))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.Equal(t, make([]byte, len(pattern)), got)
+}
+
+// A block size that does not divide the chunk still zeroes exactly the range.
+func TestZeroWithBlockSizeNotDividingChunk(t *testing.T) {
+	const blockSize = 12288
+	vb := newSizedWriteBufferVolume(t, t.TempDir(), 1, nil, 48<<20, blockSize)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.EqualValues(t, blockSize, vb.BlockSize)
+	pattern := make([]byte, 24<<20)
+	for i := range pattern {
+		pattern[i] = byte(i%253) + 1
+	}
+	require.NoError(t, vb.WriteAt(0, pattern))
+	offset, count := 4<<20-5000, 9<<20+777
+	conn := &ViperBlockConnection{vb: vb}
+	require.NoError(t, conn.Zero(uint32(count), uint64(offset), 0)) //nolint:gosec // G115: small constants
+
+	got := make([]byte, len(pattern))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	want := bytes.Clone(pattern)
+	clear(want[offset : offset+count])
+	require.Equal(t, want, got)
+}
+
 func TestZeroOutOfRangeWritesNothing(t *testing.T) {
 	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
 	t.Cleanup(func() { detachWriteBufferVolume(vb) })
@@ -1041,13 +1111,26 @@ func TestZeroOutOfRangeWritesNothing(t *testing.T) {
 	require.NoError(t, vb.WriteAt(0, block))
 	conn := &ViperBlockConnection{vb: vb}
 
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	err := conn.Zero(math.MaxUint32, 0, 0)
-	runtime.ReadMemStats(&after)
-	require.ErrorContains(t, err, viperblock.ErrRequestOutOfRange.Error())
-	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(16<<20),
-		"an out-of-range request must be refused before it allocates its length")
+	for _, request := range []struct {
+		name   string
+		count  uint32
+		offset uint64
+		want   error
+	}{
+		{"pastEnd", math.MaxUint32, 0, viperblock.ErrRequestOutOfRange},
+		{"offsetPastEnd", 4096, vb.GetVolumeSize() + 4096, viperblock.ErrRequestTooLarge},
+		{"offsetNearMax", 8192, math.MaxUint64 - 4095, viperblock.ErrRequestTooLarge},
+	} {
+		t.Run(request.name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			err := conn.Zero(request.count, request.offset, 0)
+			runtime.ReadMemStats(&after)
+			require.ErrorContains(t, err, request.want.Error())
+			require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(16<<20),
+				"an out-of-range request must be refused before it allocates its length")
+		})
+	}
 
 	got := make([]byte, len(block))
 	require.NoError(t, conn.PRead(got, 0, 0))
@@ -1059,11 +1142,13 @@ func BenchmarkZero(b *testing.B) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(logger)
 
-	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20} {
+	// 512 MiB passes the default 256 MiB mark, so it measures the drains a
+	// large request waits on.
+	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20, 512 << 20} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {
 			root := filepath.Join(b.TempDir(), "volume")
 			newVolume := func() *viperblock.VB {
-				vb := newWriteBufferVolume(b, root, 1, nil)
+				vb := newSizedWriteBufferVolume(b, root, 1, nil, uint64(max(128<<20, 2*size)), 0) //nolint:gosec // G115: size is at most 512 MiB
 				openWriteBufferWAL(b, vb)
 				return vb
 			}
@@ -1088,6 +1173,57 @@ func BenchmarkZero(b *testing.B) {
 					b.Fatal(err)
 				}
 				offset += size
+			}
+		})
+	}
+}
+
+// BenchmarkZeroParallel runs several zero requests at once on one connection,
+// as nbdkit's parallel thread model does, over disjoint ranges.
+func BenchmarkZeroParallel(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	const callers = 4
+	for _, size := range []int{1 << 20, 16 << 20} {
+		b.Run(fmt.Sprintf("%dx%d", callers, size), func(b *testing.B) {
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newWriteBufferVolume(b, root, 1, nil)
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
+			window := max(16<<20, callers*size)
+			offset := 0
+			b.SetBytes(int64(callers * size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if offset+callers*size > window {
+					b.StopTimer()
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					conn.vb = newVolume()
+					offset = 0
+					b.StartTimer()
+				}
+				var wg sync.WaitGroup
+				errs := make(chan error, callers)
+				for i := range callers {
+					start := uint64(offset + i*size) //nolint:gosec // G115: under the volume size
+					wg.Go(func() { errs <- conn.Zero(uint32(size), start, 0) }) //nolint:gosec // G115: size is at most 16 MiB
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				offset += callers * size
 			}
 		})
 	}
