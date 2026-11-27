@@ -1,0 +1,29 @@
+goos: linux
+goarch: arm64
+pkg: github.com/mulgadc/viperblock/nbd
+BenchmarkZero/4096-20         	  435936	      2758 ns/op	1485.09 MB/s	    8807 B/op	      10 allocs/op
+BenchmarkZero/4096-20         	  515899	      2759 ns/op	1484.35 MB/s	    8807 B/op	      10 allocs/op
+BenchmarkZero/4096-20         	  455382	      2854 ns/op	1435.01 MB/s	    8806 B/op	      10 allocs/op
+BenchmarkZero/4096-20         	  474952	      2820 ns/op	1452.23 MB/s	    8807 B/op	      10 allocs/op
+BenchmarkZero/4096-20         	  448564	      2846 ns/op	1439.40 MB/s	    8806 B/op	      10 allocs/op
+BenchmarkZero/4096-20         	  524553	      2661 ns/op	1539.42 MB/s	    8807 B/op	      10 allocs/op
+BenchmarkZero/1048576-20      	    2181	    526999 ns/op	1989.71 MB/s	 2236214 B/op	     533 allocs/op
+BenchmarkZero/1048576-20      	    2200	    522572 ns/op	2006.57 MB/s	 2236115 B/op	     533 allocs/op
+BenchmarkZero/1048576-20      	    2480	    496922 ns/op	2110.14 MB/s	 2236199 B/op	     533 allocs/op
+BenchmarkZero/1048576-20      	    2418	    485500 ns/op	2159.79 MB/s	 2236121 B/op	     533 allocs/op
+BenchmarkZero/1048576-20      	    2170	    498186 ns/op	2104.79 MB/s	 2236043 B/op	     533 allocs/op
+BenchmarkZero/1048576-20      	    2334	    500250 ns/op	2096.11 MB/s	 2236244 B/op	     533 allocs/op
+BenchmarkZero/12582912-20     	     247	   4740601 ns/op	2654.29 MB/s	18492500 B/op	    6263 allocs/op
+BenchmarkZero/12582912-20     	     253	   4946160 ns/op	2543.98 MB/s	18491202 B/op	    6263 allocs/op
+BenchmarkZero/12582912-20     	     242	   4704610 ns/op	2674.59 MB/s	18492450 B/op	    6263 allocs/op
+BenchmarkZero/12582912-20     	     266	   4680813 ns/op	2688.19 MB/s	18492837 B/op	    6263 allocs/op
+BenchmarkZero/12582912-20     	     289	   4530644 ns/op	2777.29 MB/s	18492858 B/op	    6263 allocs/op
+BenchmarkZero/12582912-20     	     246	   4743740 ns/op	2652.53 MB/s	18492691 B/op	    6264 allocs/op
+BenchmarkZero/33554432-20     	     100	  11167563 ns/op	3004.63 MB/s	42136422 B/op	   16685 allocs/op
+BenchmarkZero/33554432-20     	     100	  10909930 ns/op	3075.59 MB/s	42136420 B/op	   16685 allocs/op
+BenchmarkZero/33554432-20     	     100	  11274279 ns/op	2976.19 MB/s	42136424 B/op	   16685 allocs/op
+BenchmarkZero/33554432-20     	      97	  11647744 ns/op	2880.77 MB/s	42133424 B/op	   16686 allocs/op
+BenchmarkZero/33554432-20     	     100	  11265798 ns/op	2978.43 MB/s	42136412 B/op	   16685 allocs/op
+BenchmarkZero/33554432-20     	     100	  11796196 ns/op	2844.51 MB/s	42136420 B/op	   16685 allocs/op
+PASS
+ok  	github.com/mulgadc/viperblock/nbd	37.183s
