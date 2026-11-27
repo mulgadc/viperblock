@@ -531,7 +531,7 @@ func (p *ViperBlockPlugin) open(readonly bool,
 	vb.StartChunkGC()
 
 	activeVB = vb
-	snapshotListenerDone = startSnapshotListener(vb, filepath.Join(base_dir, volume, "snapshot.sock"))
+	snapshotListenerDone = startSnapshotListener(vb.DrainToBackend, filepath.Join(base_dir, volume, "snapshot.sock"))
 	success = true
 	return &ViperBlockConnection{vb: vb, readonly: readonly}, nil
 }
@@ -540,7 +540,7 @@ func (p *ViperBlockPlugin) open(readonly bool,
 // calling CreateSnapshot. The handler calls DrainToBackend — flushing WAL
 // chunks and the live checkpoint to S3 — then acks "OK\n". Returns a channel
 // closed when the goroutine exits.
-func startSnapshotListener(vb *viperblock.VB, sockPath string) chan struct{} {
+func startSnapshotListener(drain func() error, sockPath string) chan struct{} {
 	done := make(chan struct{})
 
 	// Remove any stale socket file from a previous run
@@ -565,7 +565,7 @@ func startSnapshotListener(vb *viperblock.VB, sockPath string) chan struct{} {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				if err := vb.DrainToBackend(); err != nil {
+				if err := drain(); err != nil {
 					slog.Error("snapshot socket: DrainToBackend failed", "err", err)
 					_, _ = c.Write([]byte("ERR\n"))
 					return
