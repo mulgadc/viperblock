@@ -2098,7 +2098,7 @@ func TestRecoverLocalWALsEmpty(t *testing.T) {
 
 func TestRecoverLocalWALsPartialRecord(t *testing.T) {
 	runWithBackends(t, "recover_local_wals_partial", func(t *testing.T, vb *VB) {
-		t.Run("Partial/corrupt record still recovers valid blocks", func(t *testing.T) {
+		t.Run("Partial record fails recovery and keeps the WAL", func(t *testing.T) {
 			// Write 2 valid blocks and flush to WAL
 			testData := make([][]byte, 2)
 			for i := range 2 {
@@ -2125,6 +2125,8 @@ func TestRecoverLocalWALsPartialRecord(t *testing.T) {
 			_, err = f.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03})
 			require.NoError(t, err)
 			f.Close()
+			damaged, err := os.ReadFile(lastWAL)
+			require.NoError(t, err)
 
 			// Reset in-memory state (simulate crash)
 			vb.BlocksToObject.mu.Lock()
@@ -2139,21 +2141,13 @@ func TestRecoverLocalWALsPartialRecord(t *testing.T) {
 				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
 			}
 
-			// Recovery should still succeed and recover the 2 valid blocks
-			err = vb.RecoverLocalWALs()
-			assert.NoError(t, err)
-
-			// Verify both blocks are recovered
+			require.ErrorIs(t, vb.RecoverLocalWALs(), ErrIntegrity)
+			retained, err := os.ReadFile(lastWAL)
+			require.NoError(t, err, "a WAL with a partial record must be kept")
+			require.Equal(t, damaged, retained)
 			for i := range 2 {
 				_, _, _, err := vb.LookupBlockToObject(uint64(i))
-				assert.NoError(t, err, "Block %d should be recovered despite trailing corruption", i)
-			}
-
-			// Verify data is correct
-			for i := range 2 {
-				data, err := vb.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
-				assert.NoError(t, err)
-				assert.Equal(t, testData[i], data, "Block %d data mismatch after partial recovery", i)
+				require.ErrorIs(t, err, ErrZeroBlock, "block %d must not be replayed from a rejected WAL", i)
 			}
 		})
 	})
@@ -2255,7 +2249,7 @@ func TestRecoverLocalWALsSeqNumAdvancement(t *testing.T) {
 
 func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
 	runWithBackends(t, "recover_local_wals_checksum", func(t *testing.T, vb *VB) {
-		t.Run("Mid-record checksum corruption recovers blocks before corrupt record", func(t *testing.T) {
+		t.Run("Mid-file checksum corruption fails recovery and keeps the WAL", func(t *testing.T) {
 			// This test manipulates WAL file bytes at specific offsets assuming legacy
 			// single-file format. Sharded WAL distributes records across 16 shard files
 			// and has its own recovery test (TestShardedWAL_Recovery).
@@ -2310,20 +2304,14 @@ func TestRecoverLocalWALsChecksumCorruption(t *testing.T) {
 				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
 			}
 
-			// Recovery should succeed and recover the first 2 blocks
-			err = vb.RecoverLocalWALs()
-			assert.NoError(t, err)
-
-			// Verify first 2 blocks are recovered
-			for i := range 2 {
-				data, err := vb.ReadAt(uint64(i)*uint64(vb.BlockSize), uint64(vb.BlockSize))
-				assert.NoError(t, err, "Block %d should be recovered before corrupt record", i)
-				assert.Equal(t, testData[i], data, "Block %d data mismatch", i)
+			require.ErrorIs(t, vb.RecoverLocalWALs(), ErrIntegrity)
+			retained, err := os.ReadFile(lastWAL)
+			require.NoError(t, err, "a WAL with a corrupt record must be kept")
+			require.Equal(t, walData, retained)
+			for i := range 3 {
+				_, _, _, err := vb.LookupBlockToObject(uint64(i))
+				require.ErrorIs(t, err, ErrZeroBlock, "block %d must not be replayed from a rejected WAL", i)
 			}
-
-			// Block 2 (the 3rd block) should NOT be recovered
-			_, _, _, err = vb.LookupBlockToObject(2)
-			assert.Error(t, err, "Block 2 should not be recovered due to checksum corruption")
 		})
 	})
 }
@@ -2420,7 +2408,7 @@ func TestRecoverLocalWALsBlockStoreSync(t *testing.T) {
 
 func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
 	runWithBackends(t, "recover_local_wals_corrupt_header", func(t *testing.T, vb *VB) {
-		t.Run("Corrupt header file is skipped, valid file is recovered", func(t *testing.T) {
+		t.Run("Corrupt header file fails recovery until it is removed", func(t *testing.T) {
 			// Write blocks and flush to create a valid WAL file
 			testData := make([]byte, DefaultBlockSize)
 			copy(testData, "valid_file_data")
@@ -2449,25 +2437,31 @@ func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
 				vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
 			}
 
-			// Recovery should succeed — skip corrupt file, recover from valid one
-			err = vb.RecoverLocalWALs()
-			assert.NoError(t, err)
+			before, err := os.ReadDir(walDir)
+			require.NoError(t, err)
 
-			// Verify valid block is recovered
+			// A file recovery cannot read may hold acknowledged writes, so the
+			// open fails and no file goes, not even the valid one.
+			require.Error(t, vb.RecoverLocalWALs())
+			after, err := os.ReadDir(walDir)
+			require.NoError(t, err)
+			require.Equal(t, len(before), len(after), "a failed recovery must remove no WAL file")
+			_, _, _, err = vb.LookupBlockToObject(0)
+			require.ErrorIs(t, err, ErrZeroBlock, "a failed recovery must replay nothing")
+
+			// With the unreadable file set aside, the valid file replays.
+			require.NoError(t, os.Remove(corruptFile))
+			require.NoError(t, vb.RecoverLocalWALs())
 			data, err := vb.ReadAt(0, uint64(vb.BlockSize))
-			assert.NoError(t, err)
-			assert.Equal(t, testData, data, "Block from valid WAL should be recovered")
-
-			// Verify the corrupt file is NOT deleted (kept for retry)
-			_, err = os.Stat(corruptFile)
-			assert.NoError(t, err, "Corrupt WAL file should be kept for retry, not deleted")
+			require.NoError(t, err)
+			require.Equal(t, testData, data, "Block from valid WAL should be recovered")
 		})
 	})
 }
 
 func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
 	runWithBackends(t, "recover_local_wals_all_corrupt", func(t *testing.T, vb *VB) {
-		t.Run("All files with corrupt headers results in no-op recovery", func(t *testing.T) {
+		t.Run("All files with corrupt headers fail recovery", func(t *testing.T) {
 			// Remove any existing WAL files
 			walDir := filepath.Join(vb.BaseDir, vb.GetVolume(), "wal", "chunks")
 			entries, err := os.ReadDir(walDir)
@@ -2484,9 +2478,7 @@ func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			// Recovery should succeed as a no-op (all files fail to read)
-			err = vb.RecoverLocalWALs()
-			assert.NoError(t, err)
+			require.Error(t, vb.RecoverLocalWALs())
 
 			// BlocksToObject should be empty
 			vb.BlocksToObject.mu.RLock()
@@ -2494,10 +2486,9 @@ func TestRecoverLocalWALsAllCorruptHeaders(t *testing.T) {
 			vb.BlocksToObject.mu.RUnlock()
 			assert.Equal(t, 0, count, "BlocksToObject should remain empty when all WALs are corrupt")
 
-			// Corrupt files should NOT be deleted (kept for retry)
 			entries, err = os.ReadDir(walDir)
 			require.NoError(t, err)
-			assert.Len(t, entries, 2, "Corrupt WAL files should be kept for retry")
+			assert.Len(t, entries, 2, "Corrupt WAL files must be kept")
 		})
 	})
 }
