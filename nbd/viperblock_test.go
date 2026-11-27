@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -970,4 +971,124 @@ func TestOpenRetryAfterReplayWithHeldCompaction(t *testing.T) {
 	got := make([]byte, 2*blockSize)
 	require.NoError(t, cold.PRead(got, blockSize, 0))
 	require.Equal(t, append(replayed, newData...), got)
+}
+
+// pendingProbeBackend records the most buffered write bytes the engine holds
+// at any chunk upload, which is when a drain is moving them out.
+type pendingProbeBackend struct {
+	types.Backend
+
+	vb   *viperblock.VB
+	peak atomic.Uint64
+}
+
+var _ types.Backend = (*pendingProbeBackend)(nil)
+
+func (p *pendingProbeBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectID uint64, headers *[]byte, data *[]byte) error {
+	if fileType == types.FileTypeChunk {
+		pending := p.vb.PendingBytes()
+		for {
+			peak := p.peak.Load()
+			if pending <= peak || p.peak.CompareAndSwap(peak, pending) {
+				break
+			}
+		}
+	}
+	return p.Backend.WriteCtx(ctx, fileType, objectID, headers, data)
+}
+
+func TestZeroBoundsPendingBytesPerChunk(t *testing.T) {
+	const (
+		maxPending = 8 << 20
+		chunkBytes = 4 << 20
+		written    = 72 << 20
+		offset     = 4096 + 512
+		count      = 64 << 20
+	)
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	vb.MaxPendingBytes = maxPending
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+
+	pattern := make([]byte, written)
+	for i := range pattern {
+		pattern[i] = byte(i%251) + 1
+	}
+	require.NoError(t, vb.WriteAt(0, pattern))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.DrainToBackend())
+	probe.peak.Store(0)
+
+	conn := &ViperBlockConnection{vb: vb}
+	require.NoError(t, conn.Zero(count, offset, 0))
+	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+chunkBytes+int(vb.BlockSize)),
+		"a zero request must be buffered a chunk at a time, under backpressure")
+
+	got := make([]byte, written)
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.Equal(t, pattern[:offset], got[:offset], "bytes before the range changed")
+	require.Equal(t, make([]byte, count), got[offset:offset+count], "the range is not zero")
+	require.Equal(t, pattern[offset+count:], got[offset+count:], "bytes after the range changed")
+}
+
+func TestZeroOutOfRangeWritesNothing(t *testing.T) {
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	block := bytes.Repeat([]byte{0x5a}, int(vb.BlockSize))
+	require.NoError(t, vb.WriteAt(0, block))
+	conn := &ViperBlockConnection{vb: vb}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	err := conn.Zero(math.MaxUint32, 0, 0)
+	runtime.ReadMemStats(&after)
+	require.ErrorContains(t, err, viperblock.ErrRequestOutOfRange.Error())
+	require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(16<<20),
+		"an out-of-range request must be refused before it allocates its length")
+
+	got := make([]byte, len(block))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.Equal(t, block, got)
+}
+
+func BenchmarkZero(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newWriteBufferVolume(b, root, 1, nil)
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
+			// Keep both the dirty set and temporary disk use bounded.
+			window := max(16<<20, size)
+			offset := 0
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if offset+size > window {
+					b.StopTimer()
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					conn.vb = newVolume()
+					offset = 0
+					b.StartTimer()
+				}
+				if err := conn.Zero(uint32(size), uint64(offset), 0); err != nil { //nolint:gosec // G115: size is at most 64 MiB
+					b.Fatal(err)
+				}
+				offset += size
+			}
+		})
+	}
 }
