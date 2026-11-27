@@ -829,6 +829,24 @@ func waitDeletesIdle(vb *VB, ch chan struct{}) {
 	drainSignals(ch)
 }
 
+func TestVolumeOpenRejectsFormatOneBeforeWriting(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	writer, _ := mv.engine(t, 5)
+	writer.MapFormat = MapFormatLegacy
+	require.NoError(t, writer.SaveState())
+	writer.Detach()
+
+	reader, backend := mv.engine(t, 6)
+	key := types.GetFilePath(types.FileTypeConfig, 0, reader.GetVolume())
+	before, err := backend.ReadCtx(t.Context(), types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err, key)
+	require.ErrorContains(t, reader.LoadStateAndLiveCheckpointCtx(t.Context()), "unsupported block-map format")
+	after, err := backend.ReadCtx(t.Context(), types.FileTypeConfig, 0, 0, 0)
+	require.NoError(t, err, key)
+	require.Equal(t, before, after)
+	require.Empty(t, mv.mapKeys(t, mapHeadPrefix))
+}
+
 // A head from one creation attempt never pairs with another attempt's VBState.
 func TestMapDelta_HeadFromAnotherCreationFailsTheOpen(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
