@@ -680,16 +680,41 @@ func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) e
 		return nil
 	}
 
-	data := make([]byte, count)
-
-	err := c.vb.WriteAt(offset, data)
-
-	if err != nil {
-		return backendErrToPluginError("Could not write zero data", err)
+	// nbdkit checks the range before it calls Zero; this guard keeps a direct
+	// caller from writing a prefix, and subtracts so it cannot overflow.
+	size := c.vb.GetVolumeSize()
+	if offset > size {
+		return backendErrToPluginError("Could not write zero data", viperblock.ErrRequestTooLarge)
 	}
-
+	if uint64(count) > size-offset {
+		return backendErrToPluginError("Could not write zero data", viperblock.ErrRequestOutOfRange)
+	}
+	// Each write ends on a block edge. A block larger than the buffer is
+	// written in pieces that stay inside it, so a write queues one block.
+	blockSize := uint64(c.vb.BlockSize)
+	step := uint64(zeroChunkBytes)
+	if blockSize <= step {
+		step -= step % blockSize
+	}
+	for end := offset + uint64(count); offset < end; {
+		n := min(end-offset, step-offset%step)
+		if blockSize > step {
+			n = min(end-offset, step, blockSize-offset%blockSize)
+		}
+		if err := c.vb.WriteAt(offset, zeroChunk[:n]); err != nil {
+			return backendErrToPluginError("Could not write zero data", err)
+		}
+		offset += n
+	}
 	return nil
 }
+
+// zeroChunkBytes is the most of a zero request buffered at a time. Splits fall
+// on absolute multiples of the largest whole-block step that fits in it.
+const zeroChunkBytes = 4 << 20
+
+// zeroChunk is never written: WriteAt copies its input.
+var zeroChunk [zeroChunkBytes]byte
 
 func (c *ViperBlockConnection) CanTrim() (bool, error) {
 	return !c.readonly, nil
