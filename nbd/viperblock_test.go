@@ -1103,6 +1103,41 @@ func TestZeroWithBlockSizeNotDividingChunk(t *testing.T) {
 	require.Equal(t, want, got)
 }
 
+// A block larger than the chunk is zeroed one block at a time, so a request
+// holds at most one engine block past the mark.
+func TestZeroWithBlockLargerThanChunk(t *testing.T) {
+	const (
+		blockSize  = 6 << 20
+		maxPending = 8 << 20
+	)
+	vb := newSizedWriteBufferVolume(t, t.TempDir(), 1, nil, 48<<20, blockSize)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.EqualValues(t, blockSize, vb.BlockSize)
+	vb.MaxPendingBytes = maxPending
+	pattern := make([]byte, 36<<20)
+	for i := range pattern {
+		pattern[i] = byte(i%241) + 1
+	}
+	require.NoError(t, vb.WriteAt(0, pattern))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.DrainToBackend())
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+
+	offset, count := 1<<20+300, 30<<20
+	conn := &ViperBlockConnection{vb: vb}
+	require.NoError(t, conn.Zero(uint32(count), uint64(offset), 0)) //nolint:gosec // G115: small constants
+	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+blockSize),
+		"a request may hold at most one engine block past the mark")
+
+	got := make([]byte, len(pattern))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	want := bytes.Clone(pattern)
+	clear(want[offset : offset+count])
+	require.Equal(t, want, got)
+}
+
 func TestZeroOutOfRangeWritesNothing(t *testing.T) {
 	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
 	t.Cleanup(func() { detachWriteBufferVolume(vb) })
@@ -1142,13 +1177,16 @@ func BenchmarkZero(b *testing.B) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(logger)
 
-	// 512 MiB passes the default 256 MiB mark, so it measures the drains a
-	// large request waits on.
-	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20, 512 << 20} {
+	// 512 MiB passes the default 256 MiB mark. The largest NBD zero request
+	// needs a host with about 24 GiB free memory and 10 GiB free disk.
+	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20, 512 << 20, math.MaxUint32 - 4095} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			if size > 512<<20 && os.Getenv("VIPERBLOCK_BENCH_ZERO_MAX") == "" {
+				b.Skip("set VIPERBLOCK_BENCH_ZERO_MAX=1 on a host with room for a 4 GiB request")
+			}
 			root := filepath.Join(b.TempDir(), "volume")
 			newVolume := func() *viperblock.VB {
-				vb := newSizedWriteBufferVolume(b, root, 1, nil, uint64(max(128<<20, 2*size)), 0) //nolint:gosec // G115: size is at most 512 MiB
+				vb := newSizedWriteBufferVolume(b, root, 1, nil, uint64(max(128<<20, size+(4<<20))), 0) //nolint:gosec // G115: size is under 4 GiB
 				openWriteBufferWAL(b, vb)
 				return vb
 			}
@@ -1169,7 +1207,7 @@ func BenchmarkZero(b *testing.B) {
 					offset = 0
 					b.StartTimer()
 				}
-				if err := conn.Zero(uint32(size), uint64(offset), 0); err != nil { //nolint:gosec // G115: size is at most 64 MiB
+				if err := conn.Zero(uint32(size), uint64(offset), 0); err != nil { //nolint:gosec // G115: size is under 4 GiB
 					b.Fatal(err)
 				}
 				offset += size
