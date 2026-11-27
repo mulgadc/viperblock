@@ -5582,6 +5582,9 @@ func (vb *VB) recoverLocalWALs(readWAL func(string) ([]Block, uint64, error)) (e
 	// the live checkpoint over the numbered one just saved above, and the
 	// recovered WAL files are removed below, so a stale live checkpoint here
 	// would silently lose this recovery's blocks on a second crash.
+	// A retry can load a numbered checkpoint that already names these blocks,
+	// leaving the map clean and the live checkpoint stale; write it anyway.
+	vb.BlocksToObject.dirty.Store(true)
 	if err := vb.SaveLiveCheckpoint(); err != nil {
 		return fmt.Errorf("WAL recovery: failed to save live checkpoint: %w", err)
 	}
