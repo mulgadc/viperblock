@@ -195,9 +195,9 @@ func TestFormat1RecoveryRetainsWALWhenLiveCheckpointFails(t *testing.T) {
 // The provider seal closes the volume when recovery succeeds, and a clean
 // close removes the local volume tree, so a WAL that recovery skips is lost.
 func TestSealRetainsWALWithDamagedHeader(t *testing.T) {
-	seal := func(t *testing.T, reader *VB, recover func() error) error {
+	seal := func(t *testing.T, reader *VB, recoverWALs func() error) error {
 		t.Helper()
-		if err := recover(); err != nil {
+		if err := recoverWALs(); err != nil {
 			return err
 		}
 		return reader.CloseCtx(t.Context())

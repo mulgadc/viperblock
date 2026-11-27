@@ -2445,7 +2445,7 @@ func TestRecoverLocalWALsCorruptHeaderWithValidFile(t *testing.T) {
 			require.Error(t, vb.RecoverLocalWALs())
 			after, err := os.ReadDir(walDir)
 			require.NoError(t, err)
-			require.Equal(t, len(before), len(after), "a failed recovery must remove no WAL file")
+			require.Len(t, after, len(before), "a failed recovery must remove no WAL file")
 			_, _, _, err = vb.LookupBlockToObject(0)
 			require.ErrorIs(t, err, ErrZeroBlock, "a failed recovery must replay nothing")
 
