@@ -258,6 +258,11 @@ func TestNBDWireRejectedZero(t *testing.T) {
 	reply := nbdWriteZeroes(t, conn, 0, 4096, nbdkitLog)
 	require.Zero(t, reply.err, "an in-range zero must succeed on the wire")
 
+	// A multi-chunk zero (12 MiB = three object-block chunks) succeeds
+	// through the real server: the chunked path runs end to end on the wire.
+	reply = nbdWriteZeroes(t, conn, 0, 12<<20, nbdkitLog)
+	require.Zero(t, reply.err, "a multi-chunk zero must succeed on the wire")
+
 	// Crosses the export end (32 MiB): refused on the wire. nbdkit validates
 	// the request against the advertised export size before the plugin runs
 	// and answers an out-of-range request with NBD_ENOSPC (28) — its own

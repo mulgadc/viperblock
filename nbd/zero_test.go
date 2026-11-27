@@ -458,30 +458,51 @@ func TestChunkSize_Bounded(t *testing.T) {
 		"an object block above the ceiling is capped, whatever the persisted state says")
 	assert.Equal(t, uint64(1<<20)+7, chunkSize((1<<20)+7, objBlock, block),
 		"an unaligned request below the limit stays a single write")
+	assert.Equal(t, uint64(4<<20), chunkSize(64<<20, 8<<20, 8<<20),
+		"a persisted engine block above the ceiling keeps the buffer at the ceiling")
+	assert.Equal(t, uint64(4<<20), chunkSize(4<<20, 8<<20, 8<<20),
+		"a request at the ceiling stays one chunk even with a larger block")
 }
 
 // --- benchmarks ---
 
-// BenchmarkZero measures the zero path across the common, large, multi-chunk
-// and largest-supported shapes, on WAL-initialized volumes with a bounded
-// write window, mirroring the BenchmarkPWrite pattern.
+// BenchmarkZero measures the zero path across the common, large, multi-chunk,
+// advertised-maximum and largest-benchmarked shapes, on WAL-initialized
+// volumes with a bounded write window, mirroring the BenchmarkPWrite pattern.
+// The plugin itself accepts any uint32 count within the volume size; 256 MiB
+// is the largest case the harness measures, eight times the 32 MiB maximum
+// the deployment's blocksize policy advertises.
 func BenchmarkZero(b *testing.B) {
 	logger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(logger)
 
-	for _, size := range []uint32{4 << 10, 1 << 20, 12 << 20, 32 << 20} {
+	for _, size := range []uint32{4 << 10, 1 << 20, 12 << 20, 32 << 20, 256 << 20} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {
 			root := filepath.Join(b.TempDir(), "volume")
+			// The window never sits below the case itself, and the volume
+			// holds the window plus one case, with headroom for the WAL's
+			// chunk growth.
+			window := max(64<<20, int(size))
+			volSize := uint64(window) + uint64(size)*3
 			newVolume := func() *viperblock.VB {
-				vb := newWriteBufferVolume(b, root, 1, nil)
+				backendDir := filepath.Join(root, "backend")
+				require.NoError(b, os.MkdirAll(backendDir, 0o700))
+				config := viperblock.VB{
+					VolumeName: "zero-bench", VolumeSize: volSize,
+					BaseDir: filepath.Join(root, "local"), LeaseEpoch: 1,
+					WALSyncInterval: -1, ChunkUploadInterval: -1,
+				}
+				vb, err := viperblock.New(&config, "file", file.FileConfig{
+					VolumeName: config.VolumeName, VolumeSize: volSize, BaseDir: backendDir,
+				})
+				require.NoError(b, err)
+				require.NoError(b, vb.Backend.Init())
 				openWriteBufferWAL(b, vb)
 				return vb
 			}
 			conn := &ViperBlockConnection{vb: newVolume()}
 			defer func() { detachWriteBufferVolume(conn.vb) }()
-			// Keep both the dirty set and temporary disk use bounded.
-			const window = 64 << 20
 			offset := 0
 			b.SetBytes(int64(size))
 			b.ReportAllocs()

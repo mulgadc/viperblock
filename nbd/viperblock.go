@@ -664,9 +664,11 @@ func chunkSize(count, objBlock, block uint64) uint64 {
 		objBlock = block
 	}
 	limit := min(objBlock, maxZeroChunkBytes)
-	limit -= limit % block
-	if limit == 0 {
-		limit = block
+	// Round down to a whole engine block only when one fits under the
+	// ceiling. A persisted block larger than the ceiling keeps the ceiling
+	// as the buffer, and the splitter degrades to plain chunking for it.
+	if limit >= block {
+		limit -= limit % block
 	}
 	return min(limit, count)
 }
@@ -677,7 +679,9 @@ const maxZeroChunkBytes = 4 << 20
 
 // nextZeroChunk returns the length of the next zero write range: at most
 // chunk, with every interior boundary on a block edge, and a request that
-// fits the buffer left as one write. chunk must be a block multiple.
+// fits the buffer left as one write. chunk must be a block multiple; when it
+// is not (a persisted block above the ceiling), the split degrades to plain
+// fixed-size chunking, which stays correct.
 func nextZeroChunk(offset, remaining, chunk, block uint64) uint64 {
 	if block == 0 || chunk%block != 0 {
 		block = chunk
