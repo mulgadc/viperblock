@@ -211,6 +211,13 @@ type VB struct {
 	walSyncStop   chan struct{}
 	walSyncDone   chan struct{}
 
+	// walSyncerRunning reports whether the periodic WAL syncer's goroutine is
+	// running: set by StartWALSyncer, cleared by StopWALSyncer before the stop
+	// signal, so a loose flush concurrent with the syncer's final pass either
+	// had its records covered by that pass (they were appended, and dirty,
+	// before it started) or falls back to an inline sync.
+	walSyncerRunning atomic.Bool
+
 	// ChunkUploadInterval controls how often the background goroutine flushes WAL
 	// chunks and the live checkpoint to S3 (default 30s). <= 0 disables.
 	ChunkUploadInterval time.Duration
@@ -376,6 +383,17 @@ type VB struct {
 	// UseShardedWAL enables the sharded WAL for write operations.
 	// When false, uses the legacy single-file WAL for backward compatibility.
 	UseShardedWAL bool
+
+	// WALLooseSync defers Flush's fsync to the periodic WAL syncer
+	// (PostgreSQL async-commit style): Flush moves the records into the WAL
+	// file and returns without waiting for stable storage, and the syncer
+	// covers them within WALSyncInterval. A crash or power loss inside that
+	// window loses writes the guest saw acknowledged, so this trades the
+	// flush-barrier durability contract for latency. Default false. It only
+	// defers while the WAL syncer is running; once it is stopped (Close, a
+	// disabled interval) Flush syncs inline as usual, so a barrier never
+	// reports durability it did not wait for.
+	WALLooseSync bool
 
 	// BlockToObject WAL, stored on persistent storage for redundancy and periodic checkpointing
 	BlockToObjectWAL WAL
@@ -1452,6 +1470,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		MaxPendingBytes:     config.MaxPendingBytes,
 		UploadWorkers:       config.UploadWorkers,
 		WALSyncInterval:     config.WALSyncInterval,
+		WALLooseSync:        config.WALLooseSync,
 		ChunkUploadInterval: config.ChunkUploadInterval,
 		GCEnabled:           config.GCEnabled,
 		LeaseEpoch:          config.LeaseEpoch,
@@ -1671,6 +1690,7 @@ func (vb *VB) StartWALSyncer() {
 	vb.walSyncStop = make(chan struct{})
 	vb.walSyncDone = make(chan struct{})
 	vb.walSyncTicker = time.NewTicker(vb.WALSyncInterval)
+	vb.walSyncerRunning.Store(true)
 
 	// The goroutine closes over locals, never the VB fields: the stopper nils
 	// those, and a field read here would race that write however well the
@@ -1715,6 +1735,12 @@ func (vb *VB) StopWALSyncer() {
 	if vb.walSyncStop == nil {
 		return
 	}
+
+	// Cleared before the stop signal: from this moment a loose flush falls
+	// back to an inline sync, and any records it appended before checking the
+	// flag are still covered by the final sync below (they were dirty before
+	// that pass started).
+	vb.walSyncerRunning.Store(false)
 
 	close(vb.walSyncStop)
 	<-vb.walSyncDone
@@ -1947,21 +1973,37 @@ func (vb *VB) syncShardedWALIfDirty() {
 // syncShardedWAL fsyncs only the shards written to since the last sync,
 // returning the first failure. Every dirty shard is attempted even after one
 // fails, so a single bad shard cannot leave the others unsynced.
+//
+// Shards sync concurrently: each WALShard.sync serialises on its own syncMu,
+// so per-shard ordering and dirty-flag semantics are unchanged and a barrier
+// still waits for every sync that could cover its records. The fsyncs
+// dominate a sharded flush -- measured at ~97% of the barrier's latency on
+// lab hardware -- so overlapping them removes the serial chain rather than
+// the durability work.
 func (vb *VB) syncShardedWAL() error {
 	sw := vb.ShardedWAL
 	if sw == nil {
 		return nil
 	}
 
-	var firstErr error
+	var wg sync.WaitGroup
+	errs := make([]error, NumShards)
 	for i := range NumShards {
-		shard := sw.Shards[i]
-
-		if err := shard.sync(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := sw.Shards[i].sync(); err != nil {
+				errs[i] = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
-	return firstErr
+	return nil
 }
 
 // OpenWAL creates and opens a new WAL file.
@@ -2714,6 +2756,15 @@ func (vb *VB) Flush() (err error) {
 
 	if err = vb.flushWrites(); err != nil {
 		return err
+	}
+
+	// Loose sync defers the fsync to the periodic syncer: the records are in
+	// the file and their shards are marked dirty, so the syncer covers them
+	// within WALSyncInterval. Only while the syncer is running -- with it
+	// stopped or disabled, the barrier must not report durability it never
+	// waited for, so it syncs inline as usual.
+	if vb.WALLooseSync && vb.walSyncerRunning.Load() {
+		return nil
 	}
 
 	// Sync outside Writes.mu so a slow fsync does not stall writers. Safe: the
