@@ -2856,7 +2856,7 @@ func (vb *VB) DrainToBackendCtx(ctx context.Context) (err error) {
 		vb.afterTakeConsolidatedWALs()
 	}
 
-	if err = vb.persistMapForCtx(ctx, true); err != nil {
+	if err = vb.persistMapCtx(ctx); err != nil {
 		vb.returnConsolidatedWALs(reclaim)
 		return fmt.Errorf("drain live checkpoint: %w", err)
 	}
@@ -5119,13 +5119,7 @@ func (vb *VB) LoadBlockStateCtx(ctx context.Context) (err error) {
 	}
 
 	if IsMapFenceStub(checkpoint) {
-		if err := vb.loadMapChainCtx(ctx); err != nil {
-			return err
-		}
-		vb.checkpointMu.Lock()
-		vb.mapChain.conv.repair = true
-		vb.checkpointMu.Unlock()
-		return nil
+		return vb.loadMapChainCtx(ctx)
 	}
 
 	vb.BlocksToObject.mu.Lock()
@@ -5233,17 +5227,8 @@ func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
 		}
 		return fmt.Errorf("read live checkpoint: %w", err)
 	}
-	// VBState decides the format. A stub here under a VBState that says
-	// format 1 is a conversion whose VBState write was lost or overwritten:
-	// load format 2, and the claim rewrites VBState.
 	if IsMapFenceStub(checkpoint) {
-		if err := vb.loadMapChainCtx(ctx); err != nil {
-			return err
-		}
-		vb.checkpointMu.Lock()
-		vb.mapChain.conv.repair = true
-		vb.checkpointMu.Unlock()
-		return nil
+		return vb.loadMapChainCtx(ctx)
 	}
 	vb.BlocksToObject.mu.Lock()
 	defer vb.BlocksToObject.mu.Unlock()
@@ -6418,6 +6403,9 @@ func (vb *VB) loadStateCtx(ctx context.Context, loadCheckpoint bool) error {
 	state, err := vb.selectPersistedState(ctx)
 	if err != nil {
 		return err
+	}
+	if loadCheckpoint && state.MapFormat != MapFormatDelta {
+		return fmt.Errorf("unsupported block-map format %d: expected %d", state.MapFormat, MapFormatDelta)
 	}
 
 	vb.VolumeName = state.VolumeName

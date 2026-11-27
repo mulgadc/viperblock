@@ -130,7 +130,6 @@ func rememberMapCounters(vb *viperblock.VB) {
 	headN, objN := vb.MapCounters()
 	mapHeadN.Store(max(mapHeadN.Load(), headN))
 	mapObjN.Store(max(mapObjN.Load(), objN))
-	// This engine may have converted the volume during its connection.
 	mapClaimed.Store(true)
 }
 
@@ -350,6 +349,15 @@ func (p *ViperBlockPlugin) AfterFork() error {
 }
 
 func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, error) {
+	return p.open(readonly, func(cfg *viperblock.VB, backend s3.S3Config) (*viperblock.VB, error) {
+		return viperblock.New(cfg, "s3", backend)
+	}, (*viperblock.VB).OpenWAL)
+}
+
+func (p *ViperBlockPlugin) open(readonly bool,
+	newVolume func(*viperblock.VB, s3.S3Config) (*viperblock.VB, error),
+	openBlockWAL func(*viperblock.VB, *viperblock.WAL, string) error,
+) (nbdkit.ConnectionInterface, error) {
 
 	// Admission control: at most one Open() proceeds past this point per
 	// volume. Acquired before viperblock.New() so a second concurrent
@@ -426,7 +434,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	// Credentials on cfg are deliberately not logged.
 	slog.Info("creating viperblock backend", "backend", "s3", "volume", cfg.VolumeName,
 		"bucket", cfg.Bucket, "region", cfg.Region, "endpoint", cfg.Host)
-	vb, err := viperblock.New(&vbconfig, "s3", cfg)
+	vb, err := newVolume(&vbconfig, cfg)
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not create Viperblock backend: %v", err)}
 	}
@@ -509,7 +517,7 @@ func (p *ViperBlockPlugin) Open(readonly bool) (nbdkit.ConnectionInterface, erro
 	}
 
 	// Open the block to object WAL
-	err = vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
+	err = openBlockWAL(vb, &vb.BlockToObjectWAL, filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume())))
 
 	if err != nil {
 		return &ViperBlockConnection{}, nbdkit.PluginError{Errmsg: fmt.Sprintf("Could not open Block WAL: %v", err)}
@@ -730,7 +738,7 @@ func (c *ViperBlockConnection) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
-	// No conversion flips on a closing drain, and none starts.
+	// Stop background map reservations before draining.
 	c.vb.StopMapBackground()
 	// DrainToBackend before Close so the live checkpoint is current. Close
 	// will also flush WAL chunks, but does not save the live checkpoint.
@@ -790,7 +798,7 @@ func (p *ViperBlockPlugin) Unload() {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
 	defer cancel()
 
-	// No conversion flips on this closing drain either.
+	// Stop background map reservations before draining.
 	activeVB.StopMapBackground()
 	if err := activeVB.DrainToBackendCtx(ctx); err != nil {
 		slog.Error("Unload: DrainToBackend failed", "err", err)

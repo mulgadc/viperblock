@@ -425,8 +425,7 @@ type mapChainState struct {
 	// deleteBusy is set while deferred deletes are processed.
 	deleteBusy atomic.Bool
 	fenced     atomic.Bool
-	// delta mirrors MapFormat == MapFormatDelta for readers outside
-	// checkpointMu, since a conversion flips the format while drains run.
+	// delta identifies an initialized format-2 map.
 	delta     atomic.Bool
 	qualified atomic.Bool
 	// committed is set once any head of this volume is durable, and is
@@ -445,10 +444,6 @@ type mapChainState struct {
 	// chunkSeen records when chunk GC first found each zero-reference chunk.
 	// Guarded by BlocksToObject.mu.
 	chunkSeen map[types.ChunkRef]time.Time
-
-	// conv is a format-1 volume's conversion to format 2. Guarded by
-	// checkpointMu.
-	conv mapConversion
 }
 
 type deferredMapDelete struct {
@@ -472,6 +467,13 @@ func (vb *VB) mapDeleteDeferral() time.Duration {
 
 // IsMapDelta reports whether this volume persists its map as format 2.
 func (vb *VB) IsMapDelta() bool { return vb.mapChain.delta.Load() }
+
+func (vb *VB) persistedMapFormat() uint8 {
+	if vb.IsMapDelta() {
+		return MapFormatDelta
+	}
+	return vb.MapFormat
+}
 
 // setMapDelta switches the in-memory volume to format 2, so installs record
 // their runs for the next delta.
@@ -909,7 +911,7 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
 	if vb.mapChain.claimed {
-		return vb.repairConvertedStateLocked(ctx)
+		return nil
 	}
 	// The caller's deadline runs from before the load, so a slow load cannot
 	// leave the claim landing after an older writer's deletes come due.
@@ -936,25 +938,17 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 		return fmt.Errorf("map: claim head: %w", err)
 	}
 	vb.mapChain.claimed = true
-	return vb.repairConvertedStateLocked(ctx)
+	return nil
 }
 
-// persistMapCtx makes the in-memory map durable in the volume's format. It
-// never converts a format-1 volume: only an ordinary drain does that.
+// persistMapCtx commits the in-memory block map.
 func (vb *VB) persistMapCtx(ctx context.Context) error {
-	return vb.persistMapForCtx(ctx, false)
-}
-
-func (vb *VB) persistMapForCtx(ctx context.Context, drain bool) error {
 	if !vb.IsMapDelta() {
-		return vb.persistFormatOneCtx(ctx, drain)
+		return vb.SaveLiveCheckpointCtx(ctx)
 	}
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
-	if err := vb.commitMapDeltaLocked(ctx); err != nil {
-		return err
-	}
-	return vb.finishConversionLocked(ctx)
+	return vb.commitMapDeltaLocked(ctx)
 }
 
 func (vb *VB) mapBaseDueLocked() bool {
@@ -1127,8 +1121,7 @@ func (vb *VB) stopMapBackground() {
 	}
 }
 
-// StopMapBackground stops background map work and any conversion before a
-// close's final drain, so that drain never flips a format-1 volume.
+// StopMapBackground stops new background map work before the final drain.
 func (vb *VB) StopMapBackground() { vb.stopMapBackground() }
 
 // waitMapBackground waits for every background pass to return. Only tests
