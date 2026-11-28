@@ -2547,6 +2547,10 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 		blk, err := vb.writeOneBlockLocked(ctx, b, blockSize, partial, writeStart, writeEnd,
 			data[blockStart+writeStart-offset:blockStart+writeEnd-offset])
 		if err != nil {
+			// The blocks before this one are queued, and the drain that frees
+			// them subtracts their bytes, so count them before returning.
+			vb.pendingBytes.Add(int64(len(writes)) * int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
+			vb.signalSizeTrigger()
 			return err
 		}
 		writes = append(writes, blk)
