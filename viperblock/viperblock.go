@@ -30,7 +30,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/bluebottle/pkg/safecast"
@@ -641,7 +640,7 @@ type inheritedCacheOrigin struct {
 // location of a block always remains resolvable from the extent index.
 type Cache struct {
 	mu     sync.RWMutex
-	lru    *lru.Cache[uint64, cachedBlock]
+	lru    *shardedLRU
 	Config CacheConfig
 }
 
@@ -1291,7 +1290,7 @@ func (vb *VB) SetCacheSize(size int, percentage int) error {
 	defer vb.Cache.mu.Unlock()
 
 	// Create new LRU cache with specified size
-	newCache, err := lru.New[uint64, cachedBlock](size)
+	newCache, err := newShardedLRU(size)
 	if err != nil {
 		return fmt.Errorf("failed to create new LRU cache: %w", err)
 	}
@@ -1432,7 +1431,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 		config.GCInterval = DefaultGCInterval
 	}
 
-	var lruCache *lru.Cache[uint64, cachedBlock]
+	var lruCache *shardedLRU
 
 	if config.Cache.Config.Size == 0 {
 		// Size 0 is the established "no cache" request; callers that want one
@@ -1442,7 +1441,7 @@ func newVB(config *VB, btype string, backendConfig any) (vb *VB, err error) {
 	} else {
 		// Create LRU cache with calculated size. lru.New only fails on a
 		// non-positive size, so this is a caller config error, not fatal.
-		lruCache, err = lru.New[uint64, cachedBlock](config.Cache.Config.Size)
+		lruCache, err = newShardedLRU(config.Cache.Config.Size)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create LRU cache: %w", err)
 		}

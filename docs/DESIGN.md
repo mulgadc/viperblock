@@ -83,7 +83,7 @@ Viperblock is a high-performance, WAL-backed block storage engine that provides 
 | **Chunk Consolidation** | Deduplicates and packs WAL entries into 4 MB chunk files |
 | **Block Mapping** | Extent-based index mapping logical blocks to chunk file + offset |
 | **Unified Block Store** | O(1) sharded index tracking block state across all lifecycle phases |
-| **LRU Cache** | Caches clean blocks read from the backend |
+| **LRU Cache** | Caches clean blocks read from the backend. Split into up to 64 shards by block, each with its own recency, so eviction is approximately LRU across the cache |
 | **Storage Backend** | Pluggable durable storage (file, memory, S3) |
 | **NBD Plugin** | Exposes volumes as network block devices for QEMU/KVM |
 
