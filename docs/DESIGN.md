@@ -626,7 +626,7 @@ The plugin implements the full nbdkit interface:
 | `PRead` | Read data at offset → `vb.ReadAt()` |
 | `PWrite` | Write data at offset → `vb.WriteAt()` |
 | `Flush` | Flush write buffer + WAL → `vb.Flush()` |
-| `Zero` | Write zeros to a range |
+| `Zero` | Write zeros to a range. Bounds are checked against the advertised volume size before any allocation and an out-of-range request is refused with `EINVAL` at the callback; on the wire nbdkit answers an out-of-range request with `NBD_ENOSPC` under its own protocol-layer check. An in-range request is written in block-aligned chunks through one reused buffer, with backpressure able to act between chunks. A chunk whose drain fails with `ENOSPC` leaves a zeroed prefix that can extend into the failing chunk (the engine publishes a chunk's blocks before the drain fails) while the rest keeps its prior content: a failed in-range zero can modify a prefix. |
 | `Trim` | Discard a block range |
 
 ### Plugin Configuration Parameters

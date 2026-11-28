@@ -16,3 +16,5 @@ Thumbs.db
 
 # Test reports
 *-report.txt
+nbd/nbd
+nbd/bench-all.txt

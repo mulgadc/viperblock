@@ -1,4 +1,4 @@
-module main
+module github.com/mulgadc/viperblock/nbd
 
 go 1.27.4
 

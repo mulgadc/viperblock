@@ -690,15 +690,79 @@ func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) e
 		return nil
 	}
 
-	data := make([]byte, count)
+	// Bounds before allocation, against the size GetSize advertises: a
+	// rejected request must not cost its own size, and a stale local copy
+	// would reject valid zeroes after a resize.
+	size := c.vb.GetVolumeSize()
+	if offset > size || uint64(count) > size-offset {
+		return nbdkit.PluginError{Errmsg: "zero out of range", Errno: syscall.EINVAL}
+	}
 
-	err := c.vb.WriteAt(offset, data)
-
-	if err != nil {
-		return backendErrToPluginError("Could not write zero data", err)
+	// One reused buffer, written in chunks whose interior boundaries fall on
+	// engine block edges (nextZeroChunk): backpressure can act between chunks,
+	// and a fully covered block is written once, not rebuilt from two partial
+	// writes. A chunk write that fails leaves the earlier chunks zeroed.
+	block := uint64(c.vb.BlockSize)
+	if block == 0 {
+		block = uint64(viperblock.DefaultBlockSize)
+	}
+	data := make([]byte, chunkSize(uint64(count), uint64(c.vb.ObjBlockSize), block))
+	for remaining := uint64(count); remaining > 0; {
+		n := nextZeroChunk(offset, remaining, uint64(len(data)), block)
+		if err := c.vb.WriteAt(offset, data[:n]); err != nil {
+			return backendErrToPluginError("Could not write zero data", err)
+		}
+		offset += n
+		remaining -= n
 	}
 
 	return nil
+}
+
+// chunkSize sizes the zero buffer: a fixed ceiling independent of the
+// persisted object size, rounded down to a whole engine block, then capped by
+// the request so a request below the limit stays one write.
+func chunkSize(count, objBlock, block uint64) uint64 {
+	if objBlock == 0 {
+		objBlock = uint64(viperblock.DefaultObjBlockSize)
+	}
+	if objBlock < block {
+		objBlock = block
+	}
+	limit := min(objBlock, maxZeroChunkBytes)
+	// Round down to a whole engine block only when one fits under the
+	// ceiling. A persisted block larger than the ceiling keeps the ceiling
+	// as the buffer, and the splitter degrades to plain chunking for it.
+	if limit >= block {
+		limit -= limit % block
+	}
+	return min(limit, count)
+}
+
+// maxZeroChunkBytes caps the zero buffer no matter what object size the
+// volume's persisted state carries.
+const maxZeroChunkBytes = 4 << 20
+
+// nextZeroChunk returns the length of the next zero write range: at most
+// chunk, with every interior boundary on a block edge, and a request that
+// fits the buffer left as one write. chunk must be a block multiple; when it
+// is not (a persisted block above the ceiling), the split degrades to plain
+// fixed-size chunking, which stays correct.
+func nextZeroChunk(offset, remaining, chunk, block uint64) uint64 {
+	if block == 0 || chunk%block != 0 {
+		block = chunk
+	}
+	if remaining <= chunk {
+		return remaining
+	}
+	n := chunk
+	// End this range on the next block edge, so the following range starts
+	// block-aligned. The head is at most one block, never above chunk when
+	// chunk is a block multiple.
+	if head := (block - offset%block) % block; head > 0 && head < n {
+		n = head
+	}
+	return n
 }
 
 func (c *ViperBlockConnection) CanTrim() (bool, error) {
