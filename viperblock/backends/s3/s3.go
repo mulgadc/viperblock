@@ -190,6 +190,7 @@ type Backend struct {
 }
 
 var _ types.Backend = (*Backend)(nil)
+var _ types.MapHeadAuthority = (*Backend)(nil)
 
 func New(config any) (backend *Backend, err error) {
 	cfg, ok := config.(S3Config)
@@ -424,6 +425,14 @@ func (backend *Backend) Read(fileType types.FileType, objectId uint64, offset ui
 
 func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, objectId uint64, offset uint32, length uint32) (data []byte, err error) {
 	backend.log.DebugContext(ctx, "[S3 READ] Reading object", "objectId", objectId, "offset", offset, "length", length)
+	return backend.readAtKey(ctx, fileType, backend.config.VolumeName, types.GetFilePath(fileType, objectId, backend.config.VolumeName), offset, length)
+}
+
+func (backend *Backend) ReadChunkFromCtx(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
+	return backend.readAtKey(ctx, types.FileTypeChunk, volume, ref.Key(volume), offset, length)
+}
+
+func (backend *Backend) readAtKey(ctx context.Context, fileType types.FileType, volume, filename string, offset, length uint32) (data []byte, err error) {
 	start := time.Now()
 	served := -1
 	defer func() {
@@ -431,17 +440,19 @@ func (backend *Backend) ReadCtx(ctx context.Context, fileType types.FileType, ob
 		if err != nil {
 			outcome = "error"
 		}
-		telemetry.RecordBackendIO(ctx, "read", "s3", backend.config.VolumeName, outcome, len(data), time.Since(start))
+		telemetry.RecordBackendIO(ctx, "read", "s3", volume, outcome, len(data), time.Since(start))
 		if served >= 0 {
-			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), "own", backend.config.VolumeName, served)
+			origin := "own"
+			if volume != backend.config.VolumeName {
+				origin = "inherited"
+			}
+			telemetry.RecordBackendReadSize(ctx, fileTypeName(fileType), origin, volume, served)
 		}
 	}()
 
 	if backend.config.s3Client == nil {
 		return nil, fmt.Errorf("S3 client not initialized")
 	}
-
-	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	// Fetch the object from S3 with a byte range
 	requestObject := &s3.GetObjectInput{
@@ -504,6 +515,14 @@ func (backend *Backend) Write(fileType types.FileType, objectId uint64, headers 
 }
 
 func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, objectId uint64, headers *[]byte, data *[]byte) (err error) {
+	return backend.writeAtKey(ctx, fileType, types.GetFilePath(fileType, objectId, backend.config.VolumeName), headers, data)
+}
+
+func (backend *Backend) WriteChunkCtx(ctx context.Context, ref types.ChunkRef, headers, data *[]byte) error {
+	return backend.writeAtKey(ctx, types.FileTypeChunk, ref.Key(backend.config.VolumeName), headers, data)
+}
+
+func (backend *Backend) writeAtKey(ctx context.Context, fileType types.FileType, filename string, headers, data *[]byte) (err error) {
 	start := time.Now()
 	bodyLen := 0
 	defer func() {
@@ -517,8 +536,6 @@ func (backend *Backend) WriteCtx(ctx context.Context, fileType types.FileType, o
 	if backend.config.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
-
-	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	// Combine headers and data to match file backend behavior
 	// The BlockLookup offsets include header size, so we must write headers+data
@@ -653,6 +670,14 @@ func (backend *Backend) Delete(fileType types.FileType, objectId uint64) (err er
 // backend's own volume. wrapNotFound is required here because predastore,
 // unlike real S3, errors on deleting an already-missing key.
 func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, objectId uint64) (err error) {
+	return backend.deleteAtKey(ctx, types.GetFilePath(fileType, objectId, backend.config.VolumeName))
+}
+
+func (backend *Backend) DeleteChunkCtx(ctx context.Context, ref types.ChunkRef) error {
+	return backend.deleteAtKey(ctx, ref.Key(backend.config.VolumeName))
+}
+
+func (backend *Backend) deleteAtKey(ctx context.Context, filename string) (err error) {
 	start := time.Now()
 	defer func() {
 		outcome := "success"
@@ -665,8 +690,6 @@ func (backend *Backend) DeleteCtx(ctx context.Context, fileType types.FileType, 
 	if backend.config.s3Client == nil {
 		return fmt.Errorf("S3 client not initialized")
 	}
-
-	filename := types.GetFilePath(fileType, objectId, backend.config.VolumeName)
 
 	_, err = backend.config.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(backend.config.Bucket),
@@ -754,6 +777,60 @@ func (backend *Backend) ListObjectsCtx(ctx context.Context, prefix string) (keys
 	}
 
 	return keys, nil
+}
+
+const (
+	mapHeadReadModeHeader = "X-Predastore-Read-Mode"
+	latestMapHeadMode     = "latest-map-head"
+)
+
+// MapHeadAuthorityRequired follows the reserved Spinifex EBS bucket name.
+func (backend *Backend) MapHeadAuthorityRequired() bool {
+	return backend.config.Bucket == "predastore"
+}
+
+func (backend *Backend) LatestMapHeadCtx(ctx context.Context, prefix string) (string, error) {
+	if !backend.MapHeadAuthorityRequired() {
+		return "", fmt.Errorf("map-head authority is reserved for the predastore bucket")
+	}
+	if backend.config.s3Client == nil {
+		return "", fmt.Errorf("S3 client not initialized")
+	}
+
+	confirmed := false
+	out, err := backend.config.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(backend.config.Bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(1),
+	}, func(options *s3.Options) {
+		options.APIOptions = append(options.APIOptions,
+			smithyhttp.AddHeaderValue(mapHeadReadModeHeader, latestMapHeadMode),
+			func(stack *middleware.Stack) error {
+				return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("ConfirmLatestMapHead",
+					func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (middleware.DeserializeOutput, middleware.Metadata, error) {
+						result, md, err := next.HandleDeserialize(ctx, in)
+						resp, ok := result.RawResponse.(*smithyhttp.Response)
+						confirmed = ok && resp != nil && resp.Header.Get(mapHeadReadModeHeader) == latestMapHeadMode
+						return result, md, err
+					}), middleware.Before)
+			},
+		)
+	})
+	if err != nil {
+		return "", err
+	}
+	if !confirmed || aws.ToBool(out.IsTruncated) || aws.ToString(out.NextContinuationToken) != "" ||
+		len(out.Contents) > 1 || len(out.CommonPrefixes) > 0 {
+		return "", fmt.Errorf("S3 endpoint did not confirm a bounded map-head lookup")
+	}
+	if len(out.Contents) == 0 {
+		return "", nil
+	}
+	key := aws.ToString(out.Contents[0].Key)
+	if !strings.HasPrefix(key, prefix) {
+		return "", fmt.Errorf("S3 map-head response returned a key outside its prefix")
+	}
+	return key, nil
 }
 
 func (backend *Backend) Sync() {

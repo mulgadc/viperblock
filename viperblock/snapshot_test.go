@@ -486,7 +486,7 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 		// buildFlatSection must encode exactly 1 source group.
 		clone := createCloneVB(t, vb, baseSnapID)
 
-		raw, err := clone.buildFlatSection()
+		raw, err := clone.buildFlatSection(1, blockWalChunkSize)
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, len(raw), 6, "flat section must be at least 6 bytes")
 
@@ -494,7 +494,7 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 		assert.Equal(t, uint8(1), raw[4], "version")
 		assert.Equal(t, uint8(1), raw[5], "numSources must be 1")
 
-		layers, err := parseFlatSection(raw)
+		layers, err := parseFlatSection(raw, 1, blockWalChunkSize)
 		require.NoError(t, err)
 		require.Len(t, layers, 1)
 

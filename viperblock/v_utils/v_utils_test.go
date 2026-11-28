@@ -86,6 +86,7 @@ func TestImportDiskImage_ExistingStateReadErrorFailsClosed(t *testing.T) {
 
 	volumeName := "vol-import-rejected"
 	vbConfig := &viperblock.VB{
+		LeaseEpoch: 1,
 		VolumeName: volumeName,
 		VolumeSize: uint64(viperblock.DefaultBlockSize),
 		BaseDir:    t.TempDir(),
@@ -274,12 +275,15 @@ func loadPersistedAMIState(t *testing.T, volumeName string, volumeSize uint64, s
 		Cache:             viperblock.Cache{Config: viperblock.CacheConfig{Size: 0}},
 	}
 
-	vb, err := viperblock.New(readerConfig, "s3", *s3Config)
+	vb, err := viperblock.NewStateReader(readerConfig, "s3", *s3Config)
 	require.NoError(t, err)
-	require.NoError(t, vb.Backend.Init())
-	require.NoError(t, vb.LoadState())
+	require.NoError(t, vb.InitBackendForRead(t.Context()))
+	state, err := vb.ReadStateCtx(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, viperblock.MapFormatDelta, state.MapFormat)
+	require.True(t, state.MapCommitted)
 
-	return vb.VolumeConfig.AMIMetadata.State
+	return state.VolumeConfig.AMIMetadata.State
 }
 
 // makeRawImage writes a size-byte raw disk image filled with a non-zero
@@ -313,6 +317,7 @@ func TestImportDiskImage_FailedImportLeavesPendingState(t *testing.T) {
 	key := testMasterKey(t)
 
 	vbConfig := &viperblock.VB{
+		LeaseEpoch:        1,
 		VolumeName:        volumeName,
 		VolumeSize:        blockSize, // one block: the second write overflows it
 		BaseDir:           filepath.Join(tmpDir, "viperblock"),
@@ -359,6 +364,7 @@ func TestImportDiskImage_CleanImportLeavesAvailableState(t *testing.T) {
 	imagePath := makeRawImage(t, tmpDir, volumeSize)
 
 	vbConfig := &viperblock.VB{
+		LeaseEpoch:      1,
 		VolumeName:      volumeName,
 		VolumeSize:      volumeSize,
 		BaseDir:         filepath.Join(tmpDir, "viperblock"),

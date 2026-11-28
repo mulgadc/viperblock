@@ -605,14 +605,14 @@ func TestChunkGC_WatermarkExcludesChunksMintedAfterMark(t *testing.T) {
 
 	futureID := vb.ObjectNum.Load() + 5 // never minted; stands in for "minted after mark"
 	vb.BlocksToObject.mu.Lock()
-	vb.gcRefcount[futureID] = 0
+	vb.gcRefcount[types.ChunkRef{ID: futureID}] = 0
 	vb.BlocksToObject.mu.Unlock()
 
 	vb.sweepChunks(ctx)
 	assertClosure(t, vb)
 
 	vb.BlocksToObject.mu.Lock()
-	_, stillTracked := vb.gcRefcount[futureID]
+	_, stillTracked := vb.gcRefcount[types.ChunkRef{ID: futureID}]
 	vb.BlocksToObject.mu.Unlock()
 	assert.True(t, stillTracked, "watermark clamp must leave a not-yet-minted id untouched, not attempt to delete or drop-track it")
 }
@@ -659,7 +659,7 @@ func TestChunkGC_NoDeleteBeforeCheckpointDurability(t *testing.T) {
 
 	assertChunkPresent(t, vb.Backend, vb.VolumeName, garbageChunkID)
 	vb.BlocksToObject.mu.Lock()
-	refs, tracked := vb.gcRefcount[garbageChunkID]
+	refs, tracked := vb.gcRefcount[types.ChunkRef{ID: garbageChunkID}]
 	vb.BlocksToObject.mu.Unlock()
 	require.True(t, tracked)
 	assert.Zero(t, refs)
@@ -838,8 +838,8 @@ func TestChunkGC_StaleDrainNeverClobbersNewerChunk(t *testing.T) {
 	// exactly: live chunk 1, orphaned stale chunk tracked at 0.
 	vb.BlocksToObject.mu.RLock()
 	lookup, mapOK := lookupMap(&vb.BlocksToObject)[0]
-	newerRefs := vb.gcRefcount[newerChunkID]
-	staleRefs, staleTracked := vb.gcRefcount[staleChunkID]
+	newerRefs := vb.gcRefcount[types.ChunkRef{ID: newerChunkID}]
+	staleRefs, staleTracked := vb.gcRefcount[types.ChunkRef{ID: staleChunkID}]
 	vb.BlocksToObject.mu.RUnlock()
 
 	require.True(t, mapOK, "block 0 lost its map entry entirely")
@@ -1473,7 +1473,7 @@ func TestChunkGC_DeleteChunkObjectsParallelizesAcrossWorkers(t *testing.T) {
 	for i := range ids {
 		id := uint64(i + 1)
 		ids[i] = id
-		vb.gcRefcount[id] = 0
+		vb.gcRefcount[types.ChunkRef{ID: id}] = 0
 	}
 	vb.BlocksToObject.mu.Unlock()
 
@@ -1492,7 +1492,7 @@ func TestChunkGC_DeleteChunkObjectsParallelizesAcrossWorkers(t *testing.T) {
 				return
 			default:
 				vb.BlocksToObject.mu.Lock()
-				vb.gcRefcount[next] = 1 // referenced: never a delete candidate
+				vb.gcRefcount[types.ChunkRef{ID: next}] = 1 // referenced: never a delete candidate
 				vb.BlocksToObject.mu.Unlock()
 				next++
 			}
@@ -1501,7 +1501,11 @@ func TestChunkGC_DeleteChunkObjectsParallelizesAcrossWorkers(t *testing.T) {
 	t.Cleanup(func() { close(writerStop); <-writerDone })
 
 	done := make(chan int, 1)
-	go func() { done <- vb.deleteChunkObjects(context.Background(), ids) }()
+	refs := make([]types.ChunkRef, len(ids))
+	for i, id := range ids {
+		refs[i] = types.ChunkRef{ID: id}
+	}
+	go func() { done <- vb.deleteChunkObjects(context.Background(), refs) }()
 
 	// Every candidate blocks inside DeleteCtx until release is closed, so once
 	// the pool is fully occupied, in-flight sticks at exactly `workers` until
@@ -1522,7 +1526,7 @@ func TestChunkGC_DeleteChunkObjectsParallelizesAcrossWorkers(t *testing.T) {
 	vb.BlocksToObject.mu.Lock()
 	remaining := 0
 	for _, id := range ids {
-		if _, ok := vb.gcRefcount[id]; ok {
+		if _, ok := vb.gcRefcount[types.ChunkRef{ID: id}]; ok {
 			remaining++
 		}
 	}

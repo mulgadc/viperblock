@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+
+	"github.com/mulgadc/viperblock/types"
 )
 
 // BlockState represents the lifecycle state of a block in the unified store.
@@ -43,8 +45,9 @@ func (s BlockState) String() string {
 
 // BlockEntry represents a single block's metadata and data in the unified store.
 type BlockEntry struct {
-	Data         []byte     // Block data for Hot/Pending/Cached states
-	SeqNum       uint64     // Sequence number for ordering writes
+	Data         []byte // Block data for Hot/Pending/Cached states
+	SeqNum       uint64 // Sequence number for ordering writes
+	ChunkEpoch   uint64
 	ObjectID     uint64     // Object ID for Persisted state (which chunk file)
 	ObjectOffset uint32     // Offset within the chunk file for Persisted state
 	State        BlockState // Current state of the block
@@ -118,6 +121,7 @@ type persistedExtent struct {
 	seqNums      []uint64
 	startBlock   uint64
 	objectID     uint64
+	chunkEpoch   uint64
 	objectOffset uint32
 	stride       uint32
 	numBlocks    uint16
@@ -202,6 +206,7 @@ func (ubs *UnifiedBlockStore) readPersisted(blockNum uint64) (BlockEntry, bool) 
 		SeqNum:       pe.seqNumAt(idx),
 		State:        BlockStatePersisted,
 		ObjectID:     pe.objectID,
+		ChunkEpoch:   pe.chunkEpoch,
 		ObjectOffset: pe.offsetAt(idx),
 	}, true
 }
@@ -459,6 +464,7 @@ func (ubs *UnifiedBlockStore) readEntryRun(startBlock, count uint64, out []Block
 				SeqNum:       pe.seqNumAt(idx),
 				State:        BlockStatePersisted,
 				ObjectID:     pe.objectID,
+				ChunkEpoch:   pe.chunkEpoch,
 				ObjectOffset: pe.offsetAt(idx),
 			}
 			found[i] = true
@@ -606,6 +612,10 @@ func (ubs *UnifiedBlockStore) MarkPersisted(blockNum, objectID uint64, offset ui
 // so no reader ever observes a block as unwritten mid-transition. Returns
 // the number of blocks transitioned.
 func (ubs *UnifiedBlockStore) MarkPersistedRange(blocks []uint64, objectID uint64, objectOffset uint32, stride uint32, seqNums []uint64) int {
+	return ubs.markPersistedRangeRef(blocks, types.ChunkRef{ID: objectID}, objectOffset, stride, seqNums)
+}
+
+func (ubs *UnifiedBlockStore) markPersistedRangeRef(blocks []uint64, ref types.ChunkRef, objectOffset uint32, stride uint32, seqNums []uint64) int {
 	if len(blocks) == 0 || len(blocks) != len(seqNums) {
 		return 0
 	}
@@ -646,7 +656,8 @@ func (ubs *UnifiedBlockStore) MarkPersistedRange(blocks []uint64, objectID uint6
 		run := persistedExtent{
 			startBlock:   blocks[i],
 			numBlocks:    uint16(j - i), //nolint:gosec // G115: j-i < 65535 by the loop guard above
-			objectID:     objectID,
+			objectID:     ref.ID,
+			chunkEpoch:   ref.Epoch,
 			objectOffset: objectOffset + uint32(i)*stride,
 			stride:       stride,
 			seqNums:      append([]uint64(nil), seqNums[i:j]...),
@@ -713,6 +724,10 @@ func (ubs *UnifiedBlockStore) SetPersisted(blockNum, objectID uint64, offset uin
 // checkpoint is authoritative, so this unconditionally installs the run,
 // fracturing away any overlapping extent.
 func (ubs *UnifiedBlockStore) SetPersistedRange(blocks []uint64, objectID uint64, objectOffset uint32, stride uint32, seqNums []uint64) {
+	ubs.setPersistedRangeRef(blocks, types.ChunkRef{ID: objectID}, objectOffset, stride, seqNums)
+}
+
+func (ubs *UnifiedBlockStore) setPersistedRangeRef(blocks []uint64, ref types.ChunkRef, objectOffset uint32, stride uint32, seqNums []uint64) {
 	if len(blocks) == 0 || len(blocks) != len(seqNums) {
 		return
 	}
@@ -729,7 +744,8 @@ func (ubs *UnifiedBlockStore) SetPersistedRange(blocks []uint64, objectID uint64
 		run := persistedExtent{
 			startBlock:   blocks[i],
 			numBlocks:    uint16(j - i), //nolint:gosec // G115: j-i < 65535 by the loop guard above
-			objectID:     objectID,
+			objectID:     ref.ID,
+			chunkEpoch:   ref.Epoch,
 			objectOffset: objectOffset + uint32(i)*stride,
 			stride:       stride,
 			seqNums:      append([]uint64(nil), seqNums[i:j]...),

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
@@ -37,6 +38,7 @@ func main() {
 	voldata := flag.String("voldata", "", "Volume data directory to store blocks")
 
 	volsize := flag.Uint64("size", 2<<18, "Volume size in bytes")
+	leaseEpoch := flag.Uint64("lease-epoch", 0, "Writer lease epoch for the volume")
 	encryptionKeyFile := flag.String("encryption-key-file", "", "path to AES-256 master key (32 raw bytes, 0640 or stricter); falls back to ENCRYPTION_KEY_FILE env if unset")
 
 	// S3 configuration (via environment variables)
@@ -48,6 +50,10 @@ func main() {
 	aws_host := os.Getenv("AWS_HOST")
 
 	flag.Parse()
+	if *leaseEpoch == 0 {
+		slog.Error("sfs requires a writer lease epoch")
+		os.Exit(1)
+	}
 
 	if !*createvol && *vol == "" {
 		fmt.Println("Must specify vol to create a new volume when createvol is defined")
@@ -134,6 +140,7 @@ func main() {
 	vb, err := viperblock.New(&viperblock.VB{
 		VolumeName:        *vol,
 		VolumeSize:        *volsize,
+		LeaseEpoch:        *leaseEpoch,
 		MasterKey:         mkey,
 		EncryptionEnabled: mkey != nil,
 	}, *btype, cfg)
@@ -149,44 +156,32 @@ func main() {
 		os.Exit(1)
 	}
 
-	err = vb.LoadState()
-
-	if err != nil {
-		slog.Error("sfs: LoadState failed", "error", err)
+	ctx := context.Background()
+	if err = vb.LoadStateAndLiveCheckpointCtx(ctx); err != nil {
+		slog.Error("sfs: load volume failed", "error", err)
 		os.Exit(1)
 	}
-
-	/*
-		if *vbstate != "" {
-			// First load the existing state
-
-			if _, err := os.Stat(*vbstate); os.IsNotExist(err) {
-				fmt.Println("State file does not exist, will create a new one on save")
-			} else {
-				err = vb.LoadState()
-				if err != nil {
-					fmt.Println(err)
-				}
-			}
-
-		}
-	*/
+	if err = vb.ClaimMapCtx(ctx); err != nil {
+		slog.Error("sfs: claim block map failed", "error", err)
+		os.Exit(1)
+	}
 
 	vb.SetWALBaseDir(*voldata)
-
-	walNum := vb.WAL.WallNum.Add(1)
-
-	err = vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal.%08d.bin", *voldata, vb.GetVolume(), walNum))
-
-	if err != nil {
-		slog.Error("Could not open WAL", "error", err)
+	if err = vb.RecoverLocalWALs(); err != nil {
+		slog.Error("sfs: recover WAL failed", "error", err)
 		os.Exit(1)
 	}
 
-	err = vb.ReadWAL()
-
+	walNum := vb.WAL.WallNum.Add(1)
+	if vb.UseShardedWAL {
+		vb.ShardedWAL.WallNum.Store(walNum)
+		err = vb.OpenShardedWAL()
+	} else {
+		walPath := filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, walNum, vb.GetVolume()))
+		err = vb.OpenWAL(&vb.WAL, walPath)
+	}
 	if err != nil {
-		slog.Error("Could not read WAL", "error", err)
+		slog.Error("sfs: open WAL failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -283,33 +278,8 @@ func main() {
 
 	fmt.Println("Read input file to main memory: ", len(vb.Writes.Blocks))
 
-	// Next, flush the main memory to the WAL
-	fmt.Println("Flushing main memory to WAL")
-
-	if err = vb.Flush(); err != nil {
-		slog.Error("Failed to flush", "error", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Main memory after flush: ", len(vb.Writes.Blocks))
-
-	if vb.UseShardedWAL {
-		if err = vb.WriteShardedWALToChunk(false); err != nil {
-			slog.Error("Failed to write sharded WAL to chunk", "error", err)
-			os.Exit(1)
-		}
-	} else {
-		if err = vb.WriteWALToChunk(false); err != nil {
-			slog.Error("Failed to write WAL to chunk", "error", err)
-			os.Exit(1)
-		}
-	}
-
-	// Serialize the BlocksToObject
-	err = vb.SaveBlockState()
-
-	if err != nil {
-		slog.Error("Could not serialize BlocksToObject", "error", err)
+	if err = vb.DrainToBackendCtx(ctx); err != nil {
+		slog.Error("sfs: drain volume failed", "error", err)
 		os.Exit(1)
 	}
 
