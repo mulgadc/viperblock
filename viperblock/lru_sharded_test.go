@@ -34,7 +34,7 @@ func TestShardedLRUEvictsWithinShard(t *testing.T) {
 	// Collect 257 keys per shard from a bounded search, fill every shard, then
 	// overfill shard 0 by one entry.
 	byShard := make([][]uint64, 4)
-	for b := uint64(0); b < 1<<16; b++ {
+	for b := range uint64(1 << 16) {
 		if i := s.shardIndex(b); len(byShard[i]) < 257 {
 			byShard[i] = append(byShard[i], b)
 		}
