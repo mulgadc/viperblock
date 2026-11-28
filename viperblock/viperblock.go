@@ -1968,24 +1968,33 @@ func (vb *VB) syncShardedWALIfDirty() {
 	}
 }
 
-// syncShardedWAL fsyncs only the shards written to since the last sync,
-// returning the first failure. Every dirty shard is attempted even after one
-// fails, so a single bad shard cannot leave the others unsynced.
+// syncShardedWAL fsyncs the dirty shards concurrently and returns the first
+// failure in shard order. Each shard still serialises on its own syncMu, so a
+// barrier waits for every sync that could cover its records.
 func (vb *VB) syncShardedWAL() error {
 	sw := vb.ShardedWAL
 	if sw == nil {
 		return nil
 	}
 
-	var firstErr error
+	var wg sync.WaitGroup
+	errs := make([]error, NumShards)
 	for i := range NumShards {
-		shard := sw.Shards[i]
-
-		if err := shard.sync(); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := sw.Shards[i].sync(); err != nil {
+				errs[i] = fmt.Errorf("sharded WAL sync, shard %d: %w", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
-	return firstErr
+	return nil
 }
 
 // OpenWAL creates and opens a new WAL file.
