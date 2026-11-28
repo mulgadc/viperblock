@@ -94,4 +94,42 @@ func BenchmarkBlockCache(b *testing.B) {
 			}
 		})
 	})
+
+	// The plugin's path: ReadAtInto fills the caller's buffer, as PRead does.
+	b.Run("into-hit-1MiB-parallel", func(b *testing.B) {
+		vb := pfbOpen(b, root, name, DefaultCacheBlocks, 0, false)
+		warm(b, vb)
+		var next atomic.Uint64
+		b.SetBytes(int64(window))
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			dst := make([]byte, window)
+			for pb.Next() {
+				w := next.Add(1) % (hot / pfbWindow)
+				if err := vb.ReadAtInto(uint64(pfbFragBlocks)*bs+w*window, dst); err != nil {
+					b.Error(err)
+					return
+				}
+			}
+		})
+	})
+
+	b.Run("into-miss-1MiB-parallel", func(b *testing.B) {
+		vb := pfbOpen(b, root, name, 4096, 0, false)
+		var next atomic.Uint64
+		b.SetBytes(int64(window))
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			dst := make([]byte, window)
+			for pb.Next() {
+				w := next.Add(1) % (hot / pfbWindow)
+				if err := vb.ReadAtInto(uint64(pfbFragBlocks)*bs+w*window, dst); err != nil {
+					b.Error(err)
+					return
+				}
+			}
+		})
+	})
 }
