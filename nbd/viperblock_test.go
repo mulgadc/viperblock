@@ -1585,3 +1585,19 @@ func BenchmarkSnapshotListenerReadyDrain(b *testing.B) {
 		require.NoError(b, conn.Close())
 	}
 }
+
+// gcEnabledAtStart is the plugin's GC setting before any Config call runs.
+var gcEnabledAtStart = gc_enabled
+
+func TestGCEnabledByDefaultAndExplicitOffStillDisables(t *testing.T) {
+	saved := gc_enabled
+	t.Cleanup(func() { gc_enabled = saved })
+
+	assert.True(t, gcEnabledAtStart, "a volume opened without gc_enabled must reclaim overwritten chunks")
+
+	p := &ViperBlockPlugin{}
+	require.NoError(t, p.Config("gc_enabled", "false"))
+	assert.False(t, gc_enabled)
+	require.NoError(t, p.Config("gc_enabled", "true"))
+	assert.True(t, gc_enabled)
+}
