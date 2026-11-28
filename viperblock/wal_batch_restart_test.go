@@ -22,7 +22,7 @@ func TestAcknowledgedBatchedWALSurvivesProcessKill(t *testing.T) {
 	const blockCount = 128
 	const ack = "lab-wal-flush-ack"
 	if childRoot := os.Getenv("VB_LAB_RESTART_CHILD_ROOT"); childRoot != "" {
-		vb := openRestartTestVolume(t, childRoot)
+		vb := openRestartTestVolume(t, childRoot, 1)
 		path := filepath.Join(vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))
 		require.NoError(t, vb.OpenWAL(&vb.WAL, path))
 		for i := range uint64(blockCount) {
@@ -65,7 +65,7 @@ func TestAcknowledgedBatchedWALSurvivesProcessKill(t *testing.T) {
 	require.Error(t, cmd.Wait())
 	require.Equal(t, syscall.SIGKILL, cmd.ProcessState.Sys().(syscall.WaitStatus).Signal())
 
-	reopened := openRestartTestVolume(t, root)
+	reopened := openRestartTestVolume(t, root, 2)
 	require.NoError(t, reopened.RecoverLocalWALs())
 	for i := range uint64(blockCount) {
 		got, err := reopened.ReadAt(i*uint64(reopened.BlockSize), uint64(reopened.BlockSize))
@@ -74,7 +74,10 @@ func TestAcknowledgedBatchedWALSurvivesProcessKill(t *testing.T) {
 	}
 }
 
-func openRestartTestVolume(t *testing.T, root string) *VB {
+// openRestartTestVolume creates the volume under epoch 1, or loads and claims
+// it under a later epoch. The epochs are fixed because each process counts
+// its own.
+func openRestartTestVolume(t *testing.T, root string, epoch uint64) *VB {
 	t.Helper()
 	const name = "lab-restart"
 	local, backend := filepath.Join(root, "local"), filepath.Join(root, "backend")
@@ -82,12 +85,20 @@ func openRestartTestVolume(t *testing.T, root string) *VB {
 	require.NoError(t, os.MkdirAll(backend, 0700))
 	config := VB{
 		VolumeName: name, VolumeSize: 64 << 20, BaseDir: local,
-		WALSyncInterval: -1, ChunkUploadInterval: -1,
+		WALSyncInterval: -1, ChunkUploadInterval: -1, LeaseEpoch: epoch,
 	}
 	vb, err := New(&config, "file", file.FileConfig{
 		VolumeName: name, VolumeSize: config.VolumeSize, BaseDir: backend,
 	})
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	if epoch == 1 {
+		initTestMap(t, vb)
+		require.NoError(t, vb.SaveState())
+		return vb
+	}
+	require.NoError(t, vb.LoadState())
+	require.NoError(t, vb.LoadLiveCheckpoint())
+	require.NoError(t, vb.ClaimMapCtx(t.Context()))
 	return vb
 }

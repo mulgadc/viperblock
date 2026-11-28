@@ -73,6 +73,7 @@ func nbdOpenRound(t *testing.T, volName string, numConns int) (admitted, refused
 	if err := seedVB.Backend.Init(); err != nil {
 		t.Fatalf("seed Backend.Init: %v", err)
 	}
+	initTestMap(t, seedVB)
 	if err := seedVB.SaveState(); err != nil {
 		t.Fatalf("seed SaveState: %v", err)
 	}

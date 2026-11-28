@@ -40,6 +40,7 @@ func TestConcurrentRMWWriteVsDrainAEAD(t *testing.T) {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	vb.BlockSize = DefaultBlockSize
 	vb.ObjBlockSize = 8 * DefaultBlockSize // small chunks -> high createChunkFile churn
 	require.NoError(t, vb.SaveState())

@@ -707,6 +707,7 @@ func TestReclaimAndChunkGCCannotLoseABlockTogether(t *testing.T) {
 	t.Cleanup(func() { vb.StopWALSyncer() })
 	vb.BlockSize = DefaultBlockSize
 	vb.ObjBlockSize = 16 * DefaultBlockSize
+	initTestMap(t, vb)
 	require.NoError(t, vb.SaveState())
 	require.NoError(t, vb.OpenWAL(&vb.WAL,
 		fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))

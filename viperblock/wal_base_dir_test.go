@@ -68,6 +68,7 @@ func newWALBaseDirTestVB(t *testing.T, sharded bool, separateWALDir bool) (vb *V
 	}
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 
 	if sharded {
 		require.NoError(t, vb.OpenShardedWAL())

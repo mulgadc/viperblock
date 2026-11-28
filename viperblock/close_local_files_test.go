@@ -75,6 +75,7 @@ func newChunkFailTestVB(t *testing.T) (*VB, *chunkFailBackend) {
 	vb.ShardedWAL = nil
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	backend := &chunkFailBackend{Backend: vb.Backend}
 	vb.Backend = backend
 

@@ -53,6 +53,7 @@ func newEncryptedTamperEnv(t *testing.T, volume string, key *masterkey.Key) *enc
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 
 	vb.BlockSize = DefaultBlockSize
 	vb.ObjBlockSize = 16 * DefaultBlockSize
@@ -594,6 +595,7 @@ func TestReserveSeqNum_MintsVolumeUUIDBeforeFirstSeal(t *testing.T) {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	vb.BlockSize = DefaultBlockSize
 	vb.ObjBlockSize = 16 * DefaultBlockSize
 	// Deliberately NO SaveState before writing — mirrors prepareEFIVolume,

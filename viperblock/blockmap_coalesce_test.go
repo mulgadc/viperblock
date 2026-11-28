@@ -37,6 +37,7 @@ func newCoalesceTestVB(t *testing.T, volume string, objBlockSizeBlocks int, key 
 
 	vb.BlockSize = DefaultBlockSize
 	vb.ObjBlockSize = uint32(objBlockSizeBlocks) * DefaultBlockSize
+	initTestMap(t, vb)
 	require.NoError(t, vb.SaveState())
 
 	require.NoError(t, vb.OpenWAL(&vb.WAL,
@@ -229,6 +230,7 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	// recoalescing and BlockStore's restore path.
 	require.NoError(t, vb.persistMapCtx(t.Context()))
 	vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
+	vb.LeaseEpoch = nextTestEpoch()
 	require.NoError(t, vb.LoadLiveCheckpoint())
 
 	got, err = vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))

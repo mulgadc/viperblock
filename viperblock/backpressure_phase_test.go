@@ -93,9 +93,9 @@ func TestBackpressurePollPhaseFollowsTheWritersOwnDrain(t *testing.T) {
 
 type walOpSample struct{ phase, volume, outcome string }
 
-// The live checkpoint records one checkpoint sample per dirty write, labelled
-// by outcome, and none for a clean map.
-func TestSaveLiveCheckpointRecordsItsOutcome(t *testing.T) {
+// A map commit records one checkpoint sample per batch it writes, labelled by
+// outcome, and none for a clean map.
+func TestMapCommitRecordsItsOutcome(t *testing.T) {
 	vb := newGCTestVB(t, t.TempDir(), "vol-ckpt-timer", false)
 	ctx := context.Background()
 
@@ -117,23 +117,29 @@ func TestSaveLiveCheckpointRecordsItsOutcome(t *testing.T) {
 		return append([]walOpSample(nil), samples...)
 	}
 
-	vb.BlocksToObject.dirty.Store(false)
+	installBlock := func(block uint64) {
+		t.Helper()
+		require.NoError(t, vb.Write(block, randomBlockData(1)))
+		require.NoError(t, vb.Flush())
+		require.NoError(t, vb.WriteWALToChunk(true))
+	}
+
 	require.NoError(t, vb.persistMapCtx(ctx))
 	assert.Empty(t, got(), "a clean map is not a checkpoint")
 
-	vb.BlocksToObject.dirty.Store(true)
+	installBlock(0)
 	require.NoError(t, vb.persistMapCtx(ctx))
 	assert.Equal(t, []walOpSample{{"checkpoint", "vol-ckpt-timer", "success"}}, got())
 
 	fb, ok := vb.Backend.(*file.Backend)
 	require.True(t, ok)
-	failing := &failingCheckpointBackend{Backend: fb}
-	failing.failLiveCheckpoint.Store(true)
+	failing := &mapFaultBackend{Backend: fb}
+	failing.failHead.Store(true)
 	vb.Backend = failing
 	t.Cleanup(func() { vb.Backend = fb })
 	vb.checkpointRetryBackoff = time.Microsecond
 
-	vb.BlocksToObject.dirty.Store(true)
+	installBlock(1)
 	require.Error(t, vb.persistMapCtx(ctx))
 	assert.Equal(t, []walOpSample{
 		{"checkpoint", "vol-ckpt-timer", "success"},

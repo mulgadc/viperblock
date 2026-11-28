@@ -48,7 +48,7 @@ func reopenVB(t *testing.T, dir, vol string, like *VB) *VB {
 	reopened.StopChunkUploader()
 	t.Cleanup(func() { reopened.StopWALSyncer() })
 	require.NoError(t, reopened.LoadState())
-	require.NoError(t, reopened.LoadLiveCheckpoint())
+	claimTestMap(t, reopened)
 	require.NoError(t, reopened.RecoverLocalWALs())
 	require.NoError(t, reopened.OpenWAL(&reopened.WAL,
 		fmt.Sprintf("%s/%s", reopened.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, reopened.WAL.WallNum.Load(), reopened.GetVolume()))))

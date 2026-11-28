@@ -91,6 +91,7 @@ func TestVBStateMeta_CrossVolumeSwapFailsLoad(t *testing.T) {
 		}, "file", cfg)
 		require.NoError(t, err)
 		require.NoError(t, vb.Backend.Init())
+		initTestMap(t, vb)
 		vb.BlockSize = DefaultBlockSize
 		require.NoError(t, vb.SaveState())
 		return vb
@@ -139,6 +140,7 @@ func TestVBStateMeta_RollbackLosesTieToFsync(t *testing.T) {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	vb.BlockSize = DefaultBlockSize
 
 	// v1: first SaveState. Snapshot the backend blob immediately so
@@ -207,6 +209,7 @@ func TestVBStateMeta_FirstOpenNoPriorState(t *testing.T) {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	vb.BlockSize = DefaultBlockSize
 
 	// Pre-condition: no VBState on disk yet.
@@ -320,6 +323,7 @@ func TestVBStateMeta_TruncatedBlobFails(t *testing.T) {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	vb.BlockSize = DefaultBlockSize
 	require.NoError(t, vb.SaveState())
 

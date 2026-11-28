@@ -74,6 +74,7 @@ func TestShortBackendRead_IsRefusedNotZeroFilled(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
 	initTestMap(t, vb)
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir,
 		types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir,
@@ -105,6 +106,7 @@ func TestShortBackendRead_IsRefusedNotZeroFilled(t *testing.T) {
 	vb.PendingBackendWrites.mu.Lock()
 	vb.PendingBackendWrites.Blocks = nil
 	vb.PendingBackendWrites.mu.Unlock()
+	vb.LeaseEpoch = nextTestEpoch()
 	require.NoError(t, vb.LoadLiveCheckpoint())
 
 	got, readErr := vb.ReadAt(0, uint64(nBlocks*bs))

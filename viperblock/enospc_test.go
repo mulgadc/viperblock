@@ -184,6 +184,7 @@ func newEnospcTestVB(t *testing.T) (*VB, *enospcBackend) {
 	vb.checkpointRetryBackoff = time.Microsecond
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	backend := &enospcBackend{Backend: vb.Backend}
 	vb.Backend = backend
 

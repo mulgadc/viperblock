@@ -77,6 +77,7 @@ func newBackpressureTestVB(t *testing.T, maxPendingBytes uint64, drainDelay time
 	vb.ShardedWAL = nil
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	vb.Backend = &slowBackend{Backend: vb.Backend, delay: drainDelay}
 
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))

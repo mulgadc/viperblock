@@ -898,6 +898,7 @@ func TestWriteAndRead(t *testing.T) {
 		// Note: WALNum is incremented by Close() -> WriteWALToChunk, so it will be +1
 		assert.Equal(t, prevWALNum+1, vb.WAL.WallNum.Load())
 
+		vb.LeaseEpoch = nextTestEpoch()
 		err = vb.LoadLiveCheckpoint()
 		assert.NoError(t, err)
 

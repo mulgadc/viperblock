@@ -62,6 +62,7 @@ func newCloseCtxTestVB(t *testing.T, root, volumeName string) (*VB, file.FileCon
 
 	require.NoError(t, vb.Backend.Init())
 	initTestMap(t, vb)
+	require.NoError(t, vb.SaveState())
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 
@@ -169,7 +170,7 @@ func TestCloseCtxDeadlineAbortLeavesWALRecoverable(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, reopened.Backend.Init())
 	require.NoError(t, reopened.LoadState())
-	require.NoError(t, reopened.LoadLiveCheckpoint())
+	claimTestMap(t, reopened)
 	require.NoError(t, reopened.RecoverLocalWALs())
 	require.NoError(t, reopened.OpenWAL(&reopened.WAL, fmt.Sprintf("%s/%s", reopened.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, reopened.WAL.WallNum.Load(), reopened.GetVolume()))))
 	require.NoError(t, reopened.OpenWAL(&reopened.BlockToObjectWAL, fmt.Sprintf("%s/%s", reopened.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, reopened.BlockToObjectWAL.WallNum.Load(), reopened.GetVolume()))))

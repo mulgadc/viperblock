@@ -121,6 +121,7 @@ func TestRecoverLocalWALs_RemovesShortHeaderStub(t *testing.T) {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, seed.Backend.Init())
+	initTestMap(t, seed)
 	require.NoError(t, seed.SaveState())
 	seed.StopChunkUploader()
 	seed.StopWALSyncer()
@@ -139,7 +140,7 @@ func TestRecoverLocalWALs_RemovesShortHeaderStub(t *testing.T) {
 	require.NoError(t, vb.Backend.Init())
 	require.NoError(t, vb.LoadState())
 	require.NoError(t, vb.EnsureVolumeUUID())
-	require.NoError(t, vb.LoadLiveCheckpoint())
+	claimTestMap(t, vb)
 	require.NoError(t, vb.RecoverLocalWALs())
 
 	_, statErr := os.Stat(walPath)

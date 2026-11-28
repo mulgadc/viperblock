@@ -35,6 +35,7 @@ func openOnSharedStore(t *testing.T, store, localDir, volume string, key *master
 		vb.StopWALSyncer()
 	})
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	return vb
 }
 

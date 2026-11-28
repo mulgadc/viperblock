@@ -99,6 +99,7 @@ func TestChunkDrainFastPathSurvivesAColdReopen(t *testing.T) {
 	vb.BlocksToObject.lookup.clear()
 	vb.BlocksToObject.mu.Unlock()
 
+	vb.LeaseEpoch = nextTestEpoch()
 	require.NoError(t, vb.LoadLiveCheckpointCtx(context.Background()))
 	assertBlocks(t, vb, 0, 128, 0x7E)
 }

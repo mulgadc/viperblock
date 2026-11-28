@@ -50,6 +50,7 @@ func newFileBackedVB(t *testing.T, name string, key *masterkey.Key) *VB {
 	}, "file", cfg)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	return vb
 }
 
