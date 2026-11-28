@@ -140,7 +140,7 @@ func BenchmarkBlockCache(b *testing.B) {
 		windows := hot / pfbWindow
 		sparse := func() {
 			vb.Cache.purge()
-			for w := uint64(0); w < windows; w++ {
+			for w := range windows {
 				base := uint64(pfbFragBlocks) + w*pfbWindow
 				for blk := uint64(0); blk < pfbWindow; blk += 64 {
 					if _, err := vb.ReadAtCtx(ctx, (base+blk+1)*bs, 63*bs); err != nil {
