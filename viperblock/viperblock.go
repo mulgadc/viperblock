@@ -3657,7 +3657,7 @@ func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64
 				computed = crc32.Update(computed, crc32.IEEETable, data[28:])
 				if computed != checksum {
 					vb.logger().Error("checksum mismatch in sharded WAL", "shard", shardID)
-					results[shardID].err = fmt.Errorf("checksum mismatch in shard %d", shardID)
+					results[shardID].err = fmt.Errorf("%w: checksum mismatch in shard %d", ErrIntegrity, shardID)
 					return
 				}
 
