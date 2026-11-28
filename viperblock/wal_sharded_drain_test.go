@@ -74,6 +74,15 @@ func TestShardedDrainRetainsDamagedShard(t *testing.T) {
 			},
 			integrity: true,
 		},
+		"checksum": {
+			damage: func(t *testing.T, vb *VB, name string, data []byte, _ string) []byte {
+				damaged := bytes.Clone(data)
+				damaged[vb.WALHeaderSize()+24] ^= 0xff
+				require.NoError(t, os.WriteFile(name, damaged, 0o600))
+				return damaged
+			},
+			integrity: true,
+		},
 		"magic": {
 			damage: func(t *testing.T, _ *VB, name string, data []byte, _ string) []byte {
 				damaged := bytes.Clone(data)
