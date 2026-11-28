@@ -132,4 +132,40 @@ func BenchmarkBlockCache(b *testing.B) {
 			}
 		})
 	})
+
+	// Mostly hits with a few misses: each 1 MiB read finds 4 of its 256 blocks
+	// uncached. The pattern is restored outside the timer after every pass.
+	b.Run("sparse-miss-1MiB", func(b *testing.B) {
+		vb := pfbOpen(b, root, name, DefaultCacheBlocks, 0, false)
+		windows := hot / pfbWindow
+		sparse := func() {
+			vb.Cache.purge()
+			for w := uint64(0); w < windows; w++ {
+				base := uint64(pfbFragBlocks) + w*pfbWindow
+				for blk := uint64(0); blk < pfbWindow; blk += 64 {
+					if _, err := vb.ReadAtCtx(ctx, (base+blk+1)*bs, 63*bs); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		}
+		sparse()
+		dst := make([]byte, window)
+		b.SetBytes(int64(window))
+		b.ReportAllocs()
+		b.ResetTimer()
+		w := uint64(0)
+		for b.Loop() {
+			if w == windows {
+				b.StopTimer()
+				sparse()
+				w = 0
+				b.StartTimer()
+			}
+			if err := vb.ReadAtInto(uint64(pfbFragBlocks)*bs+w*window, dst); err != nil {
+				b.Fatal(err)
+			}
+			w++
+		}
+	})
 }
