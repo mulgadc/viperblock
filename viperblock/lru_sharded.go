@@ -44,7 +44,7 @@ func (s *shardedLRU) shardIndex(block uint64) int {
 	if len(s.shards) == 1 {
 		return 0
 	}
-	return int((block * cacheShardHashMult) >> s.shift)
+	return int((block * cacheShardHashMult) >> s.shift) //nolint:gosec // G115: shift >= 58, so the index is below 64
 }
 
 func (s *shardedLRU) shard(block uint64) *lru.Cache[uint64, cachedBlock] {
