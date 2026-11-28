@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -970,4 +971,82 @@ func TestOpenRetryAfterReplayWithHeldCompaction(t *testing.T) {
 	got := make([]byte, 2*blockSize)
 	require.NoError(t, cold.PRead(got, blockSize, 0))
 	require.Equal(t, append(replayed, newData...), got)
+}
+
+func TestSnapshotListenerRefusesOverlappingDrain(t *testing.T) {
+	dir, err := os.MkdirTemp("", "vb-drain-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	path := filepath.Join(dir, "snapshot.sock")
+	entered := make(chan struct{})
+	released := make(chan struct{})
+	release := sync.OnceFunc(func() { close(released) })
+	var serialize sync.Mutex
+	var drains atomic.Int32
+	snapshotListenerDone = startSnapshotListener(func() error {
+		serialize.Lock()
+		defer serialize.Unlock()
+		if drains.Add(1) == 1 {
+			close(entered)
+			<-released
+		}
+		return nil
+	}, path)
+	t.Cleanup(func() {
+		release()
+		stopSnapshotListener()
+	})
+
+	connect := func() net.Conn {
+		t.Helper()
+		conn, err := net.DialTimeout("unix", path, time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
+		return conn
+	}
+	first := connect()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("the first drain did not start")
+	}
+	require.NoError(t, first.Close())
+
+	second := connect()
+	reply, err := io.ReadAll(second)
+	require.NoError(t, err, "an overlapping request must not wait for a stalled drain")
+	require.Equal(t, "ERR\n", string(reply))
+	require.EqualValues(t, 1, drains.Load())
+
+	release()
+	require.Eventually(t, func() bool {
+		conn, err := net.DialTimeout("unix", path, time.Second)
+		if err != nil {
+			return false
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		reply, err := io.ReadAll(conn)
+		return err == nil && string(reply) == "OK\n"
+	}, time.Second, 10*time.Millisecond)
+	require.EqualValues(t, 2, drains.Load())
+}
+
+func BenchmarkSnapshotListenerReadyDrain(b *testing.B) {
+	dir, err := os.MkdirTemp("", "vb-drain-bench-")
+	require.NoError(b, err)
+	b.Cleanup(func() { require.NoError(b, os.RemoveAll(dir)) })
+	path := filepath.Join(dir, "snapshot.sock")
+	snapshotListenerDone = startSnapshotListener(func() error { return nil }, path)
+	b.Cleanup(stopSnapshotListener)
+	b.ReportAllocs()
+	for b.Loop() {
+		conn, err := net.Dial("unix", path)
+		require.NoError(b, err)
+		reply, err := io.ReadAll(conn)
+		require.NoError(b, err)
+		require.Equal(b, "OK\n", string(reply))
+		require.NoError(b, conn.Close())
+	}
 }
