@@ -643,7 +643,7 @@ The plugin implements the full nbdkit interface:
 | `cache_size` | LRU cache size (percentage of system memory) |
 | `shardwal` | Enable sharded WAL (`true`/`false`) |
 | `lease_epoch` | This launch's lease epoch; orders a format-2 volume's map heads above every earlier launch's |
-| `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `false`) |
+| `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `true`) |
 
 ---
 
