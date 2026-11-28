@@ -31,13 +31,16 @@ func TestShardedLRUEvictsWithinShard(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, s.shards, 4)
 
-	// Fill every shard to capacity, then overfill one shard by one entry.
-	byShard := map[int][]uint64{}
-	for b := uint64(0); len(byShard) < 4 || minLen(byShard) < 257; b++ {
-		i := s.shardIndex(b)
-		byShard[i] = append(byShard[i], b)
+	// Collect 257 keys per shard from a bounded search, fill every shard, then
+	// overfill shard 0 by one entry.
+	byShard := make([][]uint64, 4)
+	for b := uint64(0); b < 1<<16; b++ {
+		if i := s.shardIndex(b); len(byShard[i]) < 257 {
+			byShard[i] = append(byShard[i], b)
+		}
 	}
-	for i := range 4 {
+	for i := range byShard {
+		require.Len(t, byShard[i], 257, "shard %d is reachable by enough keys", i)
 		for _, b := range byShard[i][:256] {
 			s.Add(b, cachedBlock{seqNum: b})
 		}
@@ -47,19 +50,11 @@ func TestShardedLRUEvictsWithinShard(t *testing.T) {
 	_, ok := s.Get(byShard[0][0])
 	assert.False(t, ok, "the least recent entry of the overfilled shard is evicted")
 	for i := 1; i < 4; i++ {
-		_, ok := s.Get(byShard[i][0])
-		assert.True(t, ok, "shard %d keeps its entries", i)
-	}
-}
-
-func minLen(m map[int][]uint64) int {
-	n := -1
-	for _, v := range m {
-		if n < 0 || len(v) < n {
-			n = len(v)
+		for _, b := range byShard[i][:256] {
+			_, ok := s.Get(b)
+			require.True(t, ok, "shard %d keeps block %d", i, b)
 		}
 	}
-	return n
 }
 
 func TestShardedLRUSpreadsStrides(t *testing.T) {
