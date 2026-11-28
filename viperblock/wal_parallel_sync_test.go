@@ -32,7 +32,7 @@ func setupShardedSyncVB(t *testing.T) *VB {
 }
 
 // A flush must not return while a sync that could cover its records is still
-// in flight on that shard, even though the other shards sync concurrently.
+// in flight: the leader's sync has cleared the flag and is mid-fsync.
 func TestShardedFlushWaitsForAnInFlightShardSync(t *testing.T) {
 	vb := setupShardedSyncVB(t)
 	data := make([]byte, vb.BlockSize)
@@ -41,32 +41,41 @@ func TestShardedFlushWaitsForAnInFlightShardSync(t *testing.T) {
 	require.NoError(t, vb.flushWrites())
 
 	shard := vb.ShardedWAL.Shards[0]
-	shard.syncMu.Lock() // a sync of shard 0 is in flight
-	flushed := make(chan error, 1)
-	go func() { flushed <- vb.Flush() }()
+	shard.mu.Lock() // the leader sync stops after clearing dirty, before fsync
+	leader := make(chan error, 1)
+	go func() { leader <- shard.sync() }()
+	require.Eventually(t, func() bool { return !shard.dirty.Load() }, 5*time.Second, time.Millisecond)
+
+	follower := make(chan error, 1)
+	go func() { follower <- vb.Flush() }()
 	select {
-	case err := <-flushed:
-		t.Fatalf("Flush returned %v while shard 0's sync was in flight", err)
+	case err := <-follower:
+		t.Fatalf("Flush returned %v while the leader's sync was in flight", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	shard.syncMu.Unlock()
-	require.NoError(t, <-flushed)
-	assert.False(t, shard.dirty.Load(), "the flush synced shard 0 once the in-flight sync ended")
+	shard.mu.Unlock()
+	require.NoError(t, <-leader)
+	require.NoError(t, <-follower)
 }
 
-// A shard whose fsync fails fails the flush, and stays dirty for a retry.
-func TestShardedFlushReturnsAShardSyncError(t *testing.T) {
+// Two failing shards and one healthy dirty shard: the flush returns the lower
+// shard's error, the failed shards stay dirty and the healthy one is synced.
+func TestShardedFlushReturnsTheFirstShardSyncError(t *testing.T) {
 	vb := setupShardedSyncVB(t)
 	data := make([]byte, vb.BlockSize)
 	_, _ = rand.Read(data)
-	require.NoError(t, vb.Write(3, data))
+	for _, b := range []uint64{2, 5, 9} {
+		require.NoError(t, vb.Write(b, data))
+	}
 	require.NoError(t, vb.flushWrites())
 
-	shard := vb.ShardedWAL.Shards[3&ShardMask]
-	require.True(t, shard.dirty.Load())
-	require.NoError(t, shard.DB.Close()) // the next fsync on this shard fails
-	err := vb.syncShardedWAL()
+	sh := vb.ShardedWAL.Shards
+	require.NoError(t, sh[5&ShardMask].DB.Close())
+	require.NoError(t, sh[9&ShardMask].DB.Close())
+	err := vb.Flush()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), fmt.Sprintf("shard %d", 3&ShardMask))
-	assert.True(t, shard.dirty.Load(), "a failed sync leaves the shard dirty")
+	assert.Contains(t, err.Error(), fmt.Sprintf("shard %d", 5&ShardMask))
+	assert.True(t, sh[5&ShardMask].dirty.Load())
+	assert.True(t, sh[9&ShardMask].dirty.Load())
+	assert.False(t, sh[2&ShardMask].dirty.Load(), "the healthy shard finished its sync")
 }
