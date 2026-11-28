@@ -200,7 +200,7 @@ func pfbOpen(b *testing.B, root, name string, cacheBlocks int, delay time.Durati
 	require.True(b, ok)
 	require.NoError(b, fb.Init())
 	require.NoError(b, vb.LoadState())
-	require.NoError(b, vb.LoadBlockState())
+	require.NoError(b, vb.LoadLiveCheckpoint())
 	if writable {
 		pfbOpenWALs(b, vb)
 		b.Cleanup(func() { pfbRetire(vb) })

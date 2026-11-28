@@ -31,6 +31,7 @@ func newRMWVB(t *testing.T) *VB {
 	})
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir,
 		types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir,

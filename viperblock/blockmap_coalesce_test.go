@@ -8,7 +8,6 @@ package viperblock
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -226,9 +225,9 @@ func TestBlockMapCoalesce_EncryptedReadback(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(want, got), "encrypted readback after cross-chunk-boundary overwrite must be byte-identical")
 
-	// Cold-reload the block map from a saved checkpoint, exercising
-	// parseBlockCheckpoint's recoalescing and BlockStore's restore path.
-	require.NoError(t, vb.SaveLiveCheckpoint())
+	// Cold-reload the block map from a commit, exercising the map load's
+	// recoalescing and BlockStore's restore path.
+	require.NoError(t, vb.persistMapCtx(t.Context()))
 	vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
 	require.NoError(t, vb.LoadLiveCheckpoint())
 
@@ -258,118 +257,4 @@ func TestBlockMapCoalesce_EntryCountIsExtentsNotBlocks(t *testing.T) {
 		"map must grow by O(extents) (%d chunks), not O(blocks) (%d blocks)", wantExtents, numBlocks)
 	require.Equal(t, wantExtents, vb.BlockStore.PersistedExtentCount())
 	require.Less(t, entryCount, numBlocks/10, "sanity: coalesced entry count must be far smaller than the block count")
-}
-
-// TestCoalesceBlockLookup_LegacyCountdownNumBlocks pins that
-// coalesceBlockLookup ignores the legacy writer's per-run countdown
-// (NumBlocks stored as 10, 9, ... 1 for one record per physical block) and
-// rebuilds runs from real geometry instead, preserving each block's own
-// SeqNum. Trusting the countdown would collapse a run onto its first
-// record's SeqNum and corrupt per-block AEAD nonces on reload.
-func TestCoalesceBlockLookup_LegacyCountdownNumBlocks(t *testing.T) {
-	const numBlocks = 10
-	const stride uint32 = DefaultBlockSize
-
-	flat := make(map[uint64]BlockLookup, numBlocks)
-	for i := range numBlocks {
-		flat[uint64(i)] = BlockLookup{
-			StartBlock:   uint64(i),
-			NumBlocks:    uint16(numBlocks - i), // legacy per-run countdown: 10, 9, ... 1
-			ObjectID:     0,
-			ObjectOffset: uint32(i) * stride,
-			SeqNum:       uint64(100 + i), // distinct per block
-		}
-	}
-
-	got := coalesceBlockLookup(flat, stride)
-
-	require.Len(t, got, 1, "the whole consecutive run must coalesce into exactly one extent, ignoring the vestigial countdown NumBlocks")
-	entry := got[0]
-	require.Equal(t, uint16(numBlocks), entry.NumBlocks, "coalesced run length must reflect real geometry, not the on-disk countdown")
-	for i := range numBlocks {
-		require.Equal(t, uint64(100+i), entry.seqNumAt(i),
-			"block %d must keep its own SeqNum; trusting the countdown would smear block 0's SeqNum across the run", i)
-	}
-}
-
-// TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback is the end-to-end
-// counterpart to TestCoalesceBlockLookup_LegacyCountdownNumBlocks: it forges
-// an on-disk checkpoint in the legacy layout for a real encrypted volume,
-// loads it through the production path, and asserts every block's AEAD
-// SeqNum survives into the BlockStore extent index and still decrypts.
-func TestBlockMapCoalesce_LegacyCheckpointEncryptedReadback(t *testing.T) {
-	var raw [masterkey.MasterKeySize]byte
-	for i := range raw {
-		raw[i] = 0x5C
-	}
-	aead, err := masterkey.NewAEAD(raw[:])
-	require.NoError(t, err)
-	key := &masterkey.Key{AEAD: aead, Fingerprint: masterkey.Fingerprint(raw[:])}
-
-	const blocksPerChunk = 16 // one chunk holds the whole write -> one extent
-	const numBlocks = 10
-	vb := newCoalesceTestVB(t, "vol-legacy-ckpt", blocksPerChunk, key)
-
-	data := randomBlocks(t, vb, numBlocks)
-	require.NoError(t, vb.WriteAt(0, data))
-	require.NoError(t, vb.Flush())
-	require.NoError(t, vb.WriteWALToChunk(true))
-
-	got, err := vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
-	require.NoError(t, err)
-	require.True(t, bytes.Equal(data, got), "baseline encrypted readback must be byte-identical")
-
-	// Capture the real per-block AEAD SeqNums the chunk was actually sealed with.
-	vb.BlocksToObject.mu.RLock()
-	require.Equal(t, 1, vb.BlocksToObject.lookup.len(), "the write must have coalesced into one extent")
-	entry := lookupMap(&vb.BlocksToObject)[0]
-	realSeqNums := make([]uint64, numBlocks)
-	for i := range numBlocks {
-		realSeqNums[i] = entry.seqNumAt(i)
-	}
-	objectID := entry.ObjectID
-	objectOffset := entry.ObjectOffset
-	vb.BlocksToObject.mu.RUnlock()
-
-	stride := vb.blockStride()
-
-	// Forge the legacy on-disk checkpoint: correct per-block SeqNum/offset,
-	// but NumBlocks written as the pre-coalesce per-run countdown (10, 9, ... 1).
-	legacy := vb.BlockToObjectWALHeader()
-	for i := range numBlocks {
-		rec := BlockLookup{
-			StartBlock:   uint64(i),
-			NumBlocks:    uint16(numBlocks - i), // vestigial countdown, as the old writer emitted
-			ObjectID:     objectID,
-			ObjectOffset: objectOffset + uint32(i)*stride,
-			SeqNum:       realSeqNums[i],
-		}
-		legacy = append(legacy, vb.writeBlockWalChunk(&rec)...)
-	}
-
-	// Guard the guard: the first forged record really must carry the inflated
-	// countdown, else this test would not exercise the regression at all.
-	firstNumBlocks := binary.BigEndian.Uint16(legacy[blockCheckpointHeaderSize+8 : blockCheckpointHeaderSize+10])
-	require.Equal(t, uint16(numBlocks), firstNumBlocks, "first legacy record must carry the inflated countdown NumBlocks")
-
-	// Drop all in-memory state and reload purely from the forged legacy bytes.
-	vb.BlockStore = NewUnifiedBlockStore(vb.BlockSize)
-	vb.BlocksToObject.mu.Lock()
-	vb.BlocksToObject.lookup.clear()
-	err = vb.parseBlockCheckpoint(legacy)
-	vb.BlocksToObject.mu.Unlock()
-	require.NoError(t, err)
-
-	// The BlockStore extent index must carry each block's ORIGINAL SeqNum,
-	// not one smeared from trusting the countdown.
-	for i := range numBlocks {
-		be, ok := vb.BlockStore.ReadEntry(uint64(i))
-		require.True(t, ok, "block %d must resolve in the reloaded BlockStore", i)
-		require.Equal(t, realSeqNums[i], be.SeqNum,
-			"block %d SeqNum must survive legacy-checkpoint load; a wrong SeqNum corrupts its AEAD nonce", i)
-	}
-
-	got, err = vb.ReadAt(0, uint64(numBlocks)*uint64(vb.BlockSize))
-	require.NoError(t, err, "legacy-checkpoint reload must not corrupt AEAD nonces")
-	require.True(t, bytes.Equal(data, got), "encrypted readback after legacy-checkpoint reload must be byte-identical")
 }

@@ -19,11 +19,9 @@ import (
 	"github.com/mulgadc/viperblock/types"
 )
 
-// Map formats a volume's VBState can record. Zero is format 1.
-const (
-	MapFormatLegacy uint8 = 1
-	MapFormatDelta  uint8 = 2
-)
+// MapFormatDelta is the block-map format a volume's VBState records: a chain
+// of heads, deltas and bases under map/. A load refuses any other value.
+const MapFormatDelta uint8 = 2
 
 const (
 	mapHeadPrefix  = "map/head."
@@ -62,31 +60,27 @@ var (
 	crc32cTable    = crc32.MakeTable(crc32.Castagnoli)
 )
 
-// Errors a format-2 volume's map can fail with. Each fails the open or the
-// commit rather than serve or persist a map that may be stale.
+// Errors a volume's map can fail with. Each fails the open or the commit
+// rather than serve or persist a map that may be stale.
 var (
+	ErrMapNotLoaded     = errors.New("map: this engine has not loaded or created the volume's map")
 	ErrMapHeadMissing   = errors.New("map: no committed head")
 	ErrMapObjectCorrupt = errors.New("map: object missing or fails its digest")
 	ErrMapEpochNotNewer = errors.New("map: newest head's epoch is not below this launch's")
-	ErrMapNoLeaseEpoch  = errors.New("map: a format-2 commit needs a lease epoch")
+	ErrMapNoLeaseEpoch  = errors.New("map: a commit needs a lease epoch")
 	ErrMapNotClaimed    = errors.New("map: this launch has not committed its first head")
 	ErrMapFenced        = errors.New("map: a newer lease holder has committed; this writer is fenced")
 	ErrMapLineage       = errors.New("map: the newest head belongs to a different creation than VBState")
 )
 
-// MapFenceStub is what a format-2 volume holds at both v1 checkpoint keys.
-// Every v1 parser rejects it on its magic before touching the map.
+// MapFenceStub is what creation writes at the two older checkpoint keys, so
+// an older build that reads either key fails closed on its magic.
 func MapFenceStub() []byte {
 	stub := make([]byte, 0, 64)
 	stub = append(stub, mapFenceMagic[:]...)
 	stub = binary.BigEndian.AppendUint16(stub, 0xFFFF)
 	stub = append(stub, "viperblock map format 2: open with a build that reads it\n"...)
 	return stub
-}
-
-// IsMapFenceStub reports whether data is the format-2 fence stub.
-func IsMapFenceStub(data []byte) bool {
-	return len(data) >= 6 && bytes.Equal(data[:4], mapFenceMagic[:]) && binary.BigEndian.Uint16(data[4:6]) == 0xFFFF
 }
 
 func mapObjectKey(prefix string, epoch, id uint64) string {
@@ -425,8 +419,8 @@ type mapChainState struct {
 	// deleteBusy is set while deferred deletes are processed.
 	deleteBusy atomic.Bool
 	fenced     atomic.Bool
-	// delta identifies an initialized format-2 map.
-	delta     atomic.Bool
+	// loaded is set once this engine has loaded or created the map.
+	loaded    atomic.Bool
 	qualified atomic.Bool
 	// committed is set once any head of this volume is durable, and is
 	// persisted in VBState as the creation-complete signal.
@@ -465,21 +459,20 @@ func (vb *VB) mapDeleteDeferral() time.Duration {
 	return DefaultMapDeleteDeferral
 }
 
-// IsMapDelta reports whether this volume persists its map as format 2.
-func (vb *VB) IsMapDelta() bool { return vb.mapChain.delta.Load() }
-
-func (vb *VB) persistedMapFormat() uint8 {
-	if vb.IsMapDelta() {
-		return MapFormatDelta
+// requireMapLoaded refuses a commit or state write from an engine that holds
+// no map: what it would persist could name an empty map over a real one.
+func (vb *VB) requireMapLoaded() error {
+	if !vb.mapChain.loaded.Load() {
+		return ErrMapNotLoaded
 	}
-	return vb.MapFormat
+	return nil
 }
 
-// setMapDelta switches the in-memory volume to format 2, so installs record
-// their runs for the next delta.
-func (vb *VB) setMapDelta() {
+// setMapLoaded marks the map as loaded or created, so installs record their
+// runs for the next delta.
+func (vb *VB) setMapLoaded() {
 	vb.MapFormat = MapFormatDelta
-	vb.mapChain.delta.Store(true)
+	vb.mapChain.loaded.Store(true)
 	vb.BlocksToObject.mu.Lock()
 	vb.BlocksToObject.trackChanges = true
 	vb.BlocksToObject.mu.Unlock()
@@ -547,8 +540,8 @@ func (vb *VB) MapCounters() (headN, objN uint64) {
 	return vb.mapChain.headN.Load(), vb.mapChain.objN.Load()
 }
 
-// InitMapDeltaCtx makes a new volume format 2 under its creation epoch: the
-// fence stub at both v1 keys, then the base and first head, each durable
+// InitMapDeltaCtx creates a new volume's map under its creation epoch: the
+// fence stub at both older keys, then the base and first head, each durable
 // before the next. With publish false, as for a seeded volume, no head is
 // written yet: the first commit writes the seeded map as the base, so no
 // head ever names an incomplete creation. The caller writes VBState last.
@@ -566,7 +559,7 @@ func (vb *VB) InitMapDeltaCtx(ctx context.Context, publish bool) error {
 	}
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
-	vb.setMapDelta()
+	vb.setMapLoaded()
 	vb.MapCreationEpoch = vb.LeaseEpoch
 	vb.mapChain.head.Creation = vb.LeaseEpoch
 	if !publish {
@@ -838,7 +831,7 @@ func (vb *VB) loadMapChainCtx(ctx context.Context) error {
 		vb.MapCreationEpoch = h.Creation
 	}
 	vb.MapFormat = MapFormatDelta
-	vb.mapChain.delta.Store(true)
+	vb.mapChain.loaded.Store(true)
 	vb.BlocksToObject.trackChanges = true
 	vb.BlocksToObject.changes = nil
 	vb.BlocksToObject.dirty.Store(false)
@@ -901,9 +894,9 @@ func (vb *VB) finishMapLoadLocked() {
 // ClaimMapCtx commits this launch's first head over the loaded map, before
 // any guest IO, so it supersedes every head an older writer can still issue.
 func (vb *VB) ClaimMapCtx(ctx context.Context) error {
-	vb.logger().Info("map format", "volume", vb.VolumeName, "format", max(vb.MapFormat, MapFormatLegacy), "epoch", vb.LeaseEpoch)
-	if !vb.IsMapDelta() {
-		return nil
+	vb.logger().Info("map claim", "volume", vb.VolumeName, "epoch", vb.LeaseEpoch)
+	if err := vb.requireMapLoaded(); err != nil {
+		return err
 	}
 	if vb.LeaseEpoch == 0 {
 		return ErrMapNoLeaseEpoch
@@ -943,9 +936,6 @@ func (vb *VB) ClaimMapCtx(ctx context.Context) error {
 
 // persistMapCtx commits the in-memory block map.
 func (vb *VB) persistMapCtx(ctx context.Context) error {
-	if !vb.IsMapDelta() {
-		return vb.SaveLiveCheckpointCtx(ctx)
-	}
 	vb.checkpointMu.Lock()
 	defer vb.checkpointMu.Unlock()
 	return vb.commitMapDeltaLocked(ctx)
@@ -967,6 +957,9 @@ func (vb *VB) mapBaseDueLocked() bool {
 // nothing: the batch merges into the next commit under new names.
 // Caller holds checkpointMu.
 func (vb *VB) commitMapDeltaLocked(ctx context.Context) (err error) {
+	if err := vb.requireMapLoaded(); err != nil {
+		return err
+	}
 	if vb.mapChain.fenced.Load() {
 		return ErrMapFenced
 	}

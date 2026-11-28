@@ -60,6 +60,7 @@ func newGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 	})
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 
@@ -100,7 +101,7 @@ func reopenGCTestVB(t *testing.T, root, volumeName string, gcEnabled bool) *VB {
 
 	require.NoError(t, vb.Backend.Init())
 	require.NoError(t, vb.LoadState())
-	require.NoError(t, vb.LoadLiveCheckpoint())
+	claimTestMap(t, vb)
 	// Must run between LoadLiveCheckpoint and OpenWAL: a "crashed" instance
 	// may have left an empty, freshly rotated local WAL segment at the same
 	// WallNum this reopen is about to (re-)create, and OpenWAL appends
@@ -146,6 +147,7 @@ func cloneGCTestVB(t *testing.T, source *VB, snapshotID, cloneVolumeName string,
 	})
 
 	require.NoError(t, clone.Backend.Init())
+	initTestMap(t, clone)
 	require.NoError(t, clone.OpenWAL(&clone.WAL, fmt.Sprintf("%s/%s", clone.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, clone.WAL.WallNum.Load(), clone.GetVolume()))))
 	require.NoError(t, clone.OpenWAL(&clone.BlockToObjectWAL, fmt.Sprintf("%s/%s", clone.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, clone.BlockToObjectWAL.WallNum.Load(), clone.GetVolume()))))
 	require.NoError(t, clone.OpenFromSnapshot(snapshotID))
@@ -290,7 +292,7 @@ func TestChunkGC_PartiallyReferencedChunkSurvives(t *testing.T) {
 // Test 3: Refcount rebuild across restart. A chunk that becomes wholly
 // unreferenced but is never swept before the process exits must still be
 // reclaimable by the next process's first sweep, via reconcileChunksOnce --
-// parseBlockCheckpoint's rebuild only sees the loaded live map, which by
+// the map load's rebuild only sees the loaded live map, which by
 // definition omits a zero-reference chunk.
 func TestChunkGC_RefcountRebuildAcrossRestart(t *testing.T) {
 	root := t.TempDir()
@@ -1250,6 +1252,7 @@ func TestChunkGC_TickerDispatchesSweep(t *testing.T) {
 		assert.NoError(t, vb.RemoveLocalFiles())
 	})
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 
@@ -1326,6 +1329,7 @@ func TestChunkGC_SweepsUnderSustainedSlowDrains(t *testing.T) {
 	vb, err := New(&vbconfig, FileBackend, backendConfig)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 

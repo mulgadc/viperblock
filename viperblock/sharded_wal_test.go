@@ -38,6 +38,7 @@ func setupShardedTestVB(t *testing.T) (*VB, func()) {
 
 	err = vb.Backend.Init()
 	require.NoError(t, err)
+	initTestMap(t, vb)
 
 	// Enable sharded WAL
 	vb.UseShardedWAL = true

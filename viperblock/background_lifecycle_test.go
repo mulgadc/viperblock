@@ -38,6 +38,7 @@ func newLifecycleTestVB(t *testing.T) *VB {
 	require.NoError(t, err)
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
 		vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load())))
 

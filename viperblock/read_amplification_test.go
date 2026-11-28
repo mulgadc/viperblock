@@ -75,6 +75,7 @@ func seedVolume(t testing.TB, volumeName string, key *masterkey.Key, writeBytes 
 	})
 	require.NoError(t, err)
 	require.NoError(t, writer.Backend.Init())
+	initTestMap(t, writer)
 	require.NoError(t, writer.OpenWAL(&writer.WAL, filepath.Join(writer.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, writer.WAL.WallNum.Load(), writer.GetVolume()))))
 	require.NoError(t, writer.OpenWAL(&writer.BlockToObjectWAL, filepath.Join(writer.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, writer.BlockToObjectWAL.WallNum.Load(), writer.GetVolume()))))
 
@@ -127,7 +128,7 @@ func coldReaderVB(t testing.TB, backendRoot, volumeName string, key *masterkey.K
 	require.True(t, ok)
 	require.NoError(t, fb.Init())
 	require.NoError(t, vb.LoadState())
-	require.NoError(t, vb.LoadBlockState())
+	require.NoError(t, vb.LoadLiveCheckpoint())
 
 	counter := &chunkReadCounter{Backend: fb}
 	vb.Backend = counter

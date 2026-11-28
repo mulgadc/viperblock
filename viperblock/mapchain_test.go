@@ -163,6 +163,31 @@ func (mv *mapVolume) engine(t testing.TB, epoch uint64) (*VB, *mapFaultBackend) 
 	return vb, wrapped
 }
 
+// testEpochs hands every test engine a lease epoch above all earlier ones, so
+// a reopen always outranks the engine that wrote the map.
+var testEpochs atomic.Uint64
+
+func nextTestEpoch() uint64 { return testEpochs.Add(1) }
+
+// initTestMap creates the volume's map the way creation does. An engine
+// built without a lease epoch is given the next one.
+func initTestMap(t testing.TB, vb *VB) {
+	t.Helper()
+	if vb.LeaseEpoch == 0 {
+		vb.LeaseEpoch = nextTestEpoch()
+	}
+	require.NoError(t, vb.InitMapDeltaCtx(context.Background(), true))
+}
+
+// claimTestMap loads the committed map on a fresh engine and claims it under
+// the next lease epoch, the way an attach does before guest IO.
+func claimTestMap(t testing.TB, vb *VB) {
+	t.Helper()
+	vb.LeaseEpoch = nextTestEpoch()
+	require.NoError(t, vb.LoadLiveCheckpoint())
+	require.NoError(t, vb.ClaimMapCtx(context.Background()))
+}
+
 func openMapWALs(t testing.TB, vb *VB) {
 	t.Helper()
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
@@ -280,17 +305,6 @@ func TestMapObject_RejectsCorruptionAndWrongVolume(t *testing.T) {
 	assert.ErrorIs(t, err, ErrMapObjectCorrupt)
 }
 
-func TestMapFenceStub_EveryV1ParserRejectsIt(t *testing.T) {
-	stub := MapFenceStub()
-	_, err := ParseBlockCheckpointBytes(stub, 1)
-	assert.Error(t, err)
-	vb := newGCTestVB(t, t.TempDir(), "vol-v1", false)
-	vb.BlocksToObject.mu.Lock()
-	err = vb.parseBlockCheckpoint(stub)
-	vb.BlocksToObject.mu.Unlock()
-	assert.Error(t, err, "a v1 load must fail on the stub, never open an empty map")
-}
-
 func TestMapDelta_ReopenReadsEveryCommittedWrite(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
 	vb, _ := mv.create(t, 5)
@@ -304,10 +318,15 @@ func TestMapDelta_ReopenReadsEveryCommittedWrite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, readBlocks(t, re, 0, 3))
 	assert.Contains(t, mv.mapKeys(t, mapHeadPrefix), mapObjectKey(mapHeadPrefix, 6, 0), "the launch claims before serving IO")
-	assert.Empty(t, mv.mapKeys(t, "map/blocks"), "no v1 checkpoint is written")
-	live, err := os.ReadFile(filepath.Join(mv.root, types.GetFilePath(types.FileTypeBlockCheckpointLive, 0, mv.name)))
-	require.NoError(t, err)
-	assert.True(t, IsMapFenceStub(live), "the live key keeps the stub")
+	assert.Empty(t, mv.mapKeys(t, "map/blocks"), "no older checkpoint is written")
+	for _, key := range []string{
+		types.GetFilePath(types.FileTypeBlockCheckpointLive, 0, mv.name),
+		types.GetFilePath(types.FileTypeBlockCheckpoint, 0, mv.name),
+	} {
+		stored, err := os.ReadFile(filepath.Join(mv.root, key))
+		require.NoError(t, err, key)
+		assert.Equal(t, MapFenceStub(), stored, "%s keeps the stub", key)
+	}
 }
 
 func TestMapDelta_OpenFailsWhenEpochIsNotNewer(t *testing.T) {
@@ -575,7 +594,7 @@ func TestMapDelta_ChunkDeletesWaitOutTheDeferral(t *testing.T) {
 	assertChunkGone(t, vb.Backend, mv.name, garbage)
 }
 
-func TestMapDelta_StubIsTheAuthorityWithoutVBState(t *testing.T) {
+func TestMapDelta_LoadWithoutVBStateReadsTheChain(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
 	vb, _ := mv.create(t, 5)
 	data := randomBlockData(1)
@@ -583,13 +602,9 @@ func TestMapDelta_StubIsTheAuthorityWithoutVBState(t *testing.T) {
 	vb.Detach()
 
 	re, _ := mv.engine(t, 6)
-	require.NoError(t, re.LoadState())
-	re.MapFormat = 0
-	re.mapChain.delta.Store(false)
-	re.BlocksToObject.trackChanges = false
 	require.NoError(t, re.LoadLiveCheckpoint())
-	assert.True(t, re.IsMapDelta())
 	assert.Equal(t, data, readBlocks(t, re, 0, 1))
+	require.NoError(t, re.ClaimMapCtx(context.Background()), "the loaded map can be claimed")
 }
 
 func walFilesUnder(t *testing.T, root, volumeName string) []string {
@@ -831,24 +846,6 @@ func waitDeletesIdle(vb *VB, ch chan struct{}) {
 	drainSignals(ch)
 }
 
-func TestVolumeOpenRejectsFormatOneBeforeWriting(t *testing.T) {
-	mv := newMapVolume(t, volumeSize, nil)
-	writer, _ := mv.engine(t, 5)
-	writer.MapFormat = MapFormatLegacy
-	require.NoError(t, writer.SaveState())
-	writer.Detach()
-
-	reader, backend := mv.engine(t, 6)
-	key := types.GetFilePath(types.FileTypeConfig, 0, reader.GetVolume())
-	before, err := backend.ReadCtx(t.Context(), types.FileTypeConfig, 0, 0, 0)
-	require.NoError(t, err, key)
-	require.ErrorContains(t, reader.LoadStateAndLiveCheckpointCtx(t.Context()), "unsupported block-map format")
-	after, err := backend.ReadCtx(t.Context(), types.FileTypeConfig, 0, 0, 0)
-	require.NoError(t, err, key)
-	require.Equal(t, before, after)
-	require.Empty(t, mv.mapKeys(t, mapHeadPrefix))
-}
-
 // A head from one creation attempt never pairs with another attempt's VBState.
 func TestMapDelta_HeadFromAnotherCreationFailsTheOpen(t *testing.T) {
 	mv := newMapVolume(t, volumeSize, nil)
@@ -1060,4 +1057,22 @@ func TestLoadRejectsUnsupportedMapFormatBeforeWriting(t *testing.T) {
 	require.NotEmpty(t, before)
 	assert.ErrorContains(t, reader.LoadStateCtx(t.Context()), "unsupported block-map format 1")
 	assert.Equal(t, before, treeDigests(t, mv.root), "the refused load wrote nothing")
+}
+
+// An engine that never loaded or created the map uploads and publishes
+// nothing on Close, and keeps its local WAL for the next open.
+func TestCloseWithoutAMapWritesNothing(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, nil)
+	vb, _ := mv.engine(t, 5)
+	openMapWALs(t, vb)
+	backendRoot := filepath.Join(mv.root, mv.name)
+	before := treeDigests(t, backendRoot)
+
+	require.NoError(t, vb.Write(0, randomBlockData(1)))
+	require.ErrorIs(t, vb.CloseCtx(t.Context()), ErrMapNotLoaded)
+
+	assert.Equal(t, before, treeDigests(t, backendRoot), "no object is written under the volume prefix")
+	_, err := os.Stat(filepath.Join(vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume())))
+	assert.ErrorIs(t, err, os.ErrNotExist, "no local VBState is written")
+	assert.NotEmpty(t, walFilesUnder(t, mv.root, mv.name), "the local WAL stays for the next open")
 }

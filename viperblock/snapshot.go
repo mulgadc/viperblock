@@ -66,13 +66,13 @@ type InheritedLayer struct {
 	SourceVolumeNameHash [32]byte
 }
 
-// drainForSnapshot runs the flush -> WriteWALToChunk -> SaveLiveCheckpoint
+// drainForSnapshot runs the flush -> WriteWALToChunk -> map commit
 // sequence that gets the source volume fully persisted before its map is
 // frozen into a snapshot. That sequence is a drain in all but name, so it
 // holds drainMu for exactly the same reason DrainToBackendCtx does (see
 // drainMu's doc comment): two overlapping drains rotate different WAL
-// segments and can publish their live checkpoints out of order, leaving the
-// older map on the backend. The volume then boots pointing blocks at
+// segments and can commit their maps out of order, leaving the older map on
+// the backend. The volume then boots pointing blocks at
 // superseded chunks and cold reads hand back stale bytes with no error
 // anywhere -- the durability half of the stale-drain repoint hazard.
 //
@@ -93,17 +93,14 @@ func (vb *VB) drainForSnapshot() error {
 		return fmt.Errorf("snapshot WAL-to-chunk failed: %w", err)
 	}
 
-	// Taken before the checkpoint for the reason DrainToBackendCtx takes it
-	// there: the batch must hold only generations this checkpoint covers.
+	// Taken before the commit for the reason DrainToBackendCtx takes it
+	// there: the batch must hold only generations this commit covers.
 	reclaim := vb.takeConsolidatedWALs()
 
-	// Chunk uploads no longer refresh the live checkpoint per-chunk (that
-	// was a parallel-upload hazard, see createChunkFile). Refresh it once
-	// here so the source volume's live checkpoint reflects the chunks just
-	// uploaded, same as DrainToBackendCtx does after its own drain.
-	// Non-fatal: a stale live checkpoint self-heals on the next drain.
+	// One commit names the chunks just uploaded, as DrainToBackendCtx does
+	// after its own drain. Non-fatal: the next drain commits them.
 	if err := vb.persistMapCtx(context.Background()); err != nil {
-		vb.logger().Warn("CreateSnapshot: SaveLiveCheckpoint failed", "err", err)
+		vb.logger().Warn("CreateSnapshot: map commit failed", "err", err)
 		vb.returnConsolidatedWALs(reclaim)
 		return nil
 	}

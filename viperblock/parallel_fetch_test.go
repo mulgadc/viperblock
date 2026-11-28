@@ -240,6 +240,7 @@ func seedVolumeChunks(t *testing.T, volumeName string, key *masterkey.Key, chunk
 	})
 	require.NoError(t, err)
 	require.NoError(t, writer.Backend.Init())
+	initTestMap(t, writer)
 	require.NoError(t, writer.OpenWAL(&writer.WAL, filepath.Join(writer.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, writer.WAL.WallNum.Load(), writer.GetVolume()))))
 	require.NoError(t, writer.OpenWAL(&writer.BlockToObjectWAL, filepath.Join(writer.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, writer.BlockToObjectWAL.WallNum.Load(), writer.GetVolume()))))
 
@@ -291,7 +292,7 @@ func fragReader(t *testing.T, root, volumeName string, key *masterkey.Key, cache
 	require.True(t, ok)
 	require.NoError(t, fb.Init())
 	require.NoError(t, vb.LoadState())
-	require.NoError(t, vb.LoadBlockState())
+	require.NoError(t, vb.LoadLiveCheckpoint())
 	vb.UseBlockStore = blockStore
 
 	gate := newFetchGate(fb, target)

@@ -62,6 +62,7 @@ func openEncryptedVBInDir(t *testing.T, dir, volumeName string, key *masterkey.K
 	require.NoError(t, vb.Backend.Init())
 	vb.BlockSize = DefaultBlockSize
 	vb.ObjBlockSize = 16 * DefaultBlockSize
+	initTestMap(t, vb)
 	require.NoError(t, vb.SaveState())
 	require.NoError(t, vb.OpenWAL(&vb.WAL,
 		fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
@@ -416,7 +417,7 @@ func TestEncryptedChunk_LiveCheckpointSeqNumConsistency(t *testing.T) {
 	require.NoError(t, writer.Write(0, data))
 	require.NoError(t, writer.Flush())
 	require.NoError(t, writer.WriteWALToChunk(true))
-	require.NoError(t, writer.SaveLiveCheckpoint())
+	require.NoError(t, writer.persistMapCtx(t.Context()))
 
 	// Remount: fresh VB over the same backend loading only from the live
 	// checkpoint — no in-memory write buffer. This is what happens on remount

@@ -124,9 +124,6 @@ var mapHeadN, mapObjN atomic.Uint64
 
 // The volume lock serializes this update with the next engine's Open.
 func rememberMapCounters(vb *viperblock.VB) {
-	if !vb.IsMapDelta() {
-		return
-	}
 	headN, objN := vb.MapCounters()
 	mapHeadN.Store(max(mapHeadN.Load(), headN))
 	mapObjN.Store(max(mapObjN.Load(), objN))

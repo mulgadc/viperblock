@@ -360,7 +360,7 @@ func TestLoadFromSnapshot(t *testing.T) {
 		// Save clone state
 		err = clone.SaveState()
 		require.NoError(t, err)
-		err = clone.SaveBlockState()
+		err = clone.persistMapCtx(t.Context())
 		require.NoError(t, err)
 
 		// Simulate reopening: reset and reload
@@ -378,7 +378,7 @@ func TestLoadFromSnapshot(t *testing.T) {
 		assert.NotNil(t, clone.BaseBlockMap)
 
 		// Reload clone's own block state
-		err = clone.LoadBlockState()
+		err = clone.LoadLiveCheckpoint()
 		require.NoError(t, err)
 
 		// Read snapshot block (block 0) -- should work via base map
@@ -524,62 +524,9 @@ func TestFlatSectionBinaryRoundtrip(t *testing.T) {
 	})
 }
 
-// TestLiveCheckpointFallback verifies that when no live checkpoint exists,
-// LoadLiveCheckpoint falls back to LoadBlockState and recovers the block map.
-func TestLiveCheckpointFallback(t *testing.T) {
-	runWithBackends(t, "live_checkpoint_fallback", func(t *testing.T, vb *VB) {
-		data := make([]byte, DefaultBlockSize*3)
-		rand.Read(data)
-
-		require.NoError(t, vb.Write(0, data))
-		require.NoError(t, vb.Flush())
-
-		if vb.UseShardedWAL {
-			require.NoError(t, vb.WriteShardedWALToChunk(true))
-		} else {
-			require.NoError(t, vb.WriteWALToChunk(true))
-		}
-
-		// SaveBlockState (not SaveLiveCheckpoint) — no live checkpoint will exist.
-		require.NoError(t, vb.SaveBlockState())
-
-		reader := &VB{
-			VolumeName:   vb.VolumeName,
-			VolumeSize:   vb.VolumeSize,
-			BlockSize:    vb.BlockSize,
-			ObjBlockSize: vb.ObjBlockSize,
-			Version:      vb.Version,
-			BaseDir:      vb.BaseDir,
-			Backend:      vb.Backend,
-			BlockToObjectWAL: WAL{
-				WALMagic: vb.BlockToObjectWAL.WALMagic,
-			},
-			BlocksToObject: BlocksToObject{},
-		}
-
-		// No live checkpoint exists: must fall back to LoadBlockState.
-		require.NoError(t, reader.LoadLiveCheckpoint())
-
-		vb.BlocksToObject.mu.RLock()
-		defer vb.BlocksToObject.mu.RUnlock()
-
-		assert.Equal(t, reader.BlocksToObject.lookup.len(), vb.BlocksToObject.lookup.len(),
-			"fallback must restore the full block map")
-
-		for blockNum, want := range lookupMap(&vb.BlocksToObject) {
-			got, ok := lookupMap(&reader.BlocksToObject)[blockNum]
-			assert.True(t, ok, "block %d missing after fallback", blockNum)
-			if ok {
-				assert.Equal(t, want.ObjectID, got.ObjectID, "block %d ObjectID", blockNum)
-				assert.Equal(t, want.ObjectOffset, got.ObjectOffset, "block %d ObjectOffset", blockNum)
-			}
-		}
-	})
-}
-
-// TestLiveCheckpointRoundtrip verifies that SaveLiveCheckpoint serialises the
-// block map to a fixed backend key and LoadLiveCheckpoint restores it exactly
-// in a separate VB instance, including small writes below the 4 MB WAL flush threshold.
+// TestLiveCheckpointRoundtrip verifies that LoadLiveCheckpoint restores a
+// committed block map exactly in a separate VB instance, including small
+// writes below the 4 MB WAL flush threshold.
 func TestLiveCheckpointRoundtrip(t *testing.T) {
 	runWithBackends(t, "live_checkpoint", func(t *testing.T, vb *VB) {
 		// 3 blocks = 12 KiB — well below the 4 MB WAL consolidation threshold.
@@ -598,7 +545,7 @@ func TestLiveCheckpointRoundtrip(t *testing.T) {
 			require.NoError(t, vb.WriteWALToChunk(true))
 		}
 
-		require.NoError(t, vb.SaveLiveCheckpoint())
+		require.NoError(t, vb.persistMapCtx(t.Context()))
 
 		// Reader VB shares the same backend but has no WAL files open —
 		// this mirrors the snapshotRunningVolume path in spinifex.
@@ -657,7 +604,7 @@ func TestObjectNumReconcileOnLoad(t *testing.T) {
 				require.NoError(t, vb.WriteWALToChunk(true))
 			}
 		}
-		require.NoError(t, vb.SaveLiveCheckpoint())
+		require.NoError(t, vb.persistMapCtx(t.Context()))
 
 		var maxObjectID uint64
 		vb.BlocksToObject.mu.RLock()
@@ -847,7 +794,7 @@ func TestNewCarriesSnapshotLinkFromConfig(t *testing.T) {
 		assert.Equal(t, source.VolumeName, reader.SourceVolumeName)
 		require.NotNil(t, reader.BaseBlockMap, "LoadState must have called OpenFromSnapshot")
 
-		require.NoError(t, reader.LoadBlockState())
+		require.NoError(t, reader.LoadLiveCheckpoint())
 
 		readData, err := reader.ReadAt(0, uint64(reader.BlockSize))
 		require.NoError(t, err)

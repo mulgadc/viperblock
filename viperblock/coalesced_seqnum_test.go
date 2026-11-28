@@ -40,7 +40,7 @@ func chunkOf(vb *VB, start uint64, fill byte, seqNums []uint64) ([]byte, []Block
 func checkpointAndReopen(t *testing.T, vb *VB, root, volumeName string) *VB {
 	t.Helper()
 	require.NoError(t, vb.SaveState())
-	require.NoError(t, vb.SaveLiveCheckpoint())
+	require.NoError(t, vb.persistMapCtx(context.Background()))
 	return reopenGCTestVB(t, root, volumeName, true)
 }
 

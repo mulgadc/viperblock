@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -289,4 +290,68 @@ func TestEncryptedReclaimWritesNoState(t *testing.T) {
 
 	assert.Zero(t, cb.count(types.FileTypeConfig),
 		"an encrypted drain must not persist state: reserveSeqNum owns that counter")
+}
+
+// countingBackend wraps a Backend and records WriteCtx calls by FileType.
+type countingBackend struct {
+	types.Backend
+
+	mu     sync.Mutex
+	counts map[types.FileType]int
+}
+
+func (c *countingBackend) WriteCtx(ctx context.Context, ft types.FileType, id uint64, h *[]byte, d *[]byte) error {
+	c.mu.Lock()
+	c.counts[ft]++
+	c.mu.Unlock()
+	return c.Backend.WriteCtx(ctx, ft, id, h, d)
+}
+
+func (c *countingBackend) count(ft types.FileType) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[ft]
+}
+
+// errBackend injects failures on the first failN WriteCtx calls for failType.
+type errBackend struct {
+	types.Backend
+
+	mu       sync.Mutex
+	failType types.FileType
+	failN    int
+	failed   int
+}
+
+func (e *errBackend) WriteCtx(ctx context.Context, ft types.FileType, id uint64, h *[]byte, d *[]byte) error {
+	if ft == e.failType {
+		e.mu.Lock()
+		if e.failed < e.failN {
+			e.failed++
+			e.mu.Unlock()
+			return errors.New("injected write failure")
+		}
+		e.mu.Unlock()
+	}
+	return e.Backend.WriteCtx(ctx, ft, id, h, d)
+}
+
+// openFastVBWithCounting opens a file-backed VB, stops the auto-started
+// uploader, wraps the backend with a write counter, and restarts the uploader
+// at the given interval.
+func openFastVBWithCounting(t *testing.T, dir, name string, interval time.Duration) (*VB, *countingBackend) {
+	t.Helper()
+	vb := openEncryptedVBInDir(t, dir, name, nil)
+	vb.StopChunkUploader()
+
+	cb := &countingBackend{Backend: vb.Backend, counts: make(map[types.FileType]int)}
+	vb.Backend = cb
+	vb.ChunkUploadInterval = interval
+	vb.StartChunkUploader()
+
+	t.Cleanup(func() {
+		vb.StopChunkUploader()
+		vb.StopWALSyncer()
+	})
+	return vb, cb
 }

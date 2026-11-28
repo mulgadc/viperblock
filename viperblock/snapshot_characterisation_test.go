@@ -76,7 +76,7 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 	require.NoError(t, owner.Write(0, blockAData))
 	require.NoError(t, owner.Flush())
 	require.NoError(t, owner.WriteShardedWALToChunk(true))
-	require.NoError(t, owner.SaveLiveCheckpoint())
+	require.NoError(t, owner.persistMapCtx(t.Context()))
 
 	// Construct a non-owning reader VB the way spinifex's
 	// snapshotRunningVolume does: shares the backend, never opens WAL files,
@@ -106,7 +106,7 @@ func TestCreateSnapshot_NonOwningPath_MissesWritesDurableAfterLoad(t *testing.T)
 	require.NoError(t, owner.Write(1, blockBData))
 	require.NoError(t, owner.Flush())
 	require.NoError(t, owner.WriteShardedWALToChunk(true))
-	require.NoError(t, owner.SaveLiveCheckpoint())
+	require.NoError(t, owner.persistMapCtx(t.Context()))
 	require.Greater(t, owner.ObjectNum.Load(), objectNumAtLoad,
 		"the owning process must have minted a new durable chunk for block 1")
 

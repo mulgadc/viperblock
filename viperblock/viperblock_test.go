@@ -177,7 +177,9 @@ func TestMain(m *testing.M) {
 			DataDir:    dataDir,
 			CertPath:   filepath.Join(repoRoot, "config", "server.pem"),
 			KeyPath:    filepath.Join(repoRoot, "config", "server.key"),
-			BucketName: "predastore",
+			// Not the reserved bucket: this server does not answer the
+			// latest-map-head lookup, so heads are found by listing.
+			BucketName: "viperblock-test",
 			AccessKey:  AccessKey,
 			SecretKey:  SecretKey,
 			AccountID:  "123456789012",
@@ -314,6 +316,7 @@ func setupTestVB(t *testing.T, testCase TestVB, backendType BackendTest) (vb *VB
 
 	err = vb.Backend.Init()
 	assert.NoError(t, err)
+	initTestMap(t, vb)
 
 	// Open the chunk WAL (sharded or legacy)
 	if vb.UseShardedWAL {
@@ -895,7 +898,7 @@ func TestWriteAndRead(t *testing.T) {
 		// Note: WALNum is incremented by Close() -> WriteWALToChunk, so it will be +1
 		assert.Equal(t, prevWALNum+1, vb.WAL.WallNum.Load())
 
-		err = vb.LoadBlockState()
+		err = vb.LoadLiveCheckpoint()
 		assert.NoError(t, err)
 
 		// Compare they are the same
@@ -1059,6 +1062,7 @@ func setupWALTruncateTestVB(t *testing.T, tag string) (*VB, string) {
 	})
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 
 	walPath := fmt.Sprintf("%s/%s/wal/chunks/wal.%08d.bin",
 		vb.BaseDir, vb.GetVolume(), vb.WAL.WallNum.Load())

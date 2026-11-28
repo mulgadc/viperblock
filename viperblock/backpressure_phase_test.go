@@ -118,11 +118,11 @@ func TestSaveLiveCheckpointRecordsItsOutcome(t *testing.T) {
 	}
 
 	vb.BlocksToObject.dirty.Store(false)
-	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
+	require.NoError(t, vb.persistMapCtx(ctx))
 	assert.Empty(t, got(), "a clean map is not a checkpoint")
 
 	vb.BlocksToObject.dirty.Store(true)
-	require.NoError(t, vb.SaveLiveCheckpointCtx(ctx))
+	require.NoError(t, vb.persistMapCtx(ctx))
 	assert.Equal(t, []walOpSample{{"checkpoint", "vol-ckpt-timer", "success"}}, got())
 
 	fb, ok := vb.Backend.(*file.Backend)
@@ -134,7 +134,7 @@ func TestSaveLiveCheckpointRecordsItsOutcome(t *testing.T) {
 	vb.checkpointRetryBackoff = time.Microsecond
 
 	vb.BlocksToObject.dirty.Store(true)
-	require.Error(t, vb.SaveLiveCheckpointCtx(ctx))
+	require.Error(t, vb.persistMapCtx(ctx))
 	assert.Equal(t, []walOpSample{
 		{"checkpoint", "vol-ckpt-timer", "success"},
 		{"checkpoint", "vol-ckpt-timer", "error"},

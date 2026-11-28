@@ -61,6 +61,7 @@ func newCloseCtxTestVB(t *testing.T, root, volumeName string) (*VB, file.FileCon
 	vb.ShardedWAL = nil
 
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir, types.GetFilePath(types.FileTypeWALBlock, vb.BlockToObjectWAL.WallNum.Load(), vb.GetVolume()))))
 

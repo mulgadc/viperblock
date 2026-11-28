@@ -2,45 +2,14 @@ package viperblock
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
-	"sync/atomic"
 	"testing"
-	"testing/iotest"
 
-	"github.com/mulgadc/bluebottle/pkg/masterkey"
-	"github.com/mulgadc/viperblock/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// format1WALVolume writes three distinct blocks to a format-1 volume's
-// single-file WAL, flushes it and detaches, so the WAL is the only copy.
-func format1WALVolume(t *testing.T) (*mapVolume, string, []byte) {
-	t.Helper()
-	volume := newMapVolume(t, 128<<20, nil)
-	writer, _ := volume.engine(t, 1)
-	require.NoError(t, writer.SaveState())
-	require.False(t, writer.IsMapDelta())
-	openMapWALs(t, writer)
-	t.Cleanup(func() { detachConsolidationVolume(writer) })
-	blockSize := int(writer.BlockSize)
-	data := make([]byte, 0, 3*blockSize)
-	for i := range 3 {
-		data = append(data, bytes.Repeat([]byte{byte(0x41 + i)}, blockSize)...)
-	}
-	require.NoError(t, writer.WriteAt(0, data))
-	require.NoError(t, writer.Flush())
-	walName := writer.WAL.DB[len(writer.WAL.DB)-1].Name()
-	walBytes, err := os.ReadFile(walName)
-	require.NoError(t, err)
-	require.Len(t, walBytes, writer.WALHeaderSize()+3*(28+blockSize))
-	detachConsolidationVolume(writer)
-	return volume, walName, walBytes
-}
 
 // sealReader loads the volume the way the provider seal path does, with a
 // chunk-write counter in front of the backend.
@@ -48,7 +17,7 @@ func sealReader(t *testing.T, volume *mapVolume, epoch uint64) (*VB, *scanChunkW
 	t.Helper()
 	reader, _ := volume.engine(t, epoch)
 	require.NoError(t, reader.LoadState())
-	require.NoError(t, reader.LoadBlockState())
+	require.NoError(t, reader.LoadLiveCheckpoint())
 	require.NoError(t, reader.ClaimMapCtx(t.Context()))
 	writes := &scanChunkWrites{Backend: reader.Backend}
 	reader.Backend = writes
@@ -65,134 +34,6 @@ func checkWALRetained(t *testing.T, walName string, want []byte) {
 	}
 }
 
-func TestFormat1ReopenRetainsWALWithBadMidFileRecord(t *testing.T) {
-	t.Run("checksum", func(t *testing.T) {
-		volume, walName, walBytes := format1WALVolume(t)
-		reader, writes := sealReader(t, volume, 2)
-		damaged := bytes.Clone(walBytes)
-		damaged[reader.WALHeaderSize()+(28+int(reader.BlockSize))+24] ^= 0xff
-		require.NoError(t, os.WriteFile(walName, damaged, 0o600))
-
-		assert.ErrorIs(t, reader.RecoverLocalWALs(), ErrIntegrity)
-		checkWALRetained(t, walName, damaged)
-		assert.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
-	})
-	t.Run("readError", func(t *testing.T) {
-		volume, walName, walBytes := format1WALVolume(t)
-		reader, writes := sealReader(t, volume, 2)
-		header := reader.WALHeaderSize()
-		firstRecord := walBytes[header : header+28+int(reader.BlockSize)]
-		failedRead := errors.New("injected WAL read error")
-
-		err := reader.recoverLocalWALs(func(path string) ([]Block, uint64, error) {
-			require.Equal(t, walName, path)
-			return reader.readWALRecoveryRecords(io.MultiReader(bytes.NewReader(firstRecord), iotest.ErrReader(failedRead)), path)
-		})
-		assert.ErrorIs(t, err, ErrIntegrity)
-		assert.ErrorIs(t, err, failedRead)
-		checkWALRetained(t, walName, walBytes)
-		assert.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
-	})
-}
-
-func TestFormat1ReopenRetainsWALWithTornRecord(t *testing.T) {
-	for _, encrypted := range []bool{false, true} {
-		t.Run(fmt.Sprintf("encrypted=%t", encrypted), func(t *testing.T) {
-			var key *masterkey.Key
-			if encrypted {
-				key = testKey(t, 0x64)
-			}
-			volume := newMapVolume(t, 128<<20, key)
-			writer, _ := volume.engine(t, 1)
-			require.NoError(t, writer.SaveState())
-			openMapWALs(t, writer)
-			t.Cleanup(func() { detachConsolidationVolume(writer) })
-			require.NoError(t, writer.WriteAt(0, bytes.Repeat([]byte{0x73}, 8192)))
-			require.NoError(t, writer.Flush())
-			wal := writer.WAL.DB[len(writer.WAL.DB)-1]
-			info, err := wal.Stat()
-			require.NoError(t, err)
-			require.NoError(t, wal.Truncate(info.Size()-1))
-			damaged, err := os.ReadFile(wal.Name())
-			require.NoError(t, err)
-			detachConsolidationVolume(writer)
-
-			reader, writes := sealReader(t, volume, 2)
-			err = reader.RecoverLocalWALs()
-			assert.ErrorIs(t, err, ErrIntegrity)
-			assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
-			checkWALRetained(t, wal.Name(), damaged)
-			assert.Zero(t, writes.count.Load(), "failed recovery cannot publish a prefix")
-		})
-	}
-}
-
-var errLiveCheckpoint = errors.New("injected live checkpoint write failure")
-
-// liveCheckpointFailBackend fails every live-checkpoint write while fail is set.
-type liveCheckpointFailBackend struct {
-	types.Backend
-
-	fail atomic.Bool
-}
-
-var _ types.Backend = (*liveCheckpointFailBackend)(nil)
-
-func (b *liveCheckpointFailBackend) WriteCtx(ctx context.Context, typ types.FileType, id uint64, headers, data *[]byte) error {
-	if typ == types.FileTypeBlockCheckpointLive && b.fail.Load() {
-		return errLiveCheckpoint
-	}
-	return b.Backend.WriteCtx(ctx, typ, id, headers, data)
-}
-
-// A stale live checkpoint outranks the numbered one on the next live open, so
-// recovery must keep the WAL until the live checkpoint names its blocks, even
-// on a seal retry whose numbered checkpoint already does.
-func TestFormat1RecoveryRetainsWALWhenLiveCheckpointFails(t *testing.T) {
-	volume := newMapVolume(t, 128<<20, nil)
-	writer, _ := volume.engine(t, 1)
-	require.NoError(t, writer.SaveState())
-	openMapWALs(t, writer)
-	t.Cleanup(func() { detachConsolidationVolume(writer) })
-	stale := bytes.Repeat([]byte{0x11}, 8192)
-	require.NoError(t, writer.WriteAt(0, stale))
-	require.NoError(t, writer.DrainToBackend())
-	_, err := writer.Backend.ReadCtx(t.Context(), types.FileTypeBlockCheckpointLive, 0, 0, 0)
-	require.NoError(t, err, "the older live checkpoint must exist")
-	want := bytes.Repeat([]byte{0x5c}, 8192)
-	require.NoError(t, writer.WriteAt(0, want))
-	require.NoError(t, writer.Flush())
-	walName := writer.WAL.DB[len(writer.WAL.DB)-1].Name()
-	walBytes, err := os.ReadFile(walName)
-	require.NoError(t, err)
-	detachConsolidationVolume(writer)
-
-	failed, _ := sealReader(t, volume, 2)
-	failing := &liveCheckpointFailBackend{Backend: failed.Backend}
-	failing.fail.Store(true)
-	failed.Backend = failing
-	failedErr := failed.RecoverLocalWALs()
-	assert.ErrorIs(t, failedErr, errLiveCheckpoint)
-	checkWALRetained(t, walName, walBytes)
-	failed.Detach()
-	if failedErr == nil {
-		return
-	}
-
-	// The retry loads the numbered checkpoint the failed attempt wrote.
-	retry, _ := sealReader(t, volume, 3)
-	require.NoError(t, retry.RecoverLocalWALs())
-	retry.Detach()
-
-	fresh, _ := volume.engine(t, 4)
-	require.NoError(t, fresh.LoadState())
-	require.NoError(t, fresh.LoadLiveCheckpoint())
-	got, err := fresh.ReadAt(0, uint64(len(want)))
-	require.NoError(t, err)
-	require.True(t, bytes.Equal(want, got), "a live-checkpoint reader must see the recovered writes")
-}
-
-// The provider seal closes the volume when recovery succeeds, and a clean
 // close removes the local volume tree, so a WAL that recovery skips is lost.
 func TestSealRetainsWALWithDamagedHeader(t *testing.T) {
 	seal := func(t *testing.T, reader *VB, recoverWALs func() error) error {
@@ -227,7 +68,6 @@ func TestSealRetainsWALWithDamagedHeader(t *testing.T) {
 			damage(damaged)
 			require.NoError(t, os.WriteFile(walName, damaged, 0o600))
 			reader, writes := sealReader(t, volume, 2)
-			require.True(t, reader.IsMapDelta())
 
 			assert.Error(t, seal(t, reader, reader.RecoverLocalWALs))
 			checkWALRetained(t, walName, damaged)

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -112,8 +114,8 @@ func TestWALReclaimSkipsStrandedGeneration(t *testing.T) {
 }
 
 // TestWALReclaimDeferredUntilCheckpointLands gates the other half of the
-// ordering. Until the checkpoint naming a generation's blocks is durable the
-// local WAL is the only record that maps them, so a failed checkpoint must
+// ordering. Until the map head naming a generation's blocks is durable the
+// local WAL is the only record that maps them, so a failed head write must
 // leave the file alone and the next successful one must release it.
 func TestWALReclaimDeferredUntilCheckpointLands(t *testing.T) {
 	dir := t.TempDir()
@@ -122,37 +124,181 @@ func TestWALReclaimDeferredUntilCheckpointLands(t *testing.T) {
 	vb.checkpointRetryBackoff = time.Microsecond
 	t.Cleanup(func() { vb.StopWALSyncer() })
 
-	// SaveLiveCheckpointCtx retries three times internally, so exhaust them.
-	eb := &errBackend{Backend: vb.Backend, failType: types.FileTypeBlockCheckpointLive, failN: 3}
-	vb.Backend = eb
+	fb, ok := vb.Backend.(*file.Backend)
+	require.True(t, ok)
+	faults := &mapFaultBackend{Backend: fb}
+	faults.failHead.Store(true)
+	vb.Backend = faults
 
 	data := make([]byte, vb.BlockSize)
 	require.NoError(t, vb.WriteAt(0, data))
 
 	require.Error(t, vb.DrainToBackendCtx(context.Background()),
-		"a checkpoint that exhausts its retries must fail the drain")
+		"a head write that exhausts its retries must fail the drain")
 
 	vb.pendingWALMu.Lock()
 	held := len(vb.consolidatedWALs)
 	vb.pendingWALMu.Unlock()
-	assert.Equal(t, 1, held, "the consolidated generation must be held until a checkpoint lands")
+	assert.Equal(t, 1, held, "the consolidated generation must be held until a head lands")
 
 	filesBefore, _ := walDirBytes(t, vb)
 	assert.GreaterOrEqual(t, filesBefore, 2,
-		"the consolidated generation must stay on disk while the checkpoint is stale")
+		"the consolidated generation must stay on disk while no head names it")
 
-	// The injected failures are spent; this drain checkpoints cleanly.
-	require.NoError(t, vb.WriteAt(uint64(vb.BlockSize), data))
+	faults.failHead.Store(false)
+	want := make([]byte, vb.BlockSize)
+	for i := range want {
+		want[i] = 0x3c
+	}
+	require.NoError(t, vb.WriteAt(uint64(vb.BlockSize), want))
 	require.NoError(t, vb.DrainToBackendCtx(context.Background()))
 
 	vb.pendingWALMu.Lock()
 	remaining := len(vb.consolidatedWALs)
 	vb.pendingWALMu.Unlock()
-	assert.Equal(t, 0, remaining, "a durable checkpoint must release every held generation")
+	assert.Equal(t, 0, remaining, "a durable head must release every held generation")
 
 	filesAfter, _ := walDirBytes(t, vb)
 	assert.Less(t, filesAfter, filesBefore,
-		"the held generations must be reclaimed once the checkpoint is durable")
+		"the held generations must be reclaimed once a head names them")
+
+	reader := committedMapReader(t, vb)
+	for block, wantBytes := range [][]byte{data, want} {
+		got, err := reader.ReadAt(uint64(block)*uint64(vb.BlockSize), uint64(vb.BlockSize))
+		require.NoError(t, err, "block %d", block)
+		assert.Equal(t, wantBytes, got, "block %d reads back from the committed map", block)
+	}
+}
+
+// TestWALReclaimBoundsLocalGrowthUnderOverwrite keeps the serving host's WAL
+// bounded while an attached guest overwrites the same blocks drain after
+// drain, and the last bytes read back after a reopen.
+func TestWALReclaimBoundsLocalGrowthUnderOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "reclaim-overwrite", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	const rounds = 8
+	const blocks = 64
+	var firstFiles int
+	var firstBytes int64
+	last := make([]byte, blocks*int(vb.BlockSize))
+	for round := range rounds {
+		for i := range last {
+			last[i] = byte(round + 1)
+		}
+		require.NoError(t, vb.WriteAt(0, last))
+		require.NoError(t, vb.DrainToBackendCtx(context.Background()))
+		files, size := walDirBytes(t, vb)
+		if round == 0 {
+			firstFiles, firstBytes = files, size
+			continue
+		}
+		assert.LessOrEqual(t, files, firstFiles, "round %d: WAL file count grew", round)
+		assert.LessOrEqual(t, size, firstBytes, "round %d: WAL bytes grew", round)
+	}
+
+	reopened := reopenAfterCrash(t, vb)
+	got, err := reopened.ReadAt(0, uint64(len(last)))
+	require.NoError(t, err)
+	assert.Equal(t, last, got, "the last overwrite reads back after a reopen")
+}
+
+// hookMapHeadBackend runs fn once, before the first map head write it sees:
+// the window between a commit taking its batch and the head landing.
+type hookMapHeadBackend struct {
+	types.Backend
+
+	once sync.Once
+	fn   func()
+}
+
+var _ types.Backend = (*hookMapHeadBackend)(nil)
+
+func (h *hookMapHeadBackend) WriteKeyCtx(ctx context.Context, key string, data []byte) error {
+	if strings.Contains(key, mapHeadPrefix) {
+		h.once.Do(h.fn)
+	}
+	return h.Backend.WriteKeyCtx(ctx, key, data)
+}
+
+// committedMapReader opens a second view of the volume with no in-memory map
+// and no WAL of its own, so every block it returns came from the committed
+// map and the chunks that map names.
+func committedMapReader(t *testing.T, vb *VB) *VB {
+	t.Helper()
+	reader := &VB{
+		VolumeName:   vb.VolumeName,
+		VolumeSize:   vb.VolumeSize,
+		BlockSize:    vb.BlockSize,
+		ObjBlockSize: vb.ObjBlockSize,
+		Version:      vb.Version,
+		BaseDir:      vb.BaseDir,
+		Backend:      vb.Backend,
+		BlockToObjectWAL: WAL{
+			WALMagic: vb.BlockToObjectWAL.WALMagic,
+		},
+		BlocksToObject: BlocksToObject{},
+	}
+	require.NoError(t, reader.LoadLiveCheckpoint())
+	return reader
+}
+
+// consolidateBlock writes one block and rotates the WAL generation holding
+// it, which is what marks the block map dirty.
+func consolidateBlock(t *testing.T, vb *VB, block uint64, fill byte) []byte {
+	t.Helper()
+	buf := make([]byte, vb.BlockSize)
+	for i := range buf {
+		buf[i] = fill
+	}
+	require.NoError(t, vb.WriteAt(block*uint64(vb.BlockSize), buf))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.WriteWALToChunk(true))
+	return buf
+}
+
+// TestDrainSkippedAsCleanDoesNotReclaimAnUnnamedGeneration drives the real
+// drain. A generation consolidated while a head is in flight is named by no
+// durable head; if the next drain returns early as clean and reclaims it, an
+// acknowledged write reads back as zeros with no error anywhere.
+func TestDrainSkippedAsCleanDoesNotReclaimAnUnnamedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	vb := openEncryptedVBInDir(t, dir, "drain-clean-reclaim", nil)
+	vb.StopChunkUploader()
+	t.Cleanup(func() { vb.StopWALSyncer() })
+
+	var late []byte
+	var lateGen uint64
+	vb.Backend = &hookMapHeadBackend{Backend: vb.Backend, fn: func() {
+		late = consolidateBlock(t, vb, 1, 0x66)
+		vb.pendingWALMu.Lock()
+		require.Len(t, vb.consolidatedWALs, 1,
+			"the generation consolidated inside the head window must be the only one pending")
+		lateGen = vb.consolidatedWALs[0]
+		vb.pendingWALMu.Unlock()
+	}}
+
+	consolidateBlock(t, vb, 0, 0x77)
+	require.NoError(t, vb.DrainToBackend())
+
+	for _, path := range vb.walGenerationFiles(lateGen) {
+		_, err := os.Stat(path)
+		require.NoError(t, err, "the first drain must not reclaim a generation its head does not name: %s", filepath.Base(path))
+	}
+
+	require.NoError(t, vb.DrainToBackend())
+
+	vb.pendingWALMu.Lock()
+	held := len(vb.consolidatedWALs)
+	vb.pendingWALMu.Unlock()
+	require.Zero(t, held, "the second drain must have released the held generation")
+
+	got, err := committedMapReader(t, vb).ReadAt(uint64(vb.BlockSize), uint64(vb.BlockSize))
+	require.NoError(t, err)
+	assert.Equal(t, late, got,
+		"the block whose generation was reclaimed must be readable from the committed map")
 }
 
 // TestReclaimedWALStillReadsFromCheckpoint is the durability half: reclaim is
@@ -275,7 +421,7 @@ func TestUnlinkBeforeCheckpointLosesAcknowledgedWrites(t *testing.T) {
 		"unlinking on upload success must lose the write: if this passes, the chunk upload alone made the map durable and the checkpoint ordering could be dropped")
 
 	// The same volume, with the ordering honoured, keeps the data.
-	require.NoError(t, vb.SaveLiveCheckpoint())
+	require.NoError(t, vb.persistMapCtx(context.Background()))
 	after := &VB{
 		VolumeName:   vb.VolumeName,
 		VolumeSize:   vb.VolumeSize,
@@ -312,7 +458,7 @@ func reopenAfterCrash(t *testing.T, vb *VB) *VB {
 	require.NoError(t, err)
 	require.NoError(t, reopened.Backend.Init())
 	require.NoError(t, reopened.LoadState())
-	require.NoError(t, reopened.LoadLiveCheckpoint())
+	claimTestMap(t, reopened)
 	require.NoError(t, reopened.RecoverLocalWALs())
 	require.NoError(t, reopened.OpenWAL(&reopened.WAL,
 		fmt.Sprintf("%s/%s", reopened.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, reopened.WAL.WallNum.Load(), reopened.GetVolume()))))
@@ -467,7 +613,7 @@ func TestRecoveryWithASurvivingWALReadsByteIdentical(t *testing.T) {
 	}
 	require.NoError(t, vb.Flush())
 	require.NoError(t, vb.WriteWALToChunk(true))
-	require.NoError(t, vb.SaveLiveCheckpoint())
+	require.NoError(t, vb.persistMapCtx(context.Background()))
 
 	// The crash lands here: the checkpoint is durable and reclaim has not run,
 	// so every consolidated generation is still on disk.
@@ -618,7 +764,7 @@ func TestReclaimAndChunkGCCannotLoseABlockTogether(t *testing.T) {
 	require.NoError(t, reopened.Backend.Init())
 	t.Cleanup(func() { reopened.StopChunkUploader(); reopened.StopWALSyncer() })
 	require.NoError(t, reopened.LoadState())
-	require.NoError(t, reopened.LoadLiveCheckpoint())
+	claimTestMap(t, reopened)
 	require.NoError(t, reopened.RecoverLocalWALs())
 	require.NoError(t, reopened.OpenWAL(&reopened.WAL,
 		fmt.Sprintf("%s/%s", reopened.WAL.BaseDir, types.GetFilePath(types.FileTypeWALChunk, reopened.WAL.WallNum.Load(), reopened.GetVolume()))))

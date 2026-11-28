@@ -52,7 +52,7 @@ func TestStaleDrain_ColdReopenPreservesNewestBytes(t *testing.T) {
 
 	// Publish volume config + the live checkpoint, then boot a fresh VB.
 	require.NoError(t, vb.SaveState())
-	require.NoError(t, vb.SaveLiveCheckpoint())
+	require.NoError(t, vb.persistMapCtx(context.Background()))
 
 	reopened := reopenGCTestVB(t, root, vol, false)
 	got, err := reopened.ReadAt(0, uint64(bs))
@@ -106,6 +106,7 @@ func TestSequentialPartialWrites_ColdReopenByteExact(t *testing.T) {
 	vb, err := New(&vbconfig, FileBackend, backendConfig)
 	require.NoError(t, err)
 	require.NoError(t, vb.Backend.Init())
+	initTestMap(t, vb)
 	require.NoError(t, vb.OpenWAL(&vb.WAL, fmt.Sprintf("%s/%s", vb.WAL.BaseDir,
 		types.GetFilePath(types.FileTypeWALChunk, vb.WAL.WallNum.Load(), vb.GetVolume()))))
 	require.NoError(t, vb.OpenWAL(&vb.BlockToObjectWAL, fmt.Sprintf("%s/%s", vb.BlockToObjectWAL.BaseDir,
