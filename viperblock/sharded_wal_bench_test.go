@@ -193,6 +193,8 @@ func BenchmarkWriteWALToChunk_Sharded(b *testing.B) {
 		wg.Wait()
 		b.StartTimer()
 
-		vb.WriteShardedWALToChunk(true)
+		if err := vb.WriteShardedWALToChunk(true); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

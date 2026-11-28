@@ -1371,6 +1371,58 @@ func BenchmarkZero(b *testing.B) {
 	}
 }
 
+// BenchmarkPWriteParallel runs several writes at once on one connection, as
+// nbdkit's parallel thread model does, over disjoint ranges.
+func BenchmarkPWriteParallel(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	const callers = 4
+	for _, size := range []int{4 << 10, 1 << 20} {
+		b.Run(fmt.Sprintf("%dx%d", callers, size), func(b *testing.B) {
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newWriteBufferVolume(b, root, 1, nil)
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
+			buf := bytes.Repeat([]byte{0x56}, size)
+			const window = 16 << 20
+			offset := 0
+			b.SetBytes(int64(callers * size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if offset+callers*size > window {
+					b.StopTimer()
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					conn.vb = newVolume()
+					offset = 0
+					b.StartTimer()
+				}
+				var wg sync.WaitGroup
+				errs := make(chan error, callers)
+				for i := range callers {
+					start := uint64(offset + i*size) //nolint:gosec // G115: under the volume size
+					wg.Go(func() { errs <- conn.PWrite(buf, start, 0) })
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				offset += callers * size
+			}
+		})
+	}
+}
+
 // BenchmarkZeroParallel runs several zero requests at once on one connection,
 // as nbdkit's parallel thread model does, over disjoint ranges.
 func BenchmarkZeroParallel(b *testing.B) {
