@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1185,6 +1186,103 @@ func TestZeroFailedPartialBlockCountsQueuedBlocks(t *testing.T) {
 	require.ErrorContains(t, err, "failed to read block 1 for RMW")
 	require.Equal(t, uint64(blockSize), reopened.PendingBytes(),
 		"the full block queued before the failed read must be counted")
+}
+
+// Repeated failed steps must still be held to the high-water mark, or a
+// guest that keeps hitting one bad block grows the buffer without limit.
+func TestZeroRepeatedFailuresRespectBackpressure(t *testing.T) {
+	const (
+		blockSize  = 4096
+		maxPending = 4 * blockSize
+		attempts   = 20
+	)
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(1)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	openWriteBufferWAL(t, reopened)
+	reopened.MaxPendingBytes = maxPending
+	conn := &ViperBlockConnection{vb: reopened}
+	for range attempts {
+		err := conn.Zero(blockSize+512, 0, 0)
+		require.ErrorContains(t, err, "failed to read block 1 for RMW", "the original error must survive")
+		require.LessOrEqual(t, reopened.PendingBytes(), uint64(maxPending+blockSize),
+			"failed requests must not grow the buffer past the mark")
+	}
+}
+
+// gatedChunkReadBackend holds every chunk read until release is closed, then
+// fails it.
+type gatedChunkReadBackend struct {
+	types.Backend
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+var _ types.Backend = (*gatedChunkReadBackend)(nil)
+
+var errGatedChunkRead = errors.New("injected chunk read failure")
+
+func (g *gatedChunkReadBackend) hold() error {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return errGatedChunkRead
+}
+
+func (g *gatedChunkReadBackend) ReadCtx(ctx context.Context, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	if fileType == types.FileTypeChunk {
+		return nil, g.hold()
+	}
+	return g.Backend.ReadCtx(ctx, fileType, objectID, offset, length)
+}
+
+func (g *gatedChunkReadBackend) ReadChunkFromCtx(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
+	return nil, g.hold()
+}
+
+// A drain that frees a queued block while its writer still waits on a later
+// read must not take the counter below zero.
+func TestZeroDrainDuringFailedReadKeepsCounter(t *testing.T) {
+	const blockSize = 4096
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	openWriteBufferWAL(t, reopened)
+	gate := &gatedChunkReadBackend{Backend: reopened.Backend, entered: make(chan struct{}), release: make(chan struct{})}
+	reopened.Backend = gate
+	conn := &ViperBlockConnection{vb: reopened}
+	done := make(chan error, 1)
+	go func() { done <- conn.Zero(blockSize+512, 0, 0) }()
+	select {
+	case <-gate.entered:
+	case err := <-done:
+		t.Fatalf("Zero returned before its read of block 1: %v", err)
+	}
+
+	require.NoError(t, reopened.DrainToBackend())
+	assert.Less(t, reopened.PendingBytes(), uint64(1<<40), "the counter went below zero")
+	close(gate.release)
+	require.ErrorContains(t, <-done, "failed to read block 1 for RMW")
+	assert.Zero(t, reopened.PendingBytes())
 }
 
 func TestZeroOutOfRangeWritesNothing(t *testing.T) {
