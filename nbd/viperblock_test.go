@@ -985,14 +985,16 @@ func TestOpenRetryAfterReplayWithHeldCompaction(t *testing.T) {
 type pendingProbeBackend struct {
 	types.Backend
 
-	vb   *viperblock.VB
-	peak atomic.Uint64
+	vb      *viperblock.VB
+	peak    atomic.Uint64
+	uploads atomic.Int64
 }
 
 var _ types.Backend = (*pendingProbeBackend)(nil)
 
 func (p *pendingProbeBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectID uint64, headers *[]byte, data *[]byte) error {
 	if fileType == types.FileTypeChunk {
+		p.uploads.Add(1)
 		p.observe()
 	}
 	return p.Backend.WriteCtx(ctx, fileType, objectID, headers, data)
@@ -1040,9 +1042,11 @@ func TestZeroBoundsPendingBytesPerChunk(t *testing.T) {
 	require.NoError(t, vb.Flush())
 	require.NoError(t, vb.DrainToBackend())
 	probe.peak.Store(0)
+	probe.uploads.Store(0)
 
 	conn := &ViperBlockConnection{vb: vb}
 	require.NoError(t, conn.Zero(count, offset, 0))
+	require.Positive(t, probe.uploads.Load(), "the request must drive at least one drain")
 	t.Logf("peak pending bytes %d", probe.peak.Load())
 	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+chunkBytes+int(vb.BlockSize)),
 		"a zero request must be buffered a chunk at a time, under backpressure")
@@ -1074,6 +1078,7 @@ func TestZeroParallelBoundsPendingBytesPerRequest(t *testing.T) {
 	require.NoError(t, vb.Flush())
 	require.NoError(t, vb.DrainToBackend())
 	probe.peak.Store(0)
+	probe.uploads.Store(0)
 
 	conn := &ViperBlockConnection{vb: vb}
 	errs := make(chan error, requests)
@@ -1086,6 +1091,7 @@ func TestZeroParallelBoundsPendingBytesPerRequest(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
+	require.Positive(t, probe.uploads.Load(), "the request must drive at least one drain")
 	t.Logf("peak pending bytes %d", probe.peak.Load())
 	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+requests*(chunkBytes+int(vb.BlockSize))),
 		"each in-flight zero request may hold at most one chunk past the mark")
@@ -1143,6 +1149,7 @@ func TestZeroWithBlockLargerThanChunk(t *testing.T) {
 	offset, count := 1<<20+300, 30<<20
 	conn := &ViperBlockConnection{vb: vb}
 	require.NoError(t, conn.Zero(uint32(count), uint64(offset), 0)) //nolint:gosec // G115: small constants
+	require.Positive(t, probe.uploads.Load(), "the request must drive at least one drain")
 	t.Logf("peak pending bytes %d", probe.peak.Load())
 	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+blockSize),
 		"a request may hold at most one engine block past the mark")
@@ -1152,6 +1159,32 @@ func TestZeroWithBlockLargerThanChunk(t *testing.T) {
 	want := bytes.Clone(pattern)
 	clear(want[offset : offset+count])
 	require.Equal(t, want, got)
+}
+
+// A step whose last partial block cannot be read has already queued its full
+// blocks, and those must count toward backpressure.
+func TestZeroFailedPartialBlockCountsQueuedBlocks(t *testing.T) {
+	const blockSize = 4096
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(1)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	require.Zero(t, reopened.PendingBytes())
+	conn := &ViperBlockConnection{vb: reopened}
+	err = conn.Zero(blockSize+512, 0, 0)
+	require.ErrorContains(t, err, "failed to read block 1 for RMW")
+	require.Equal(t, uint64(blockSize), reopened.PendingBytes(),
+		"the full block queued before the failed read must be counted")
 }
 
 func TestZeroOutOfRangeWritesNothing(t *testing.T) {
@@ -1197,7 +1230,7 @@ func BenchmarkZero(b *testing.B) {
 	// needs a host with about 24 GiB free memory and 10 GiB free disk.
 	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20, 512 << 20, math.MaxUint32 - 4095} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {
-			if size > 512<<20 && os.Getenv("VIPERBLOCK_BENCH_ZERO_MAX") == "" {
+			if size > 512<<20 && os.Getenv("VIPERBLOCK_BENCH_ZERO_MAX") != "1" {
 				b.Skip("set VIPERBLOCK_BENCH_ZERO_MAX=1 on a host with room for a 4 GiB request")
 			}
 			root := filepath.Join(b.TempDir(), "volume")
