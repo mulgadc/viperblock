@@ -3614,19 +3614,24 @@ func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64
 			filename := filepath.Join(sw.BaseDir,
 				types.GetShardedWALPath(vb.GetVolume(), walNum, shardID))
 
+			// Open and rotation create every shard, empty ones too, so a
+			// missing file is a lost shard and fails the drain.
 			file, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 			if err != nil {
-				if os.IsNotExist(err) {
-					return // Empty shard, no file
-				}
 				results[shardID].err = fmt.Errorf("failed to open shard %d for reading: %w", shardID, err)
 				return
 			}
 			defer file.Close()
 
-			// Skip WAL header
-			if _, err := file.Seek(int64(headerSize), io.SeekStart); err != nil {
-				results[shardID].err = fmt.Errorf("failed to seek past header in shard %d: %w", shardID, err)
+			// The shard may hold the only copy of acknowledged writes, so a
+			// header or record that cannot be fully read fails the drain.
+			header := make([]byte, headerSize)
+			if _, err := io.ReadFull(file, header); err != nil {
+				results[shardID].err = fmt.Errorf("%w: read header of shard %d: %w", ErrIntegrity, shardID, err)
+				return
+			}
+			if err := vb.checkWALHeader(header, filename); err != nil {
+				results[shardID].err = fmt.Errorf("%w: shard %d: %w", ErrIntegrity, shardID, err)
 				return
 			}
 
@@ -3634,16 +3639,12 @@ func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64
 			recordSize := 28 + int(vb.BlockSize)
 			for {
 				data := make([]byte, recordSize)
-				n, err := file.Read(data)
-				if err != nil {
+				if _, err := io.ReadFull(file, data); err != nil {
 					if err == io.EOF {
 						break
 					}
-					results[shardID].err = fmt.Errorf("error reading shard %d: %w", shardID, err)
+					results[shardID].err = fmt.Errorf("%w: read record in shard %d: %w", ErrIntegrity, shardID, err)
 					return
-				}
-				if n < recordSize {
-					break // Incomplete record at EOF, discard
 				}
 
 				// Validate checksum
@@ -5262,21 +5263,30 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 		return nil, 0, fmt.Errorf("failed to read WAL header: %w", err)
 	}
 
-	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
-		if vb.EncryptionEnabled && bytes.Equal(header[:4], []byte{'V', 'B', 'W', 'L'}) {
-			return nil, 0, fmt.Errorf("%w: WAL magic mismatch in %s (file=VBWL, runtime=VBWE)", ErrPreEncryptionFormat, filename)
-		}
-		return nil, 0, fmt.Errorf("WAL magic mismatch in %s: got %q, expected %q", filename, header[:4], vb.WAL.WALMagic[:])
-	}
-	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
-		return nil, 0, fmt.Errorf("WAL version mismatch in %s", filename)
-	}
-	walBlockSize := binary.BigEndian.Uint32(header[6:10])
-	if walBlockSize != vb.BlockSize {
-		return nil, 0, fmt.Errorf("WAL blocksize mismatch in %s: WAL has %d, expected %d", filename, walBlockSize, vb.BlockSize)
+	if err := vb.checkWALHeader(header, filename); err != nil {
+		return nil, 0, err
 	}
 
 	return vb.readWALRecoveryRecords(f, filename)
+}
+
+// checkWALHeader rejects a WAL header whose magic, version or block size does
+// not match this volume.
+func (vb *VB) checkWALHeader(header []byte, filename string) error {
+	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
+		if vb.EncryptionEnabled && bytes.Equal(header[:4], []byte{'V', 'B', 'W', 'L'}) {
+			return fmt.Errorf("%w: WAL magic mismatch in %s (file=VBWL, runtime=VBWE)", ErrPreEncryptionFormat, filename)
+		}
+		return fmt.Errorf("WAL magic mismatch in %s: got %q, expected %q", filename, header[:4], vb.WAL.WALMagic[:])
+	}
+	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
+		return fmt.Errorf("WAL version mismatch in %s", filename)
+	}
+	walBlockSize := binary.BigEndian.Uint32(header[6:10])
+	if walBlockSize != vb.BlockSize {
+		return fmt.Errorf("WAL blocksize mismatch in %s: WAL has %d, expected %d", filename, walBlockSize, vb.BlockSize)
+	}
+	return nil
 }
 
 func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uint64, error) {
