@@ -1128,6 +1128,33 @@ func TestZeroWithBlockSizeNotDividingChunk(t *testing.T) {
 
 // A block larger than the chunk is zeroed one block at a time, so a request
 // holds at most one engine block past the mark.
+// Zeroing a whole block replaces it, so it must not need the old contents,
+// even when the block is larger than the zero buffer.
+func TestZeroWholeLargeBlockNeedsNoRead(t *testing.T) {
+	const blockSize = 6 << 20
+	root := t.TempDir()
+	vb := newSizedWriteBufferVolume(t, root, 1, nil, 48<<20, blockSize)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(0, bytes.Repeat([]byte{0x29}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(0)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	require.EqualValues(t, blockSize, reopened.BlockSize)
+	openWriteBufferWAL(t, reopened)
+	conn := &ViperBlockConnection{vb: reopened}
+	require.NoError(t, conn.Zero(blockSize, 0, 0), "a whole block is replaced, so its old data must not be read")
+	got := make([]byte, blockSize)
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.True(t, bytes.Equal(make([]byte, blockSize), got))
+}
+
 func TestZeroWithBlockLargerThanChunk(t *testing.T) {
 	const (
 		blockSize  = 6 << 20
