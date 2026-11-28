@@ -2519,8 +2519,7 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	//
 	// Blocks are published one at a time rather than as one batch so a block's
 	// lock is never held while another block's backend read is in flight.
-	var writes []Block
-
+	queued := false
 	for b := startBlock; b <= endBlock; b++ {
 		blockStart := b * blockSize
 		blockEnd := blockStart + blockSize
@@ -2544,19 +2543,21 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 
 		partial := writeStart > 0 || writeEnd < blockSize
 
-		blk, err := vb.writeOneBlockLocked(ctx, b, blockSize, partial, writeStart, writeEnd,
-			data[blockStart+writeStart-offset:blockStart+writeEnd-offset])
-		if err != nil {
-			// The blocks before this one are queued, and the drain that frees
-			// them subtracts their bytes, so count them before returning.
-			vb.pendingBytes.Add(int64(len(writes)) * int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
-			vb.signalSizeTrigger()
+		if _, err := vb.writeOneBlockLocked(ctx, b, blockSize, partial, writeStart, writeEnd,
+			data[blockStart+writeStart-offset:blockStart+writeEnd-offset]); err != nil {
+			// Blocks queued before this one hold this writer to the mark too;
+			// the caller still gets the rebuild error, never a drain error.
+			if queued {
+				vb.signalSizeTrigger()
+				if bpErr := vb.awaitBackpressure(ctx); bpErr != nil {
+					vb.logger().Warn("write backpressure after a failed rebuild", "block", b, "err", bpErr)
+				}
+			}
 			return err
 		}
-		writes = append(writes, blk)
+		queued = true
 	}
 
-	vb.pendingBytes.Add(int64(len(writes)) * int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
 	vb.signalSizeTrigger()
 
 	// Backpressure gate: block this guest write until buffered bytes drop
@@ -2643,8 +2644,11 @@ func (vb *VB) writeOneBlockLocked(ctx context.Context, b, blockSize uint64, part
 
 	blk := Block{SeqNum: seqNum, Block: b, Len: blockSize, Data: blockData}
 
+	// Counted under the lock that publishes it, so a drain that frees the
+	// block can never subtract bytes that are not yet counted.
 	vb.Writes.mu.Lock()
 	vb.Writes.Blocks = append(vb.Writes.Blocks, blk)
+	vb.pendingBytes.Add(int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
 	vb.Writes.mu.Unlock()
 
 	if vb.UseBlockStore && vb.BlockStore != nil {
