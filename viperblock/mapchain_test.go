@@ -2,6 +2,8 @@ package viperblock
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1003,4 +1005,59 @@ func TestMapCounterSampleDoesNotWaitForHeldClaim(t *testing.T) {
 	}
 	release()
 	require.NoError(t, <-done)
+}
+
+// writeRawVBState persists state as both state copies, sealed as the engine
+// seals it, without going through the engine's own state build.
+func writeRawVBState(t *testing.T, vb *VB, state VBState) {
+	t.Helper()
+	data, err := json.Marshal(state)
+	require.NoError(t, err)
+	if vb.EncryptionEnabled {
+		nonce := makeNonce(state.StateSeqNum, state.VolumeUUID, DomainVBStateMeta)
+		data = sealMeta(vb.aead, data, makeMetaAAD(vb.volumeNameHash, "vbstate", state.StateSeqNum), nonce)
+	}
+	local := filepath.Join(vb.BaseDir, types.GetFilePath(types.FileTypeConfig, 0, vb.GetVolume()))
+	require.NoError(t, writeFileAtomic(local, data, 0600))
+	require.NoError(t, vb.pushStateToBackend(context.Background(), data))
+}
+
+// treeDigests maps every file under root to the digest of its bytes.
+func treeDigests(t *testing.T, root string) map[string][32]byte {
+	t.Helper()
+	out := map[string][32]byte{}
+	require.NoError(t, filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out[path] = sha256.Sum256(data)
+		return nil
+	}))
+	return out
+}
+
+// A VBState that names a map format other than 2 fails the shared load path
+// before the encrypted open reserves its first SeqNum window.
+func TestLoadRejectsUnsupportedMapFormatBeforeWriting(t *testing.T) {
+	mv := newMapVolume(t, volumeSize, testKey(t, 7))
+	writer, _ := mv.create(t, 5)
+	writeDrain(t, writer, 0, randomBlockData(1))
+	require.NoError(t, writer.CloseCtx(t.Context()))
+
+	reader, _ := mv.engine(t, 6)
+	state, err := reader.ReadStateCtx(t.Context())
+	require.NoError(t, err)
+	require.True(t, state.EncryptionEnabled)
+	state.MapFormat = 1
+	state.StateSeqNum++
+	writeRawVBState(t, reader, state)
+
+	before := treeDigests(t, mv.root)
+	require.NotEmpty(t, before)
+	assert.ErrorContains(t, reader.LoadStateCtx(t.Context()), "unsupported block-map format 1")
+	assert.Equal(t, before, treeDigests(t, mv.root), "the refused load wrote nothing")
 }
