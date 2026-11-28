@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -354,10 +356,17 @@ func reopenWriteBufferVolume(t *testing.T, root string, key *masterkey.Key) *vip
 
 func newWriteBufferVolume(t testing.TB, root string, epoch uint64, key *masterkey.Key) *viperblock.VB {
 	t.Helper()
+	return newSizedWriteBufferVolume(t, root, epoch, key, 128<<20, 0)
+}
+
+// newSizedWriteBufferVolume is newWriteBufferVolume with a chosen volume size
+// and block size; a zero block size uses the engine default.
+func newSizedWriteBufferVolume(t testing.TB, root string, epoch uint64, key *masterkey.Key, size uint64, blockSize uint32) *viperblock.VB {
+	t.Helper()
 	backendDir := filepath.Join(root, "backend")
 	require.NoError(t, os.MkdirAll(backendDir, 0700))
 	config := viperblock.VB{
-		VolumeName: "borrowed-buf", VolumeSize: 128 << 20,
+		VolumeName: "borrowed-buf", VolumeSize: size, BlockSize: blockSize,
 		BaseDir: filepath.Join(root, "local"), LeaseEpoch: epoch,
 		WALSyncInterval: -1, ChunkUploadInterval: -1,
 		MasterKey: key, EncryptionEnabled: key != nil,
@@ -971,6 +980,532 @@ func TestOpenRetryAfterReplayWithHeldCompaction(t *testing.T) {
 	got := make([]byte, 2*blockSize)
 	require.NoError(t, cold.PRead(got, blockSize, 0))
 	require.Equal(t, append(replayed, newData...), got)
+}
+
+// pendingProbeBackend records the most buffered write bytes the engine holds
+// at any chunk upload, which is when a drain is moving them out.
+type pendingProbeBackend struct {
+	types.Backend
+
+	vb      *viperblock.VB
+	peak    atomic.Uint64
+	uploads atomic.Int64
+}
+
+var _ types.Backend = (*pendingProbeBackend)(nil)
+
+func (p *pendingProbeBackend) WriteCtx(ctx context.Context, fileType types.FileType, objectID uint64, headers *[]byte, data *[]byte) error {
+	if fileType == types.FileTypeChunk {
+		p.uploads.Add(1)
+		p.observe()
+	}
+	return p.Backend.WriteCtx(ctx, fileType, objectID, headers, data)
+}
+
+// observe records the engine's current buffered write bytes if they are the
+// most seen so far.
+func (p *pendingProbeBackend) observe() {
+	pending := p.vb.PendingBytes()
+	for {
+		peak := p.peak.Load()
+		if pending <= peak || p.peak.CompareAndSwap(peak, pending) {
+			return
+		}
+	}
+}
+
+// probeZeroBench installs a pending-byte probe on vb and returns it.
+func probeZeroBench(vb *viperblock.VB) *pendingProbeBackend {
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+	return probe
+}
+
+func TestZeroBoundsPendingBytesPerChunk(t *testing.T) {
+	const (
+		maxPending = 8 << 20
+		chunkBytes = 4 << 20
+		written    = 72 << 20
+		offset     = 4096 + 512
+		count      = 64 << 20
+	)
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	vb.MaxPendingBytes = maxPending
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+
+	pattern := make([]byte, written)
+	for i := range pattern {
+		pattern[i] = byte(i%251) + 1
+	}
+	require.NoError(t, vb.WriteAt(0, pattern))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.DrainToBackend())
+	probe.peak.Store(0)
+	probe.uploads.Store(0)
+
+	conn := &ViperBlockConnection{vb: vb}
+	require.NoError(t, conn.Zero(count, offset, 0))
+	require.Positive(t, probe.uploads.Load(), "the request must drive at least one drain")
+	t.Logf("peak pending bytes %d", probe.peak.Load())
+	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+chunkBytes+int(vb.BlockSize)),
+		"a zero request must be buffered a chunk at a time, under backpressure")
+
+	got := make([]byte, written)
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.Equal(t, pattern[:offset], got[:offset], "bytes before the range changed")
+	require.Equal(t, make([]byte, count), got[offset:offset+count], "the range is not zero")
+	require.Equal(t, pattern[offset+count:], got[offset+count:], "bytes after the range changed")
+}
+
+// The plugin runs in nbdkit's parallel thread model, so several requests can
+// each add a chunk before any of them waits. The bound is one chunk per request.
+func TestZeroParallelBoundsPendingBytesPerRequest(t *testing.T) {
+	const (
+		maxPending = 4 << 20
+		chunkBytes = 4 << 20
+		requests   = 4
+		count      = 24 << 20
+	)
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	vb.MaxPendingBytes = maxPending
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+	pattern := bytes.Repeat([]byte{0x3c}, requests*count)
+	require.NoError(t, vb.WriteAt(0, pattern))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.DrainToBackend())
+	probe.peak.Store(0)
+	probe.uploads.Store(0)
+
+	conn := &ViperBlockConnection{vb: vb}
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Go(func() { errs <- conn.Zero(count, uint64(i*count), 0) }) //nolint:gosec // G115: i*count is under the volume size
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Positive(t, probe.uploads.Load(), "the request must drive at least one drain")
+	t.Logf("peak pending bytes %d", probe.peak.Load())
+	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+requests*(chunkBytes+int(vb.BlockSize))),
+		"each in-flight zero request may hold at most one chunk past the mark")
+
+	got := make([]byte, len(pattern))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.Equal(t, make([]byte, len(pattern)), got)
+}
+
+// A block size that does not divide the chunk still zeroes exactly the range.
+func TestZeroWithBlockSizeNotDividingChunk(t *testing.T) {
+	const blockSize = 12288
+	vb := newSizedWriteBufferVolume(t, t.TempDir(), 1, nil, 48<<20, blockSize)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.EqualValues(t, blockSize, vb.BlockSize)
+	pattern := make([]byte, 24<<20)
+	for i := range pattern {
+		pattern[i] = byte(i%253) + 1
+	}
+	require.NoError(t, vb.WriteAt(0, pattern))
+	offset, count := 4<<20-5000, 9<<20+777
+	conn := &ViperBlockConnection{vb: vb}
+	require.NoError(t, conn.Zero(uint32(count), uint64(offset), 0)) //nolint:gosec // G115: small constants
+
+	got := make([]byte, len(pattern))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	want := bytes.Clone(pattern)
+	clear(want[offset : offset+count])
+	require.Equal(t, want, got)
+}
+
+// A block larger than the chunk is zeroed one block at a time, so a request
+// holds at most one engine block past the mark.
+// Zeroing a whole block replaces it, so it must not need the old contents,
+// even when the block is larger than the zero buffer.
+func TestZeroWholeLargeBlockNeedsNoRead(t *testing.T) {
+	const blockSize = 6 << 20
+	root := t.TempDir()
+	vb := newSizedWriteBufferVolume(t, root, 1, nil, 48<<20, blockSize)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(0, bytes.Repeat([]byte{0x29}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(0)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	require.EqualValues(t, blockSize, reopened.BlockSize)
+	openWriteBufferWAL(t, reopened)
+	conn := &ViperBlockConnection{vb: reopened}
+	require.NoError(t, conn.Zero(blockSize, 0, 0), "a whole block is replaced, so its old data must not be read")
+	got := make([]byte, blockSize)
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.True(t, bytes.Equal(make([]byte, blockSize), got))
+}
+
+func TestZeroWithBlockLargerThanChunk(t *testing.T) {
+	const (
+		blockSize  = 6 << 20
+		maxPending = 8 << 20
+	)
+	vb := newSizedWriteBufferVolume(t, t.TempDir(), 1, nil, 48<<20, blockSize)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.EqualValues(t, blockSize, vb.BlockSize)
+	vb.MaxPendingBytes = maxPending
+	pattern := make([]byte, 36<<20)
+	for i := range pattern {
+		pattern[i] = byte(i%241) + 1
+	}
+	require.NoError(t, vb.WriteAt(0, pattern))
+	require.NoError(t, vb.Flush())
+	require.NoError(t, vb.DrainToBackend())
+	probe := &pendingProbeBackend{Backend: vb.Backend, vb: vb}
+	vb.Backend = probe
+
+	offset, count := 1<<20+300, 30<<20
+	conn := &ViperBlockConnection{vb: vb}
+	require.NoError(t, conn.Zero(uint32(count), uint64(offset), 0)) //nolint:gosec // G115: small constants
+	require.Positive(t, probe.uploads.Load(), "the request must drive at least one drain")
+	t.Logf("peak pending bytes %d", probe.peak.Load())
+	require.LessOrEqual(t, probe.peak.Load(), uint64(maxPending+blockSize),
+		"a request may hold at most one engine block past the mark")
+
+	got := make([]byte, len(pattern))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	want := bytes.Clone(pattern)
+	clear(want[offset : offset+count])
+	require.Equal(t, want, got)
+}
+
+// A step whose last partial block cannot be read has already queued its full
+// blocks, and those must count toward backpressure.
+func TestZeroFailedPartialBlockCountsQueuedBlocks(t *testing.T) {
+	const blockSize = 4096
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(1)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	require.Zero(t, reopened.PendingBytes())
+	conn := &ViperBlockConnection{vb: reopened}
+	err = conn.Zero(blockSize+512, 0, 0)
+	require.ErrorContains(t, err, "failed to read block 1 for RMW")
+	require.Equal(t, uint64(blockSize), reopened.PendingBytes(),
+		"the full block queued before the failed read must be counted")
+}
+
+// Repeated failed steps must still be held to the high-water mark, or a
+// guest that keeps hitting one bad block grows the buffer without limit.
+func TestZeroRepeatedFailuresRespectBackpressure(t *testing.T) {
+	const (
+		blockSize  = 4096
+		maxPending = 4 * blockSize
+		attempts   = 20
+	)
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	object, _, _, err := vb.LookupBlockToObject(1)
+	require.NoError(t, err)
+	chunkPath := types.GetFilePath(types.FileTypeChunk, object, vb.GetVolume())
+	require.NoError(t, os.Remove(filepath.Join(root, "backend", chunkPath)))
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	openWriteBufferWAL(t, reopened)
+	reopened.MaxPendingBytes = maxPending
+	conn := &ViperBlockConnection{vb: reopened}
+	for range attempts {
+		err := conn.Zero(blockSize+512, 0, 0)
+		require.ErrorContains(t, err, "failed to read block 1 for RMW", "the original error must survive")
+		require.LessOrEqual(t, reopened.PendingBytes(), uint64(maxPending+blockSize),
+			"failed requests must not grow the buffer past the mark")
+	}
+}
+
+// gatedChunkReadBackend holds every chunk read until release is closed, then
+// fails it.
+type gatedChunkReadBackend struct {
+	types.Backend
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+var _ types.Backend = (*gatedChunkReadBackend)(nil)
+
+var errGatedChunkRead = errors.New("injected chunk read failure")
+
+func (g *gatedChunkReadBackend) hold() error {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return errGatedChunkRead
+}
+
+func (g *gatedChunkReadBackend) ReadCtx(ctx context.Context, fileType types.FileType, objectID uint64, offset, length uint32) ([]byte, error) {
+	if fileType == types.FileTypeChunk {
+		return nil, g.hold()
+	}
+	return g.Backend.ReadCtx(ctx, fileType, objectID, offset, length)
+}
+
+func (g *gatedChunkReadBackend) ReadChunkFromCtx(ctx context.Context, volume string, ref types.ChunkRef, offset, length uint32) ([]byte, error) {
+	return nil, g.hold()
+}
+
+// A drain that frees a queued block while its writer still waits on a later
+// read must not take the counter below zero.
+func TestZeroDrainDuringFailedReadKeepsCounter(t *testing.T) {
+	const blockSize = 4096
+	root := t.TempDir()
+	vb := newWriteBufferVolume(t, root, 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	require.NoError(t, vb.WriteAt(blockSize, bytes.Repeat([]byte{0x31}, blockSize)))
+	require.NoError(t, vb.DrainToBackend())
+	detachWriteBufferVolume(vb)
+	vb = nil
+
+	reopened := reopenWriteBufferVolume(t, root, nil)
+	openWriteBufferWAL(t, reopened)
+	gate := &gatedChunkReadBackend{Backend: reopened.Backend, entered: make(chan struct{}), release: make(chan struct{})}
+	reopened.Backend = gate
+	conn := &ViperBlockConnection{vb: reopened}
+	done := make(chan error, 1)
+	go func() { done <- conn.Zero(blockSize+512, 0, 0) }()
+	select {
+	case <-gate.entered:
+	case err := <-done:
+		t.Fatalf("Zero returned before its read of block 1: %v", err)
+	}
+
+	require.NoError(t, reopened.DrainToBackend())
+	assert.Less(t, reopened.PendingBytes(), uint64(1<<40), "the counter went below zero")
+	close(gate.release)
+	require.ErrorContains(t, <-done, "failed to read block 1 for RMW")
+	assert.Zero(t, reopened.PendingBytes())
+}
+
+func TestZeroOutOfRangeWritesNothing(t *testing.T) {
+	vb := newWriteBufferVolume(t, t.TempDir(), 1, nil)
+	t.Cleanup(func() { detachWriteBufferVolume(vb) })
+	openWriteBufferWAL(t, vb)
+	block := bytes.Repeat([]byte{0x5a}, int(vb.BlockSize))
+	require.NoError(t, vb.WriteAt(0, block))
+	conn := &ViperBlockConnection{vb: vb}
+
+	for _, request := range []struct {
+		name   string
+		count  uint32
+		offset uint64
+		want   error
+	}{
+		{"pastEnd", math.MaxUint32, 0, viperblock.ErrRequestOutOfRange},
+		{"offsetPastEnd", 4096, vb.GetVolumeSize() + 4096, viperblock.ErrRequestTooLarge},
+		{"offsetNearMax", 8192, math.MaxUint64 - 4095, viperblock.ErrRequestTooLarge},
+	} {
+		t.Run(request.name, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			err := conn.Zero(request.count, request.offset, 0)
+			runtime.ReadMemStats(&after)
+			require.ErrorContains(t, err, request.want.Error())
+			require.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(16<<20),
+				"an out-of-range request must be refused before it allocates its length")
+		})
+	}
+
+	got := make([]byte, len(block))
+	require.NoError(t, conn.PRead(got, 0, 0))
+	require.Equal(t, block, got)
+}
+
+func BenchmarkZero(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	// 512 MiB passes the default 256 MiB mark. The largest NBD zero request
+	// needs a host with about 24 GiB free memory and 10 GiB free disk.
+	for _, size := range []int{4 << 10, 1 << 20, 4 << 20, 64 << 20, 512 << 20, math.MaxUint32 - 4095} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			if size > 512<<20 && os.Getenv("VIPERBLOCK_BENCH_ZERO_MAX") != "1" {
+				b.Skip("set VIPERBLOCK_BENCH_ZERO_MAX=1 on a host with room for a 4 GiB request")
+			}
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newSizedWriteBufferVolume(b, root, 1, nil, uint64(max(128<<20, size+(4<<20))), 0) //nolint:gosec // G115: size is under 4 GiB
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
+			// The peak is sampled at each chunk upload and after each request,
+			// so it includes what earlier requests in the window left buffered.
+			probe := probeZeroBench(conn.vb)
+			var peak uint64
+			defer func() { b.ReportMetric(float64(max(peak, probe.peak.Load())), "peak-pending-B") }()
+			// Keep both the dirty set and temporary disk use bounded.
+			window := max(16<<20, size)
+			offset := 0
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if offset+size > window {
+					b.StopTimer()
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					peak = max(peak, probe.peak.Load())
+					conn.vb = newVolume()
+					probe = probeZeroBench(conn.vb)
+					offset = 0
+					b.StartTimer()
+				}
+				if err := conn.Zero(uint32(size), uint64(offset), 0); err != nil { //nolint:gosec // G115: size is under 4 GiB
+					b.Fatal(err)
+				}
+				probe.observe()
+				offset += size
+			}
+		})
+	}
+}
+
+// BenchmarkPWriteParallel runs several writes at once on one connection, as
+// nbdkit's parallel thread model does, over disjoint ranges.
+func BenchmarkPWriteParallel(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	const callers = 4
+	for _, size := range []int{4 << 10, 1 << 20} {
+		b.Run(fmt.Sprintf("%dx%d", callers, size), func(b *testing.B) {
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newWriteBufferVolume(b, root, 1, nil)
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
+			buf := bytes.Repeat([]byte{0x56}, size)
+			const window = 16 << 20
+			offset := 0
+			b.SetBytes(int64(callers * size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if offset+callers*size > window {
+					b.StopTimer()
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					conn.vb = newVolume()
+					offset = 0
+					b.StartTimer()
+				}
+				var wg sync.WaitGroup
+				errs := make(chan error, callers)
+				for i := range callers {
+					start := uint64(offset + i*size) //nolint:gosec // G115: under the volume size
+					wg.Go(func() { errs <- conn.PWrite(buf, start, 0) })
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				offset += callers * size
+			}
+		})
+	}
+}
+
+// BenchmarkZeroParallel runs several zero requests at once on one connection,
+// as nbdkit's parallel thread model does, over disjoint ranges.
+func BenchmarkZeroParallel(b *testing.B) {
+	logger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(logger)
+
+	const callers = 4
+	for _, size := range []int{1 << 20, 16 << 20} {
+		b.Run(fmt.Sprintf("%dx%d", callers, size), func(b *testing.B) {
+			root := filepath.Join(b.TempDir(), "volume")
+			newVolume := func() *viperblock.VB {
+				vb := newWriteBufferVolume(b, root, 1, nil)
+				openWriteBufferWAL(b, vb)
+				return vb
+			}
+			conn := &ViperBlockConnection{vb: newVolume()}
+			defer func() { detachWriteBufferVolume(conn.vb) }()
+			probe := probeZeroBench(conn.vb)
+			var peak uint64
+			defer func() { b.ReportMetric(float64(max(peak, probe.peak.Load())), "peak-pending-B") }()
+			window := max(16<<20, callers*size)
+			offset := 0
+			b.SetBytes(int64(callers * size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if offset+callers*size > window {
+					b.StopTimer()
+					detachWriteBufferVolume(conn.vb)
+					conn.vb = nil
+					require.NoError(b, os.RemoveAll(root))
+					peak = max(peak, probe.peak.Load())
+					conn.vb = newVolume()
+					probe = probeZeroBench(conn.vb)
+					offset = 0
+					b.StartTimer()
+				}
+				var wg sync.WaitGroup
+				errs := make(chan error, callers)
+				for i := range callers {
+					start := uint64(offset + i*size) //nolint:gosec // G115: under the volume size
+					wg.Go(func() { errs <- conn.Zero(uint32(size), start, 0) }) //nolint:gosec // G115: size is at most 16 MiB
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				probe.observe()
+				offset += callers * size
+			}
+		})
+	}
 }
 
 func TestSnapshotListenerRefusesOverlappingDrain(t *testing.T) {

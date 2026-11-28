@@ -2519,8 +2519,7 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 	//
 	// Blocks are published one at a time rather than as one batch so a block's
 	// lock is never held while another block's backend read is in flight.
-	var writes []Block
-
+	queued := false
 	for b := startBlock; b <= endBlock; b++ {
 		blockStart := b * blockSize
 		blockEnd := blockStart + blockSize
@@ -2544,15 +2543,21 @@ func (vb *VB) WriteAtCtx(ctx context.Context, offset uint64, data []byte) error 
 
 		partial := writeStart > 0 || writeEnd < blockSize
 
-		blk, err := vb.writeOneBlockLocked(ctx, b, blockSize, partial, writeStart, writeEnd,
-			data[blockStart+writeStart-offset:blockStart+writeEnd-offset])
-		if err != nil {
+		if _, err := vb.writeOneBlockLocked(ctx, b, blockSize, partial, writeStart, writeEnd,
+			data[blockStart+writeStart-offset:blockStart+writeEnd-offset]); err != nil {
+			// Blocks queued before this one hold this writer to the mark too;
+			// the caller still gets the rebuild error, never a drain error.
+			if queued {
+				vb.signalSizeTrigger()
+				if bpErr := vb.awaitBackpressure(ctx); bpErr != nil {
+					vb.logger().Warn("write backpressure after a failed rebuild", "block", b, "err", bpErr)
+				}
+			}
 			return err
 		}
-		writes = append(writes, blk)
+		queued = true
 	}
 
-	vb.pendingBytes.Add(int64(len(writes)) * int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
 	vb.signalSizeTrigger()
 
 	// Backpressure gate: block this guest write until buffered bytes drop
@@ -2639,8 +2644,11 @@ func (vb *VB) writeOneBlockLocked(ctx context.Context, b, blockSize uint64, part
 
 	blk := Block{SeqNum: seqNum, Block: b, Len: blockSize, Data: blockData}
 
+	// Counted under the lock that publishes it, so a drain that frees the
+	// block can never subtract bytes that are not yet counted.
 	vb.Writes.mu.Lock()
 	vb.Writes.Blocks = append(vb.Writes.Blocks, blk)
+	vb.pendingBytes.Add(int64(blockSize)) //nolint:gosec // G115: blockSize is 4KB-class, no overflow risk
 	vb.Writes.mu.Unlock()
 
 	if vb.UseBlockStore && vb.BlockStore != nil {
@@ -3610,19 +3618,24 @@ func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64
 			filename := filepath.Join(sw.BaseDir,
 				types.GetShardedWALPath(vb.GetVolume(), walNum, shardID))
 
+			// Open and rotation create every shard, empty ones too, so a
+			// missing file is a lost shard and fails the drain.
 			file, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 			if err != nil {
-				if os.IsNotExist(err) {
-					return // Empty shard, no file
-				}
 				results[shardID].err = fmt.Errorf("failed to open shard %d for reading: %w", shardID, err)
 				return
 			}
 			defer file.Close()
 
-			// Skip WAL header
-			if _, err := file.Seek(int64(headerSize), io.SeekStart); err != nil {
-				results[shardID].err = fmt.Errorf("failed to seek past header in shard %d: %w", shardID, err)
+			// The shard may hold the only copy of acknowledged writes, so a
+			// header or record that cannot be fully read fails the drain.
+			header := make([]byte, headerSize)
+			if _, err := io.ReadFull(file, header); err != nil {
+				results[shardID].err = fmt.Errorf("%w: read header of shard %d: %w", ErrIntegrity, shardID, err)
+				return
+			}
+			if err := vb.checkWALHeader(header, filename); err != nil {
+				results[shardID].err = fmt.Errorf("%w: shard %d: %w", ErrIntegrity, shardID, err)
 				return
 			}
 
@@ -3630,16 +3643,12 @@ func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64
 			recordSize := 28 + int(vb.BlockSize)
 			for {
 				data := make([]byte, recordSize)
-				n, err := file.Read(data)
-				if err != nil {
+				if _, err := io.ReadFull(file, data); err != nil {
 					if err == io.EOF {
 						break
 					}
-					results[shardID].err = fmt.Errorf("error reading shard %d: %w", shardID, err)
+					results[shardID].err = fmt.Errorf("%w: read record in shard %d: %w", ErrIntegrity, shardID, err)
 					return
-				}
-				if n < recordSize {
-					break // Incomplete record at EOF, discard
 				}
 
 				// Validate checksum
@@ -3648,7 +3657,7 @@ func (vb *VB) consolidateShardedWALGeneration(ctx context.Context, walNum uint64
 				computed = crc32.Update(computed, crc32.IEEETable, data[28:])
 				if computed != checksum {
 					vb.logger().Error("checksum mismatch in sharded WAL", "shard", shardID)
-					results[shardID].err = fmt.Errorf("checksum mismatch in shard %d", shardID)
+					results[shardID].err = fmt.Errorf("%w: checksum mismatch in shard %d", ErrIntegrity, shardID)
 					return
 				}
 
@@ -5235,9 +5244,9 @@ func (vb *VB) LoadLiveCheckpointCtx(ctx context.Context) error {
 	return vb.parseBlockCheckpoint(checkpoint)
 }
 
-// readWALFileForRecovery opens a WAL file read-only and returns all valid blocks.
-// Format 2 rejects an incomplete or invalid record; format 1 retains its
-// legacy prefix replay for short tails.
+// readWALFileForRecovery opens a WAL file read-only and returns all its blocks.
+// Every format rejects an incomplete or invalid record with ErrIntegrity, so
+// recovery never replays a prefix and drops the rest.
 func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -5258,33 +5267,39 @@ func (vb *VB) readWALFileForRecovery(filename string) ([]Block, uint64, error) {
 		return nil, 0, fmt.Errorf("failed to read WAL header: %w", err)
 	}
 
-	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
-		if vb.EncryptionEnabled && bytes.Equal(header[:4], []byte{'V', 'B', 'W', 'L'}) {
-			return nil, 0, fmt.Errorf("%w: WAL magic mismatch in %s (file=VBWL, runtime=VBWE)", ErrPreEncryptionFormat, filename)
-		}
-		return nil, 0, fmt.Errorf("WAL magic mismatch in %s: got %q, expected %q", filename, header[:4], vb.WAL.WALMagic[:])
-	}
-	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
-		return nil, 0, fmt.Errorf("WAL version mismatch in %s", filename)
-	}
-	walBlockSize := binary.BigEndian.Uint32(header[6:10])
-	if walBlockSize != vb.BlockSize {
-		return nil, 0, fmt.Errorf("WAL blocksize mismatch in %s: WAL has %d, expected %d", filename, walBlockSize, vb.BlockSize)
+	if err := vb.checkWALHeader(header, filename); err != nil {
+		return nil, 0, err
 	}
 
 	return vb.readWALRecoveryRecords(f, filename)
 }
 
+// checkWALHeader rejects a WAL header whose magic, version or block size does
+// not match this volume.
+func (vb *VB) checkWALHeader(header []byte, filename string) error {
+	if !bytes.Equal(header[:4], vb.WAL.WALMagic[:]) {
+		if vb.EncryptionEnabled && bytes.Equal(header[:4], []byte{'V', 'B', 'W', 'L'}) {
+			return fmt.Errorf("%w: WAL magic mismatch in %s (file=VBWL, runtime=VBWE)", ErrPreEncryptionFormat, filename)
+		}
+		return fmt.Errorf("WAL magic mismatch in %s: got %q, expected %q", filename, header[:4], vb.WAL.WALMagic[:])
+	}
+	if binary.BigEndian.Uint16(header[4:6]) != vb.Version {
+		return fmt.Errorf("WAL version mismatch in %s", filename)
+	}
+	walBlockSize := binary.BigEndian.Uint32(header[6:10])
+	if walBlockSize != vb.BlockSize {
+		return fmt.Errorf("WAL blocksize mismatch in %s: WAL has %d, expected %d", filename, walBlockSize, vb.BlockSize)
+	}
+	return nil
+}
+
 func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uint64, error) {
-	strict := vb.IsMapDelta()
 	var blocks []Block
 	var maxSeqNum uint64
 
 	// Encrypted WAL records are 40+BlockSize (24-byte header + ciphertext +
 	// 16-byte tag); unencrypted records are 28+BlockSize (24-byte header +
-	// CRC32 + plaintext). Both record sizes are fixed, so a tail tear shows
-	// up as ErrUnexpectedEOF and stops replay at the last fully-written
-	// record (same fail-tolerant posture as the legacy CRC path).
+	// CRC32 + plaintext). Both sizes are fixed, so a torn tail is ErrUnexpectedEOF.
 	if vb.EncryptionEnabled {
 		recordSize := 40 + int(vb.BlockSize)
 		record := make([]byte, recordSize)
@@ -5292,16 +5307,10 @@ func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uin
 		initAAD(&aad, vb.volumeNameHash)
 		for {
 			if _, err := io.ReadFull(f, record); err != nil {
-				if err == io.EOF || (!strict && err == io.ErrUnexpectedEOF) {
+				if err == io.EOF {
 					break
 				}
-				if strict {
-					return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: read record: %w", filename, ErrIntegrity, err)
-				}
-				// Any other I/O error means we can't be sure whether
-				// the remainder is a tear or tamper; keep the WAL for
-				// retry rather than dropping records on the floor.
-				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: read record: %w", filename, err)
+				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: read record: %w", filename, ErrIntegrity, err)
 			}
 
 			seqNum := binary.BigEndian.Uint64(record[0:8])
@@ -5335,11 +5344,8 @@ func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uin
 	for {
 		record := make([]byte, recordSize)
 		if _, err := io.ReadFull(f, record); err != nil {
-			if strict && err != io.EOF {
+			if err != io.EOF {
 				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: read record: %w", filename, ErrIntegrity, err)
-			}
-			if err != io.EOF && err != io.ErrUnexpectedEOF {
-				vb.logger().Warn("WAL recovery: I/O error reading record, stopping", "file", filename, "error", err, "valid_records_so_far", len(blocks))
 			}
 			break
 		}
@@ -5350,11 +5356,7 @@ func (vb *VB) readWALRecoveryRecords(f io.Reader, filename string) ([]Block, uin
 		checksumValidated = crc32.Update(checksumValidated, crc32.IEEETable, record[28:])
 
 		if checksumValidated != checksum {
-			if strict {
-				return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: WAL checksum mismatch on block %d", filename, ErrIntegrity, binary.BigEndian.Uint64(record[8:16]))
-			}
-			vb.logger().Warn("WAL recovery: checksum mismatch, stopping read", "file", filename, "valid_records_so_far", len(blocks))
-			break
+			return nil, 0, fmt.Errorf("readWALFileForRecovery: %s: %w: WAL checksum mismatch on block %d", filename, ErrIntegrity, binary.BigEndian.Uint64(record[8:16]))
 		}
 
 		seqNum := binary.BigEndian.Uint64(record[:8])
@@ -5447,8 +5449,7 @@ func (vb *VB) recoverLocalWALs(readWAL func(string) ([]Block, uint64, error)) (e
 				}
 				continue
 			}
-			vb.logger().Error("WAL recovery: failed to read WAL file, keeping for retry", "file", fname, "error", err)
-			continue
+			return fmt.Errorf("WAL recovery: cannot read %s: %w", fname, err)
 		}
 		successFiles = append(successFiles, fname)
 		allBlocks = append(allBlocks, blocks...)
@@ -5599,8 +5600,11 @@ func (vb *VB) recoverLocalWALs(readWAL func(string) ([]Block, uint64, error)) (e
 	// the live checkpoint over the numbered one just saved above, and the
 	// recovered WAL files are removed below, so a stale live checkpoint here
 	// would silently lose this recovery's blocks on a second crash.
-	if cpErr := vb.SaveLiveCheckpoint(); cpErr != nil {
-		vb.logger().Warn("WAL recovery: SaveLiveCheckpoint failed", "err", cpErr)
+	// A retry can load a numbered checkpoint that already names these blocks,
+	// leaving the map clean and the live checkpoint stale; write it anyway.
+	vb.BlocksToObject.dirty.Store(true)
+	if err := vb.SaveLiveCheckpoint(); err != nil {
+		return fmt.Errorf("WAL recovery: failed to save live checkpoint: %w", err)
 	}
 
 	// Remove only successfully-read WAL files (keep failed ones for retry)
