@@ -88,6 +88,7 @@ func dropInMemoryCopies(t *testing.T, vb *VB) {
 	vb.PendingBackendWrites.mu.Lock()
 	vb.PendingBackendWrites.Blocks = nil
 	vb.PendingBackendWrites.mu.Unlock()
+	vb.LeaseEpoch = nextTestEpoch()
 	require.NoError(t, vb.LoadLiveCheckpoint())
 }
 

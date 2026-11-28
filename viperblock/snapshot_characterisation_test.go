@@ -389,7 +389,7 @@ func createNamedCloneVB(t *testing.T, source *VB, snapshotID, suffix string) *VB
 			VolumeName: cloneName,
 			VolumeSize: source.VolumeSize,
 			Region:     "ap-southeast-2",
-			Bucket:     "predastore",
+			Bucket:     sharedBucket,
 			AccessKey:  AccessKey,
 			SecretKey:  SecretKey,
 			Host:       source.Backend.GetHost(),

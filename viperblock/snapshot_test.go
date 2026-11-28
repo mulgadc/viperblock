@@ -835,6 +835,7 @@ func createCloneVB(t *testing.T, source *VB, snapshotID string) *VB {
 	// Load snapshot base map
 	err = clone.OpenFromSnapshot(snapshotID)
 	require.NoError(t, err)
+	initTestMap(t, clone)
 
 	return clone
 }
@@ -863,7 +864,7 @@ func cloneBackendConfigFor(source *VB, cloneName string) any {
 			VolumeName: cloneName,
 			VolumeSize: source.VolumeSize,
 			Region:     "ap-southeast-2",
-			Bucket:     "predastore",
+			Bucket:     sharedBucket,
 			AccessKey:  AccessKey,
 			SecretKey:  SecretKey,
 			Host:       source.Backend.GetHost(),

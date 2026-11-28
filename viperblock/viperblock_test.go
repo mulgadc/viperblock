@@ -1588,7 +1588,7 @@ func TestImportDiskImage(t *testing.T) {
 				VolumeSize: vb.VolumeSize,
 
 				Region:     "ap-southeast-2",
-				Bucket:     "predastore",
+				Bucket:     sharedBucket,
 				AccessKey:  AccessKey,
 				SecretKey:  SecretKey,
 				Host:       fmt.Sprintf("https://%s", vb.Backend.GetHost()),

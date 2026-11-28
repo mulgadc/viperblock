@@ -66,7 +66,7 @@ func TestWireQualifiedSnapshotGC(t *testing.T) {
 					WALSyncInterval: -1, ChunkUploadInterval: -1, GCInterval: -1, GCEnabled: true,
 					QualifiedChunks: true, LeaseEpoch: epoch, LaunchChunkIDs: &atomic.Uint64{},
 				}, S3Backend, s3.S3Config{
-					VolumeName: name, VolumeSize: volumeSize, Region: "ap-southeast-2", Bucket: "predastore",
+					VolumeName: name, VolumeSize: volumeSize, Region: "ap-southeast-2", Bucket: sharedBucket,
 					AccessKey: os.Getenv("AWS_ACCESS_KEY_ID"), SecretKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
 					Host: endpoint, HTTPClient: client,
 				})
