@@ -75,7 +75,7 @@ Plugin parameters:
 | `access_key` / `secret_key` | S3 credentials (S3 backend) |
 | `cache_size` | LRU cache as percentage of system memory |
 | `shardwal` | Enable sharded WAL (`true`/`false`) |
-| `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `false`) |
+| `gc_enabled` | Enable chunk garbage collection (`true`/`false`, default `true`) |
 
 ## Capabilities
 

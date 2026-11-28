@@ -157,9 +157,9 @@ func closeStartupWALs(vb *viperblock.VB) {
 
 var encryption_key_file string
 
-// gc_enabled mirrors viperblock.VB.GCEnabled. Defaults false so chunk GC
-// stays off until the spawning process explicitly opts in.
-var gc_enabled bool = false
+// gc_enabled mirrors viperblock.VB.GCEnabled. Defaults true so a volume opened
+// without the key reclaims superseded chunks; gc_enabled=false turns it off.
+var gc_enabled = true
 
 var disk []byte
 
