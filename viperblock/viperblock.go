@@ -6498,8 +6498,8 @@ func (vb *VB) loadStateCtx(ctx context.Context, loadCheckpoint bool) error {
 	if err != nil {
 		return err
 	}
-	if loadCheckpoint && state.MapFormat != MapFormatDelta {
-		return fmt.Errorf("unsupported block-map format %d: expected %d", state.MapFormat, MapFormatDelta)
+	if state.MapFormat != MapFormatDelta {
+		return fmt.Errorf("unsupported block-map format %d", state.MapFormat)
 	}
 
 	vb.VolumeName = state.VolumeName
