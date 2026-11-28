@@ -188,7 +188,7 @@ func BenchmarkFlush_Concurrent(b *testing.B) {
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					block := next.Add(1) % 4096
+					block := next.Add(1) % (volumeSize / 4096)
 					if err := vb.WriteAt(block*4096, data); err != nil {
 						b.Error(err)
 						return
