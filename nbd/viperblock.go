@@ -706,12 +706,22 @@ func (c *ViperBlockConnection) Zero(count uint32, offset uint64, flags uint32) e
 	if blockSize <= step {
 		step -= step % blockSize
 	}
+	var wholeBlock []byte
 	for end := offset + uint64(count); offset < end; {
 		n := min(end-offset, step-offset%step)
+		buf := zeroChunk[:]
 		if blockSize > step {
 			n = min(end-offset, step, blockSize-offset%blockSize)
+			// A whole block is replaced in one write, so its old data is never
+			// read; the request still holds at most one block.
+			if offset%blockSize == 0 && end-offset >= blockSize {
+				if wholeBlock == nil {
+					wholeBlock = make([]byte, blockSize)
+				}
+				n, buf = blockSize, wholeBlock
+			}
 		}
-		if err := c.vb.WriteAt(offset, zeroChunk[:n]); err != nil {
+		if err := c.vb.WriteAt(offset, buf[:n]); err != nil {
 			return backendErrToPluginError("Could not write zero data", err)
 		}
 		offset += n
